@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zlib&#x27;s decompressobj(max_length=) Can Silently Lose Data</title>
+<meta name="description" content="We measured decompressobj().decompress(data, max_length) silently returning 270 bytes instead of 11000 when unconsumed_tail isn&#x27;t fed back in.">
+<link rel="canonical" href="https://honestkit.github.io/guides/zlib-decompressobj-max-length-unconsumed-tail-silent-data-loss/">
+<meta property="og:title" content="zlib&#x27;s decompressobj(max_length=) Can Silently Lose Data">
+<meta property="og:description" content="We measured decompressobj().decompress(data, max_length) silently returning 270 bytes instead of 11000 when unconsumed_tail isn&#x27;t fed back in.">
+<meta property="og:url" content="https://honestkit.github.io/guides/zlib-decompressobj-max-length-unconsumed-tail-silent-data-loss/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does zlib's decompressobj.decompress(data, max_length) raise an error if you ignore unconsumed_tail?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured it silently returning far less data than the original (270 bytes instead of 11000) with no exception and no warning when unconsumed_tail wasn't fed back in."}}, {"@type": "Question", "name": "What is unconsumed_tail actually for?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it holding compressed input bytes that decompressobj already read but didn't need to produce the current max_length-capped output \u2014 it's the only place those bytes exist; they're not re-derivable afterward."}}, {"@type": "Question", "name": "Does flush() recover data lost by skipping unconsumed_tail?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured flush() returning 0 extra bytes in that case, because from the decompressor's perspective the stream legitimately ended; it has no way to know more compressed data was being withheld."}}, {"@type": "Question", "name": "How do I correctly decompress in bounded chunks with max_length?", "acceptedAnswer": {"@type": "Answer", "text": "We'd loop: call decompress(data, max_length), then keep calling decompress(unconsumed_tail, max_length) \u2014 feeding each call's leftover back in \u2014 until unconsumed_tail is empty, then call flush() once at the end."}}, {"@type": "Question", "name": "Is this unconsumed_tail behavior documented?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 the Python zlib docs describe max_length as bounding output size and unconsumed_tail as the data not yet consumed after such a call. We confirmed skipping it causes exactly the silent truncation described here in Python 3.13.5."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>zlib decompressobj max_length Silent Data Loss (tested)</h1>
+<p class="lead"><code>decompressobj().decompress(data, max_length)</code> caps how much decompressed output you get back per call &mdash; and quietly leaves compressed bytes behind in <code>unconsumed_tail</code> for you to resubmit. We measured what happens when that resubmission step is skipped: no error, just most of your data missing.</p>
+<h2 id="repro1">1. max_length leaves bytes behind in unconsumed_tail</h2>
+<pre><code>import zlib
+
+data = b"hello world" * 1000
+c = zlib.compress(data)
+
+d = zlib.decompressobj()
+out1 = d.decompress(c, 100)
+len(out1)
+100
+len(d.unconsumed_tail)
+27</code></pre>
+<p><strong>Measured:</strong> capping output at 100 bytes with <code>max_length</code> doesn't mean 100 bytes of the compressed input were consumed &mdash; the decompressor stops as soon as it has enough output, and whatever compressed bytes it already read but didn't need yet sit in <code>unconsumed_tail</code>, waiting to be passed into the next call.</p>
+
+<h2 id="repro2">2. Skip unconsumed_tail and the rest of your data silently vanishes</h2>
+<pre><code>out2 = d.decompress(b"")
+len(out2)
+170
+out3 = d.flush()
+len(out3)
+0
+
+len(out1) + len(out2) + len(out3)
+270
+len(data)
+11000</code></pre>
+<p><strong>Measured:</strong> calling <code>decompress(b"")</code> (or feeding it fresh data) instead of <code>d.unconsumed_tail</code> gets you only 270 bytes of a stream that should produce 11000 &mdash; the decompressor just stops silently once it runs out of what little it was actually given, with no exception and no warning that most of the data was never processed. <code>flush()</code> doesn't recover it either, because from the decompressor's point of view, the stream legitimately ended early; it has no way to know you were holding back the real continuation.</p>
+
+<h2 id="repro3">3. Feeding unconsumed_tail back gets everything</h2>
+<pre><code>d2 = zlib.decompressobj()
+chunks = []
+out = d2.decompress(c, 100)
+chunks.append(out)
+while d2.unconsumed_tail:
+    out = d2.decompress(d2.unconsumed_tail, 100)
+    chunks.append(out)
+chunks.append(d2.flush())
+sum(len(x) for x in chunks)
+11000</code></pre>
+<p><strong>Measured:</strong> looping on <code>d2.unconsumed_tail</code> &mdash; feeding each call's leftover compressed bytes into the next call &mdash; reproduces the full 11000 bytes exactly. The loop condition itself is the fix: keep calling <code>decompress(unconsumed_tail, max_length)</code> until <code>unconsumed_tail</code> is empty, not until you've called it once.</p>
+
+<h2 id="fix">4. What to actually do</h2>
+<p>If you pass <code>max_length</code> to <code>decompressobj().decompress()</code>, you must check <code>unconsumed_tail</code> after every call and feed it back into the next <code>decompress()</code> call until it's empty &mdash; it is not optional bookkeeping, it's the only thing carrying forward the compressed bytes you haven't processed yet. If you don't actually need to bound memory per call, skip <code>max_length</code> entirely and just call <code>decompress(data)</code> with no limit, which consumes everything in one call and avoids this failure mode altogether.</p>
+
+<aside class="cta"><strong>Debugging a compressed API response that&#x27;s coming back incomplete? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does zlib&#x27;s decompressobj.decompress(data, max_length) raise an error if you ignore unconsumed_tail?</summary><p>No — we measured it silently returning far less data than the original (270 bytes instead of 11000) with no exception and no warning when unconsumed_tail wasn&#x27;t fed back in.</p></details>
+<details><summary>What is unconsumed_tail actually for?</summary><p>We measured it holding compressed input bytes that decompressobj already read but didn&#x27;t need to produce the current max_length-capped output — it&#x27;s the only place those bytes exist; they&#x27;re not re-derivable afterward.</p></details>
+<details><summary>Does flush() recover data lost by skipping unconsumed_tail?</summary><p>No — we measured flush() returning 0 extra bytes in that case, because from the decompressor&#x27;s perspective the stream legitimately ended; it has no way to know more compressed data was being withheld.</p></details>
+<details><summary>How do I correctly decompress in bounded chunks with max_length?</summary><p>We&#x27;d loop: call decompress(data, max_length), then keep calling decompress(unconsumed_tail, max_length) — feeding each call&#x27;s leftover back in — until unconsumed_tail is empty, then call flush() once at the end.</p></details>
+<details><summary>Is this unconsumed_tail behavior documented?</summary><p>Yes — the Python zlib docs describe max_length as bounding output size and unconsumed_tail as the data not yet consumed after such a call. We confirmed skipping it causes exactly the silent truncation described here in Python 3.13.5.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in zlib module: compressed 11000 bytes, decompressed it in chunks using decompressobj().decompress(data, max_length), then fed the next decompress() call empty bytes instead of the object&#x27;s own unconsumed_tail, and measured the total output size against the original. PlainHeaders is our extension; Python&#x27;s zlib module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

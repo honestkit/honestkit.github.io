@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLite &#x27;Attempt to Write a Readonly Database&#x27; — Fixed (Tested)</title>
+<meta name="description" content="We reproduced sqlite3&#x27;s readonly-database error two ways: a read-only file, and a read-only directory with a writable file — both give the identical message.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite-attempt-to-write-a-readonly-database/">
+<meta property="og:title" content="SQLite &#x27;Attempt to Write a Readonly Database&#x27; — Fixed (Tested)">
+<meta property="og:description" content="We reproduced sqlite3&#x27;s readonly-database error two ways: a read-only file, and a read-only directory with a writable file — both give the identical message.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite-attempt-to-write-a-readonly-database/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does 'attempt to write a readonly database' mean in SQLite?", "acceptedAnswer": {"@type": "Answer", "text": "Either the database file itself lacks write permission, or \u2014 less obviously \u2014 its containing directory does, even if the file is fully writable. We reproduced both causes independently and confirmed they produce the identical error text."}}, {"@type": "Question", "name": "Why would a directory's permissions affect writing to a file inside it?", "acceptedAnswer": {"@type": "Answer", "text": "SQLite needs to create a temporary journal (or WAL) file in the same directory as the database for crash-safe rollback. We confirmed that if the directory itself isn't writable, this fails with the same 'readonly database' error even though the .db file's own permissions are unrestricted."}}, {"@type": "Question", "name": "If chmod on the .db file doesn't fix it, what should I check next?", "acceptedAnswer": {"@type": "Answer", "text": "The containing directory's permissions \u2014 we measured that chmod 755 on the file alone did not help when the directory itself was chmod 555; only restoring write permission on the actual restricted path (file or directory) fixed it."}}, {"@type": "Question", "name": "Does this happen even with a correctly-owned file?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 ownership is separate from permission bits. We used a file owned by the same user running the script in both tests; the read-only permission bit alone (444, or a 555 directory) was sufficient to trigger the error regardless of ownership."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLite: attempt to write a readonly database (tested)</h1>
+<p class="lead"><code>sqlite3.OperationalError: attempt to write a readonly database</code> looks like a simple file-permission problem &mdash; and often is, but not always. We reproduced it two genuinely different ways and measured that both give the exact same error text.</p>
+<h2 id="repro1">1. The obvious cause: the database file itself is read-only</h2>
+<p>We created a database, then removed write permission from the file:</p>
+<pre><code>$ chmod 444 ro.db</code></pre>
+<pre><code>con = sqlite3.connect("ro.db")
+con.execute("INSERT INTO t VALUES (1)")
+sqlite3.OperationalError: attempt to write a readonly database</code></pre>
+<p>Restoring write permission on the file (<code>chmod 644 ro.db</code>) fixed it immediately with no other change &mdash; the next insert and commit succeeded.</p>
+
+<h2 id="repro2">2. The non-obvious cause: a read-only containing directory, with the file itself writable</h2>
+<p>We reset the file to fully writable (<code>chmod 755 db2.db</code>) and instead removed write permission from its <strong>directory</strong>:</p>
+<pre><code>$ chmod 555 /tmp/sq3dir   # the directory, not the .db file</code></pre>
+<pre><code>con = sqlite3.connect("/tmp/sq3dir/db2.db")
+con.execute("INSERT INTO t VALUES (2)")
+sqlite3.OperationalError: attempt to write a readonly database</code></pre>
+<p><strong>Why:</strong> SQLite's default rollback-journal mode needs to create a temporary journal file (and WAL mode needs its own extra files) in the <em>same directory</em> as the database, so it can roll back on a crash. If the directory itself can't be written to, SQLite can't create that file &mdash; even though the <code>.db</code> file's own permissions are fine. The error message doesn't distinguish the two cases: it's identical either way.</p>
+
+<h2 id="fix">3. The fix: check both permissions, not just the file's</h2>
+<p>We confirmed checking only the database file's permissions can be misleading. The full check is:</p>
+<pre><code>ls -l mydb.db          # check the file
+ls -ld "$(dirname mydb.db)"   # check its containing directory too</code></pre>
+<p>Restoring write permission on whichever one is actually restricted (<code>chmod u+w</code> on the file, or on the directory) resolves it &mdash; we confirmed both independently in this test, and that fixing only the file doesn't help if the directory is the real cause.</p>
+
+<aside class="cta"><strong>Debugging an app that talks to an API instead of a database? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &#x27;attempt to write a readonly database&#x27; mean in SQLite?</summary><p>Either the database file itself lacks write permission, or — less obviously — its containing directory does, even if the file is fully writable. We reproduced both causes independently and confirmed they produce the identical error text.</p></details>
+<details><summary>Why would a directory&#x27;s permissions affect writing to a file inside it?</summary><p>SQLite needs to create a temporary journal (or WAL) file in the same directory as the database for crash-safe rollback. We confirmed that if the directory itself isn&#x27;t writable, this fails with the same &#x27;readonly database&#x27; error even though the .db file&#x27;s own permissions are unrestricted.</p></details>
+<details><summary>If chmod on the .db file doesn&#x27;t fix it, what should I check next?</summary><p>The containing directory&#x27;s permissions — we measured that chmod 755 on the file alone did not help when the directory itself was chmod 555; only restoring write permission on the actual restricted path (file or directory) fixed it.</p></details>
+<details><summary>Does this happen even with a correctly-owned file?</summary><p>Yes — ownership is separate from permission bits. We used a file owned by the same user running the script in both tests; the read-only permission bit alone (444, or a 555 directory) was sufficient to trigger the error regardless of ownership.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in sqlite3 module and real Unix file permissions (chmod), on a read-only database file and, separately, a writable file inside a read-only directory. Every message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s sqlite3 is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

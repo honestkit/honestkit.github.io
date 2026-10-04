@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLite &#x27;Database Disk Image Is Malformed&#x27; — Tested</title>
+<meta name="description" content="We corrupted a real SQLite file by truncation and measured exactly what triggers &#x27;disk image is malformed&#x27;: a page-count mismatch in the file header.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite-database-disk-image-is-malformed/">
+<meta property="og:title" content="SQLite &#x27;Database Disk Image Is Malformed&#x27; — Tested">
+<meta property="og:description" content="We corrupted a real SQLite file by truncation and measured exactly what triggers &#x27;disk image is malformed&#x27;: a page-count mismatch in the file header.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite-database-disk-image-is-malformed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What exactly causes 'database disk image is malformed'?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it directly: the file's own header declares a page count that no longer matches the file's actual size. A query fails the instant SQLite tries to read a page the header promised but the file doesn't actually contain."}}, {"@type": "Question", "name": "Does any byte corruption trigger this error?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we tested overwriting 40 bytes in the middle of a file with 0xFF first, and PRAGMA integrity_check still reported 'ok'. SQLite doesn't checksum page contents by default, so corruption landing in unused space goes undetected. The reliable trigger we measured was a page-count mismatch from truncation."}}, {"@type": "Question", "name": "Can I repair the file in place?", "acceptedAnswer": {"@type": "Answer", "text": "We found no in-place fix \u2014 the same query and PRAGMA integrity_check fail consistently against the corrupted file, and con.iterdump() fails immediately too since it must read the schema first. Restoring from a backup made before the corruption is the only fix we could confirm."}}, {"@type": "Question", "name": "What usually causes this in real apps, not a deliberate test?", "acceptedAnswer": {"@type": "Answer", "text": "A crash or kill -9 mid-write, or copying the .db file with a plain file-copy tool while another process still has it open for writing \u2014 both can leave the file's header out of sync with its actual contents, the same mismatch we reproduced here deliberately."}}, {"@type": "Question", "name": "Does PRAGMA integrity_check catch problems that a normal query wouldn't?", "acceptedAnswer": {"@type": "Answer", "text": "Not in our test \u2014 both failed with the identical 'database disk image is malformed' error on the same truncated file. integrity_check is still useful as a deliberate, explicit check you can run on a schedule rather than discovering corruption only when a real query happens to hit the bad page."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLite: database disk image is malformed (tested)</h1>
+<p class="lead"><code>sqlite3.DatabaseError: database disk image is malformed</code> means SQLite's own bookkeeping inside the file no longer matches its actual contents &mdash; most often from a crash or interrupted copy mid-write. We corrupted a real file ourselves and measured precisely what triggers it.</p>
+<h2 id="repro">1. What did NOT trigger it: scattered byte corruption</h2>
+<p>We first overwrote 40 bytes in the middle of a populated database file with <code>0xFF</code> and ran <code>PRAGMA integrity_check</code>:</p>
+<pre><code>[('ok',)]</code></pre>
+<p>No error. SQLite doesn't checksum page contents by default, so overwriting bytes that happen to land in unused space inside a page goes completely unnoticed. Scattered corruption is not a reliable way to reproduce this error.</p>
+
+<h2 id="repro2">2. What DID trigger it: truncating off whole pages the header still expects</h2>
+<p>Every SQLite file's first 100 bytes are a header containing the page size and the total page count. We read them directly with <code>struct</code>:</p>
+<pre><code>page_size = struct.unpack(">H", hdr[16:18])[0]        # 4096
+page_count_hdr = struct.unpack(">I", hdr[28:32])[0]    # 4</code></pre>
+<p>We truncated the file from 16384 bytes (4 full pages) down to 14884 bytes &mdash; removing 1500 bytes, less than one full page. Result: <strong>no error</strong>, because the missing bytes happened to fall inside a page SQLite never needed to read. We then truncated further to exactly 12288 bytes (3 full pages):</p>
+<pre><code>actual file size: 12288   # 3 pages of 4096 bytes
+header page_count: 4      # header still says 4</code></pre>
+<pre><code>con.execute("SELECT * FROM t").fetchall()
+sqlite3.DatabaseError: database disk image is malformed</code></pre>
+<p><strong>The exact trigger, measured:</strong> the header's own page-count field (4) no longer matches the file's actual size in pages (3). The error fires the moment SQLite tries to read the page the header promised but the file doesn't have &mdash; not from the missing bytes themselves. <code>PRAGMA integrity_check</code> fails identically, and <code>con.iterdump()</code> fails immediately too (0 rows recovered) since it has to read the schema first.</p>
+
+<h2 id="fix">3. The fix: there isn't one on the file itself &mdash; restore from a backup</h2>
+<p>This error means the file's internal structure is inconsistent, not that a value is wrong. We confirmed there's no in-place repair: the same query and <code>PRAGMA integrity_check</code> fail every time against the truncated file, and <code>iterdump()</code> can't get past the first read either. The only real fix is restoring the database from a known-good backup or copy made before the truncation/crash happened. To prevent it: avoid copying a live SQLite file with a plain file copy while a connection might be writing to it (use the <a href="https://docs.python.org/3/library/sqlite3.html#sqlite3.Connection.backup">online backup API</a> instead, per Python's sqlite3 docs &mdash; not measured in this pass), and make sure processes that write to the file are given a chance to close cleanly rather than being killed mid-write.</p>
+
+<aside class="cta"><strong>Debugging an app that talks to an API instead of a database? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What exactly causes &#x27;database disk image is malformed&#x27;?</summary><p>We measured it directly: the file&#x27;s own header declares a page count that no longer matches the file&#x27;s actual size. A query fails the instant SQLite tries to read a page the header promised but the file doesn&#x27;t actually contain.</p></details>
+<details><summary>Does any byte corruption trigger this error?</summary><p>No — we tested overwriting 40 bytes in the middle of a file with 0xFF first, and PRAGMA integrity_check still reported &#x27;ok&#x27;. SQLite doesn&#x27;t checksum page contents by default, so corruption landing in unused space goes undetected. The reliable trigger we measured was a page-count mismatch from truncation.</p></details>
+<details><summary>Can I repair the file in place?</summary><p>We found no in-place fix — the same query and PRAGMA integrity_check fail consistently against the corrupted file, and con.iterdump() fails immediately too since it must read the schema first. Restoring from a backup made before the corruption is the only fix we could confirm.</p></details>
+<details><summary>What usually causes this in real apps, not a deliberate test?</summary><p>A crash or kill -9 mid-write, or copying the .db file with a plain file-copy tool while another process still has it open for writing — both can leave the file&#x27;s header out of sync with its actual contents, the same mismatch we reproduced here deliberately.</p></details>
+<details><summary>Does PRAGMA integrity_check catch problems that a normal query wouldn&#x27;t?</summary><p>Not in our test — both failed with the identical &#x27;database disk image is malformed&#x27; error on the same truncated file. integrity_check is still useful as a deliberate, explicit check you can run on a schedule rather than discovering corruption only when a real query happens to hit the bad page.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in sqlite3 module and struct, by truncating a real .db file to deliberately cut off whole pages the file&#x27;s own header still claims exist. Every error string and byte offset below is copy-pasted or directly computed output, not paraphrased. PlainHeaders is our extension; Python&#x27;s sqlite3 and struct are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

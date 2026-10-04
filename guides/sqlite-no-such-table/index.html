@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLite &#x27;No Such Table&#x27; Error — 3 Causes, Tested</title>
+<meta name="description" content="We reproduced sqlite3&#x27;s &#x27;no such table&#x27; three ways and measured that table names are case-insensitive, so a casing mismatch is never the cause.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite-no-such-table/">
+<meta property="og:title" content="SQLite &#x27;No Such Table&#x27; Error — 3 Causes, Tested">
+<meta property="og:description" content="We reproduced sqlite3&#x27;s &#x27;no such table&#x27; three ways and measured that table names are case-insensitive, so a casing mismatch is never the cause.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite-no-such-table/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does SQLite care about uppercase vs lowercase table names?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured that a table created as Users is successfully queried as users with zero error. Case is never the real cause of 'no such table', even though it looks like an obvious first suspect."}}, {"@type": "Question", "name": "Why didn't sqlite3.connect() warn me I was opening a new, empty database?", "acceptedAnswer": {"@type": "Answer", "text": "By design: sqlite3.connect() creates the file if it doesn't exist, with no warning. We confirmed the new file existed at 0 bytes after connecting \u2014 the only way you find out is a later query failing with 'no such table'."}}, {"@type": "Question", "name": "How do I check which tables actually exist in the file I'm connected to?", "acceptedAnswer": {"@type": "Answer", "text": "Run SELECT name FROM sqlite_master WHERE type='table'; on the open connection \u2014 we used this to confirm whether a 'no such table' error meant the wrong file or a table that was never created."}}, {"@type": "Question", "name": "Is 'no such table' the same error as a missing database file?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 connecting to a path that doesn't exist yet succeeds silently and creates an empty file, which we confirmed directly. The 'no such table' error only fires later, when a query names a table that isn't in whichever file you're actually connected to."}}, {"@type": "Question", "name": "Could a schema migration that didn't run cause this?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 this is the same underlying error as repro 1 (table never created). If your app runs migrations on startup and one failed silently or was skipped, every query against the tables it would have created fails identically."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLite: no such table (tested)</h1>
+<p class="lead"><code>sqlite3.OperationalError: no such table: X</code> means the table named in your query doesn't exist in the database you're actually connected to. We reproduced three distinct ways this happens and measured one surprising non-cause along the way.</p>
+<h2 id="repro1">1. The table was never created</h2>
+<p>Querying a brand-new, empty database file:</p>
+<pre><code>con = sqlite3.connect("nst.db")
+con.execute("SELECT * FROM users")
+sqlite3.OperationalError: no such table: users</code></pre>
+<p>This is the literal case: no <code>CREATE TABLE</code> ever ran against this file. Running the migration or setup script that creates the table fixes it.</p>
+
+<h2 id="repro2">2. Connected to the wrong file &mdash; and sqlite3 won't warn you</h2>
+<p>We created the table in <code>nst.db</code>, then by mistake connected to <code>nst2.db</code> instead:</p>
+<pre><code>con2 = sqlite3.connect("nst2.db")
+con2.execute("SELECT * FROM Users")
+sqlite3.OperationalError: no such table: Users</code></pre>
+<p><strong>The trap:</strong> <code>sqlite3.connect()</code> silently creates an empty file if the path doesn't exist yet &mdash; we confirmed <code>nst2.db</code> existed afterward at 0 bytes. There's no error for "this database is empty" or "this isn't the file you meant"; you only find out when a query against a missing table fails. A relative path run from the wrong working directory is the most common way this happens in practice.</p>
+
+<h2 id="repro3">3. A typo in the table name &mdash; but NOT a case mismatch</h2>
+<p>We created a table as <code>Users</code> (capital U) and queried it as <code>users</code> (lowercase):</p>
+<pre><code>con.execute("CREATE TABLE Users (id INTEGER)")
+con.execute("SELECT * FROM users")  # lowercase
+# succeeded &mdash; no error, returned rows normally</code></pre>
+<p><strong>Measured:</strong> SQLite table names are case-insensitive, so casing is never the actual cause of this error, even though it's a common first guess. A genuine typo does fail, though:</p>
+<pre><code>con.execute("SELECT * FROM Usres")
+sqlite3.OperationalError: no such table: Usres</code></pre>
+
+<h2 id="fix">4. The fix: check which database file you're actually in</h2>
+<p>Since the error message doesn't distinguish "table was never created" from "wrong file," the fastest check is listing what tables actually exist in the file you're connected to:</p>
+<pre><code>SELECT name FROM sqlite_master WHERE type='table';</code></pre>
+<p>An empty result confirms you're either in the wrong file or before any migration ran &mdash; not a naming or casing issue, which we measured doesn't apply to SQLite table names.</p>
+
+<aside class="cta"><strong>Debugging an app that talks to an API instead of a database? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does SQLite care about uppercase vs lowercase table names?</summary><p>No — we measured that a table created as Users is successfully queried as users with zero error. Case is never the real cause of &#x27;no such table&#x27;, even though it looks like an obvious first suspect.</p></details>
+<details><summary>Why didn&#x27;t sqlite3.connect() warn me I was opening a new, empty database?</summary><p>By design: sqlite3.connect() creates the file if it doesn&#x27;t exist, with no warning. We confirmed the new file existed at 0 bytes after connecting — the only way you find out is a later query failing with &#x27;no such table&#x27;.</p></details>
+<details><summary>How do I check which tables actually exist in the file I&#x27;m connected to?</summary><p>Run SELECT name FROM sqlite_master WHERE type=&#x27;table&#x27;; on the open connection — we used this to confirm whether a &#x27;no such table&#x27; error meant the wrong file or a table that was never created.</p></details>
+<details><summary>Is &#x27;no such table&#x27; the same error as a missing database file?</summary><p>No — connecting to a path that doesn&#x27;t exist yet succeeds silently and creates an empty file, which we confirmed directly. The &#x27;no such table&#x27; error only fires later, when a query names a table that isn&#x27;t in whichever file you&#x27;re actually connected to.</p></details>
+<details><summary>Could a schema migration that didn&#x27;t run cause this?</summary><p>Yes — this is the same underlying error as repro 1 (table never created). If your app runs migrations on startup and one failed silently or was skipped, every query against the tables it would have created fails identically.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in sqlite3 module across three distinct repro cases: a genuinely empty database, a connection to the wrong file, and a table-name typo. Every error string below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s sqlite3 is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

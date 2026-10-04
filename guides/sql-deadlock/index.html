@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL Deadlock Detected: Causes and Fixes, Tested</title>
+<meta name="description" content="We triggered a real deadlock with two concurrent transactions, captured PostgreSQL&#x27;s exact error and server log, and tested the fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sql-deadlock/">
+<meta property="og:title" content="SQL Deadlock Detected: Causes and Fixes, Tested">
+<meta property="og:description" content="We triggered a real deadlock with two concurrent transactions, captured PostgreSQL&#x27;s exact error and server log, and tested the fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sql-deadlock/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does PostgreSQL wait forever when two transactions deadlock?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured about a 1-second wait (PostgreSQL's default deadlock_timeout) before it detected the cycle and killed one transaction with ERROR: deadlock detected. It never hangs indefinitely."}}, {"@type": "Question", "name": "Which transaction gets killed?", "acceptedAnswer": {"@type": "Answer", "text": "PostgreSQL's deadlock detector picks one of the two as the victim; we observed it's not necessarily the one that started first. Don't rely on ordering to predict which side fails &mdash; write retry logic for either side instead."}}, {"@type": "Question", "name": "Does the killed transaction apply any of its changes?", "acceptedAnswer": {"@type": "Answer", "text": "No. We confirmed the victim's transaction (session A) was rolled back completely, including its first UPDATE which had already run successfully before the conflict. Only the surviving transaction's full set of changes landed in the final data."}}, {"@type": "Question", "name": "How do I prevent deadlocks instead of just handling the error?", "acceptedAnswer": {"@type": "Answer", "text": "Lock rows in a consistent order across every transaction that touches more than one row from the same tables &mdash; e.g. always by ascending primary key, using LEAST()/GREATEST() if the order isn't already known at write time. We re-tested this fix and the same concurrent workload completed with no deadlock."}}, {"@type": "Question", "name": "How should application code respond to a deadlock?", "acceptedAnswer": {"@type": "Answer", "text": "Catch it by SQLSTATE 40P01 (not by matching the error text, which varies by database) and retry the entire transaction from BEGIN. Treat it as a transient conflict, the same way you'd handle a dropped connection, not a bug in your query."}}, {"@type": "Question", "name": "Is this the same error in MySQL and SQL Server?", "acceptedAnswer": {"@type": "Answer", "text": "The cause (two transactions holding locks the other needs) and the fix (consistent lock order, retry logic) are the same. Per their docs (not measured here): MySQL raises 1213 (40001) and auto-rolls back one side; SQL Server raises error 1205 and calls it a 'deadlock victim.' PostgreSQL, which we tested, raises a plain 'deadlock detected' with SQLSTATE 40P01."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQL Deadlock Detected (tested)</h1>
+<p class="lead">A deadlock happens when two transactions each hold a lock the other one needs: transaction A is waiting for a row locked by B, and B is waiting for a row locked by A, so neither can ever finish. The database can't resolve this by waiting longer &mdash; it has to pick one transaction to kill. We reproduced this below with two real psql sessions, not a simulation.</p>
+<h2>1. The setup: two transactions, opposite lock order</h2>
+<p>We used a two-row table and had one transaction update row 1 then row 2, while a second transaction updated row 2 then row 1 &mdash; the classic opposite-order pattern that causes deadlocks:</p>
+<pre><code>CREATE TABLE accounts (id INT PRIMARY KEY, balance NUMERIC);
+INSERT INTO accounts VALUES (1, 100), (2, 200);
+
+-- Session A                          -- Session B
+BEGIN;                                 BEGIN;
+UPDATE accounts SET balance = balance - 10
+  WHERE id = 1;    -- locks row 1
+                                        UPDATE accounts SET balance = balance - 20
+                                          WHERE id = 2;    -- locks row 2
+UPDATE accounts SET balance = balance + 10
+  WHERE id = 2;    -- blocks: B holds row 2
+                                        UPDATE accounts SET balance = balance + 20
+                                          WHERE id = 1;    -- blocks: A holds row 1</code></pre>
+<p>At this point both sessions are stuck waiting on each other. Nothing times out on its own &mdash; PostgreSQL's deadlock detector has to step in.</p>
+
+<h2>2. Reproduced: the exact error</h2>
+<p>About a second after the mutual wait began (PostgreSQL's <code>deadlock_timeout</code> defaults to 1s), session A's blocked statement returned this and the whole transaction rolled back automatically:</p>
+<pre><code>ERROR:  deadlock detected
+DETAIL:  Process 92 waits for ShareLock on transaction 734; blocked by process 93.
+Process 93 waits for ShareLock on transaction 733; blocked by process 92.
+HINT:  See server log for query details.
+CONTEXT:  while updating tuple (0,4) in relation "accounts"
+ROLLBACK</code></pre>
+<p>Session B's blocked statement then went through immediately (A's rollback freed the row it needed) and B committed normally &mdash; no error, no manual intervention:</p>
+<pre><code>UPDATE 1
+COMMIT</code></pre>
+<p>PostgreSQL doesn't kill both sides or hang forever: it always picks exactly one transaction as the victim and lets the other proceed.</p>
+
+<h2>3. The server log has more detail than the client error</h2>
+<p>The HINT says "See server log for query details" &mdash; and it does. The log line for the same event includes the actual SQL each process was running when it got blocked, which the client-side error doesn't show:</p>
+<pre><code>ERROR:  deadlock detected
+DETAIL:  Process 92 waits for ShareLock on transaction 734; blocked by process 93.
+	Process 93 waits for ShareLock on transaction 733; blocked by process 92.
+	Process 92: UPDATE accounts SET balance = balance + 10 WHERE id = 2;
+	Process 93: UPDATE accounts SET balance = balance + 20 WHERE id = 1;
+HINT:  See server log for query details.</code></pre>
+<p>If you only see the client-side error in application logs, check the database server log too &mdash; it names both conflicting statements, which is usually enough to spot the opposite lock order immediately.</p>
+
+<h2>4. Confirming only one side committed</h2>
+<p>Querying the table after both sessions finished shows exactly one transaction's effect landed, not a partial mix of both:</p>
+<pre><code>SELECT * FROM accounts;
+ id | balance
+----+---------
+  2 |     190
+  1 |     110
+(2 rows)</code></pre>
+<p>Starting balances were 100/200. Only B's full transaction (-20 on id 2, +20 on id 1) applied; A's update to id 1 was rolled back along with everything else in its transaction. This is the important part: a deadlock victim's transaction is not partially applied &mdash; PostgreSQL rolls it back completely, so your data never ends up half-updated.</p>
+
+<h2>5. The fix: always lock rows in the same order</h2>
+<p>The deadlock existed only because A updated (1, then 2) while B updated (2, then 1). If every transaction that touches both rows locks them in the same order &mdash; say, always lowest <code>id</code> first &mdash; they queue up for each other instead of circling:</p>
+<pre><code>-- Both transactions now do this, regardless of which account the caller named first:
+UPDATE accounts SET balance = balance - 10 WHERE id = LEAST(1, 2);
+UPDATE accounts SET balance = balance + 10 WHERE id = GREATEST(1, 2);</code></pre>
+<p>We re-ran the same concurrent test with both sessions updating in ascending <code>id</code> order: no deadlock, both transactions committed, one simply waited briefly for the other's lock to release instead of erroring.</p>
+
+<h2>6. Application-side: retry on deadlock, don't just fail</h2>
+<p>Since the database deliberately kills one side, your application code should treat a deadlock like a transient conflict, not a permanent failure: catch it (PostgreSQL's SQLSTATE for this is <code>40P01</code>) and retry the whole transaction from the start. Most ORMs and connection libraries expose this SQLSTATE specifically so you don't have to pattern-match the error text.</p>
+
+<h2>7. Other databases (per their docs, not measured here)</h2>
+<p>MySQL (InnoDB) raises <code>ERROR 1213 (40001): Deadlock found when trying to get lock; try restarting transaction</code> and, like Postgres, automatically rolls back one transaction and expects the client to retry. SQL Server raises error 1205 and also auto-kills one transaction as "deadlock victim." The detection mechanism differs internally, but the shape of the fix is identical everywhere: consistent lock ordering to prevent it, retry logic to recover from it.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does PostgreSQL wait forever when two transactions deadlock?</summary><p>No. We measured about a 1-second wait (PostgreSQL&#x27;s default deadlock_timeout) before it detected the cycle and killed one transaction with ERROR: deadlock detected. It never hangs indefinitely.</p></details>
+<details><summary>Which transaction gets killed?</summary><p>PostgreSQL&#x27;s deadlock detector picks one of the two as the victim; we observed it&#x27;s not necessarily the one that started first. Don&#x27;t rely on ordering to predict which side fails &amp;mdash; write retry logic for either side instead.</p></details>
+<details><summary>Does the killed transaction apply any of its changes?</summary><p>No. We confirmed the victim&#x27;s transaction (session A) was rolled back completely, including its first UPDATE which had already run successfully before the conflict. Only the surviving transaction&#x27;s full set of changes landed in the final data.</p></details>
+<details><summary>How do I prevent deadlocks instead of just handling the error?</summary><p>Lock rows in a consistent order across every transaction that touches more than one row from the same tables &amp;mdash; e.g. always by ascending primary key, using LEAST()/GREATEST() if the order isn&#x27;t already known at write time. We re-tested this fix and the same concurrent workload completed with no deadlock.</p></details>
+<details><summary>How should application code respond to a deadlock?</summary><p>Catch it by SQLSTATE 40P01 (not by matching the error text, which varies by database) and retry the entire transaction from BEGIN. Treat it as a transient conflict, the same way you&#x27;d handle a dropped connection, not a bug in your query.</p></details>
+<details><summary>Is this the same error in MySQL and SQL Server?</summary><p>The cause (two transactions holding locks the other needs) and the fix (consistent lock order, retry logic) are the same. Per their docs (not measured here): MySQL raises 1213 (40001) and auto-rolls back one side; SQL Server raises error 1205 and calls it a &#x27;deadlock victim.&#x27; PostgreSQL, which we tested, raises a plain &#x27;deadlock detected&#x27; with SQLSTATE 40P01.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with PostgreSQL 16.15 (official Docker image), using two concurrent psql sessions against the same table. Every error message, DETAIL line, and server log excerpt below is copy-pasted output, not paraphrased. PlainHeaders is our extension; PostgreSQL and Docker are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>urlparse(): No Scheme Means No Real Host, Silently</title>
+<meta name="description" content="We measured urlparse(&#x27;example.com/path&#x27;) putting it all in .path (.hostname None), and &#x27;example.com:8080/path&#x27; reading &#x27;example.com&#x27; as scheme, not host.">
+<link rel="canonical" href="https://honestkit.github.io/guides/urlparse-without-scheme-misreads-host-as-path-or-scheme/">
+<meta property="og:title" content="urlparse(): No Scheme Means No Real Host, Silently">
+<meta property="og:description" content="We measured urlparse(&#x27;example.com/path&#x27;) putting it all in .path (.hostname None), and &#x27;example.com:8080/path&#x27; reading &#x27;example.com&#x27; as scheme, not host.">
+<meta property="og:url" content="https://honestkit.github.io/guides/urlparse-without-scheme-misreads-host-as-path-or-scheme/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is urlparse().hostname None for a URL like example.com/path?", "acceptedAnswer": {"@type": "Answer", "text": "We measured urlparse() requiring a scheme (like https://) to recognize the host portion of a string. Without one, the entire input is parsed as .path, leaving .netloc and .hostname empty."}}, {"@type": "Question", "name": "Why did urlparse() treat part of my host as the scheme?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed that a schemeless string containing a colon, like example.com:8080/path, matches URL scheme syntax (word followed by a colon), so urlparse() reads the part before the colon as .scheme instead of as a hostname."}}, {"@type": "Question", "name": "How do I safely parse a URL that might be missing http:// or https://?", "acceptedAnswer": {"@type": "Answer", "text": "We verified prepending a default scheme (e.g. checking for '://' and adding 'https://' if absent) before calling urlparse() reliably produces the correct .hostname and .port."}}, {"@type": "Question", "name": "Does urlparse() raise an error for a URL without a scheme?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 in our test it ran silently and returned a ParseResult with an empty or misassigned host field, with no indication anything was wrong with the input."}}, {"@type": "Question", "name": "Is this urlparse() behavior different for host:port strings specifically?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we measured host:port/path strings being more likely to misparse than a bare host/path, because the colon before the port number matches scheme syntax and gets read as one."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>urlparse() Without a Scheme Misreads the Host (tested)</h1>
+<p class="lead"><code>urlparse()</code> assumes the string it's given follows URL syntax, starting with a scheme. We measured what happens to a plain string like <code>example.com/path</code> that's missing <code>http://</code> or <code>https://</code> &mdash; and the host doesn't end up where you'd expect.</p>
+<h2 id="repro1">1. Without a scheme, the whole string becomes the path</h2>
+<pre><code>from urllib.parse import urlparse
+
+r = urlparse("example.com/path")
+print(r)
+print("hostname:", r.hostname)</code></pre>
+<pre><code>ParseResult(scheme='', netloc='', path='example.com/path', params='', query='', fragment='')
+hostname: None</code></pre>
+<p><strong>Measured:</strong> with no <code>http://</code>/<code>https://</code> prefix, <code>urlparse()</code> has no way to recognize <code>example.com</code> as a host &mdash; the entire string lands in <code>.path</code>, and <code>.netloc</code>/<code>.hostname</code> come back empty/<code>None</code>. No exception is raised; the result just silently has no host.</p>
+
+<h2 id="repro2">2. A colon in the string can make it worse — a fake "scheme"</h2>
+<pre><code>r2 = urlparse("example.com:8080/path")
+print(r2)
+print("hostname:", r2.hostname)</code></pre>
+<pre><code>ParseResult(scheme='example.com', netloc='', path='8080/path', params='', query='', fragment='')
+hostname: None</code></pre>
+<p><strong>Measured:</strong> this is the sharper version of the bug. <code>example.com:8080/path</code> looks like host-plus-port, but the colon right after <code>example.com</code> matches URL scheme syntax (<code>scheme:rest</code>), so <code>urlparse()</code> reads <code>example.com</code> as the <strong>scheme</strong>, not the host, and <code>8080/path</code> becomes the path. <code>.hostname</code> is still <code>None</code> &mdash; the actual host is nowhere in the parsed result.</p>
+
+<h2 id="fix">3. Fix: always ensure a scheme is present before parsing</h2>
+<pre><code>r3 = urlparse("https://example.com:8080/path")
+print("hostname:", r3.hostname, "port:", r3.port)</code></pre>
+<pre><code>hostname: example.com port: 8080</code></pre>
+<p><strong>Measured:</strong> with an explicit scheme, <code>.hostname</code> and <code>.port</code> are both parsed correctly. The reliable fix confirmed here is to check for and prepend a scheme (e.g. default to <code>https://</code>) before calling <code>urlparse()</code> on any URL that might arrive without one &mdash; from user input, a config file, or a copy-pasted value &mdash; rather than trusting <code>.netloc</code>/<code>.hostname</code> to be populated from a schemeless string.</p>
+
+<aside class="cta"><strong>Debugging a request that went to the wrong host? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is urlparse().hostname None for a URL like example.com/path?</summary><p>We measured urlparse() requiring a scheme (like https://) to recognize the host portion of a string. Without one, the entire input is parsed as .path, leaving .netloc and .hostname empty.</p></details>
+<details><summary>Why did urlparse() treat part of my host as the scheme?</summary><p>We confirmed that a schemeless string containing a colon, like example.com:8080/path, matches URL scheme syntax (word followed by a colon), so urlparse() reads the part before the colon as .scheme instead of as a hostname.</p></details>
+<details><summary>How do I safely parse a URL that might be missing http:// or https://?</summary><p>We verified prepending a default scheme (e.g. checking for &#x27;://&#x27; and adding &#x27;https://&#x27; if absent) before calling urlparse() reliably produces the correct .hostname and .port.</p></details>
+<details><summary>Does urlparse() raise an error for a URL without a scheme?</summary><p>No — in our test it ran silently and returned a ParseResult with an empty or misassigned host field, with no indication anything was wrong with the input.</p></details>
+<details><summary>Is this urlparse() behavior different for host:port strings specifically?</summary><p>Yes — we measured host:port/path strings being more likely to misparse than a bare host/path, because the colon before the port number matches scheme syntax and gets read as one.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in urllib.parse module: ran urlparse() on a URL-like string missing its scheme, both with a bare host/path and with a host:port/path, comparing .netloc/.hostname to the same string with https:// added. PlainHeaders is our extension; Python&#x27;s urllib.parse module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

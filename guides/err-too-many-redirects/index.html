@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ERR_TOO_MANY_REDIRECTS: Causes and Fixes (Tested)</title>
+<meta name="description" content="We built redirect loops on purpose: a plain /a to /b loop, a proxy that hides HTTPS, a cookie the app never sees and a cached 301. Here is what Chromium, curl, Node and Python did, and how each loop was fixed.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-too-many-redirects/">
+<meta property="og:title" content="ERR_TOO_MANY_REDIRECTS: Causes and Fixes (Tested)">
+<meta property="og:description" content="We built redirect loops on purpose: a plain /a to /b loop, a proxy that hides HTTPS, a cookie the app never sees and a cached 301. Here is what Chromium, curl, Node and Python did, and how each loop was fixed.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-too-many-redirects/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How many redirects does Chrome follow before ERR_TOO_MANY_REDIRECTS?", "acceptedAnswer": {"@type": "Answer", "text": "In our test Chromium 153 made 20 requests on a two-URL loop before it gave up with net::ERR_TOO_MANY_REDIRECTS."}}, {"@type": "Question", "name": "Why does my site loop only behind Cloudflare or a load balancer?", "acceptedAnswer": {"@type": "Answer", "text": "The proxy speaks HTTP to your app, so an HTTPS-forcing rule fires on every request. Send X-Forwarded-Proto: https from the proxy and make the app trust it, or use end-to-end TLS. In our test, the header alone was not enough. The app also had to read it."}}, {"@type": "Question", "name": "I fixed the server but the browser still loops. Why?", "acceptedAnswer": {"@type": "Answer", "text": "Browsers cache 301s. In our test Chromium kept failing with zero requests reaching the fixed server until we used a fresh profile. Clear the site's cache or use a private window."}}, {"@type": "Question", "name": "Can a cookie cause ERR_TOO_MANY_REDIRECTS?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. If the login cookie is never sent back (wrong Path, Domain, Secure on HTTP, or SameSite), the protected page keeps redirecting to login. A Path set too narrowly reproduced the loop in our test."}}, {"@type": "Question", "name": "What does curl error 47 mean?", "acceptedAnswer": {"@type": "Answer", "text": "curl followed its redirect limit and stopped. The default with -L is 50, shown as 'Maximum (50) redirects followed'. Use --max-redirs to set a lower limit while debugging."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ERR_TOO_MANY_REDIRECTS (tested)</h1>
+<p class="lead"><code>ERR_TOO_MANY_REDIRECTS</code> means the browser followed redirects until it hit its limit and gave up. The page is not slow. Two URLs are sending you to each other. We reproduced the common causes and counted every hop on the server.</p>
+<h2>1. What the error means</h2>
+<p>A redirect is a 3xx response with a <code>Location</code> header. The browser follows it. If URL A redirects to B and B redirects back to A, the chain never ends. Every client has a limit. When it is reached, Chromium shows <code>ERR_TOO_MANY_REDIRECTS</code>. Firefox calls it "The page isn't redirecting properly".</p>
+<p>We ran a Node server where <code>/a</code> returned 302 to <code>/b</code> and <code>/b</code> returned 302 to <code>/a</code>. The server counted every request.</p>
+
+<h2>2. How many hops each client follows</h2>
+<table>
+<tr><th>Client</th><th>Error it gave</th><th>Requests the server saw</th></tr>
+<tr><td>Chromium 153</td><td><code>net::ERR_TOO_MANY_REDIRECTS</code></td><td>20 (10 to /a, 10 to /b)</td></tr>
+<tr><td>curl -L (default)</td><td><code>curl: (47) Maximum (50) redirects followed</code>, exit code 47</td><td>51</td></tr>
+<tr><td>curl -L --max-redirs 5</td><td><code>Maximum (5) redirects followed</code></td><td>6</td></tr>
+<tr><td>Node.js 24 fetch</td><td><code>fetch failed</code>, cause <code>redirect count exceeded</code></td><td>21</td></tr>
+<tr><td>Python urllib</td><td><code>HTTPError 302</code> "redirect error that would lead to an infinite loop"</td><td>9</td></tr>
+</table>
+<p>Python stops early because urllib also refuses to visit the same URL more than 4 extra times. It saw <code>/a</code> 5 times and gave up. The others count hops only.</p>
+<p>To see the loop yourself, print each hop without following too far:</p>
+<pre><code>curl -sIL --max-redirs 6 https://example.com/ | grep -iE '^(HTTP|location)'</code></pre>
+<p>If the same two <code>location</code> values alternate, you have a loop. Our <a href="/guides/check-redirect-chain/">redirect chain guide</a> covers this in detail.</p>
+
+<h2>3. The classic cause: HTTPS redirect behind a proxy</h2>
+<p>A load balancer or CDN terminates TLS. It then talks plain HTTP to your app. The app has a rule "if the request is not HTTPS, redirect to HTTPS". The app only sees HTTP, so it redirects. The browser comes back over HTTPS, the proxy forwards it as HTTP again, and the loop never ends.</p>
+<p>We built this: a small Node proxy on one port forwarding to an app on another. The app redirected with 301 whenever it thought the request was not HTTPS.</p>
+<table>
+<tr><th>Setup</th><th>Result</th></tr>
+<tr><td>Proxy sends no <code>X-Forwarded-Proto</code></td><td>Loop. <code>curl --max-redirs 10</code> failed with error 47. The app saw 11 requests.</td></tr>
+<tr><td>Proxy adds <code>X-Forwarded-Proto: https</code>, app reads it</td><td>200 on the first request. 0 redirects.</td></tr>
+<tr><td>Proxy adds the header, app ignores it</td><td>Still a loop. 11 requests, error 47.</td></tr>
+</table>
+<p>So the fix needs both halves. The proxy must send the header. The app must trust it. In Express that is:</p>
+<pre><code>app.set('trust proxy', 1);           // trust the first proxy hop
+app.use((req, res, next) =&gt; {
+  if (req.secure) return next();    // req.secure uses X-Forwarded-Proto now
+  res.redirect(301, 'https://' + req.headers.host + req.url);
+});</code></pre>
+<p>In nginx, as the proxy:</p>
+<pre><code>proxy_set_header X-Forwarded-Proto $scheme;</code></pre>
+<p>Only trust these headers from your own proxy. See <a href="/guides/x-forwarded-for-real-ip-nginx/">X-Forwarded-For and the real client IP</a> and <a href="/guides/forwarded-header-vs-x-forwarded-for/">Forwarded vs X-Forwarded-For</a>.</p>
+
+<h2>4. Cloudflare Flexible SSL and WordPress (from the docs, not measured)</h2>
+<p>Cloudflare's "Flexible" SSL mode connects to your origin over HTTP. If the origin forces HTTPS, it redirects every request, and Cloudflare's documentation lists this as a cause of redirect loops. The documented fix is to install a certificate on the origin and set SSL mode to "Full" or "Full (strict)".</p>
+<p>In WordPress, the <code>siteurl</code> and <code>home</code> settings must match the URL visitors use. If one says <code>http://</code> and the site forces HTTPS, or one has <code>www</code> and the server strips it, WordPress and the server can redirect against each other. Check both values in Settings, General, or in <code>wp-config.php</code> with <code>WP_HOME</code> and <code>WP_SITEURL</code>.</p>
+
+<h2>5. Cookie loops: login that never sticks</h2>
+<p><code>/login</code> sets a session cookie and redirects to <code>/app</code>. <code>/app</code> does not see the cookie and redirects back to <code>/login</code>. We tested three cookies in Chromium on <code>http://127.0.0.1</code>:</p>
+<table>
+<tr><th>Cookie set by /login</th><th>Chromium result</th></tr>
+<tr><td><code>Path=/</code></td><td>200 at /app. 1 request each.</td></tr>
+<tr><td><code>Path=/path/login</code> (too narrow)</td><td><code>ERR_TOO_MANY_REDIRECTS</code>. 10 requests to each URL. The cookie was stored but never sent to /app.</td></tr>
+<tr><td><code>Path=/; Secure</code> over plain http</td><td>200 at /app. Chromium stored and sent the Secure cookie.</td></tr>
+</table>
+<p>The Secure result surprised us at first. Chromium treats <code>127.0.0.1</code> and <code>localhost</code> as secure contexts, so it accepted the Secure cookie over HTTP. On a real <code>http://</code> domain a Secure cookie is rejected, and the same code would loop. Test on a real hostname before you trust a local result. Wrong <code>Domain</code> or <code>SameSite</code> settings fail the same way. See <a href="/guides/samesite-cookie-lax-strict-none/">SameSite Lax, Strict and None</a>.</p>
+
+<h2>6. Fixed it, still looping? The cached 301</h2>
+<p>Browsers cache 301 redirects. We made <code>/p</code> and <code>/q</code> loop with 301, loaded it in Chromium, then fixed the server so <code>/q</code> returned 200.</p>
+<table>
+<tr><th>Step</th><th>Result</th><th>Requests to server</th></tr>
+<tr><td>First visit, loop</td><td>ERR_TOO_MANY_REDIRECTS</td><td>2 (one each, the rest came from cache)</td></tr>
+<tr><td>Server fixed, same browser profile</td><td>Still ERR_TOO_MANY_REDIRECTS, also for /q directly</td><td>0</td></tr>
+<tr><td>Server fixed, fresh profile</td><td>200 "q ok"</td><td>2</td></tr>
+</table>
+<p>The fixed server never received a request from the old profile. Clear the site's cache and cookies, or test in a private window. While you debug, use 302 or 307 so nothing gets cached. See <a href="/guides/301-vs-302-vs-307-vs-308-redirect/">301 vs 302 vs 307 vs 308</a>.</p>
+
+<h2>7. Checklist</h2>
+<p>1. Print the chain with <code>curl -sIL --max-redirs 6</code> and find the two URLs that alternate. 2. If it flips between http and https, check your proxy headers or CDN SSL mode. 3. If it flips between www and non-www, check every layer that rewrites the host. 4. If it flips between /login and a protected page, check the cookie's Path, Domain, Secure and SameSite. 5. After the fix, test in a fresh profile because of cached 301s.</p>
+<aside class="cta"><strong>See every redirect hop and the headers that cause it:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How many redirects does Chrome follow before ERR_TOO_MANY_REDIRECTS?</summary><p>In our test Chromium 153 made 20 requests on a two-URL loop before it gave up with net::ERR_TOO_MANY_REDIRECTS.</p></details>
+<details><summary>Why does my site loop only behind Cloudflare or a load balancer?</summary><p>The proxy speaks HTTP to your app, so an HTTPS-forcing rule fires on every request. Send X-Forwarded-Proto: https from the proxy and make the app trust it, or use end-to-end TLS. In our test, the header alone was not enough. The app also had to read it.</p></details>
+<details><summary>I fixed the server but the browser still loops. Why?</summary><p>Browsers cache 301s. In our test Chromium kept failing with zero requests reaching the fixed server until we used a fresh profile. Clear the site&#x27;s cache or use a private window.</p></details>
+<details><summary>Can a cookie cause ERR_TOO_MANY_REDIRECTS?</summary><p>Yes. If the login cookie is never sent back (wrong Path, Domain, Secure on HTTP, or SameSite), the protected page keeps redirecting to login. A Path set too narrowly reproduced the loop in our test.</p></details>
+<details><summary>What does curl error 47 mean?</summary><p>curl followed its redirect limit and stopped. The default with -L is 50, shown as &#x27;Maximum (50) redirects followed&#x27;. Use --max-redirs to set a lower limit while debugging.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153 (Playwright 1.63), curl 8.14.1, Node.js 24.21.0 fetch and Python 3.13.5 urllib, against small Node servers on 127.0.0.1 that counted every request. PlainHeaders is our extension; curl, Python, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

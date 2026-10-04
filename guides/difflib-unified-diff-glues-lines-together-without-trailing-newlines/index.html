@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>difflib.unified_diff() Silently Glues Lines Together (Tested)</title>
+<meta name="description" content="We measured unified_diff() output becoming one garbled line when input came from split(&#x27;\n&#x27;) instead of splitlines(keepends=True) -- silently, no error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/difflib-unified-diff-glues-lines-together-without-trailing-newlines/">
+<meta property="og:title" content="difflib.unified_diff() Silently Glues Lines Together (Tested)">
+<meta property="og:description" content="We measured unified_diff() output becoming one garbled line when input came from split(&#x27;\n&#x27;) instead of splitlines(keepends=True) -- silently, no error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/difflib-unified-diff-glues-lines-together-without-trailing-newlines/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does difflib.unified_diff() output look garbled?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it happening when input lines don't each end with their own newline -- unified_diff() concatenates entries with no separator of its own, so adjacent lines run together in the joined output."}}, {"@type": "Question", "name": "What's the right way to split text into lines for difflib?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed str.splitlines(keepends=True) preserves the newlines unified_diff() needs, while the more intuitive str.split('\\\\n') strips them and causes the glued-together output."}}, {"@type": "Question", "name": "Does unified_diff() raise an error when lines lack newlines?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it silently producing malformed output with no exception, so the bug only shows up when you look at the printed diff, not at the point the problem was introduced."}}, {"@type": "Question", "name": "Does difflib mark a missing trailing newline like real diff tools do?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we confirmed Python's unified_diff() does not emit the '\\\\ No newline at end of file' marker that command-line diff/patch tools use; a missing final newline is simply not flagged."}}, {"@type": "Question", "name": "Does this affect context_diff() too?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- context_diff() builds its output the same way, joining whatever lines it's given, so it has the identical gluing problem if the input lines don't already end in their own newlines."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>difflib unified_diff() Glues Lines Together Without Trailing Newlines (tested)</h1>
+<p class="lead"><code>difflib.unified_diff()</code> expects each input line to already end with its own newline. We measured what happens when it doesn't, using the single most common way people accidentally strip them: <code>str.split("\\n")</code> instead of <code>str.splitlines(keepends=True)</code>.</p>
+<h2 id="repro1">1. Lines without their own newline get glued together</h2>
+<pre><code>import difflib
+
+a = ["line1\n", "line2", "line3\n"]   # middle line has no trailing \n
+b = ["line1\n", "line2 changed", "line3\n"]
+
+diff = list(difflib.unified_diff(a, b, fromfile="a.txt", tofile="b.txt"))
+print("".join(diff))</code></pre>
+<pre><code>--- a.txt
++++ b.txt
+@@ -1,3 +1,3 @@
+ line1
+-line2+line2 changed line3</code></pre>
+<p><strong>Measured:</strong> the last three lines of the diff &mdash; the removed line, the added line, and the unchanged line after it &mdash; are fused into one garbled line with no exception and no warning. <code>unified_diff()</code> doesn't insert separators between entries; it assumes each line you gave it already carries its own trailing <code>\n</code>, and when one doesn't, the next entry just runs straight on.</p>
+
+<h2 id="repro2">2. The common way this happens: split() instead of splitlines(keepends=True)</h2>
+<pre><code>text_a = "line1\nline2\nline3"
+text_b = "line1\nline2 changed\nline3"
+
+wrong_a = text_a.split("\n")                     # strips every newline
+right_a = text_a.splitlines(keepends=True)        # keeps them
+
+print("split():", wrong_a)
+print("splitlines(keepends=True):", right_a)</code></pre>
+<pre><code>split(): ['line1', 'line2', 'line3']
+splitlines(keepends=True): ['line1\n', 'line2\n', 'line3']</code></pre>
+<p><strong>Measured:</strong> <code>text.split("\n")</code> is the natural-looking way to turn a string into lines, but it discards every newline, including internal ones that <code>unified_diff()</code> relies on to separate its own output. <code>splitlines(keepends=True)</code> is the one that preserves what's needed (note even this leaves the very last line without a trailing <code>\n</code> if the source string didn't end with one &mdash; real diff tools handle that case with a "\ No newline at end of file" marker; Python's <code>difflib</code> does not emit one at all).</p>
+
+<h2 id="fix">3. Fix: always build diff input with splitlines(keepends=True)</h2>
+<pre><code>a_lines = text_a.splitlines(keepends=True)
+b_lines = text_b.splitlines(keepends=True)
+print("".join(difflib.unified_diff(a_lines, b_lines)))</code></pre>
+<pre><code>---
++++
+@@ -1,3 +1,3 @@
+ line1
+-line2
++line2 changed
+ line3</code></pre>
+<p><strong>Measured:</strong> once every line (except possibly the last) carries its own newline, <code>unified_diff()</code>'s output joins back into a correctly separated, readable diff with no further changes needed.</p>
+<aside class="cta"><strong>Diffing two API response bodies to debug a change? Check the real headers behind each request first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does difflib.unified_diff() output look garbled?</summary><p>We measured it happening when input lines don&#x27;t each end with their own newline -- unified_diff() concatenates entries with no separator of its own, so adjacent lines run together in the joined output.</p></details>
+<details><summary>What&#x27;s the right way to split text into lines for difflib?</summary><p>We confirmed str.splitlines(keepends=True) preserves the newlines unified_diff() needs, while the more intuitive str.split(&#x27;\\n&#x27;) strips them and causes the glued-together output.</p></details>
+<details><summary>Does unified_diff() raise an error when lines lack newlines?</summary><p>No -- we measured it silently producing malformed output with no exception, so the bug only shows up when you look at the printed diff, not at the point the problem was introduced.</p></details>
+<details><summary>Does difflib mark a missing trailing newline like real diff tools do?</summary><p>No -- we confirmed Python&#x27;s unified_diff() does not emit the &#x27;\\ No newline at end of file&#x27; marker that command-line diff/patch tools use; a missing final newline is simply not flagged.</p></details>
+<details><summary>Does this affect context_diff() too?</summary><p>Yes -- context_diff() builds its output the same way, joining whatever lines it&#x27;s given, so it has the identical gluing problem if the input lines don&#x27;t already end in their own newlines.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in difflib: ran unified_diff() on lines produced by str.split(&#x27;\n&#x27;) (no trailing newlines) versus str.splitlines(keepends=True) (newlines preserved), then joined the output the standard way. PlainHeaders is our extension; Python&#x27;s difflib module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

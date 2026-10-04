@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Domain to Company Name: Free Lookup From a Website&#x27;s Own Tags (Python, No API Key)</title>
+<meta name="description" content="Turn a list of domains into company names for free: read the name a site publishes about itself (schema.org Organization, og:site_name, title) with a tested Python script, and why WHOIS rarely helps.">
+<link rel="canonical" href="https://honestkit.github.io/guides/domain-to-company-name/">
+<meta property="og:title" content="Domain to Company Name: Free Lookup From a Website&#x27;s Own Tags (Python, No API Key)">
+<meta property="og:description" content="Turn a list of domains into company names for free: read the name a site publishes about itself (schema.org Organization, og:site_name, title) with a tested Python script, and why WHOIS rarely helps.">
+<meta property="og:url" content="https://honestkit.github.io/guides/domain-to-company-name/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is there a free API to get a company name from a domain?", "acceptedAnswer": {"@type": "Answer", "text": "The company's own website is the free source: schema.org Organization data, og:site_name or the page title. The script on this page reads them in that order."}}, {"@type": "Question", "name": "Can WHOIS tell me who owns a domain?", "acceptedAnswer": {"@type": "Answer", "text": "Rarely, today. Most registrars redact owner details for privacy, so the organization field is usually empty or a proxy service."}}, {"@type": "Question", "name": "How do I get a company name from an email address?", "acceptedAnswer": {"@type": "Answer", "text": "Take the part after @ and look up that domain, but skip free email providers like gmail.com or outlook.com: they say nothing about the sender's employer."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to get a company name from a domain</h1>
+<p class="lead">Most company websites state their own name in machine-readable tags. Reading those tags turns a domain into a company name without any paid API.</p>
+<h2>Where the name is</h2>
+<ol><li><strong>schema.org Organization</strong> data (JSON-LD in a <code>&lt;script type="application/ld+json"&gt;</code> block): the most deliberate source, since it is written for search engines.</li>
+<li><strong><code>og:site_name</code></strong>, the Open Graph tag used for link previews.</li>
+<li><strong>The page title</strong>, usually "Page – Company": a fallback that needs trimming.</li></ol>
+<p>WHOIS and RDAP rarely help: since GDPR most registrars redact the owner, and the organization field, when present, is often a hosting or privacy service.</p>
+<h2>Python script (standard library only)</h2>
+<pre><code>import json, re, sys, urllib.request
+from html.parser import HTMLParser
+
+class Head(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.meta, self.ld, self.title, self._in = {}, [], "", None
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "meta" and a.get("content"):
+            self.meta[(a.get("property") or a.get("name") or "").lower()] = a["content"]
+        self._in = tag if tag == "title" or (tag == "script" and a.get("type") == "application/ld+json") else None
+    def handle_data(self, data):
+        if self._in == "title": self.title += data
+        elif self._in == "script": self.ld.append(data)
+    def handle_endtag(self, tag):
+        self._in = None
+
+def org_names(node):
+    if isinstance(node, list):
+        for n in node: yield from org_names(n)
+    elif isinstance(node, dict):
+        types = node.get("@type", [])
+        if isinstance(types, str): types = [types]
+        if any(t in ("Organization", "Corporation", "OnlineBusiness") for t in types) and isinstance(node.get("name"), str):
+            yield node["name"]
+        for v in node.values(): yield from org_names(v)
+
+def company_name(domain):
+    req = urllib.request.Request("https://" + domain, headers={"User-Agent": "Mozilla/5.0 (company lookup)"})
+    html = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+    p = Head(); p.feed(html)
+    for block in p.ld:
+        try:
+            for name in org_names(json.loads(block)):
+                return name, "schema.org"
+        except ValueError:
+            pass
+    if p.meta.get("og:site_name"):
+        return p.meta["og:site_name"], "og:site_name"
+    return re.split(r"\s[|\-–·:]\s", p.title.strip())[0], "title"
+
+for d in sys.argv[1:]:
+    try:
+        print(d, *company_name(d), sep="\t")
+    except Exception as e:
+        print(d, "error: " + str(e), sep="\t")</code></pre>
+<p>Run it as <code>python3 company_name.py stripe.com notion.so example.com</code>. Our test run:</p>
+<pre><code>stripe.com     Stripe          schema.org
+notion.so      Notion          og:site_name
+github.com     GitHub          og:site_name
+shopify.com    Shopify         schema.org
+hubspot.com    HubSpot         schema.org
+atlassian.com  Atlassian       schema.org
+example.com    Example Domain  title</code></pre>
+<p>The third column says where the name came from. Rows from <code>title</code> deserve a look: example.com has no company tags, so the title is all there is. Sites that build their page with JavaScript may send almost empty HTML; the script then falls back to the title or fails.</p>
+<h2>A list of domains, with logos and social links</h2>
+<p>Our <a href="/apify/company-website-enrichment/">Company Website Enrichment actor on Apify</a> takes domains or URLs and returns one row per company: name, description, logo, official social pages (LinkedIn, X, Facebook, Instagram, YouTube and more), contact details from structured data, and optionally tech stack, domain age and email provider, as CSV, Excel or JSON. Billed per company.</p>
+<aside class="cta"><strong>Many companies at once?</strong> <a href="/apify/company-website-enrichment/">Company Enrichment from Domain (Logo, Socials, Tech)</a> (hosted, pay per result)</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is there a free API to get a company name from a domain?</summary><p>The company&#x27;s own website is the free source: schema.org Organization data, og:site_name or the page title. The script on this page reads them in that order.</p></details>
+<details><summary>Can WHOIS tell me who owns a domain?</summary><p>Rarely, today. Most registrars redact owner details for privacy, so the organization field is usually empty or a proxy service.</p></details>
+<details><summary>How do I get a company name from an email address?</summary><p>Take the part after @ and look up that domain, but skip free email providers like gmail.com or outlook.com: they say nothing about the sender&#x27;s employer.</p></details>
+</section>
+<p class="note">Written with AI assistance. The script was run on 2026-10-01 for stripe.com, notion.so, github.com, shopify.com, hubspot.com, atlassian.com and example.com; the output shown is from that run. The Apify tool is ours; the APIs are free to call directly.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Git: &#x27;Unable to Unlink&#x27;, &#x27;Path is Unmerged&#x27; — Fixed</title>
+<meta name="description" content="We reproduced 3 distinct git errors — unable to unlink, path is unmerged, and object file is empty — and measured the exact fix for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/git-unable-to-unlink-path-is-unmerged-object-file-is-empty/">
+<meta property="og:title" content="Git: &#x27;Unable to Unlink&#x27;, &#x27;Path is Unmerged&#x27; — Fixed">
+<meta property="og:description" content="We reproduced 3 distinct git errors — unable to unlink, path is unmerged, and object file is empty — and measured the exact fix for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/git-unable-to-unlink-path-is-unmerged-object-file-is-empty/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does git say a path is unmerged when I just want to discard my changes to one file?", "acceptedAnswer": {"@type": "Answer", "text": "git checkout -- <path> only works when the index has a single staged version of that file. During a conflict the index holds 3 versions (yours, theirs, and the common ancestor), so it refuses rather than guess. Use git checkout --ours -- <path> or git checkout --theirs -- <path> to pick a side explicitly, then git add it."}}, {"@type": "Question", "name": "I have write access to the file so why does 'unable to unlink' still happen?", "acceptedAnswer": {"@type": "Answer", "text": "Deleting a file needs write permission on its containing directory, not the file itself \u2014 we confirmed this by chmod'ing the directory to 555 (read-only) with the file otherwise normal. git's checkout always deletes the old file before writing the new one, so a locked-down or network-mounted parent directory blocks it even if the file's own permissions look fine."}}, {"@type": "Question", "name": "Is 'object file is empty' always unrecoverable?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured two working recoveries. If any other clone or backup has the same commit, its object file is byte-identical (same SHA = same content) and can simply be copied over. If no copy exists anywhere, moving the branch ref back to the last good commit with git update-ref restores a working repository, at the cost of losing the corrupted commit and anything built on top of it."}}, {"@type": "Question", "name": "What actually causes a git object file to become empty on disk?", "acceptedAnswer": {"@type": "Answer", "text": "A loose object file gets created in one filesystem write. A process kill (OOM, power loss, Ctrl+C at the wrong instant), a full disk mid-write, or underlying disk/filesystem corruption can all leave a 0-byte file where a compressed object should be. It's a storage-layer accident, not something a normal git command causes on its own."}}, {"@type": "Question", "name": "Does a local git clone always share object files with its source repo?", "acceptedAnswer": {"@type": "Answer", "text": "By default, yes \u2014 git clone on the same filesystem hardlinks objects for speed, so corrupting one copy corrupts both, since they're literally the same inode. We confirmed this by watching a 'backup' clone go bad along with the original. Pass --no-hardlinks to git clone for a clone meant to serve as an independent backup."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>git: unable to unlink / path is unmerged / object file is empty (tested)</h1>
+<p class="lead">These three git error messages look related but have three different causes: a permissions problem, an unresolved merge conflict, and a corrupted repository object. We reproduced all three on git 2.47.3 and measured a working fix for each, including a real recovery for the scariest one &mdash; a corrupted object file.</p>
+<h2 id="unmerged">1. error: path 'FILE' is unmerged</h2>
+<p>We created a real merge conflict (two branches editing the same line of the same file) and ran <code>git merge</code>, which correctly stopped with <code>CONFLICT (content): Merge conflict in f.txt</code>. The file now shows as <code>UU</code> (both sides modified) in <code>git status --short</code>. Running <code>git checkout -- f.txt</code> at that point &mdash; a common reflex to "just reset the file" &mdash; produced:</p>
+<pre><code>error: path &#39;f.txt&#39; is unmerged</code></pre>
+<p><strong>Why:</strong> during a conflict, git's index holds three versions of the file at once (ours, theirs, and the common ancestor stage), not one. <code>git checkout -- &lt;path&gt;</code> only knows how to restore a single staged version, so it refuses outright rather than guessing which side you want.</p>
+<p><strong>The fix</strong> depends on which side you actually want to keep:</p>
+<pre><code># keep YOUR side for this file, discard theirs
+git checkout --ours -- f.txt
+git add f.txt
+
+# keep THEIR side for this file, discard yours
+git checkout --theirs -- f.txt
+git add f.txt
+
+# or open the file, remove the &lt;&lt;&lt;&lt;&lt;&lt;&lt;/=======/&gt;&gt;&gt;&gt;&gt;&gt;&gt; markers by hand, then
+git add f.txt
+git commit</code></pre>
+<p>We confirmed <code>git checkout --ours -- f.txt</code> immediately resolves the conflict for that file and moves it out of unmerged state, letting <code>git commit</code> proceed.</p>
+
+<h2 id="unlink">2. error: unable to unlink old 'FILE': Permission denied</h2>
+<p>We reproduced this by making a directory read-only (<code>chmod 555</code>) and then asking git to replace a file inside it (<code>git checkout HEAD~1 -- sub/f.txt</code>, which has to delete the current version before writing the old one):</p>
+<pre><code>error: unable to unlink old &#39;sub/f.txt&#39;: Permission denied</code></pre>
+<p><strong>Why:</strong> git's checkout strategy is delete-then-recreate, not edit-in-place. Deleting a file requires write permission on its <strong>containing directory</strong>, not the file itself &mdash; a detail that trips people up. This also surfaces on network filesystems, files locked by another process (a running build, an editor with an open handle, a virus scanner), or files <code>chattr +i</code>-protected on Linux.</p>
+<p><strong>The fix</strong> we confirmed: restore write permission on the directory, then retry.</p>
+<pre><code>chmod 755 sub        # or whatever permission the directory should normally have
+git checkout HEAD~1 -- sub/f.txt   # now succeeds</code></pre>
+<p>On a shared or CI machine, also check for another process holding the file open (<code>lsof FILE</code> on Linux/macOS) and for directories owned by a different user (<code>ls -la</code> the parent directory) before changing permissions blindly.</p>
+
+<h2 id="empty">3. error: object file ... is empty / fatal: bad object HEAD</h2>
+<p>This is the serious one: a git object (commit, tree, or blob) on disk has 0 bytes, usually from a killed process, a full disk, or a bad disk/filesystem during a write. We reproduced it by truncating the loose object file for the current HEAD commit:</p>
+<pre><code>error: object file .git/objects/46/3fd27... is empty
+error: object file .git/objects/46/3fd27... is empty
+error: object file .git/objects/46/3fd27... is empty
+fatal: bad object HEAD</code></pre>
+<p>At this point <code>git log</code>, <code>git status</code>, <code>git show</code>, and even <code>git cat-file -p &lt;sha&gt;</code> on that exact object all fail the same way &mdash; the repository is unusable until the object is restored or removed from history. <code>git fsck</code> correctly flags it as <code>object corrupt or missing</code> along with every ref and reflog entry that points to it.</p>
+<p><strong>Fix 1 (best): copy the identical object from another clone.</strong> Because git object filenames are the content's SHA-1 hash, any other clone, fork, or backup that has the same commit has a byte-identical file at the same path. We confirmed this works end to end: cloning the repo <em>before</em> corrupting it, corrupting the original's object file, then copying the healthy clone's object file over:</p>
+<pre><code>cp /path/to/healthy-clone/.git/objects/46/3fd27... .git/objects/46/3fd27...
+git log --oneline   # repo is immediately readable again
+git fsck            # clean, no errors</code></pre>
+<p><strong>Gotcha we hit first:</strong> a <em>local</em> <code>git clone</code> hardlinks object files to the source repo by default (same inode) &mdash; corrupting the original also silently corrupted our first "backup" clone, since they were the same file on disk. Use <code>git clone --no-hardlinks</code> for any clone you intend to keep as an independent backup, or clone over a network/file transfer (which never hardlinks).</p>
+<p><strong>Fix 2 (if no copy of the object exists anywhere): roll the branch back to the last good commit.</strong> This discards the corrupted commit (and anything after it) but makes the repository usable again. We confirmed moving the branch ref directly to the last known-good commit works even while HEAD is unreadable:</p>
+<pre><code>git update-ref refs/heads/master &lt;parent-sha-of-the-corrupt-commit&gt;
+git log --oneline   # repo works again, now at the parent commit</code></pre>
+<p>You can find the parent SHA from a teammate's clone, from CI logs, from <code>git reflog</code> entries that predate the corruption, or from the commit hash shown in an old pull request / email / chat message if nothing else survived. Whichever fix you use, immediately run <code>git fsck</code> and, if you have remotes, <code>git fetch --all</code> afterward to confirm nothing else references the lost object.</p>
+
+<aside class="cta"><strong>Debugging an API your git hooks or CI talk to? Check the real headers and status it sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does git say a path is unmerged when I just want to discard my changes to one file?</summary><p>git checkout -- &lt;path&gt; only works when the index has a single staged version of that file. During a conflict the index holds 3 versions (yours, theirs, and the common ancestor), so it refuses rather than guess. Use git checkout --ours -- &lt;path&gt; or git checkout --theirs -- &lt;path&gt; to pick a side explicitly, then git add it.</p></details>
+<details><summary>I have write access to the file so why does &#x27;unable to unlink&#x27; still happen?</summary><p>Deleting a file needs write permission on its containing directory, not the file itself — we confirmed this by chmod&#x27;ing the directory to 555 (read-only) with the file otherwise normal. git&#x27;s checkout always deletes the old file before writing the new one, so a locked-down or network-mounted parent directory blocks it even if the file&#x27;s own permissions look fine.</p></details>
+<details><summary>Is &#x27;object file is empty&#x27; always unrecoverable?</summary><p>No — we measured two working recoveries. If any other clone or backup has the same commit, its object file is byte-identical (same SHA = same content) and can simply be copied over. If no copy exists anywhere, moving the branch ref back to the last good commit with git update-ref restores a working repository, at the cost of losing the corrupted commit and anything built on top of it.</p></details>
+<details><summary>What actually causes a git object file to become empty on disk?</summary><p>A loose object file gets created in one filesystem write. A process kill (OOM, power loss, Ctrl+C at the wrong instant), a full disk mid-write, or underlying disk/filesystem corruption can all leave a 0-byte file where a compressed object should be. It&#x27;s a storage-layer accident, not something a normal git command causes on its own.</p></details>
+<details><summary>Does a local git clone always share object files with its source repo?</summary><p>By default, yes — git clone on the same filesystem hardlinks objects for speed, so corrupting one copy corrupts both, since they&#x27;re literally the same inode. We confirmed this by watching a &#x27;backup&#x27; clone go bad along with the original. Pass --no-hardlinks to git clone for a clone meant to serve as an independent backup.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with git version 2.47.3 on Linux, using throwaway repos under /tmp. Every message and exit path below is copy-pasted output from that git binary, not paraphrased or taken from docs. PlainHeaders is our extension; git is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

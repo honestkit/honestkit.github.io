@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Retry-After Header (429 / 503): Seconds vs Date, curl --retry and Python Retry (Tested)</title>
+<meta name="description" content="How Retry-After works on 429 Too Many Requests and 503 responses, seconds vs HTTP-date, and measured retry timing for curl --retry and Python requests/urllib3 Retry, including the huge Retry-After that hangs a script.">
+<link rel="canonical" href="https://honestkit.github.io/guides/retry-after-header-429/">
+<meta property="og:title" content="Retry-After Header (429 / 503): Seconds vs Date, curl --retry and Python Retry (Tested)">
+<meta property="og:description" content="How Retry-After works on 429 Too Many Requests and 503 responses, seconds vs HTTP-date, and measured retry timing for curl --retry and Python requests/urllib3 Retry, including the huge Retry-After that hangs a script.">
+<meta property="og:url" content="https://honestkit.github.io/guides/retry-after-header-429/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is Retry-After in seconds or milliseconds?", "acceptedAnswer": {"@type": "Answer", "text": "Seconds (a whole number), or an HTTP date. There is no millisecond form."}}, {"@type": "Question", "name": "Does Python requests respect Retry-After?", "acceptedAnswer": {"@type": "Answer", "text": "Only with a urllib3 Retry mounted on the session. Then it waited exactly the header's 3 seconds in our test, even without status_forcelist. Plain requests.get() doesn't retry at all."}}, {"@type": "Question", "name": "Does curl --retry respect Retry-After?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. curl 8.14 waited 3 s for Retry-After: 3 (seconds or date), and the header beat --retry-delay."}}, {"@type": "Question", "name": "What happens if Retry-After is very long?", "acceptedAnswer": {"@type": "Answer", "text": "urllib3 sleeps the whole time (our 300 s test hung the script). Cap it with a Retry subclass; curl with --retry-max-time gives up instead."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Retry-After header on 429 and 503: seconds vs date, and what curl and Python do</h1>
+<p class="lead">Retry-After tells a client how long to wait before trying again, either as seconds or as a date. We measured whether curl and Python's requests actually wait for it.</p>
+<h2>1. The two formats</h2>
+<pre><code>HTTP/1.1 429 Too Many Requests
+Retry-After: 3
+
+HTTP/1.1 503 Service Unavailable
+Retry-After: Thu, 01 Oct 2026 12:10:03 GMT</code></pre>
+<p>Seconds is simpler and doesn't depend on clocks. A date has one-second resolution: in our test a date "3 seconds ahead" produced a first wait of 2.17 s, because the fraction of the current second was cut off.</p>
+<h2>2. What the clients did (gaps between the 3 requests)</h2>
+<table><thead><tr><th>Client</th><th>Retry-After: 3</th><th>Date +3 s</th><th>No header</th></tr></thead><tbody>
+<tr><td><code>curl --retry 5</code></td><td>3.0 s, 3.0 s</td><td>3.0 s, 3.0 s</td><td>1 s, 2 s (doubling)</td></tr>
+<tr><td>requests + urllib3 <code>Retry(status_forcelist=[429, 503])</code></td><td>3.0 s, 3.0 s</td><td>2.17 s, 3.0 s</td><td>0 s, 1 s (backoff_factor 0.5)</td></tr>
+</tbody></table>
+<ul><li>curl retries 429 and 503 without extra flags, and <code>--retry-delay 1</code> did not shorten a Retry-After of 3 s: the header won.</li>
+<li>urllib3 waited for Retry-After on 429/503 even without <code>status_forcelist</code>. <code>respect_retry_after_header=False</code> made it ignore the header (gaps 0 s, 1 s).</li></ul>
+<h2>3. The trap: a huge Retry-After</h2>
+<p>With <code>Retry-After: 300</code>, the Python script simply slept: it was still waiting when we killed it after 8 seconds. urllib3 has no upper limit on that wait. Cap it yourself:</p>
+<pre><code>import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+class CappedRetry(Retry):
+    def get_retry_after(self, response):
+        wait = super().get_retry_after(response)
+        return None if wait is None else min(wait, 30)  # never sleep more than 30 s
+
+s = requests.Session()
+s.mount("https://", HTTPAdapter(max_retries=CappedRetry(total=5, backoff_factor=0.5, status_forcelist=[429, 503])))
+r = s.get("https://api.example.com/items")</code></pre>
+<p>With the cap at 2 s, the same 300 s server got retries 2.0 s apart and the call succeeded. curl instead gives up: <code>curl --retry 5 --retry-max-time 10</code> returned the 429 at once, because 300 s doesn't fit in 10 s. Use <code>--retry-max-time</code> on anything that runs unattended.</p>
+<h2>4. Sending it from your server</h2>
+<pre><code># nginx rate limiting: return 429 instead of the default 503
+limit_req_status 429;
+# add the header on those responses (adjust to your limit)
+add_header Retry-After 10 always;</code></pre>
+<p>The nginx lines were not part of this test. Check what your server sends with <code>curl -sI https://your-site/ | grep -i retry-after</code> or the free <a href="/tools/http-headers/">HTTP headers tool</a>.</p>
+<aside class="cta"><strong>Inspect or edit response headers in the browser:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is Retry-After in seconds or milliseconds?</summary><p>Seconds (a whole number), or an HTTP date. There is no millisecond form.</p></details>
+<details><summary>Does Python requests respect Retry-After?</summary><p>Only with a urllib3 Retry mounted on the session. Then it waited exactly the header&#x27;s 3 seconds in our test, even without status_forcelist. Plain requests.get() doesn&#x27;t retry at all.</p></details>
+<details><summary>Does curl --retry respect Retry-After?</summary><p>Yes. curl 8.14 waited 3 s for Retry-After: 3 (seconds or date), and the header beat --retry-delay.</p></details>
+<details><summary>What happens if Retry-After is very long?</summary><p>urllib3 sleeps the whole time (our 300 s test hung the script). Cap it with a Retry subclass; curl with --retry-max-time gives up instead.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 against a local server that answered 429 or 503 twice, then 200, logging the time of every request: curl 8.14.1 and Python requests 2.32.3 with urllib3 2.3.0. Retry-After was sent as seconds (3), as an HTTP date 3 seconds ahead, as 300 seconds, or not at all. PlainHeaders is our extension; curl and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

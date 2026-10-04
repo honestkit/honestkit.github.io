@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker No Space Left on Device: Causes and Fixes</title>
+<meta name="description" content="We reproduced the exact write failure, show the real docker system df command to find what&#x27;s eating space, and tested two real fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/docker-no-space-left-on-device/">
+<meta property="og:title" content="Docker No Space Left on Device: Causes and Fixes">
+<meta property="og:description" content="We reproduced the exact write failure, show the real docker system df command to find what&#x27;s eating space, and tested two real fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/docker-no-space-left-on-device/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does this mean my whole disk is full?", "acceptedAnswer": {"@type": "Answer", "text": "Not necessarily. We demonstrated the error with a 10 MB tmpfs limit that had nothing to do with overall disk space. docker system df is the right first check: it shows Docker's own breakdown (images, containers, volumes, build cache) before you assume it's the host disk."}}, {"@type": "Question", "name": "What's the single biggest thing to check first?", "acceptedAnswer": {"@type": "Answer", "text": "Build cache and unused images, in our experience and per Docker's own system df output above (3.2 GB and 1.2 GB reclaimable respectively on a typical dev host) &mdash; these accumulate silently from repeated docker build runs and rarely get cleaned automatically."}}, {"@type": "Question", "name": "Is docker system prune safe to run?", "acceptedAnswer": {"@type": "Answer", "text": "docker system prune only removes resources Docker considers unused (stopped containers, dangling images, unused networks, unused build cache) by default; it won't touch anything attached to a running container. docker system prune -a is more aggressive and also removes unused (not just dangling) images, so check docker system df before and after to see exactly what it reclaimed."}}, {"@type": "Question", "name": "Why did dd write some data before failing?", "acceptedAnswer": {"@type": "Answer", "text": "We observed this directly: dd wrote exactly up to the available space (10 of the requested 50 MB) before erroring on the write that exceeded it. The filesystem doesn't reject the write upfront; it fails partway through once space actually runs out."}}, {"@type": "Question", "name": "My host disk itself is full, not just Docker's share \u2014 what then?", "acceptedAnswer": {"@type": "Answer", "text": "Check df -h on the host directly. Docker's system df only accounts for what Docker manages (images, containers, volumes, build cache); application logs, other services, and unrelated files on the same partition can fill the disk without showing up in Docker's own accounting at all."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Docker: No Space Left on Device (tested)</h1>
+<p class="lead">This error means whatever filesystem your container is writing to &mdash; its writable layer, a bind mount, a volume, or a size-limited tmpfs &mdash; has run out of room. It's rarely about total host disk space; it's almost always one specific thing (often Docker's own image/build cache, or an unbounded log/volume) that filled up.</p>
+<h2>1. Reproduced: a real write failure</h2>
+<p>We mounted a tmpfs capped at 10 MB and tried to write 50 MB into it &mdash; this is bounded to RAM, so it's safe to run without risking real disk:</p>
+<pre><code>docker run --rm --tmpfs /data:size=10m alpine sh -c "dd if=/dev/zero of=/data/file bs=1M count=50"
+
+dd: error writing '/data/file': No space left on device
+11+0 records in
+10+0 records out
+10485760 bytes (10.0MB) copied, 0.011571 seconds, 864.2MB/s</code></pre>
+<p>Notice <code>dd</code> wrote exactly up to the 10 MB limit (<code>10+0 records out</code>) before failing on the 11th block &mdash; the write didn't fail instantly, it filled the available space first. The same shape of error happens on a full bind mount, full named volume, or full host disk; only the underlying cause differs.</p>
+
+<h2>2. Find out what's actually full: don't assume it's the whole disk</h2>
+<p>In the real-world version of this error, it's almost never the entire host disk &mdash; it's Docker's own storage. <code>docker system df</code> breaks down exactly where Docker's disk usage is going, with no guessing:</p>
+<pre><code>docker system df
+TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+Images          32        22        17.27GB   3.228GB (18%)
+Containers      22        21        94.15MB   4.096kB (0%)
+Local Volumes   8         2         80.59MB   80.59MB (100%)
+Build Cache     59        1         1.196GB   1.193GB</code></pre>
+<p>The <code>RECLAIMABLE</code> column is the key number: on this host, 3.2 GB of images and 1.2 GB of build cache could be freed without affecting anything currently running. <code>Local Volumes</code> shows 100% reclaimable because those 8 volumes aren't attached to any running container right now.</p>
+
+<h2>3. Fix 1: raise the limit (when the limit itself was wrong)</h2>
+<p>If the mount's size limit was simply set too small for legitimate use, raising it is the direct fix &mdash; we confirmed the identical write succeeds once the tmpfs is large enough:</p>
+<pre><code>docker run --rm --tmpfs /data:size=100m alpine sh -c "dd if=/dev/zero of=/data/file bs=1M count=50 && echo OK"
+
+50+0 records in
+50+0 records out
+52428800 bytes (50.0MB) copied, 0.037491 seconds, 1.3GB/s
+OK</code></pre>
+
+<h2>4. Fix 2: reclaim space instead of raising a limit</h2>
+<p>If the real problem is Docker's accumulated images/cache (the common host-disk case, not a deliberately-sized mount), reclaim it instead of expanding anything:</p>
+<pre><code># safe: only removes resources not in use by any container
+docker system prune
+
+# more aggressive: also removes unused (not just dangling) images
+docker system prune -a
+
+# just the build cache, often the single biggest reclaimable chunk
+docker builder prune</code></pre>
+<p>Run <code>docker system df</code> again afterward to confirm the reclaim actually freed what you expected &mdash; don't assume the prune worked without checking the new numbers.</p>
+
+<h2>5. The real host disk is a different check</h2>
+<p>If <code>docker system df</code> shows nothing unusually large, the host filesystem itself (often <code>/var/lib/docker</code>'s partition) may be full from something outside Docker entirely &mdash; application logs, other services, a growing database file. Check that separately with <code>df -h</code> on the host; Docker's own accounting only covers what Docker itself manages.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does this mean my whole disk is full?</summary><p>Not necessarily. We demonstrated the error with a 10 MB tmpfs limit that had nothing to do with overall disk space. docker system df is the right first check: it shows Docker&#x27;s own breakdown (images, containers, volumes, build cache) before you assume it&#x27;s the host disk.</p></details>
+<details><summary>What&#x27;s the single biggest thing to check first?</summary><p>Build cache and unused images, in our experience and per Docker&#x27;s own system df output above (3.2 GB and 1.2 GB reclaimable respectively on a typical dev host) &amp;mdash; these accumulate silently from repeated docker build runs and rarely get cleaned automatically.</p></details>
+<details><summary>Is docker system prune safe to run?</summary><p>docker system prune only removes resources Docker considers unused (stopped containers, dangling images, unused networks, unused build cache) by default; it won&#x27;t touch anything attached to a running container. docker system prune -a is more aggressive and also removes unused (not just dangling) images, so check docker system df before and after to see exactly what it reclaimed.</p></details>
+<details><summary>Why did dd write some data before failing?</summary><p>We observed this directly: dd wrote exactly up to the available space (10 of the requested 50 MB) before erroring on the write that exceeded it. The filesystem doesn&#x27;t reject the write upfront; it fails partway through once space actually runs out.</p></details>
+<details><summary>My host disk itself is full, not just Docker&#x27;s share — what then?</summary><p>Check df -h on the host directly. Docker&#x27;s system df only accounts for what Docker manages (images, containers, volumes, build cache); application logs, other services, and unrelated files on the same partition can fill the disk without showing up in Docker&#x27;s own accounting at all.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Docker Engine 29.8.1 on Linux. The write failure below is real, reproduced output from a size-limited tmpfs mount (bounded to 10 MB of RAM, not real disk) so it&#x27;s safe to run anywhere; the diagnosis commands (docker system df) are run against a real host. PlainHeaders is our extension; Docker is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Node.js &quot;Error: socket hang up&quot; (ECONNRESET): Causes and Fixes</title>
+<meta name="description" content="We triggered socket hang up 7 ways in Node 24 and logged the exact error from http.request, fetch and axios. The cause, the code, and the fix for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/socket-hang-up-nodejs/">
+<meta property="og:title" content="Node.js &quot;Error: socket hang up&quot; (ECONNRESET): Causes and Fixes">
+<meta property="og:description" content="We triggered socket hang up 7 ways in Node 24 and logged the exact error from http.request, fetch and axios. The cause, the code, and the fix for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/socket-hang-up-nodejs/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Node say ECONNRESET when the server closed cleanly?", "acceptedAnswer": {"@type": "Answer", "text": "The http client uses code ECONNRESET for every 'socket hang up', whether the close was a FIN or a real reset. In our tests a clean socket.destroy() on the server gave 'socket hang up' with code ECONNRESET."}}, {"@type": "Question", "name": "Why does fetch not show 'socket hang up'?", "acceptedAnswer": {"@type": "Answer", "text": "Built-in fetch uses undici, not the http module. It throws 'TypeError: fetch failed' and the reason is in err.cause, for example 'SocketError: other side closed' with code UND_ERR_SOCKET. Always log err.cause."}}, {"@type": "Question", "name": "Can my own code cause socket hang up?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Calling req.destroy() before the response, often inside a 'timeout' handler, gives the exact same 'socket hang up' ECONNRESET error. Pass an error to destroy() so your logs show the real reason."}}, {"@type": "Question", "name": "Why do I get random socket hang up errors under load?", "acceptedAnswer": {"@type": "Answer", "text": "Most likely a stale keep-alive socket: the server or a proxy closed an idle connection as the client reused it. We reproduced it in a 2-3 ms window. Set the client agent's idle timeout lower than the server's and retry idempotent requests once when req.reusedSocket is true."}}, {"@type": "Question", "name": "Does the http.request timeout option abort the request?", "acceptedAnswer": {"@type": "Answer", "text": "No. In our test, timeout: 500 with no 'timeout' handler still waited and returned 200 after 3 s. You must call req.destroy() in the 'timeout' handler yourself."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Error: socket hang up in Node.js (tested)</h1>
+<p class="lead"><code>Error: socket hang up</code> with <code>code: 'ECONNRESET'</code> means the connection closed before a response arrived. The cause can be the server, the client, or a stale keep-alive socket. We reproduced each cause in Node 24 and recorded what <code>http.request</code>, <code>fetch</code> and axios report.</p>
+<h2>1. What "socket hang up" means</h2>
+<p>Node's <code>http</code> client throws <code>Error: socket hang up</code> when the socket closes after the request was sent but before any response headers came back. The error code is always <code>ECONNRESET</code>, even when the close was a clean FIN and not a TCP reset.</p>
+<p>If the headers already arrived and the body is cut off, you get a different error: <code>Error: aborted</code> on the response object. Built-in <code>fetch</code> (undici) never says "socket hang up". It throws <code>TypeError: fetch failed</code> and puts the real reason in <code>err.cause</code>.</p>
+
+<h2>2. Our test setup</h2>
+<p>We ran a Node 24.21.0 HTTP server and an HTTPS server on localhost, plus a raw TCP server that speaks minimal HTTP/1.1. Each scenario was hit with three clients: <code>http.request</code>, built-in <code>fetch</code>, and axios 1.20.0. We logged <code>err.name</code>, <code>err.message</code>, <code>err.code</code> and <code>err.cause</code>.</p>
+
+<h2>3. Results: the exact error per cause and client</h2>
+<table>
+<tr><th>Cause</th><th>http.request</th><th>fetch (undici)</th><th>axios 1.20.0</th></tr>
+<tr><td>Server destroys socket without responding (<code>req.socket.destroy()</code>)</td><td><code>Error: socket hang up</code>, code <code>ECONNRESET</code></td><td><code>TypeError: fetch failed</code>, cause <code>SocketError: other side closed</code>, code <code>UND_ERR_SOCKET</code></td><td><code>Error: socket hang up</code>, code <code>ECONNRESET</code></td></tr>
+<tr><td>Server process crashes mid-request (uncaught throw in handler)</td><td><code>socket hang up</code> / <code>ECONNRESET</code></td><td><code>fetch failed</code> / <code>other side closed</code> / <code>UND_ERR_SOCKET</code></td><td><code>socket hang up</code> / <code>ECONNRESET</code></td></tr>
+<tr><td>Next request after the crash (nothing listening)</td><td colspan="3"><code>Error: connect ECONNREFUSED 127.0.0.1:8993</code> (http.request)</td></tr>
+<tr><td>Server sends headers, then destroys socket mid-body</td><td><code>Error: aborted</code>, code <code>ECONNRESET</code> (on the response)</td><td><code>TypeError: terminated</code>, cause <code>other side closed</code></td><td><code>AxiosError: stream has been aborted</code>, code <code>ERR_BAD_RESPONSE</code></td></tr>
+<tr><td>Server idle timeout (<code>server.setTimeout(500)</code>, handler takes 3 s)</td><td><code>socket hang up</code> / <code>ECONNRESET</code> at 503 ms</td><td><code>fetch failed</code> / <code>other side closed</code> at 503 ms</td><td><code>socket hang up</code> / <code>ECONNRESET</code></td></tr>
+<tr><td>Plain http:// to an HTTPS port</td><td><code>socket hang up</code> / <code>ECONNRESET</code> (3 ms)</td><td><code>fetch failed</code> / <code>other side closed</code></td><td><code>socket hang up</code> / <code>ECONNRESET</code></td></tr>
+<tr><td>https:// to a plain HTTP port</td><td><code>Error: write EPROTO ... wrong version number</code>, code <code>EPROTO</code></td><td><code>fetch failed</code>, cause code <code>ERR_SSL_WRONG_VERSION_NUMBER</code></td><td><code>write EPROTO ... wrong version number</code>, code <code>EPROTO</code></td></tr>
+<tr><td>Stale keep-alive socket (see section 5)</td><td><code>socket hang up</code> or <code>read ECONNRESET</code>, <code>req.reusedSocket</code> = true</td><td><code>fetch failed</code>, cause <code>read ECONNRESET</code></td><td><code>socket hang up</code> or <code>read ECONNRESET</code></td></tr>
+</table>
+<p>curl against the "destroy without responding" server prints <code>curl: (52) Empty reply from server</code>. That is the same event seen from curl.</p>
+
+<h2>4. When the client hangs up itself</h2>
+<p>A "socket hang up" can be your own code. Calling <code>req.destroy()</code> before the response arrives gives exactly the same message as a server-side close. This is the most confusing case.</p>
+<table>
+<tr><th>Client action (server takes 3 s)</th><th>Error</th></tr>
+<tr><td><code>req.destroy()</code> after 300 ms</td><td><code>Error: socket hang up</code>, code <code>ECONNRESET</code> at 304 ms</td></tr>
+<tr><td><code>timeout: 500</code> + <code>req.on('timeout', () =&gt; req.destroy())</code></td><td><code>Error: socket hang up</code>, code <code>ECONNRESET</code> at 504 ms</td></tr>
+<tr><td><code>timeout: 500</code> with no 'timeout' handler</td><td>No error. The request waited and got 200 after 3 s.</td></tr>
+<tr><td>fetch + <code>AbortSignal.timeout(300)</code></td><td><code>TimeoutError: The operation was aborted due to timeout</code></td></tr>
+<tr><td>fetch + <code>AbortController.abort()</code></td><td><code>AbortError: This operation was aborted</code></td></tr>
+<tr><td>axios <code>timeout: 300</code></td><td><code>AxiosError: timeout of 300ms exceeded</code>, code <code>ECONNABORTED</code></td></tr>
+<tr><td>axios <code>signal</code> aborted</td><td><code>CanceledError: canceled</code>, code <code>ERR_CANCELED</code></td></tr>
+</table>
+<p>Two lessons. The <code>timeout</code> option of <code>http.request</code> only emits an event; it does not cancel anything. And if you destroy on timeout, you get "socket hang up", which looks like a server fault. Pass an error to make it clear: <code>req.destroy(new Error('client timeout'))</code>. The server sees this as a client abort, which nginx logs as <a href="/guides/499-client-closed-request/">499 Client Closed Request</a>.</p>
+
+<h2>5. The stale keep-alive race</h2>
+<p>In Node 24 <code>http.globalAgent</code> has <code>keepAlive: true</code> (we printed its options). Idle sockets are reused. If the server closes an idle socket at the same moment the client sends a new request on it, the request fails.</p>
+<p>We built a raw TCP server that closes idle connections after 1000 ms and does <em>not</em> send a <code>Keep-Alive: timeout</code> header (like many proxies and non-Node servers). We sent a request, waited 970 to 1030 ms, then sent another.</p>
+<table>
+<tr><th>Client</th><th>Failures</th><th>When</th><th>Error</th></tr>
+<tr><td>http.request, global agent</td><td>2 of 31</td><td>998 and 1000 ms idle</td><td><code>read ECONNRESET</code> and <code>socket hang up</code>, both with <code>reusedSocket</code> true</td></tr>
+<tr><td>axios default</td><td>2 of 31</td><td>998 and 1000 ms idle</td><td><code>read ECONNRESET</code> and <code>socket hang up</code></td></tr>
+<tr><td>fetch</td><td>0 of 31 in the sweep; 3 of 24 in a denser 994–1001 ms run</td><td>997 ms idle</td><td><code>fetch failed</code>, cause <code>read ECONNRESET</code></td></tr>
+<tr><td>http.request, <code>new http.Agent({keepAlive: true, timeout: 900})</code></td><td>0 of 24</td><td>994–1001 ms</td><td>None. Every request used a new socket.</td></tr>
+</table>
+<p>The window is a few milliseconds wide. In production, with thousands of requests, it turns into a steady trickle of random errors.</p>
+<p>Against a Node 24 server with <code>keepAliveTimeout = 1000</code> we saw <strong>0 failures</strong> with all three clients, even with <code>keepAliveTimeoutBuffer = 0</code>. The Node server sends <code>Keep-Alive: timeout=1</code>, and the clients dropped the socket before reusing it (<code>reusedSocket</code> was false every time). Also, Node 24 servers have <code>keepAliveTimeoutBuffer</code> = 1000 by default: with <code>keepAliveTimeout = 1000</code> the server really closed the idle socket after 2002 ms. More on the header in <a href="/guides/keep-alive-header-connection/">Keep-Alive and Connection headers</a>.</p>
+
+<h2>6. How to fix it</h2>
+<ul>
+<li><strong>Find out who closed.</strong> Check server logs for a crash or a timeout at the same time. A <code>ECONNREFUSED</code> right after a hang up means the server process died.</li>
+<li><strong>Client idle timeout below the server's.</strong> Set the agent's idle <code>timeout</code> lower than the server's (or proxy's, or load balancer's) keep-alive timeout. In our test, <code>timeout: 900</code> against a 1000 ms server removed every failure.</li>
+<li><strong>Retry idempotent requests once on a reused socket.</strong> The failures all had <code>req.reusedSocket === true</code>. Retry GET, HEAD, PUT and DELETE in that case. Do not blindly retry POST.</li>
+<li><strong>Check the scheme and port.</strong> http:// to an HTTPS port is a hang up; https:// to an HTTP port is <code>EPROTO</code> "wrong version number".</li>
+<li><strong>Handle client timeouts on purpose.</strong> Use <code>AbortSignal.timeout()</code> with fetch, or <code>req.destroy(new Error('timeout'))</code> with http, so your logs say "timeout" instead of "socket hang up".</li>
+<li><strong>Raise server timeouts for slow handlers</strong> (<code>server.setTimeout</code>, proxy read timeouts), or make the endpoint asynchronous.</li>
+</ul>
+<pre><code>const agent = new http.Agent({ keepAlive: true, timeout: 50_000 }); // server/LB idle is 60 s
+
+function get(url, retried = false) {
+  return new Promise((resolve, reject) =&gt; {
+    const req = http.get(url, { agent }, resolve);
+    req.on('error', err =&gt; {
+      if (!retried &amp;&amp; req.reusedSocket &amp;&amp; err.code === 'ECONNRESET') {
+        return resolve(get(url, true));   // stale socket: retry once
+      }
+      reject(err);
+    });
+  });
+}</code></pre>
+<p>For fetch, undici's <code>Agent</code> has its own <code>keepAliveTimeout</code> option (per the undici docs, not measured here). For the server-side view of resets, read <a href="/guides/err-connection-reset-econnreset/">ERR_CONNECTION_RESET / ECONNRESET</a>. Behind a proxy, the same race shows up as <a href="/guides/502-bad-gateway/">502 Bad Gateway</a>.</p>
+<aside class="cta"><strong>Check the Connection and Keep-Alive headers your server actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Node say ECONNRESET when the server closed cleanly?</summary><p>The http client uses code ECONNRESET for every &#x27;socket hang up&#x27;, whether the close was a FIN or a real reset. In our tests a clean socket.destroy() on the server gave &#x27;socket hang up&#x27; with code ECONNRESET.</p></details>
+<details><summary>Why does fetch not show &#x27;socket hang up&#x27;?</summary><p>Built-in fetch uses undici, not the http module. It throws &#x27;TypeError: fetch failed&#x27; and the reason is in err.cause, for example &#x27;SocketError: other side closed&#x27; with code UND_ERR_SOCKET. Always log err.cause.</p></details>
+<details><summary>Can my own code cause socket hang up?</summary><p>Yes. Calling req.destroy() before the response, often inside a &#x27;timeout&#x27; handler, gives the exact same &#x27;socket hang up&#x27; ECONNRESET error. Pass an error to destroy() so your logs show the real reason.</p></details>
+<details><summary>Why do I get random socket hang up errors under load?</summary><p>Most likely a stale keep-alive socket: the server or a proxy closed an idle connection as the client reused it. We reproduced it in a 2-3 ms window. Set the client agent&#x27;s idle timeout lower than the server&#x27;s and retry idempotent requests once when req.reusedSocket is true.</p></details>
+<details><summary>Does the http.request timeout option abort the request?</summary><p>No. In our test, timeout: 500 with no &#x27;timeout&#x27; handler still waited and returned 200 after 3 s. You must call req.destroy() in the &#x27;timeout&#x27; handler yourself.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 (http.request, built-in fetch/undici), axios 1.20.0 and curl 8.14.1 against local Node and raw TCP test servers. Lines marked as from the docs were not measured. PlainHeaders is our extension; Node.js, axios and curl are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

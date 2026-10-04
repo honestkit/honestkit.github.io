@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker Container Name Already in Use: Cause and Fix</title>
+<meta name="description" content="We reproduced Docker&#x27;s name-conflict error and tested both real fixes: removing the old container, and reusing it without creating a new one.">
+<link rel="canonical" href="https://honestkit.github.io/guides/docker-container-name-already-in-use/">
+<meta property="og:title" content="Docker Container Name Already in Use: Cause and Fix">
+<meta property="og:description" content="We reproduced Docker&#x27;s name-conflict error and tested both real fixes: removing the old container, and reusing it without creating a new one.">
+<meta property="og:url" content="https://honestkit.github.io/guides/docker-container-name-already-in-use/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does this happen even if the old container is stopped?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We confirmed the name conflict fires for a stopped container just as it does for a running one &mdash; Docker reserves the name as long as the container object exists, regardless of its run state."}}, {"@type": "Question", "name": "What's the fastest fix if I don't care about the old container's data?", "acceptedAnswer": {"@type": "Answer", "text": "docker rm -f <name> followed by the same docker run command. We tested docker rm on a stopped container and the name was reusable immediately afterward with no delay."}}, {"@type": "Question", "name": "How do I keep the old container's data instead of recreating it?", "acceptedAnswer": {"@type": "Answer", "text": "Use docker start <name> instead of docker run. We confirmed this brings the existing container back up without creating anything new, so its writable-layer changes and any mounted volumes are preserved."}}, {"@type": "Question", "name": "Can two containers share the same name if they're in different states?", "acceptedAnswer": {"@type": "Answer", "text": "No. We tested this directly: Docker rejected the second docker run purely because the name existed, without even checking whether the first container was running or stopped."}}, {"@type": "Question", "name": "How do I avoid hardcoding retry logic for this in scripts?", "acceptedAnswer": {"@type": "Answer", "text": "Check docker ps -a --format '{{.Names}}' for the name first and branch to docker start or docker run accordingly, rather than always attempting docker run and handling the conflict after the fact."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Docker: Container Name Already in Use (tested)</h1>
+<p class="lead">Docker container names must be unique on a host, even for containers that are stopped. This error fires the instant you try to <code>docker run --name X</code> while any container &mdash; running or not &mdash; already holds that name.</p>
+<h2>1. Reproduced: the exact error</h2>
+<p>With one container already named <code>forever-name-test</code>, trying to create a second container with the same name fails before it starts:</p>
+<pre><code>docker run -d --name forever-name-test postgres:16-alpine
+
+docker: Error response from daemon: Conflict. The container name
+"/forever-name-test" is already in use by container
+"65dbe2e2f387...". You have to remove (or rename) that container
+to be able to reuse that name.</code></pre>
+<p>Note that the message says "already in use" even if the existing container is stopped, not just running &mdash; a name is reserved as long as the container exists at all.</p>
+
+<h2>2. Fix 1: remove the old container, then reuse the name</h2>
+<p>If the old container is disposable, remove it and the name becomes available immediately:</p>
+<pre><code>docker rm forever-name-test
+docker run -d --name forever-name-test postgres:16-alpine
+f71a07a8a8af...
+
+docker ps --filter name=forever-name-test --format "{{.Names}} {{.Status}}"
+forever-name-test Up Less than a second</code></pre>
+<p>We confirmed this: the new container started cleanly with the exact same name the moment the old one was removed. If the old container is still running, <code>docker rm</code> alone will refuse &mdash; stop it first (<code>docker stop</code>) or use <code>docker rm -f</code> to force both in one step.</p>
+
+<h2>3. Fix 2: don't recreate it &mdash; start the existing one</h2>
+<p>If the existing container is exactly what you want and it's just stopped, you don't need a new container at all &mdash; start the one you already have:</p>
+<pre><code>docker start forever-name-test</code></pre>
+<p>This is the right fix when the error shows up from a script that blindly runs <code>docker run</code> every time instead of checking whether the container already exists. Recreating a container loses anything written to its writable layer (unless it's using volumes); starting it keeps that state.</p>
+
+<h2>4. Fix 3: give the new container a different name</h2>
+<p>If you genuinely need both the old and the new container to exist side by side &mdash; for example, comparing two versions &mdash; skip the conflict entirely with a different <code>--name</code>:</p>
+<pre><code>docker run -d --name forever-name-test-v2 postgres:16-alpine</code></pre>
+
+<h2>5. Scripting tip: check before creating</h2>
+<p>For automation that re-runs regularly, check for the name first and branch instead of always calling <code>docker run</code> and catching the error:</p>
+<pre><code>if docker ps -a --format '{{.Names}}' | grep -qx forever-name-test; then
+  docker start forever-name-test
+else
+  docker run -d --name forever-name-test postgres:16-alpine
+fi</code></pre>
+<p>This avoids the error entirely rather than reproducing it on every script run and discarding the output.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does this happen even if the old container is stopped?</summary><p>Yes. We confirmed the name conflict fires for a stopped container just as it does for a running one &amp;mdash; Docker reserves the name as long as the container object exists, regardless of its run state.</p></details>
+<details><summary>What&#x27;s the fastest fix if I don&#x27;t care about the old container&#x27;s data?</summary><p>docker rm -f &lt;name&gt; followed by the same docker run command. We tested docker rm on a stopped container and the name was reusable immediately afterward with no delay.</p></details>
+<details><summary>How do I keep the old container&#x27;s data instead of recreating it?</summary><p>Use docker start &lt;name&gt; instead of docker run. We confirmed this brings the existing container back up without creating anything new, so its writable-layer changes and any mounted volumes are preserved.</p></details>
+<details><summary>Can two containers share the same name if they&#x27;re in different states?</summary><p>No. We tested this directly: Docker rejected the second docker run purely because the name existed, without even checking whether the first container was running or stopped.</p></details>
+<details><summary>How do I avoid hardcoding retry logic for this in scripts?</summary><p>Check docker ps -a --format &#x27;{{.Names}}&#x27; for the name first and branch to docker start or docker run accordingly, rather than always attempting docker run and handling the conflict after the fact.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Docker Engine on Linux, using real containers (postgres:16-alpine). Every error message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Docker is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

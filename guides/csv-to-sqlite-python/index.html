@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSV to SQLite in Python (sqlite3, No pandas): Typed Columns, NULLs, Safe Quoting</title>
+<meta name="description" content="Load a CSV file into an SQLite table with Python&#x27;s built-in sqlite3 and csv modules: column types inferred from the data, empty cells as NULL, leading-zero ids kept as text, parameterized inserts. Tested on real data.">
+<link rel="canonical" href="https://honestkit.github.io/guides/csv-to-sqlite-python/">
+<meta property="og:title" content="CSV to SQLite in Python (sqlite3, No pandas): Typed Columns, NULLs, Safe Quoting">
+<meta property="og:description" content="Load a CSV file into an SQLite table with Python&#x27;s built-in sqlite3 and csv modules: column types inferred from the data, empty cells as NULL, leading-zero ids kept as text, parameterized inserts. Tested on real data.">
+<meta property="og:url" content="https://honestkit.github.io/guides/csv-to-sqlite-python/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I import CSV into SQLite without Python?", "acceptedAnswer": {"@type": "Answer", "text": "In the sqlite3 shell (version 3.32 or later): .import --csv file.csv tablename. It creates the table from the header if it does not exist, but every column is TEXT."}}, {"@type": "Question", "name": "Can I do this with pandas?", "acceptedAnswer": {"@type": "Answer", "text": "Yes: pd.read_csv('file.csv').to_sql('table', sqlite3.connect('db.sqlite'), index=False). Note that pandas reads 02134 as the number 2134 unless you set dtype=str for that column."}}, {"@type": "Question", "name": "Why use ? placeholders instead of building the SQL string?", "acceptedAnswer": {"@type": "Answer", "text": "Placeholders let sqlite3 handle quotes, commas and newlines in values correctly and prevent SQL injection from the file's content."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to import a CSV into SQLite with Python</h1>
+<p class="lead">Python ships with both csv and sqlite3, so loading a CSV into a database needs no installs. The two details that usually go wrong are column types and empty cells; this script handles both.</p>
+<h2>1. The script</h2>
+<p>Save as <code>csv2sqlite.py</code>:</p>
+<pre><code>import csv, re, sqlite3, sys
+
+csv_path, db_path, table = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(csv_path, newline='', encoding='utf-8-sig') as f:
+    rows = list(csv.reader(f))
+header, data = rows[0], [r for r in rows[1:] if any(c.strip() for c in r)]
+
+def col_type(i):
+    vals = [r[i].strip() for r in data if i &lt; len(r) and r[i].strip()]
+    if vals and all(re.fullmatch(r'-?(0|[1-9]\d*)', v) for v in vals): return 'INTEGER'
+    if vals and all(re.fullmatch(r'-?(0|[1-9]\d*)(\.\d+)?([eE][-+]?\d+)?', v) for v in vals): return 'REAL'
+    return 'TEXT'  # includes ids with leading zeros such as 02134
+
+q = lambda name: '"' + name.replace('"', '""') + '"'
+types = [col_type(i) for i in range(len(header))]
+db = sqlite3.connect(db_path)
+db.execute(f'CREATE TABLE {q(table)} ({", ".join(f"{q(h)} {t}" for h, t in zip(header, types))})')
+db.executemany(f'INSERT INTO {q(table)} VALUES ({", ".join("?" * len(header))})',
+               [[None if (v := (r[i] if i &lt; len(r) else '')).strip() == '' else v for i in range(len(header))] for r in data])
+db.commit()
+print(f'{len(data)} rows -&gt; {db_path}:{table}', dict(zip(header, types)) if len(header) &lt;= 8 else f'{len(header)} columns')
+</code></pre>
+<h2>2. Run it</h2>
+<pre><code>python3 csv2sqlite.py products.csv shop.db products
+sqlite3 shop.db "SELECT * FROM products"</code></pre>
+<p>On our test file it printed <code>3 rows -&gt; shop.db:products {'id': 'INTEGER', 'name': 'TEXT', 'zip': 'TEXT', 'price': 'REAL', 'in_stock': 'TEXT', 'notes': 'TEXT'}</code>. The zip column stays TEXT because one value is <code>02134</code>, and <code>O'Brien</code> or <code>"Pro"</code> need no escaping because the values are passed as parameters (<code>?</code>), never pasted into the SQL.</p>
+<h2>3. What it does</h2>
+<ul><li><strong>Types</strong>: a column is INTEGER or REAL only if every non-empty value is a plain number; otherwise TEXT. In the country-codes file, <code>Dial</code> is TEXT because Anguilla's code is <code>1-264</code>, while <code>ISO3166-1-numeric</code> is INTEGER.</li>
+<li><strong>NULLs</strong>: empty cells are stored as NULL, not as empty strings, so <code>WHERE zip IS NULL</code> works.</li>
+<li><strong>Excel files saved as CSV</strong>: <code>utf-8-sig</code> removes the BOM that would otherwise end up in the first column name.</li></ul>
+<h2>4. Limits</h2>
+<ul><li>The table must not exist yet; add <code>DROP TABLE IF EXISTS</code> before <code>CREATE TABLE</code> if you reload.</li>
+<li>Comma-separated only; pass <code>delimiter=';'</code> to <code>csv.reader</code> for European Excel files.</li>
+<li>All rows are read into memory; for files of millions of rows, insert in batches while reading, or use the sqlite3 shell: <code>.import --csv products.csv products</code> (everything becomes TEXT there).</li></ul>
+<h2>5. Other databases, no code</h2>
+<p>For PostgreSQL, MySQL or SQL Server, paste the CSV into the free <a href="/tools/csv-to-sql/">CSV to SQL converter</a>: it writes CREATE TABLE and INSERT statements with the same typing rules and the right quoting for each database.</p>
+<aside class="cta"><strong>Skip the steps:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I import CSV into SQLite without Python?</summary><p>In the sqlite3 shell (version 3.32 or later): .import --csv file.csv tablename. It creates the table from the header if it does not exist, but every column is TEXT.</p></details>
+<details><summary>Can I do this with pandas?</summary><p>Yes: pd.read_csv(&#x27;file.csv&#x27;).to_sql(&#x27;table&#x27;, sqlite3.connect(&#x27;db.sqlite&#x27;), index=False). Note that pandas reads 02134 as the number 2134 unless you set dtype=str for that column.</p></details>
+<details><summary>Why use ? placeholders instead of building the SQL string?</summary><p>Placeholders let sqlite3 handle quotes, commas and newlines in values correctly and prevent SQL injection from the file&#x27;s content.</p></details>
+</section>
+<p class="note">Written with AI assistance. The script was run on 2026-10-01 with Python 3.13&#x27;s standard library on the country-codes dataset (249 rows, 56 columns), the JSONPlaceholder users CSV (10 rows, 15 columns) and a file with quotes, commas, a leading-zero zip code and empty cells; every value read back from SQLite matched the CSV. PlainTables is our extension; the other methods are free and built into Excel, Google Sheets and pandas.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

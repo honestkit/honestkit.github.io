@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker Pull Access Denied: Causes and Fixes, Tested</title>
+<meta name="description" content="We reproduced this error from a typo&#x27;d image name and a bad tag, and show why it almost never means an actual permissions problem.">
+<link rel="canonical" href="https://honestkit.github.io/guides/docker-pull-access-denied/">
+<meta property="og:title" content="Docker Pull Access Denied: Causes and Fixes, Tested">
+<meta property="og:description" content="We reproduced this error from a typo&#x27;d image name and a bad tag, and show why it almost never means an actual permissions problem.">
+<meta property="og:url" content="https://honestkit.github.io/guides/docker-pull-access-denied/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does 'pull access denied' always mean a login problem?", "acceptedAnswer": {"@type": "Answer", "text": "No, we confirmed this directly: the identical message appeared both for a simple typo (alpin instead of alpine) and for a completely nonexistent made-up repository name, neither of which has anything to do with permissions."}}, {"@type": "Question", "name": "How do I tell a typo from a real permissions issue?", "acceptedAnswer": {"@type": "Answer", "text": "Check the image on the registry's website while logged out of any account. If the page loads publicly, the problem is the name or tag you typed, not access rights. If the page itself requires login to view, it's genuinely private and you need docker login."}}, {"@type": "Question", "name": "Why did I get a different, more specific error for a bad tag?", "acceptedAnswer": {"@type": "Answer", "text": "We reproduced this too: pulling a real image (alpine) with a nonexistent tag returned 'not found' and explicitly named the image as resolved, unlike the generic access-denied message for a nonexistent repository. The clearer message appears specifically when the repository itself is confirmed valid."}}, {"@type": "Question", "name": "My pull works locally but fails in CI with this error \u2014 why?", "acceptedAnswer": {"@type": "Answer", "text": "The most common real cause (not a typo) is that the docker login from an earlier CI step didn't carry over to the step that runs the pull, often because they run in different job containers or shells. Re-authenticate in the same step/context that does the pull."}}, {"@type": "Question", "name": "Is 'manifest unknown' the same thing as this error?", "acceptedAnswer": {"@type": "Answer", "text": "It's related but distinct: manifest unknown (an older wording some registries still use, per their docs) specifically means the repository was found but the tag/digest wasn't, which we reproduced as 'not found' on current Docker. 'Pull access denied' is the separate, more ambiguous message for when the repository name itself can't be resolved at all."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Docker Pull Access Denied (tested)</h1>
+<p class="lead">This error is misleading: despite the wording, it's almost never about your login or permissions. Docker Hub returns the same generic 'access denied' response whether an image is truly private and you lack access, or the repository name simply doesn't exist &mdash; so a typo looks identical to a real permissions problem.</p>
+<h2>1. Reproduced: a typo'd or nonexistent image name</h2>
+<pre><code>docker pull alpin
+Using default tag: latest
+Error response from daemon: pull access denied for alpin,
+repository does not exist or may require 'docker login'</code></pre>
+<p>Nothing is actually denied here &mdash; <code>alpin</code> (missing the final <code>e</code>) simply isn't a real repository. Docker's own message hedges between the two possibilities ("does not exist <em>or</em> may require login") because, from Docker Hub's API response, it genuinely can't distinguish them without you being authenticated.</p>
+
+<h2>2. Reproduced: same message for a made-up namespace</h2>
+<pre><code>docker pull thisrepodoesnotexist12345/nope
+Using default tag: latest
+Error response from daemon: pull access denied for thisrepodoesnotexist12345/nope,
+repository does not exist or may require 'docker login'</code></pre>
+<p>Identical wording to the typo case. This is the key thing to understand: this exact error is what you'd also see if the image were real but genuinely private and you weren't logged in as an authorized user. The message alone can't tell you which situation you're in.</p>
+
+<h2>3. A different error for a bad tag on a real image</h2>
+<p>If the repository name is correct but the tag doesn't exist, Docker gives a more specific (and more useful) error instead:</p>
+<pre><code>docker pull alpine:this-tag-does-not-exist
+Error response from daemon: failed to resolve reference
+"docker.io/library/alpine:this-tag-does-not-exist":
+docker.io/library/alpine:this-tag-does-not-exist: not found</code></pre>
+<p>This one names the image <em>and confirms it exists</em>, just not at that tag &mdash; a strong signal the fix is to check the tag list on the registry, not your credentials. (Older Docker versions, and some other registries, phrase this as <code>manifest unknown</code> instead of <code>not found</code> &mdash; same cause, different wording, per Docker's release notes.)</p>
+
+<h2>4. How to actually tell which case you're in</h2>
+<ol>
+<li><strong>Check spelling and namespace first.</strong> Most "access denied" reports are a typo, a missing <code>library/</code> for official images used in other contexts, or a missing organization prefix (e.g. <code>myorg/myimage</code> vs just <code>myimage</code>).</li>
+<li><strong>Check the registry in a browser (logged out).</strong> If the image page loads publicly, it's not a permissions issue &mdash; re-check the exact name and tag you typed.</li>
+<li><strong>If it's a private image, authenticate and retry.</strong>
+<pre><code>docker login
+docker pull yourorg/private-image</code></pre>
+A real permissions failure will look identical to a typo until you've confirmed you're logged in as a user with access &mdash; so always do this step before concluding it's a permissions bug in your CI pipeline or Dockerfile.</li>
+</ol>
+
+<h2>5. Common real cause: CI pipelines losing login state</h2>
+<p>Outside of typos, the most frequent real-world trigger is a CI job that pulls a private image in a later step after the <code>docker login</code> session from an earlier step expired or ran in a different container/shell that didn't share credentials. If a pull worked locally but fails identically in CI, check whether the login step actually ran in the same execution context as the pull, not just earlier in the pipeline file.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does &#x27;pull access denied&#x27; always mean a login problem?</summary><p>No, we confirmed this directly: the identical message appeared both for a simple typo (alpin instead of alpine) and for a completely nonexistent made-up repository name, neither of which has anything to do with permissions.</p></details>
+<details><summary>How do I tell a typo from a real permissions issue?</summary><p>Check the image on the registry&#x27;s website while logged out of any account. If the page loads publicly, the problem is the name or tag you typed, not access rights. If the page itself requires login to view, it&#x27;s genuinely private and you need docker login.</p></details>
+<details><summary>Why did I get a different, more specific error for a bad tag?</summary><p>We reproduced this too: pulling a real image (alpine) with a nonexistent tag returned &#x27;not found&#x27; and explicitly named the image as resolved, unlike the generic access-denied message for a nonexistent repository. The clearer message appears specifically when the repository itself is confirmed valid.</p></details>
+<details><summary>My pull works locally but fails in CI with this error — why?</summary><p>The most common real cause (not a typo) is that the docker login from an earlier CI step didn&#x27;t carry over to the step that runs the pull, often because they run in different job containers or shells. Re-authenticate in the same step/context that does the pull.</p></details>
+<details><summary>Is &#x27;manifest unknown&#x27; the same thing as this error?</summary><p>It&#x27;s related but distinct: manifest unknown (an older wording some registries still use, per their docs) specifically means the repository was found but the tag/digest wasn&#x27;t, which we reproduced as &#x27;not found&#x27; on current Docker. &#x27;Pull access denied&#x27; is the separate, more ambiguous message for when the repository name itself can&#x27;t be resolved at all.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Docker Engine 29.8.1 on Linux, pulling real (and deliberately nonexistent) public images. Every error message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Docker is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>itertools.cycle Freezes the First Lap, Replays It Forever</title>
+<meta name="description" content="We measured itertools.cycle in Python 3.13.5: it caches the first pass of a generator and replays it forever, even when the source would give fresh values.">
+<link rel="canonical" href="https://honestkit.github.io/guides/itertools-cycle-freezes-the-first-lap-replays-it-forever/">
+<meta property="og:title" content="itertools.cycle Freezes the First Lap, Replays It Forever">
+<meta property="og:description" content="We measured itertools.cycle in Python 3.13.5: it caches the first pass of a generator and replays it forever, even when the source would give fresh values.">
+<meta property="og:url" content="https://honestkit.github.io/guides/itertools-cycle-freezes-the-first-lap-replays-it-forever/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does itertools.cycle re-run my generator every lap?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured this: cycle() consumes the generator to exhaustion exactly once, caches the values it produced, and replays that fixed cache on every subsequent lap. The generator's code never runs again."}}, {"@type": "Question", "name": "Why does my 'random' generator give the same values every time inside itertools.cycle?", "acceptedAnswer": {"@type": "Answer", "text": "Because cycle() only pulls from the generator on the first pass. Whatever values came out that first time -- random or not -- are cached and repeated forever, so a random-looking first lap becomes a fixed, repeating pattern."}}, {"@type": "Question", "name": "How do I make itertools.cycle re-evaluate the source on every lap?", "acceptedAnswer": {"@type": "Answer", "text": "You can't with cycle() itself -- it's built to cache. Instead, wrap the generator function in an infinite loop (while True: yield from your_generator()) so each lap calls the function fresh rather than relying on cycle()'s cache."}}, {"@type": "Question", "name": "Does this caching behavior apply to a plain list passed to itertools.cycle?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, in effect -- a list is already a fixed sequence of values, so cycling it was always going to repeat the same items. The surprise is specific to generators and other one-shot iterables, where people expect re-execution but get a cache instead."}}, {"@type": "Question", "name": "Is itertools.cycle's caching documented?", "acceptedAnswer": {"@type": "Answer", "text": "The Python docs describe cycle() as saving a copy of each element as it's produced, which implies the caching, but they don't call out the random-generator or side-effect implications directly -- it's easy to miss until you measure it, as we did here."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>itertools.cycle Freezes the First Lap, Replays It Forever (tested)</h1>
+<p class="lead"><code>itertools.cycle()</code> sounds like it repeatedly re-runs the iterable you give it, lap after lap. We measured what it actually does with a generator that produces different values each time it runs, and <code>cycle()</code> only ever consumes it once.</p>
+<h2 id="repro1">1. A generator's side effects only run on the first lap</h2>
+<pre><code>import itertools
+
+calls = []
+def gen():
+    for i in range(3):
+        calls.append(i)
+        yield i
+
+c = itertools.cycle(gen())
+result = list(itertools.islice(c, 9))  # 3 full laps
+print("output:   ", result)
+print("gen() ran for:", calls)</code></pre>
+<pre><code>output:    [0, 1, 2, 0, 1, 2, 0, 1, 2]
+gen() ran for: [0, 1, 2]</code></pre>
+<p><strong>Measured:</strong> the output does repeat <code>[0, 1, 2]</code> three times, but <code>calls</code> only ever has three entries -- <code>gen()</code>'s body executed exactly once, not three times. <code>cycle()</code> reads the generator to exhaustion a single time, caches every value it produced, then serves later laps straight from that cache.</p>
+
+<h2 id="repro2">2. A "random" generator gives the exact same values on every lap</h2>
+<pre><code>import itertools, random
+
+random.seed(0)
+def random_gen():
+    for _ in range(3):
+        yield random.randint(1, 100)
+
+c = itertools.cycle(random_gen())
+print(list(itertools.islice(c, 9)))</code></pre>
+<pre><code>[50, 98, 54, 50, 98, 54, 50, 98, 54]</code></pre>
+<p><strong>Measured:</strong> the three "random" numbers from the first lap -- <code>50, 98, 54</code> -- repeat identically forever. Anyone expecting <code>cycle()</code> to call <code>random_gen()</code> fresh each time around (giving nine different numbers) gets three numbers locked in place instead, with no error or warning that it happened.</p>
+
+<h2 id="repro3">3. Passing a function instead of a generator object fixes it</h2>
+<pre><code>import itertools, random
+
+random.seed(0)
+def random_gen():
+    for _ in range(3):
+        yield random.randint(1, 100)
+
+def fresh_forever():
+    while True:
+        yield from random_gen()  # re-created and re-run every lap
+
+f = fresh_forever()
+print(list(itertools.islice(f, 9)))</code></pre>
+<pre><code>[50, 98, 54, 6, 34, 66, 63, 52, 39]</code></pre>
+<p><strong>Measured:</strong> wrapping the generator in a <code>while True</code> loop that calls <code>random_gen()</code> fresh each pass gives nine distinct numbers, because each lap re-runs the generator function from scratch instead of asking <code>cycle()</code> to replay a cache. This is a different tool for a different need: use it when you actually want the source re-evaluated every lap; use plain <code>itertools.cycle()</code> when repeating the same fixed sequence is exactly what you want.</p>
+<aside class="cta"><strong>Building a request loop that rotates values? Check the real headers behind each request first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does itertools.cycle re-run my generator every lap?</summary><p>No -- we measured this: cycle() consumes the generator to exhaustion exactly once, caches the values it produced, and replays that fixed cache on every subsequent lap. The generator&#x27;s code never runs again.</p></details>
+<details><summary>Why does my &#x27;random&#x27; generator give the same values every time inside itertools.cycle?</summary><p>Because cycle() only pulls from the generator on the first pass. Whatever values came out that first time -- random or not -- are cached and repeated forever, so a random-looking first lap becomes a fixed, repeating pattern.</p></details>
+<details><summary>How do I make itertools.cycle re-evaluate the source on every lap?</summary><p>You can&#x27;t with cycle() itself -- it&#x27;s built to cache. Instead, wrap the generator function in an infinite loop (while True: yield from your_generator()) so each lap calls the function fresh rather than relying on cycle()&#x27;s cache.</p></details>
+<details><summary>Does this caching behavior apply to a plain list passed to itertools.cycle?</summary><p>Yes, in effect -- a list is already a fixed sequence of values, so cycling it was always going to repeat the same items. The surprise is specific to generators and other one-shot iterables, where people expect re-execution but get a cache instead.</p></details>
+<details><summary>Is itertools.cycle&#x27;s caching documented?</summary><p>The Python docs describe cycle() as saving a copy of each element as it&#x27;s produced, which implies the caching, but they don&#x27;t call out the random-generator or side-effect implications directly -- it&#x27;s easy to miss until you measure it, as we did here.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in itertools module: passed a generator (with and without an internal random.randint() call, seeded for reproducibility) to itertools.cycle(), then pulled multiple full laps with itertools.islice() and recorded both the output and how many times the generator&#x27;s body actually ran. PlainHeaders is our extension; Python&#x27;s itertools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

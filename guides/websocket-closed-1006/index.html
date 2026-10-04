@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebSocket Closed With Code 1006: Causes and Fixes (Tested)</title>
+<meta name="description" content="Code 1006 means no close frame arrived. We killed a server and cut a socket to reproduce it, and compared it to clean 1000 and server-error 1011 closes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/websocket-closed-1006/">
+<meta property="og:title" content="WebSocket Closed With Code 1006: Causes and Fixes (Tested)">
+<meta property="og:description" content="Code 1006 means no close frame arrived. We killed a server and cut a socket to reproduce it, and compared it to clean 1000 and server-error 1011 closes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/websocket-closed-1006/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does WebSocket close code 1006 mean?", "acceptedAnswer": {"@type": "Answer", "text": "It means the connection was lost without a close frame being exchanged. In our tests, both killing the server process and cutting the TCP socket produced code 1006 with an empty reason and wasClean false, on both a browser client and a Node ws client."}}, {"@type": "Question", "name": "Can a server send code 1006 on purpose?", "acceptedAnswer": {"@type": "Answer", "text": "No. We confirmed browsers reject ws.close(1006) outright; it is reserved for the client or server implementation to report locally when no close frame arrived, not a code either side transmits."}}, {"@type": "Question", "name": "How is 1006 different from 1000 or 1011?", "acceptedAnswer": {"@type": "Answer", "text": "In our tests, ws.close(1000, 'bye') and ws.close(1011, 'internal error') both arrived with wasClean true and the exact reason string sent. 1006 arrived with wasClean false and an empty reason, because no close frame was ever sent."}}, {"@type": "Question", "name": "Does 1006 mean my server crashed?", "acceptedAnswer": {"@type": "Answer", "text": "It's one cause, and the one we measured with kill -9. It can equally mean a proxy or NAT dropped an idle connection, or the client's own network dropped out. The code alone can't tell you which; check server logs and timing."}}, {"@type": "Question", "name": "What should my client do when it gets code 1006?", "acceptedAnswer": {"@type": "Answer", "text": "Reconnect with backoff. Since 1006 carries no information beyond 'transport gone', retrying is the standard response. Pair it with a ping/pong heartbeat so real timeouts get detected and closed with a proper code instead of silently becoming a 1006."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>WebSocket Closed With Code 1006 (tested)</h1>
+<p class="lead"><code>1006</code> is the WebSocket close code a client makes up when the connection dropped without a proper close handshake. It is never sent on the wire. We reproduced it with a real Node.js <code>ws</code> server and two real clients (Chromium and a Node <code>ws</code> client), and contrasted it with a clean <code>1000</code> close and a server-side <code>1011</code> error close.</p>
+<h2>1. What 1006 means</h2>
+<p>Every WebSocket close normally carries a close frame with a code and an optional reason, sent by whichever side closes first. <code>1006</code> is different: the spec reserves it as a code the implementation reports locally when the connection was lost <em>without</em> a close frame. You will never see <code>1006</code> arrive on the wire, and you can never set it yourself with <code>ws.close(1006)</code> &mdash; browsers reject that call.</p>
+<p>In practice 1006 means: the TCP connection ended, or stopped responding, before either side sent a close frame. The client's <code>WebSocket.onclose</code> fires with <code>code: 1006</code>, <code>reason: ""</code>, <code>wasClean: false</code>.</p>
+
+<h2>2. Our test setup</h2>
+<p>A Node.js <code>ws</code> server on <code>127.0.0.1:8990</code> exposed four paths, one per scenario:</p>
+<pre><code>wss.on('connection', (ws, req) =&gt; {
+  if (req.url === '/clean')       setTimeout(() =&gt; ws.close(1000, 'bye'), 200);
+  if (req.url === '/servererror') setTimeout(() =&gt; ws.close(1011, 'internal error'), 200);
+  if (req.url === '/destroy')     setTimeout(() =&gt; ws._socket.destroy(), 200);
+  if (req.url === '/abrupt')      { /* process gets kill -9'd from outside */ }
+});</code></pre>
+<p>We connected with a real browser (Chromium 153, via Playwright) and separately with a Node <code>ws</code> client, and read the actual <code>CloseEvent</code>/<code>close</code> callback.</p>
+
+<h2>3. Results: four closes, four different codes</h2>
+<table>
+<tr><th>Scenario</th><th>Chromium <code>onclose</code></th><th>Node <code>ws</code> client <code>close</code></th></tr>
+<tr><td><code>ws.close(1000, 'bye')</code> &mdash; clean close</td><td><code>code 1000, reason "bye", wasClean true</code></td><td>same</td></tr>
+<tr><td><code>ws.close(1011, 'internal error')</code> &mdash; server-side error close</td><td><code>code 1011, reason "internal error", wasClean true</code></td><td>same</td></tr>
+<tr><td><code>ws._socket.destroy()</code> &mdash; raw TCP socket cut, process stays alive, no close frame</td><td><code>code 1006, reason "", wasClean false</code></td><td><code>code 1006, reason ""</code></td></tr>
+<tr><td><code>kill -9</code> on the whole server process while a client was connected</td><td><code>code 1006, reason "", wasClean false</code>, observed 19&ndash;466 ms after the kill</td><td><code>code 1006, reason ""</code></td></tr>
+</table>
+<p>Both a mid-stream <code>socket.destroy()</code> and a full <code>kill -9</code> of the server process produced the same result on both clients: <code>1006</code>, empty reason, <code>wasClean: false</code>. A clean <code>ws.close(1000)</code> and a deliberate server error close with <code>ws.close(1011, ...)</code> both arrived with <code>wasClean: true</code> and the exact code and reason string the server sent. Chromium did not fire a separate <code>onerror</code> event before <code>onclose</code> in the 1006 cases in our runs &mdash; only <code>onclose</code> fired, with <code>1006</code>.</p>
+
+<h2>4. Why 1006 happens</h2>
+<ul>
+<li><strong>The server process crashed or was killed.</strong> Our <code>kill -9</code> test: no time for any close frame, TCP just stops responding, then resets. The client sees 1006.</li>
+<li><strong>A proxy, load balancer or idle timeout silently dropped the TCP connection.</strong> Same effect as our <code>socket.destroy()</code> test: the transport goes away without a WebSocket close frame.</li>
+<li><strong>The client's machine lost network</strong> (wifi drop, laptop sleep) before a close frame could be exchanged.</li>
+<li><strong>A firewall or NAT closed an idle connection</strong> without an RST or FIN reaching one side in time to carry a close frame.</li>
+</ul>
+<p>In all of these, nobody explicitly decided to close the WebSocket with a code; the code is the client's own inference that the handshake never completed.</p>
+
+<h2>5. How to tell 1006 apart from a real close code</h2>
+<p>Log the full event, not just a truthy/falsy check:</p>
+<pre><code>ws.onclose = (e) =&gt; {
+  console.log('code', e.code, 'reason', JSON.stringify(e.reason), 'wasClean', e.wasClean);
+};</code></pre>
+<p>If <code>wasClean</code> is <code>false</code> and <code>code</code> is <code>1006</code>, you lost the transport, not the application. Codes like <code>1000</code> (normal), <code>1001</code> (going away, e.g. tab closed or server shutting down gracefully), and <code>1011</code> (server hit an internal error) all arrive with <code>wasClean: true</code> because a real close frame was exchanged, as our tests confirm.</p>
+
+<h2>6. Fixes and mitigations</h2>
+<ul>
+<li><strong>Reconnect with backoff on 1006.</strong> Since it means "transport died, no details," the only useful client response is usually: wait, then reconnect. Don't treat it as a fatal application error.</li>
+<li><strong>Add application-level heartbeats.</strong> Use WebSocket ping/pong (or your own periodic message) so a dead connection is detected and closed with a real code (e.g. <code>1001</code>) before the OS-level timeout silently drops it.</li>
+<li><strong>Check proxy/load-balancer idle timeouts.</strong> If 1006 happens on a predictable interval, something between client and server is dropping idle connections; lower your heartbeat interval below that timeout.</li>
+<li><strong>Don't try to set 1006 yourself.</strong> Browsers throw <code>InvalidAccessError</code> if you call <code>ws.close(1006)</code>; it is reserved for the implementation only.</li>
+<li>If you instead see a page-level network error rather than a WebSocket close, see <a href="/guides/websocket-connection-failed/">WebSocket Connection Failed</a> for the handshake-stage version of this problem.</li>
+</ul>
+<aside class="cta"><strong>Check the handshake headers your WebSocket upgrade actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does WebSocket close code 1006 mean?</summary><p>It means the connection was lost without a close frame being exchanged. In our tests, both killing the server process and cutting the TCP socket produced code 1006 with an empty reason and wasClean false, on both a browser client and a Node ws client.</p></details>
+<details><summary>Can a server send code 1006 on purpose?</summary><p>No. We confirmed browsers reject ws.close(1006) outright; it is reserved for the client or server implementation to report locally when no close frame arrived, not a code either side transmits.</p></details>
+<details><summary>How is 1006 different from 1000 or 1011?</summary><p>In our tests, ws.close(1000, &#x27;bye&#x27;) and ws.close(1011, &#x27;internal error&#x27;) both arrived with wasClean true and the exact reason string sent. 1006 arrived with wasClean false and an empty reason, because no close frame was ever sent.</p></details>
+<details><summary>Does 1006 mean my server crashed?</summary><p>It&#x27;s one cause, and the one we measured with kill -9. It can equally mean a proxy or NAT dropped an idle connection, or the client&#x27;s own network dropped out. The code alone can&#x27;t tell you which; check server logs and timing.</p></details>
+<details><summary>What should my client do when it gets code 1006?</summary><p>Reconnect with backoff. Since 1006 carries no information beyond &#x27;transport gone&#x27;, retrying is the standard response. Pair it with a ping/pong heartbeat so real timeouts get detected and closed with a proper code instead of silently becoming a 1006.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 (ws 8.x server and client) and headless Chromium 153 via Playwright, against a local ws server on 127.0.0.1:8990. Each close code below is a close code we actually received, not a description from a spec. PlainHeaders is our extension; Node.js, ws and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>configparser: ${section:option} Silently Isn&#x27;t Interpolated</title>
+<meta name="description" content="We measured ConfigParser&#x27;s default interpolation leaving ${section:option} unexpanded with no error, returning literal text. Fix: pass ExtendedInterpolation().">
+<link rel="canonical" href="https://honestkit.github.io/guides/configparser-dollar-brace-syntax-silently-not-interpolated/">
+<meta property="og:title" content="configparser: ${section:option} Silently Isn&#x27;t Interpolated">
+<meta property="og:description" content="We measured ConfigParser&#x27;s default interpolation leaving ${section:option} unexpanded with no error, returning literal text. Fix: pass ExtendedInterpolation().">
+<meta property="og:url" content="https://honestkit.github.io/guides/configparser-dollar-brace-syntax-silently-not-interpolated/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does configparser support ${section:option} interpolation syntax?", "acceptedAnswer": {"@type": "Answer", "text": "Only with ExtendedInterpolation. We measured the default ConfigParser (BasicInterpolation) leaving ${section:option} completely unexpanded, as a literal string, with no error."}}, {"@type": "Question", "name": "Why didn't I get an error when my configparser interpolation didn't work?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed BasicInterpolation treats $ and { as plain characters, not interpolation syntax, since it only recognizes %(option)s. Unrecognized syntax isn't invalid syntax to it, so nothing raises \u2014 the value is just returned as-is."}}, {"@type": "Question", "name": "How do I enable ${} style variable substitution in configparser?", "acceptedAnswer": {"@type": "Answer", "text": "We verified passing interpolation=configparser.ExtendedInterpolation() to ConfigParser() makes ${option} (same section) and ${section:option} (cross-section) expand correctly."}}, {"@type": "Question", "name": "Does this silent failure also happen with cross-section references?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we measured ${common:home} under the default interpolation returning the literal unexpanded string even though cross-section lookup is exactly what ${section:option} syntax is meant for."}}, {"@type": "Question", "name": "Is %(option)s the same thing as ${option} in configparser?", "acceptedAnswer": {"@type": "Answer", "text": "No. %(option)s is BasicInterpolation's syntax and works by default; ${option} and ${section:option} are ExtendedInterpolation's syntax and require explicitly passing interpolation=ExtendedInterpolation() to ConfigParser()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>configparser ${} Syntax Silently Not Interpolated (tested)</h1>
+<p class="lead">Plenty of config systems (Docker Compose, Spring, many YAML/INI tools) use <code>${section:option}</code> or <code>${VAR}</code> for variable substitution. We measured what Python's default <code>ConfigParser</code> does with that exact syntax &mdash; and it isn't an error. It's silence.</p>
+<h2 id="repro1">1. The default interpolation doesn't recognize ${...} &mdash; and doesn't complain</h2>
+<pre><code>import configparser
+
+c = configparser.ConfigParser()
+c.read_string("""
+[section]
+base = /home/user
+path = ${section:base}/data
+""")
+print(c.get("section", "path"))</code></pre>
+<pre><code>${section:base}/data</code></pre>
+<p><strong>Measured:</strong> no exception, no warning &mdash; <code>read_string()</code> parses cleanly and <code>get()</code> returns the value with <code>${section:base}</code> left exactly as written, not substituted with <code>/home/user</code>. The default <code>BasicInterpolation</code> only understands <code>%(option)s</code> syntax; it treats <code>$</code> and <code>{</code> as ordinary characters, so the reference simply isn't recognized as something to expand.</p>
+
+<h2 id="repro2">2. Same silent result across sections, which is ${}'s main selling point elsewhere</h2>
+<pre><code>c2 = configparser.ConfigParser()
+c2.read_string("""
+[common]
+home = /home/user
+[section]
+path = ${common:home}/data
+""")
+print(c2.get("section", "path"))</code></pre>
+<pre><code>${common:home}/data</code></pre>
+<p><strong>Measured:</strong> cross-section references &mdash; the exact pattern <code>${section:option}</code> is designed for &mdash; are just as silently un-expanded under the default interpolation. If this file came from copying an example written for <code>ExtendedInterpolation</code> (or ported from a non-Python config format that uses <code>${}</code>), every downstream reader of <code>path</code> gets a literal, broken string with zero signal that anything went wrong.</p>
+
+<h2 id="fix">3. Fix: use ExtendedInterpolation, or use the %(option)s syntax BasicInterpolation actually supports</h2>
+<pre><code>c3 = configparser.ConfigParser(interpolation=configparser.ExtendedInterpolation())
+c3.read_string("""
+[common]
+home = /home/user
+[section]
+path = ${common:home}/data
+""")
+print(c3.get("section", "path"))</code></pre>
+<pre><code>/home/user/data</code></pre>
+<p><strong>Measured:</strong> passing <code>interpolation=configparser.ExtendedInterpolation()</code> to the constructor makes <code>${section:option}</code> (and same-section <code>${option}</code>) expand correctly, including across sections. Alternatively, if you don't need <code>${}</code> specifically, rewriting the value with the default syntax &mdash; <code>%(base)s</code> for same-section, no built-in cross-section shorthand without Extended &mdash; also works under plain <code>BasicInterpolation</code>. Either way, the fix is explicit and one-line; the dangerous part is that the broken version never raises anything to point you at it.</p>
+
+<aside class="cta"><strong>Debugging a config value an API client reads before making a request? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does configparser support ${section:option} interpolation syntax?</summary><p>Only with ExtendedInterpolation. We measured the default ConfigParser (BasicInterpolation) leaving ${section:option} completely unexpanded, as a literal string, with no error.</p></details>
+<details><summary>Why didn&#x27;t I get an error when my configparser interpolation didn&#x27;t work?</summary><p>We confirmed BasicInterpolation treats $ and { as plain characters, not interpolation syntax, since it only recognizes %(option)s. Unrecognized syntax isn&#x27;t invalid syntax to it, so nothing raises — the value is just returned as-is.</p></details>
+<details><summary>How do I enable ${} style variable substitution in configparser?</summary><p>We verified passing interpolation=configparser.ExtendedInterpolation() to ConfigParser() makes ${option} (same section) and ${section:option} (cross-section) expand correctly.</p></details>
+<details><summary>Does this silent failure also happen with cross-section references?</summary><p>Yes — we measured ${common:home} under the default interpolation returning the literal unexpanded string even though cross-section lookup is exactly what ${section:option} syntax is meant for.</p></details>
+<details><summary>Is %(option)s the same thing as ${option} in configparser?</summary><p>No. %(option)s is BasicInterpolation&#x27;s syntax and works by default; ${option} and ${section:option} are ExtendedInterpolation&#x27;s syntax and require explicitly passing interpolation=ExtendedInterpolation() to ConfigParser().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in configparser module: parsed a value using ${section:option} syntax under the default ConfigParser (BasicInterpolation) and under ConfigParser(interpolation=ExtendedInterpolation()), comparing the returned string in both cases. PlainHeaders is our extension; Python&#x27;s configparser module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

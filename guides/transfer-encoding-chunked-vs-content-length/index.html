@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transfer-Encoding: chunked vs Content-Length, Tested in Node.js and nginx</title>
+<meta name="description" content="When Node.js and nginx send Content-Length and when they switch to Transfer-Encoding: chunked, what chunks look like on the wire, and what happens when a request carries both headers.">
+<link rel="canonical" href="https://honestkit.github.io/guides/transfer-encoding-chunked-vs-content-length/">
+<meta property="og:title" content="Transfer-Encoding: chunked vs Content-Length, Tested in Node.js and nginx">
+<meta property="og:description" content="When Node.js and nginx send Content-Length and when they switch to Transfer-Encoding: chunked, what chunks look like on the wire, and what happens when a request carries both headers.">
+<meta property="og:url" content="https://honestkit.github.io/guides/transfer-encoding-chunked-vs-content-length/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between Transfer-Encoding chunked and Content-Length?", "acceptedAnswer": {"@type": "Answer", "text": "Content-Length gives the body size up front; chunked sends the body in pieces, each prefixed with its size, ending with a 0-size chunk. In our tests Node used Content-Length for res.end(body) and chunked for res.write() streaming."}}, {"@type": "Question", "name": "Why does nginx send Transfer-Encoding: chunked instead of Content-Length?", "acceptedAnswer": {"@type": "Answer", "text": "In our test a static file had Content-Length until gzip compressed it; the gzip response was chunked because the compressed size isn't known in advance. Proxied responses kept the upstream's framing."}}, {"@type": "Question", "name": "Can a request have both Content-Length and Transfer-Encoding?", "acceptedAnswer": {"@type": "Answer", "text": "It shouldn't: nginx 1.31 and Node 24 both answered 400 Bad Request to one that did."}}, {"@type": "Question", "name": "Does HTTP/2 use chunked encoding?", "acceptedAnswer": {"@type": "Answer", "text": "No. HTTP/2 and HTTP/3 frame data themselves; Transfer-Encoding: chunked is HTTP/1.1 only."}}, {"@type": "Question", "name": "How do I see the raw chunks?", "acceptedAnswer": {"@type": "Answer", "text": "curl --raw URL shows the hex sizes and CRLFs; plain curl decodes them."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Transfer-Encoding: chunked vs Content-Length: when servers use which (tested in Node and nginx)</h1>
+<p class="lead">An HTTP/1.1 body needs a known end: either a Content-Length up front, or chunked encoding where each piece carries its own size. We logged which one Node and nginx picked.</p>
+<h2>1. Which header did the response get?</h2>
+<table><thead><tr><th>Server / case</th><th>Response framing</th></tr></thead><tbody>
+<tr><td>Node <code>res.end(body)</code> in one call (12 B and 5,000 B)</td><td><code>Content-Length</code></td></tr>
+<tr><td>Node <code>res.write()</code> then <code>res.end()</code></td><td><code>Transfer-Encoding: chunked</code></td></tr>
+<tr><td>nginx static file</td><td><code>Content-Length: 17</code></td></tr>
+<tr><td>nginx static file, <code>gzip on</code>, client sends <code>Accept-Encoding: gzip</code></td><td><strong>chunked</strong> + <code>Content-Encoding: gzip</code> (compressed size isn't known in advance)</td></tr>
+<tr><td>nginx <code>proxy_pass</code></td><td>passed through: upstream Content-Length stayed Content-Length, upstream chunked stayed chunked</td></tr>
+<tr><td>nginx, client speaking HTTP/1.0</td><td>neither header: body ends when the connection closes</td></tr>
+</tbody></table>
+<p>So "why does my response have no Content-Length?" usually means compression or streaming. Both are fine; clients handle either.</p>
+<h2>2. What chunks look like</h2>
+<pre><code>$ curl --raw http://localhost/write    # CR/LF shown as \r\n
+6\r\n
+part1\n\r\n
+6\r\n
+part2\n\r\n
+0\r\n
+\r\n</code></pre>
+<p>Each chunk is its size in hex, CRLF, the data, CRLF; a zero-size chunk ends the body. Plain <code>curl</code> (without <code>--raw</code>) strips this and shows only <code>part1</code>/<code>part2</code>. HTTP/2 and HTTP/3 have no chunked encoding at all; framing is built into the protocol.</p>
+<h2>3. Requests, and never sending both</h2>
+<ul><li>A chunked <strong>request</strong> body through nginx reached the upstream as <code>Content-Length: 6</code>: nginx buffered it and re-framed it.</li>
+<li>A request with <strong>both</strong> <code>Content-Length</code> and <code>Transfer-Encoding: chunked</code> got <strong>400 Bad Request</strong> from nginx and from Node. That ambiguity is the basis of request smuggling, so modern servers refuse it.</li>
+<li>Node will still <em>send</em> both on a response if you set both headers yourself: we got <code>Content-Length: 12</code> and <code>Transfer-Encoding: chunked</code> with a chunk-framed body. Set neither by hand; let the server choose.</li></ul>
+<p>Check what a live URL sends with the free <a href="/tools/http-headers/">HTTP headers checker</a>; for compression choices see <a href="/guides/content-encoding-gzip-vs-br-nginx/">gzip vs br in nginx, measured</a>.</p>
+<aside class="cta"><strong>See whether a URL answers with Content-Length or chunked:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between Transfer-Encoding chunked and Content-Length?</summary><p>Content-Length gives the body size up front; chunked sends the body in pieces, each prefixed with its size, ending with a 0-size chunk. In our tests Node used Content-Length for res.end(body) and chunked for res.write() streaming.</p></details>
+<details><summary>Why does nginx send Transfer-Encoding: chunked instead of Content-Length?</summary><p>In our test a static file had Content-Length until gzip compressed it; the gzip response was chunked because the compressed size isn&#x27;t known in advance. Proxied responses kept the upstream&#x27;s framing.</p></details>
+<details><summary>Can a request have both Content-Length and Transfer-Encoding?</summary><p>It shouldn&#x27;t: nginx 1.31 and Node 24 both answered 400 Bad Request to one that did.</p></details>
+<details><summary>Does HTTP/2 use chunked encoding?</summary><p>No. HTTP/2 and HTTP/3 frame data themselves; Transfer-Encoding: chunked is HTTP/1.1 only.</p></details>
+<details><summary>How do I see the raw chunks?</summary><p>curl --raw URL shows the hex sizes and CRLFs; plain curl decodes them.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 with Node.js 24 (http module) and a throwaway nginx 1.31.6 container (static files with gzip on, and proxy_pass to the Node server; removed afterwards), using curl -D and --raw and raw requests over nc. The HTTP/2 remark is from RFC 9113, not this test. PlainHeaders is our extension; the other methods are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

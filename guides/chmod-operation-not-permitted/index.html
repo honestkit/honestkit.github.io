@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chmod Operation Not Permitted: Cause and Fix, Tested</title>
+<meta name="description" content="We reproduced chmod&#x27;s real ownership error and show why root access, not a different mode number, is the actual fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/chmod-operation-not-permitted/">
+<meta property="og:title" content="chmod Operation Not Permitted: Cause and Fix, Tested">
+<meta property="og:description" content="We reproduced chmod&#x27;s real ownership error and show why root access, not a different mode number, is the actual fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/chmod-operation-not-permitted/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does chmod fail even when I'm trying to make the file MORE open (777)?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed this directly: chmod checks who's running the command before it looks at the requested mode at all. A non-owner, non-root user can't change the mode bits in either direction, no matter what number is requested."}}, {"@type": "Question", "name": "What actually fixes this \u2014 a different chmod flag?", "acceptedAnswer": {"@type": "Answer", "text": "No flag or mode number bypasses it. We tested this: the only real fixes are running as root (sudo), having root change ownership to you first (chown), or asking the actual owner to make the change themselves."}}, {"@type": "Question", "name": "My own project file suddenly has this error \u2014 why?", "acceptedAnswer": {"@type": "Answer", "text": "Check its owner with ls -la first. A common real-world cause is the file having been extracted/copied with sudo at some point, or written by a Docker container as a different UID via a bind mount \u2014 both silently leave files owned by someone other than your normal user even inside what looks like your own directory."}}, {"@type": "Question", "name": "Is 'Operation not permitted' the same as 'Permission denied'?", "acceptedAnswer": {"@type": "Answer", "text": "They're related but we distinguish them specifically: chmod itself says Operation not permitted for this ownership-level failure. A separate 'Permission denied' (e.g. when running a script) more often means a missing execute bit on a file you do own, which plain chmod +x \u2014 something you can run yourself \u2014 fixes."}}, {"@type": "Question", "name": "Does this happen on files I created myself?", "acceptedAnswer": {"@type": "Answer", "text": "Only if ownership changed after creation \u2014 normally you own files you create and chmod works immediately, which we confirmed (the second reproduction above). If you're seeing this on a file you're sure you created, check ls -la's owner column; it's likely changed via a copy/extract/mount operation that ran as a different user."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>chmod: Operation Not Permitted (tested)</h1>
+<p class="lead">This error (often searched as 'chmod permission denied') means the current user isn't allowed to change this file's permissions at all &mdash; and on Linux, that's a strict rule: only the file's owner or the root user can run chmod on it, no matter what permission bits are currently set.</p>
+<h2>1. Reproduced: chmod on a file you don't own</h2>
+<pre><code>ls -la /etc/shadow
+-rw-r----- 1 root shadow 1116 Sep 26 14:35 /etc/shadow
+
+chmod 777 /etc/shadow
+chmod: changing permissions of '/etc/shadow': Operation not permitted</code></pre>
+<p>Notice this fails even though the attempted mode (<code>777</code>, wide open) has nothing to do with the problem &mdash; chmod checks <em>who you are</em> before it looks at <em>what you're asking for</em>. A non-owner, non-root user can't change a file's mode to anything, including making it more permissive.</p>
+
+<h2>2. The same command works instantly on a file you do own</h2>
+<pre><code>chmod 755 /tmp/chmodtest/notmine.txt
+ls -la /tmp/chmodtest/notmine.txt
+-rwxr-xr-x 1 jacque jacque 0 Oct  3 05:32 /tmp/chmodtest/notmine.txt</code></pre>
+<p>Same user, same command, only the file's ownership differs. This confirms the error is purely about ownership, not about the specific mode bits requested or the file's current permissions.</p>
+
+<h2>3. The fix: become the owner, or become root</h2>
+<p>There's no chmod flag or mode number that works around this &mdash; the only real fixes are:</p>
+<ul>
+<li><strong>Run it as root</strong> (e.g. <code>sudo chmod ...</code>), if you're authorized to and the system allows it.</li>
+<li><strong>Take ownership first</strong>, if you're root or otherwise authorized: <code>chown youruser file && chmod 755 file</code>.</li>
+<li><strong>Ask whoever owns it</strong> to make the change, if it's not your file and you don't have root access &mdash; which is frequently the <em>correct</em> outcome, not just a workaround. A permission boundary that can't be bypassed without root is usually there on purpose.</li>
+</ul>
+
+<h2>4. A common trap: "it worked yesterday" after a file got copied or extracted as a different user</h2>
+<p>A frequent real-world trigger isn't a stranger's file &mdash; it's your own project file that ended up owned by someone else without you noticing, commonly because:</p>
+<ul>
+<li>A file was extracted from a tarball/zip or copied with <code>sudo</code>/as root at some point, silently leaving it root-owned in what otherwise looks like your own project directory.</li>
+<li>A Docker bind mount wrote a file as the container's internal user (often root or a numeric UID that doesn't map to your host user), leaving host-side files with foreign ownership.</li>
+</ul>
+<p>Check with <code>ls -la</code> before assuming your chmod command itself is wrong &mdash; if the owner column isn't your username, that's the actual cause, and no amount of adjusting the mode number will fix it.</p>
+
+<h2>5. Is this the same as "Permission denied"?</h2>
+<p>They're closely related but not identical wording: <code>chmod</code> itself specifically says <strong>Operation not permitted</strong> (as reproduced above) when the problem is ownership. A plain <strong>Permission denied</strong> more often shows up on other operations (opening, writing, executing a file) where regular Unix read/write/execute bits &mdash; not ownership of the chmod call itself &mdash; are what's blocking you. If you're chasing a different "Permission denied" (e.g. "bash: ./script.sh: Permission denied"), that's usually missing execute bit (<code>chmod +x script.sh</code>, which you'd need to actually own the file to run) rather than this ownership-level error.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does chmod fail even when I&#x27;m trying to make the file MORE open (777)?</summary><p>We confirmed this directly: chmod checks who&#x27;s running the command before it looks at the requested mode at all. A non-owner, non-root user can&#x27;t change the mode bits in either direction, no matter what number is requested.</p></details>
+<details><summary>What actually fixes this — a different chmod flag?</summary><p>No flag or mode number bypasses it. We tested this: the only real fixes are running as root (sudo), having root change ownership to you first (chown), or asking the actual owner to make the change themselves.</p></details>
+<details><summary>My own project file suddenly has this error — why?</summary><p>Check its owner with ls -la first. A common real-world cause is the file having been extracted/copied with sudo at some point, or written by a Docker container as a different UID via a bind mount — both silently leave files owned by someone other than your normal user even inside what looks like your own directory.</p></details>
+<details><summary>Is &#x27;Operation not permitted&#x27; the same as &#x27;Permission denied&#x27;?</summary><p>They&#x27;re related but we distinguish them specifically: chmod itself says Operation not permitted for this ownership-level failure. A separate &#x27;Permission denied&#x27; (e.g. when running a script) more often means a missing execute bit on a file you do own, which plain chmod +x — something you can run yourself — fixes.</p></details>
+<details><summary>Does this happen on files I created myself?</summary><p>Only if ownership changed after creation — normally you own files you create and chmod works immediately, which we confirmed (the second reproduction above). If you&#x27;re seeing this on a file you&#x27;re sure you created, check ls -la&#x27;s owner column; it&#x27;s likely changed via a copy/extract/mount operation that ran as a different user.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 on a real Linux system, running chmod against a file the current user doesn&#x27;t own. Every error message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; these are standard Linux tools.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RangeError: Maximum Call Stack Size Exceeded — Causes and Fixes</title>
+<meta name="description" content="We measured this RangeError in Node 24 and headless Chromium: it&#x27;s catchable, caused by deep/infinite recursion, and --stack-size can even crash the process.">
+<link rel="canonical" href="https://honestkit.github.io/guides/maximum-call-stack-size-exceeded/">
+<meta property="og:title" content="RangeError: Maximum Call Stack Size Exceeded — Causes and Fixes">
+<meta property="og:description" content="We measured this RangeError in Node 24 and headless Chromium: it&#x27;s catchable, caused by deep/infinite recursion, and --stack-size can even crash the process.">
+<meta property="og:url" content="https://honestkit.github.io/guides/maximum-call-stack-size-exceeded/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is 'Maximum call stack size exceeded' the same as an out-of-memory crash?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured it as a normal, catchable RangeError (e instanceof RangeError is true) that does not end the process by itself. A JS heap out-of-memory crash is fatal and the process cannot recover; see our JavaScript heap out of memory guide for that case."}}, {"@type": "Question", "name": "What's the most common cause?", "acceptedAnswer": {"@type": "Answer", "text": "A recursive function with a missing, wrong, or unreachable base case. We reproduced it with a one-line self-calling function and with two functions calling each other (mutual recursion) when neither checked a stopping condition."}}, {"@type": "Question", "name": "Does the error message differ between Node.js and the browser?", "acceptedAnswer": {"@type": "Answer", "text": "We tested Node.js 24 and headless Chromium 153 and got the exact same message, 'RangeError: Maximum call stack size exceeded', because both run on V8. Per MDN docs (not measured by us), Firefox instead says 'too much recursion' and Safari/JavaScriptCore has its own wording."}}, {"@type": "Question", "name": "Does Node's --stack-size flag fix infinite recursion?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured it only raising how many frames you get before the same RangeError (about 10,400 frames by default vs about 85,000 at --stack-size=8000). It's for genuinely deep but finite recursion, not infinite recursion. We also measured that setting it too high (65500) made Node segfault (exit code 139) instead of throwing a clean error."}}, {"@type": "Question", "name": "Can I just catch the error and move on?", "acceptedAnswer": {"@type": "Answer", "text": "You can catch it; we confirmed try/catch works and the process keeps running afterward. But it's a symptom, not a fix. Find and correct the missing base case instead of relying on the catch."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Maximum Call Stack Size Exceeded (tested)</h1>
+<p class="lead"><code>RangeError: Maximum call stack size exceeded</code> means a function called itself (directly or through other functions) so many times that the call stack ran out of room. It is almost always a recursive function with a missing or broken base case. Unlike an out-of-memory crash, this one is a normal catchable exception.</p>
+<h2>1. The exact error</h2>
+<p>A function that calls itself with no way to stop:</p>
+<pre><code>function recurse(n) { return recurse(n + 1); }
+recurse(0);</code></pre>
+<p>Run with plain Node.js, this crashes the process:</p>
+<pre><code>RangeError: Maximum call stack size exceeded
+    at recurse (file.mjs:1:23)
+    at recurse (file.mjs:1:30)
+    at recurse (file.mjs:1:30)
+    ...
+Node.js v24.21.0</code></pre>
+<p>We measured the same <code>recurse(n+1)</code> function in headless Chromium 153 (via Playwright, using <code>page.evaluate</code>). The message was identical: <code>RangeError: Maximum call stack size exceeded</code>, with no engine-specific wording difference. Both Node and Chromium run on V8, which explains the match; other engines (Firefox's SpiderMonkey, Safari's JavaScriptCore) use different wording per MDN docs (e.g. Firefox says "too much recursion"), but we did not measure those.</p>
+
+<h2>2. It IS catchable, unlike heap-out-of-memory</h2>
+<p>This is the key practical fact: a stack overflow throws a normal JavaScript exception. You can <code>try/catch</code> it and keep running.</p>
+<pre><code>function recurse(n) { return recurse(n + 1); }
+try {
+  recurse(0);
+} catch (e) {
+  console.log(e.name + ':', e.message);     // RangeError: Maximum call stack size exceeded
+  console.log(e instanceof RangeError);      // true
+}</code></pre>
+<p>We confirmed <code>e instanceof RangeError</code> is <code>true</code> and the process does not exit. This is very different from a JS heap exhaustion crash, which throws a fatal error the process usually cannot recover from &mdash; see <a href="/guides/javascript-heap-out-of-memory/">JavaScript heap out of memory</a> for that contrast, and <a href="/guides/exit-code-137/">exit code 137</a> if your process is instead being killed by the OS (a different problem: memory limit, not call stack).</p>
+
+<h2>3. Common real-world cause: mutual recursion with no termination</h2>
+<p>The bug is not always a single self-calling function. Two functions that call each other, each assuming the other one checks the exit condition, overflow the same way:</p>
+<pre><code>function a(n) { return b(n + 1); }   // forgot to check n here
+function b(n) { return a(n + 1); }   // and forgot here too
+a(0);</code></pre>
+<p>We ran this and got the identical <code>RangeError: Maximum call stack size exceeded</code>. The stack trace alternates between <code>a</code> and <code>b</code>, which is the tell that it's mutual recursion rather than simple self-recursion &mdash; scan the trace for a repeating two-function pattern instead of one name repeated.</p>
+<p>The fix is always the same shape: make sure every recursive path has a base case that returns without recursing, and double check it for <em>every</em> function involved when recursion is mutual.</p>
+<pre><code>function factorial(n) {
+  if (n &lt;= 1) return 1;        // base case
+  return n * factorial(n - 1);
+}</code></pre>
+
+<h2>4. Does increasing the stack size help?</h2>
+<p>Node exposes <code>--stack-size</code> (in KB) to grow the call stack before V8 throws. We measured how many recursive frames a simple function could reach before throwing:</p>
+<table>
+<tr><th>Flag</th><th>Frames reached before RangeError</th></tr>
+<tr><td>(default)</td><td>~10,437</td></tr>
+<tr><td><code>--stack-size=2000</code></td><td>~21,274</td></tr>
+<tr><td><code>--stack-size=8000</code></td><td>~85,274</td></tr>
+<tr><td><code>--stack-size=65500</code></td><td>process segfaulted (exit code 139), no RangeError at all</td></tr>
+</table>
+<p>So the flag does raise the ceiling roughly proportionally. But we measured that pushing it too high (65500 KB) made Node crash with a <strong>segmentation fault</strong> instead of a clean <code>RangeError</code> &mdash; V8's internal limit no longer matched the OS thread's real stack size, and the process died harder, not safer. Treat <code>--stack-size</code> as a narrow workaround for one known-deep-but-finite algorithm, never a fix for unbounded recursion, and test any value you pick before relying on it.</p>
+
+<h2>5. How to actually fix it</h2>
+<ul>
+<li><strong>Add or fix the base case.</strong> This is the cause in the large majority of cases: a condition that should stop recursion is missing, inverted, or unreachable for some inputs.</li>
+<li><strong>Check mutual recursion carefully.</strong> With two or more functions calling each other, verify the base case is reachable from every entry point, not just one.</li>
+<li><strong>Convert deep recursion to a loop.</strong> JavaScript has no guaranteed tail-call optimization in V8, so a genuinely deep (not infinite) recursive algorithm over large input should be rewritten iteratively with an explicit stack/queue array.</li>
+<li><strong>Check for accidental re-entry.</strong> A common trigger is a function that, inside a callback or event handler, ends up calling itself indirectly &mdash; e.g. a setter that triggers a watcher that calls the setter again.</li>
+<li><strong>Catch it at a boundary if needed.</strong> Since it's a normal <code>RangeError</code>, you can wrap a risky recursive call in <code>try/catch</code> as a safety net while you find the real cause &mdash; but treat that as temporary, not the fix.</li>
+</ul>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is &#x27;Maximum call stack size exceeded&#x27; the same as an out-of-memory crash?</summary><p>No. We measured it as a normal, catchable RangeError (e instanceof RangeError is true) that does not end the process by itself. A JS heap out-of-memory crash is fatal and the process cannot recover; see our JavaScript heap out of memory guide for that case.</p></details>
+<details><summary>What&#x27;s the most common cause?</summary><p>A recursive function with a missing, wrong, or unreachable base case. We reproduced it with a one-line self-calling function and with two functions calling each other (mutual recursion) when neither checked a stopping condition.</p></details>
+<details><summary>Does the error message differ between Node.js and the browser?</summary><p>We tested Node.js 24 and headless Chromium 153 and got the exact same message, &#x27;RangeError: Maximum call stack size exceeded&#x27;, because both run on V8. Per MDN docs (not measured by us), Firefox instead says &#x27;too much recursion&#x27; and Safari/JavaScriptCore has its own wording.</p></details>
+<details><summary>Does Node&#x27;s --stack-size flag fix infinite recursion?</summary><p>No. We measured it only raising how many frames you get before the same RangeError (about 10,400 frames by default vs about 85,000 at --stack-size=8000). It&#x27;s for genuinely deep but finite recursion, not infinite recursion. We also measured that setting it too high (65500) made Node segfault (exit code 139) instead of throwing a clean error.</p></details>
+<details><summary>Can I just catch the error and move on?</summary><p>You can catch it; we confirmed try/catch works and the process keeps running afterward. But it&#x27;s a symptom, not a fix. Find and correct the missing base case instead of relying on the catch.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js v24.21.0 and headless Chromium 153 via Playwright 1.63 on the same box. Browser wording for other engines (Firefox, Safari) is per MDN docs, not measured. PlainHeaders is our extension; Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

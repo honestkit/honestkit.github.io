@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker Port Is Already Allocated: Cause and Fix, Tested</title>
+<meta name="description" content="We reproduced Docker&#x27;s port conflict error, found exactly which container held the port, and tested both real fixes end to end.">
+<link rel="canonical" href="https://honestkit.github.io/guides/docker-port-is-already-allocated/">
+<meta property="og:title" content="Docker Port Is Already Allocated: Cause and Fix, Tested">
+<meta property="og:description" content="We reproduced Docker&#x27;s port conflict error, found exactly which container held the port, and tested both real fixes end to end.">
+<meta property="og:url" content="https://honestkit.github.io/guides/docker-port-is-already-allocated/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I find what's using a port without knowing the container name?", "acceptedAnswer": {"@type": "Answer", "text": "docker ps --filter \"publish=PORT\" --format \"table {{.Names}}\\t{{.Ports}}\" lists every container publishing that port. We confirmed it returns the exact container name instantly, with no need to inspect each container individually."}}, {"@type": "Question", "name": "What if docker ps shows nothing but I still get the error?", "acceptedAnswer": {"@type": "Answer", "text": "Then a non-Docker process on the host has the port. On Linux, ss -ltnp (or lsof -i :PORT) shows the owning process; Docker can't publish a container port to a host port that any process already holds."}}, {"@type": "Question", "name": "Does stopping the container free the port immediately?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, we confirmed this directly: docker stop released the port instantly, and a new container on the same host port started successfully right after, with no delay or retry needed."}}, {"@type": "Question", "name": "Can I avoid this entirely?", "acceptedAnswer": {"@type": "Answer", "text": "Publish to a different host port (-p 18090:80 instead of -p 18089:80) if both containers need to run simultaneously. The container's internal port can stay the same; only the host-side number needs to be unique."}}, {"@type": "Question", "name": "Is this the same as 'address already in use'?", "acceptedAnswer": {"@type": "Answer", "text": "They're closely related: 'port is already allocated' is Docker's own message when it won't even try to bind; the underlying OS-level error if Docker did try would be 'address already in use'. Either way, the fix is identical: free the port or pick a different one."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Docker: Port Is Already Allocated (tested)</h1>
+<p class="lead">This error means another container (or another process on the host) already has the host port you're trying to publish. Docker can't bind the same host port twice, so the second <code>docker run</code> fails before the new container ever starts.</p>
+<h2>1. Reproduced: the exact error</h2>
+<p>With one container already publishing host port 18089, starting a second container on the same port fails immediately:</p>
+<pre><code>docker run -d --name forever-port-test2 -p 18089:80 postgres:16-alpine
+
+docker: Error response from daemon: failed to set up container networking:
+driver failed programming external connectivity on endpoint forever-port-test2
+(b786a9a7...): Bind for 0.0.0.0:18089 failed: port is already allocated.</code></pre>
+<p>The new container is never created &mdash; this fails at the networking setup step, before the image even runs.</p>
+
+<h2>2. Find out which container is holding the port</h2>
+<p>Before changing anything, confirm what's actually using it. <code>docker ps</code> with a port filter answers this directly:</p>
+<pre><code>docker ps --filter "publish=18089" --format "table {{.Names}}\t{{.Ports}}"
+
+NAMES               PORTS
+forever-port-test   0.0.0.0:18089-&gt;80/tcp, [::]:18089-&gt;80/tcp</code></pre>
+<p>If nothing shows up here but the error still happens, a non-Docker process on the host has the port &mdash; check with <code>ss -ltnp</code> (Linux) instead.</p>
+
+<h2>3. Fix 1: stop the container that's holding the port</h2>
+<p>If the existing container is disposable or you just forgot it was running, stop it and the port frees up immediately:</p>
+<pre><code>docker stop forever-port-test
+docker run -d --name forever-port-test3 -p 18089:80 postgres:16-alpine
+9bf47358272d...
+
+docker ps --filter name=forever-port-test3 --format "{{.Names}} {{.Status}}"
+forever-port-test3 Up Less than a second</code></pre>
+<p>We confirmed this: the second container started cleanly the moment the port was free, with no other changes.</p>
+
+<h2>4. Fix 2: publish a different host port instead</h2>
+<p>If you need both containers running at once, don't free the port &mdash; map the new container to a different host port and keep the same container port:</p>
+<pre><code>docker run -d --name forever-port-test4 -p 18090:80 postgres:16-alpine</code></pre>
+<p>This works with zero changes to the container image; only the <code>-p host:container</code> mapping changes. Use this when the two containers genuinely need to coexist, rather than stopping one to free the port.</p>
+
+<h2>5. Why this isn't a "docker restart" problem</h2>
+<p>A common mistake is assuming a crashed or stopped container released the port &mdash; it didn't, because the port is held until the container is <em>removed</em>, not just stopped, in the specific case of restarting with the exact same name and port mapping expecting a clean slate. In practice the error we reproduced happens with a <em>running</em> container holding the port; a stopped container with the same host port mapping does not block a new container from using that port, since Docker only reserves the port while the container's network endpoint is active. If you still get this error after stopping what you thought was the conflicting container, re-run the <code>docker ps --filter publish=</code> command from step 2 &mdash; something else, possibly unrelated, is using it.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I find what&#x27;s using a port without knowing the container name?</summary><p>docker ps --filter &quot;publish=PORT&quot; --format &quot;table {{.Names}}\t{{.Ports}}&quot; lists every container publishing that port. We confirmed it returns the exact container name instantly, with no need to inspect each container individually.</p></details>
+<details><summary>What if docker ps shows nothing but I still get the error?</summary><p>Then a non-Docker process on the host has the port. On Linux, ss -ltnp (or lsof -i :PORT) shows the owning process; Docker can&#x27;t publish a container port to a host port that any process already holds.</p></details>
+<details><summary>Does stopping the container free the port immediately?</summary><p>Yes, we confirmed this directly: docker stop released the port instantly, and a new container on the same host port started successfully right after, with no delay or retry needed.</p></details>
+<details><summary>Can I avoid this entirely?</summary><p>Publish to a different host port (-p 18090:80 instead of -p 18089:80) if both containers need to run simultaneously. The container&#x27;s internal port can stay the same; only the host-side number needs to be unique.</p></details>
+<details><summary>Is this the same as &#x27;address already in use&#x27;?</summary><p>They&#x27;re closely related: &#x27;port is already allocated&#x27; is Docker&#x27;s own message when it won&#x27;t even try to bind; the underlying OS-level error if Docker did try would be &#x27;address already in use&#x27;. Either way, the fix is identical: free the port or pick a different one.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Docker Engine on Linux, using real containers (postgres:16-alpine). Every error message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Docker is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

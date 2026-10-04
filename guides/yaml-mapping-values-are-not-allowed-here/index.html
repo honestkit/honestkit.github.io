@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YAML: &#x27;Mapping Values Are Not Allowed Here&#x27; — Fixed</title>
+<meta name="description" content="We reproduced PyYAML&#x27;s &#x27;mapping values are not allowed here&#x27; error 2 ways and measured the exact fix: it&#x27;s almost always an unquoted colon.">
+<link rel="canonical" href="https://honestkit.github.io/guides/yaml-mapping-values-are-not-allowed-here/">
+<meta property="og:title" content="YAML: &#x27;Mapping Values Are Not Allowed Here&#x27; — Fixed">
+<meta property="og:description" content="We reproduced PyYAML&#x27;s &#x27;mapping values are not allowed here&#x27; error 2 ways and measured the exact fix: it&#x27;s almost always an unquoted colon.">
+<meta property="og:url" content="https://honestkit.github.io/guides/yaml-mapping-values-are-not-allowed-here/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does YAML say 'mapping values are not allowed here' when my file is already a mapping?", "acceptedAnswer": {"@type": "Answer", "text": "The message refers to where YAML encountered an unexpected colon, not to your overall document structure. We confirmed the two real causes: an unquoted value that itself contains a colon (like a URL, time, or Windows path), or sibling keys indented inconsistently so a nested value gets misread as a second colon in the wrong place."}}, {"@type": "Question", "name": "How do I fix 'mapping values are not allowed here' caused by a colon in my value?", "acceptedAnswer": {"@type": "Answer", "text": "Quote the value: key: \"value: with a colon\" instead of key: value: with a colon. We confirmed PyYAML parses the quoted form as a single string with no error, while the identical unquoted text fails immediately at the second colon."}}, {"@type": "Question", "name": "My indentation looks right but I still get this error \u2014 what am I missing?", "acceptedAnswer": {"@type": "Answer", "text": "Count spaces exactly; YAML has no tolerance for sibling keys at different indentation levels, even by one space. We reproduced the error with b: at 2 spaces and c: at 3 spaces under the same parent \u2014 visually similar but not byte-identical indentation. Use a YAML-aware editor or linter (yamllint) to catch this instead of eyeballing it."}}, {"@type": "Question", "name": "Can I use tabs for YAML indentation if I'm careful about spacing?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed PyYAML rejects any tab character in indentation outright with 'found character \\'\\t\\' that cannot start any token', regardless of consistency. This isn't a PyYAML-specific restriction; the YAML spec itself forbids tabs for indentation in every compliant parser. Convert tabs to spaces."}}, {"@type": "Question", "name": "Does PyYAML warn me if my file has the same key twice?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we tested this directly and PyYAML's safe_load silently resolves a: 1 / a: 2 (same key) to {'a': 2}, keeping the last occurrence with zero error or warning. If duplicate keys are a bug you want caught, use a linter like yamllint, which does flag them by default, rather than relying on the parser."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>yaml.scanner.ScannerError: mapping values are not allowed here (tested)</h1>
+<p class="lead"><code>yaml.scanner.ScannerError: mapping values are not allowed here</code> is one of the most-searched YAML errors, and the wording is confusing &mdash; your file probably already <em>is</em> a mapping. We reproduced it two different ways with PyYAML 6.0.3 and found the real cause both times is the same thing: an unquoted colon (<code>:</code>) somewhere YAML doesn't expect one.</p>
+<h2 id="cause1">1. Cause: a colon inside a plain (unquoted) scalar value</h2>
+<p>We parsed a value that itself contains a colon, written without quotes:</p>
+<pre><code>key: value : extra</code></pre>
+<pre><code>yaml.scanner.ScannerError: mapping values are not allowed here
+  in "&lt;unicode string&gt;", line 1, column 12:
+    key: value : extra
+               ^</code></pre>
+<p><strong>Why:</strong> YAML uses <code>key: value</code> (colon-space) as its mapping syntax. The parser reads <code>key: value</code> as one complete key/value pair, then hits a second bare <code>:</code> and interprets it as the start of <em>another</em> mapping entry &mdash; but a plain scalar can't contain a nested mapping, so it fails right there. This is exactly what happens with real-world values like a URL (<code>http://example.com</code>), a time (<code>12:30</code>), or a Windows path (<code>C:\Users</code>) written unquoted after a key.</p>
+<p><strong>The fix</strong> we confirmed: quote any value that contains a colon.</p>
+<pre><code>key: "value : extra"   # parses as the single string "value : extra"</code></pre>
+
+<h2 id="cause2">2. Cause: inconsistent indentation makes a nested value look like a new mapping</h2>
+<p>We also hit the identical error from bad indentation, with no colon-in-value involved at all:</p>
+<pre><code>a:
+  b: 1
+   c: 2</code></pre>
+<pre><code>yaml.scanner.ScannerError: mapping values are not allowed here
+  in "&lt;unicode string&gt;", line 3, column 5:
+       c: 2
+        ^</code></pre>
+<p><strong>Why:</strong> <code>c: 2</code> is indented one space deeper than its sibling <code>b: 1</code> (3 spaces vs 2), so the parser doesn't read it as a second key in the same mapping as <code>b</code>. It instead tries to read <code>c</code> as part of <code>b</code>'s own value, then finds a colon where it expected plain scalar content &mdash; the same underlying "colon in the wrong place" failure as cause 1, just produced by misaligned indentation instead of an unquoted value. The fix is to align sibling keys to the exact same indentation (here, both at 2 spaces).</p>
+
+<h2 id="related">3. Two related errors we measured in the same pass</h2>
+<p>A tab character in indentation fails differently &mdash; and earlier, during tokenizing rather than parsing:</p>
+<pre><code>a:
+	b: 1</code></pre>
+<pre><code>yaml.scanner.ScannerError: while scanning for the next token
+found character &#39;\t&#39; that cannot start any token
+  in "&lt;unicode string&gt;", line 2, column 1:
+    	b: 1
+    ^</code></pre>
+<p>The YAML spec forbids tabs for indentation entirely (spaces only) &mdash; this is not PyYAML being strict, every spec-compliant parser rejects it. Fix: replace leading tabs with spaces.</p>
+<p>A missing space after the key's colon produces a third, distinct message:</p>
+<pre><code>key1: value1
+key2:value2</code></pre>
+<pre><code>yaml.scanner.ScannerError: while scanning a simple key
+could not find expected &#39;:&#39;</code></pre>
+<p>Here <code>key2:value2</code> has no space after the colon, so YAML reads the whole thing as one scalar (not a key at all) and then can't find the mapping colon it expected on the next line. Fix: always put a space after the key's colon (<code>key2: value2</code>).</p>
+
+<h2 id="jsyaml">4. Does js-yaml (Node.js) give the same message?</h2>
+<p>No &mdash; we ran the identical bad-indentation input through js-yaml 4.x on Node.js v24.21.0 and got different wording for the same root cause:</p>
+<pre><code>YAMLException: bad indentation of a mapping entry (4:5)</code></pre>
+<p>Same underlying problem (misaligned sibling keys), different parser, different error text. If you're searching for your exact message and not finding this page's wording, check which YAML library/language threw it &mdash; PyYAML, js-yaml, Ruby's Psych, and Java's SnakeYAML each phrase these failures differently even though the YAML spec they're enforcing is the same.</p>
+
+<h2 id="dupkeys">5. A silent gotcha we found while testing: PyYAML does NOT error on duplicate keys</h2>
+<p>We expected <code>a: 1\na: 2</code> (the same key twice) to raise an error. It didn't &mdash; <code>yaml.safe_load</code> returned <code>{&#39;a&#39;: 2}</code> with no warning, silently keeping the last value and discarding the first. If you need duplicate keys caught, PyYAML's loader won't do it for you; a schema validator or a linter like <code>yamllint</code> (which does flag duplicate keys by default) is the tool for that, not the parser itself.</p>
+
+<aside class="cta"><strong>Debugging a YAML-configured API or webhook? Check the real headers and status it sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does YAML say &#x27;mapping values are not allowed here&#x27; when my file is already a mapping?</summary><p>The message refers to where YAML encountered an unexpected colon, not to your overall document structure. We confirmed the two real causes: an unquoted value that itself contains a colon (like a URL, time, or Windows path), or sibling keys indented inconsistently so a nested value gets misread as a second colon in the wrong place.</p></details>
+<details><summary>How do I fix &#x27;mapping values are not allowed here&#x27; caused by a colon in my value?</summary><p>Quote the value: key: &quot;value: with a colon&quot; instead of key: value: with a colon. We confirmed PyYAML parses the quoted form as a single string with no error, while the identical unquoted text fails immediately at the second colon.</p></details>
+<details><summary>My indentation looks right but I still get this error — what am I missing?</summary><p>Count spaces exactly; YAML has no tolerance for sibling keys at different indentation levels, even by one space. We reproduced the error with b: at 2 spaces and c: at 3 spaces under the same parent — visually similar but not byte-identical indentation. Use a YAML-aware editor or linter (yamllint) to catch this instead of eyeballing it.</p></details>
+<details><summary>Can I use tabs for YAML indentation if I&#x27;m careful about spacing?</summary><p>No — we confirmed PyYAML rejects any tab character in indentation outright with &#x27;found character \&#x27;\t\&#x27; that cannot start any token&#x27;, regardless of consistency. This isn&#x27;t a PyYAML-specific restriction; the YAML spec itself forbids tabs for indentation in every compliant parser. Convert tabs to spaces.</p></details>
+<details><summary>Does PyYAML warn me if my file has the same key twice?</summary><p>No — we tested this directly and PyYAML&#x27;s safe_load silently resolves a: 1 / a: 2 (same key) to {&#x27;a&#x27;: 2}, keeping the last occurrence with zero error or warning. If duplicate keys are a bug you want caught, use a linter like yamllint, which does flag them by default, rather than relying on the parser.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with PyYAML 6.0.3 on Python 3.13 (yaml.safe_load), and separately with js-yaml 4.x on Node.js v24.21.0 for comparison. Every message and line:column below is copy-pasted output, not paraphrased. PlainHeaders is our extension; PyYAML/js-yaml are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

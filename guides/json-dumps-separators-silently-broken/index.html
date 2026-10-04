@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>json.dumps(separators=) Can Silently Output Broken JSON</title>
+<meta name="description" content="We measured that swapping json.dumps()&#x27;s separators= tuple order produces invalid JSON with zero error at dump time — it fails later, only when parsed.">
+<link rel="canonical" href="https://honestkit.github.io/guides/json-dumps-separators-silently-broken/">
+<meta property="og:title" content="json.dumps(separators=) Can Silently Output Broken JSON">
+<meta property="og:description" content="We measured that swapping json.dumps()&#x27;s separators= tuple order produces invalid JSON with zero error at dump time — it fails later, only when parsed.">
+<meta property="og:url" content="https://honestkit.github.io/guides/json-dumps-separators-silently-broken/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What order do the two values in json.dumps()'s separators= tuple go in?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed it's (item_separator, key_separator) \u2014 the first string separates items in an object or array, the second separates a key from its value; the standard minify recipe is separators=(\\\",\\\", \\\":\\\")."}}, {"@type": "Question", "name": "Does json.dumps() validate the separators= argument?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured that swapping the tuple order, or even passing the same string for both values, produces output with zero error or warning at dump time; json.dumps() just interpolates whatever strings it's given with no sanity check."}}, {"@type": "Question", "name": "If separators= is wrong, when does the error actually appear?", "acceptedAnswer": {"@type": "Answer", "text": "Not at dump time \u2014 we confirmed the broken JSON string is returned successfully, and the error only surfaces later when something calls json.loads() on it, raising the same Expecting ':' delimiter error covered in our JSON delimiter guide, with no indication the real cause was a swapped separators= tuple."}}, {"@type": "Question", "name": "What's the correct separators= value to fully minify JSON?", "acceptedAnswer": {"@type": "Answer", "text": "We tested and confirmed separators=(\\\",\\\", \\\":\\\") removes all whitespace between items and key-value pairs, producing the smallest valid JSON output, as opposed to the default (\\\", \\\", \\\": \\\") which includes a space after each."}}, {"@type": "Question", "name": "How can I catch a swapped separators= argument before it ships?", "acceptedAnswer": {"@type": "Answer", "text": "We'd add a round-trip test \u2014 call json.loads() immediately on whatever json.dumps() with a custom separators= produces, in the same test \u2014 since there's no validation inside json.dumps() itself to catch the mistake automatically."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>json.dumps() separators= Silently Produces Broken JSON (tested)</h1>
+<p class="lead"><code>json.dumps(d, separators=(item_sep, key_sep))</code> takes the two separator strings in a specific order. Get that order backwards and <code>json.dumps()</code> happily returns syntactically broken JSON &mdash; no exception, no warning. We measured exactly what breaks and why it's easy to get wrong.</p>
+<h2 id="repro1">1. The correct, common "minify" recipe</h2>
+<pre><code>import json
+
+d = {"a": 1, "b": 2}
+
+json.dumps(d)
+'{"a": 1, "b": 2}'
+
+json.dumps(d, separators=(",", ":"))
+'{"a":1,"b":2}'</code></pre>
+<p><strong>Measured:</strong> <code>separators</code> takes a 2-tuple of <code>(item_separator, key_separator)</code> &mdash; the first string goes between items in an object or array, the second goes between a key and its value. <code>(",", ":")</code> is the standard "minify" recipe copied all over the internet, and it works correctly here.</p>
+
+<h2 id="repro2">2. Swap the order, and json.dumps() doesn't complain</h2>
+<pre><code>json.dumps(d, separators=(":", ","))
+'{"a",1:"b",2}'</code></pre>
+<p><strong>Measured:</strong> this is obviously not valid JSON &mdash; commas and colons are in the wrong places &mdash; but <code>json.dumps()</code> returned it with no exception and no warning. The function does not validate that the item separator and key separator differ, or that either one is even a sensible JSON token; it just interpolates whatever strings you give it.</p>
+
+<h2 id="repro3">3. Passing the same string for both is accepted too</h2>
+<pre><code>json.dumps(d, separators=(",", ","))
+'{"a",1,"b",2}'</code></pre>
+<p><strong>Measured:</strong> no distinct key/value marker at all, and still zero error at dump time. The mistake only surfaces downstream, when something tries to read this string back as JSON.</p>
+
+<h2 id="repro4">4. The failure shows up later, on the parsing side</h2>
+<pre><code>broken = json.dumps(d, separators=(":", ","))
+json.loads(broken)
+json.decoder.JSONDecodeError: Expecting \':\' delimiter: line 1 column 5 (char 4)</code></pre>
+<p><strong>Measured:</strong> the exact same <a href="/guides/json-expecting-property-name-double-quotes/">"Expecting ':' delimiter"</a> error covered in our delimiter guide, except here the cause is on the writing side, not the reading side &mdash; whoever wrote this JSON did it wrong, and whoever reads it will see an error that gives no hint the real bug is in a <code>separators=</code> argument three files away.</p>
+
+<h2 id="fix">5. How to get this right every time</h2>
+<p>Remember the order as "comma before colon," matching how a normal (non-swapped) JSON object reads left to right: items are separated by <code>,</code> first, keys and values by <code>:</code> second &mdash; so the tuple is always <code>(",", ":")</code> for minified output, never the reverse. If you only want to drop the default's extra spaces without compacting fully, pass <code>separators=(", ", ": ")</code> (with the same order, just keeping the spaces) rather than guessing at a custom pair. There's no built-in validation to catch a swapped tuple, so if this code path isn't covered by a round-trip test (dump then immediately re-parse), a swap can ship silently.</p>
+
+<aside class="cta"><strong>Debugging a minified API response that won&#x27;t parse? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What order do the two values in json.dumps()&#x27;s separators= tuple go in?</summary><p>We confirmed it&#x27;s (item_separator, key_separator) — the first string separates items in an object or array, the second separates a key from its value; the standard minify recipe is separators=(\&quot;,\&quot;, \&quot;:\&quot;).</p></details>
+<details><summary>Does json.dumps() validate the separators= argument?</summary><p>No — we measured that swapping the tuple order, or even passing the same string for both values, produces output with zero error or warning at dump time; json.dumps() just interpolates whatever strings it&#x27;s given with no sanity check.</p></details>
+<details><summary>If separators= is wrong, when does the error actually appear?</summary><p>Not at dump time — we confirmed the broken JSON string is returned successfully, and the error only surfaces later when something calls json.loads() on it, raising the same Expecting &#x27;:&#x27; delimiter error covered in our JSON delimiter guide, with no indication the real cause was a swapped separators= tuple.</p></details>
+<details><summary>What&#x27;s the correct separators= value to fully minify JSON?</summary><p>We tested and confirmed separators=(\&quot;,\&quot;, \&quot;:\&quot;) removes all whitespace between items and key-value pairs, producing the smallest valid JSON output, as opposed to the default (\&quot;, \&quot;, \&quot;: \&quot;) which includes a space after each.</p></details>
+<details><summary>How can I catch a swapped separators= argument before it ships?</summary><p>We&#x27;d add a round-trip test — call json.loads() immediately on whatever json.dumps() with a custom separators= produces, in the same test — since there&#x27;s no validation inside json.dumps() itself to catch the mistake automatically.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in json module, calling json.dumps() with various separators= tuples and then feeding the output back through json.loads(), printing the exact results. PlainHeaders is our extension; Python&#x27;s json module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

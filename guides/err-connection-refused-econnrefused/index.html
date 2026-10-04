@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ERR_CONNECTION_REFUSED / ECONNREFUSED: localhost Fixes (Tested)</title>
+<meta name="description" content="We bound a server to 127.0.0.1, ::1, 0.0.0.0 and :: and hit it as localhost, 127.0.0.1 and [::1] from Chromium, curl, Node and Python. Full matrix and fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-connection-refused-econnrefused/">
+<meta property="og:title" content="ERR_CONNECTION_REFUSED / ECONNREFUSED: localhost Fixes (Tested)">
+<meta property="og:description" content="We bound a server to 127.0.0.1, ::1, 0.0.0.0 and :: and hit it as localhost, 127.0.0.1 and [::1] from Chromium, curl, Node and Python. Full matrix and fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-connection-refused-econnrefused/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between ERR_CONNECTION_REFUSED and ECONNREFUSED?", "acceptedAnswer": {"@type": "Answer", "text": "None in cause. Chrome reports a refused TCP connect as net::ERR_CONNECTION_REFUSED; Node reports it as code ECONNREFUSED; Python as Errno 111 Connection refused; curl as exit code 7. All mean no socket was listening on that address and port."}}, {"@type": "Question", "name": "Why does localhost work but 127.0.0.1 is refused?", "acceptedAnswer": {"@type": "Answer", "text": "Your server is listening on ::1 only. In our test, a Node server given host 'localhost' bound to [::1] alone. localhost resolves to ::1 first, so it connects, while 127.0.0.1 is refused. Bind to :: or 127.0.0.1 explicitly."}}, {"@type": "Question", "name": "Why does Node say ECONNREFUSED ::1 when my server is running?", "acceptedAnswer": {"@type": "Answer", "text": "The server listens on 127.0.0.1 and Node resolved localhost to ::1 first (verbatim order since Node 17). Node 24 normally falls back to 127.0.0.1, but with autoSelectFamily false we got connect ECONNREFUSED ::1:8990. Use 127.0.0.1 in the URL or bind the server to ::."}}, {"@type": "Question", "name": "Does binding to 0.0.0.0 accept IPv6 too?", "acceptedAnswer": {"@type": "Answer", "text": "No. In our test a server on 0.0.0.0 accepted localhost and 127.0.0.1 but refused [::1]. Binding to :: on Linux accepted all three, because IPv6 sockets also take IPv4 unless ipv6Only is set."}}, {"@type": "Question", "name": "Why does browser fetch only say Failed to fetch?", "acceptedAnswer": {"@type": "Answer", "text": "Browsers hide network error details from JavaScript. In Chromium 153 the script got TypeError: Failed to fetch, while the DevTools console showed net::ERR_CONNECTION_REFUSED. Check the console or Network tab, or try the URL with curl."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ERR_CONNECTION_REFUSED / ECONNREFUSED (tested)</h1>
+<p class="lead"><code>ERR_CONNECTION_REFUSED</code> (Chrome) and <code>ECONNREFUSED</code> (Node, Python) mean the same thing: nothing was listening on that address and port, so the OS said no. Most of the time the server is down or on another port. The sneaky case is when it is running, but on 127.0.0.1 while the client tries ::1, or the other way round. We measured every combination.</p>
+<h2>1. What "connection refused" means</h2>
+<p>The client sent a TCP connect (SYN) and the other side answered with a reset right away. On the same machine that happens when no socket is listening on that exact IP address and port. The request never reached your app, so there is no HTTP status, no headers and no server log line.</p>
+<p>It fails fast. Every refused connect in our tests failed in 0 ms. If you wait seconds and then fail, that is a timeout (firewall dropping packets), not a refusal. If the connection opens and then dies, see <a href="/guides/err-connection-reset-econnreset/">ERR_CONNECTION_RESET / ECONNRESET</a>.</p>
+
+<h2>2. The exact error in each client</h2>
+<p>We pointed each client at a port with nothing listening.</p>
+<table>
+<tr><th>Client</th><th>What it reported</th></tr>
+<tr><td>Chromium 153 navigation</td><td><code>net::ERR_CONNECTION_REFUSED</code> (page shows "This site can't be reached")</td></tr>
+<tr><td>Chromium 153 <code>fetch()</code></td><td>JS gets only <code>TypeError: Failed to fetch</code>. The console shows <code>Failed to load resource: net::ERR_CONNECTION_REFUSED</code></td></tr>
+<tr><td>curl 8.14.1</td><td>exit code 7, <code>curl: (7) Failed to connect to 127.0.0.1 port 8991 after 0 ms: Could not connect to server</code></td></tr>
+<tr><td>Node 24 <code>fetch</code></td><td><code>TypeError: fetch failed</code>; <code>err.cause.code</code> = <code>ECONNREFUSED</code>, <code>err.cause.message</code> = <code>connect ECONNREFUSED 127.0.0.1:8991</code></td></tr>
+<tr><td>Node 24 <code>fetch</code> to <code>localhost</code></td><td><code>err.cause</code> is an <code>AggregateError</code> with code <code>ECONNREFUSED</code> and an <strong>empty</strong> message. The details are in <code>err.cause.errors</code>: <code>connect ECONNREFUSED ::1:8991</code> and <code>connect ECONNREFUSED 127.0.0.1:8991</code></td></tr>
+<tr><td>Python urllib</td><td><code>URLError: &lt;urlopen error [Errno 111] Connection refused&gt;</code></td></tr>
+<tr><td>Python requests 2.32.3</td><td><code>ConnectionError: HTTPConnectionPool(host='127.0.0.1', port=8991): Max retries exceeded ... Failed to establish a new connection: [Errno 111] Connection refused</code></td></tr>
+</table>
+<p>Note the Node <code>localhost</code> case. If you only log <code>err.cause.message</code>, you log an empty string. Log <code>err.cause.code</code> and <code>err.cause.errors</code> too.</p>
+<pre><code>try {
+  await fetch('http://localhost:3000/');
+} catch (err) {
+  const c = err.cause;
+  console.log(c?.code, c?.message || c?.errors?.map(e =&gt; e.message));
+}</code></pre>
+
+<h2>3. localhost is two addresses</h2>
+<p>On our box <code>/etc/hosts</code> maps <code>localhost</code> to both <code>127.0.0.1</code> and <code>::1</code>. The system resolver returns <code>::1</code> first. So did Python's <code>socket.getaddrinfo</code>. Node 24's <code>dns.getDefaultResultOrder()</code> is <code>verbatim</code> (the default since Node 17), so <code>dns.lookup('localhost')</code> also returned <code>::1</code> first.</p>
+<p>That matters on both sides. A client asking for <code>localhost</code> tries <code>::1</code> first. A server told to listen on <code>localhost</code> picks one address only: our Node server given <code>host: 'localhost'</code> bound to <code>[::1]:8990</code> and nothing else.</p>
+
+<h2>4. The matrix: bind address vs client target</h2>
+<p>We ran a Node http server bound to each address on port 8990, then connected with curl, Node fetch, Python urllib, Python requests, and Chromium (navigation and fetch). All five clients agreed in every cell.</p>
+<table>
+<tr><th>Server binds to</th><th>ss -ltn shows</th><th>localhost</th><th>127.0.0.1</th><th>[::1]</th></tr>
+<tr><td><code>127.0.0.1</code></td><td>127.0.0.1:8990</td><td>OK (via 127.0.0.1)</td><td>OK</td><td>Refused</td></tr>
+<tr><td><code>::1</code></td><td>[::1]:8990</td><td>OK (via ::1)</td><td>Refused</td><td>OK</td></tr>
+<tr><td><code>localhost</code> (Node)</td><td>[::1]:8990</td><td>OK (via ::1)</td><td>Refused</td><td>OK</td></tr>
+<tr><td><code>0.0.0.0</code></td><td>0.0.0.0:8990</td><td>OK (via 127.0.0.1)</td><td>OK</td><td>Refused</td></tr>
+<tr><td><code>::</code> (dual-stack)</td><td>*:8990</td><td>OK (via ::1)</td><td>OK (server sees ::ffff:127.0.0.1)</td><td>OK</td></tr>
+<tr><td><code>::</code> with <code>ipv6Only: true</code></td><td>[::]:8990</td><td>OK (via ::1)</td><td>Refused</td><td>OK</td></tr>
+</table>
+<p>Three things stand out:</p>
+<ul>
+<li><strong><code>0.0.0.0</code> is IPv4 only.</strong> It means "all IPv4 addresses". It does not accept <code>[::1]</code>.</li>
+<li><strong><code>::</code> is the only bind that accepted all three targets</strong>, because Linux lets an IPv6 socket also take IPv4 (our box has <code>net.ipv6.bindv6only = 0</code>). Turn on <code>ipv6Only</code> and 127.0.0.1 is refused again.</li>
+<li><strong><code>localhost</code> as a client target worked in every row.</strong> Modern clients try the next address when the first is refused. curl's verbose log shows it:</li>
+</ul>
+<pre><code>$ curl -v http://localhost:8990/      # server on 127.0.0.1 only
+*   Trying [::1]:8990...
+* connect to ::1 port 8990 from ::1 port 59782 failed: Connection refused
+*   Trying 127.0.0.1:8990...
+* Connected to localhost (127.0.0.1) port 8990</code></pre>
+
+<h2>5. The Node 17+ localhost trap</h2>
+<p>Node 17 switched DNS results to verbatim order, so <code>localhost</code> became <code>::1</code> first. Servers that only listened on 127.0.0.1 then got <code>ECONNREFUSED ::1:PORT</code>. In Node 24 the fallback hides this for most code: <code>net.getDefaultAutoSelectFamily()</code> is <code>true</code> (250 ms per attempt), and <code>fetch</code> fell back to 127.0.0.1 in our test.</p>
+<p>The trap still exists when the fallback is off. With a server on 127.0.0.1 only:</p>
+<pre><code>net.connect({ port: 8990, host: 'localhost', autoSelectFamily: false })
+// error: ECONNREFUSED  connect ECONNREFUSED ::1:8990
+
+net.connect({ port: 8990, host: 'localhost', autoSelectFamily: true })
+// connected to 127.0.0.1</code></pre>
+<p>Libraries that pass their own <code>lookup</code> or <code>family</code>, older Node versions and other runtimes can still hit it. If your error says <code>::1</code> and your server listens on 127.0.0.1, this is it.</p>
+
+<h2>6. Defaults of common dev servers</h2>
+<ul>
+<li><strong>Flask 3.1.3</strong> <code>app.run()</code> bound to <code>127.0.0.1:8990</code> only. <code>curl http://[::1]:8990/</code> was refused; <code>localhost</code> worked through the fallback.</li>
+<li><strong>Python 3.13 <code>python3 -m http.server</code></strong> with no <code>-b</code> bound to <code>0.0.0.0</code> on our box (it printed "Serving HTTP on 0.0.0.0"). So <code>[::1]</code> is refused.</li>
+<li><strong>Node <code>listen(port, 'localhost')</code></strong> bound to <code>::1</code> only, as in the matrix.</li>
+</ul>
+
+<h2>7. Docker port publishing (from the Docker docs, not measured)</h2>
+<ul>
+<li><code>-p 8080:80</code> publishes on all host interfaces. <code>-p 127.0.0.1:8080:80</code> publishes on IPv4 loopback only, so <code>[::1]:8080</code> on the host may be refused.</li>
+<li>The app <em>inside</em> the container must listen on <code>0.0.0.0</code> (or <code>::</code>), not <code>127.0.0.1</code>. Container loopback is not the host's loopback, so a server bound to 127.0.0.1 inside cannot be reached through the published port.</li>
+<li>Inside a container, <code>localhost</code> is the container itself. To reach another container use its service name; to reach the host, Docker Desktop provides <code>host.docker.internal</code>.</li>
+</ul>
+
+<h2>8. How to fix it</h2>
+<ol>
+<li><strong>Is it running?</strong> <code>ss -ltn | grep :PORT</code> (Linux) or <code>lsof -iTCP:PORT -sTCP:LISTEN</code> (macOS). No line means nothing listens. Check the server's own log for a crash or "address in use".</li>
+<li><strong>Right port?</strong> Compare the port in the error with the one the server printed.</li>
+<li><strong>Right address?</strong> Compare the address in the error (<code>::1</code> or <code>127.0.0.1</code>) with the <code>ss</code> output. Use the matrix above.</li>
+<li><strong>Pick one fix:</strong> make the client use the exact address the server binds (<code>http://127.0.0.1:3000</code>), or bind the server to <code>::</code> so both families work. Bind to <code>0.0.0.0</code>/<code>::</code> only if you mean to expose it on the network.</li>
+<li><strong>Proxy or container in between?</strong> If nginx shows <a href="/guides/502-bad-gateway/">502 Bad Gateway</a>, its error log (per the nginx docs and common reports, not measured) names the upstream with <code>(111: Connection refused)</code>. Apply steps 1 to 3 to the upstream address.</li>
+</ol>
+<p>Once it connects, check the real response with <a href="/tools/http-headers/">our HTTP headers tool</a>.</p>
+<aside class="cta"><strong>Once it connects, check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between ERR_CONNECTION_REFUSED and ECONNREFUSED?</summary><p>None in cause. Chrome reports a refused TCP connect as net::ERR_CONNECTION_REFUSED; Node reports it as code ECONNREFUSED; Python as Errno 111 Connection refused; curl as exit code 7. All mean no socket was listening on that address and port.</p></details>
+<details><summary>Why does localhost work but 127.0.0.1 is refused?</summary><p>Your server is listening on ::1 only. In our test, a Node server given host &#x27;localhost&#x27; bound to [::1] alone. localhost resolves to ::1 first, so it connects, while 127.0.0.1 is refused. Bind to :: or 127.0.0.1 explicitly.</p></details>
+<details><summary>Why does Node say ECONNREFUSED ::1 when my server is running?</summary><p>The server listens on 127.0.0.1 and Node resolved localhost to ::1 first (verbatim order since Node 17). Node 24 normally falls back to 127.0.0.1, but with autoSelectFamily false we got connect ECONNREFUSED ::1:8990. Use 127.0.0.1 in the URL or bind the server to ::.</p></details>
+<details><summary>Does binding to 0.0.0.0 accept IPv6 too?</summary><p>No. In our test a server on 0.0.0.0 accepted localhost and 127.0.0.1 but refused [::1]. Binding to :: on Linux accepted all three, because IPv6 sockets also take IPv4 unless ipv6Only is set.</p></details>
+<details><summary>Why does browser fetch only say Failed to fetch?</summary><p>Browsers hide network error details from JavaScript. In Chromium 153 the script got TypeError: Failed to fetch, while the DevTools console showed net::ERR_CONNECTION_REFUSED. Check the console or Network tab, or try the URL with curl.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 on Debian Linux with headless Chromium 153.0.8010.12 (Playwright), Node.js 24.21.0, curl 8.14.1, Python 3.13.5 (urllib, requests 2.32.3) and Flask 3.1.3. Test servers were Node http servers bound to six different addresses. Docker parts are from the Docker docs, not measured. PlainHeaders is our extension; curl, Python, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

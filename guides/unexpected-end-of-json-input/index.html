@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unexpected end of JSON input / Unexpected token &#x27;&lt;&#x27;: Fixes</title>
+<meta name="description" content="We triggered every common cause in Chromium 153, Node 24 and Python: empty 204, HEAD, truncated body, HTML error page. Exact messages and the fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/unexpected-end-of-json-input/">
+<meta property="og:title" content="Unexpected end of JSON input / Unexpected token &#x27;&lt;&#x27;: Fixes">
+<meta property="og:description" content="We triggered every common cause in Chromium 153, Node 24 and Python: empty 204, HEAD, truncated body, HTML error page. Exact messages and the fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/unexpected-end-of-json-input/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does res.json() fail on a 204 response?", "acceptedAnswer": {"@type": "Answer", "text": "A 204 has no body, and res.json() tries to parse an empty string. In Chromium 153 we got \"Failed to execute 'json' on 'Response': Unexpected end of JSON input\"; Node 24 said \"Unexpected end of JSON input\". Check res.status === 204 or read res.text() and skip empty bodies."}}, {"@type": "Question", "name": "What does Unexpected token '<' mean?", "acceptedAnswer": {"@type": "Answer", "text": "The body starts with <, so it is HTML, not JSON. Usually it is an error page, a 404 page or your SPA's index.html. Log res.status, the Content-Type and the first 100 characters of res.text() to see which."}}, {"@type": "Question", "name": "Does res.json() check the Content-Type header?", "acceptedAnswer": {"@type": "Answer", "text": "No. In Node 24 a valid JSON body sent as text/html parsed fine with res.json(). The parser only looks at the text. That is why you should check the Content-Type yourself before parsing."}}, {"@type": "Question", "name": "Why does fetch with mode no-cors give Unexpected end of input?", "acceptedAnswer": {"@type": "Answer", "text": "A cross-origin no-cors response is opaque: status 0 and an empty body. Chromium 153 threw \"SyntaxError: Unexpected end of input\" on res.json(). You cannot read it. Add CORS headers on the server instead."}}, {"@type": "Question", "name": "What is the Python version of this error?", "acceptedAnswer": {"@type": "Answer", "text": "requests raises requests.exceptions.JSONDecodeError: Expecting value: line 1 column 1 (char 0) for an empty body, a 204, a HEAD response or an HTML page. Call raise_for_status() and check r.content before r.json()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Unexpected end of JSON input (tested)</h1>
+<p class="lead"><code>SyntaxError: Unexpected end of JSON input</code> means the parser ran out of text. Usually the body was empty. <code>Unexpected token '&lt;'</code> means the body was HTML, not JSON. We reproduced each cause in Chromium, Node.js and Python and recorded the exact messages.</p>
+<h2>1. The short answer</h2>
+<p><code>res.json()</code> and <code>JSON.parse()</code> do not care about the status code. They just parse whatever text arrived. Two cases cover most reports:</p>
+<ul>
+<li><strong>Empty body</strong> (204, HEAD, a 200 with nothing in it, whitespace only): <code>Unexpected end of JSON input</code>.</li>
+<li><strong>HTML body</strong> (an error page, a 404 page, your SPA's <code>index.html</code>): <code>Unexpected token '&lt;', "&lt;!DOCTYPE "... is not valid JSON</code>.</li>
+</ul>
+<p>The fix is the same for both: read the body as text first, check <code>res.ok</code> and the Content-Type, and only then parse.</p>
+
+<h2>2. Our test setup</h2>
+<p>A Node.js server returned one bad response per URL: 204 with no body, 200 <code>application/json</code> with no body, a cut-off JSON body, a 500 HTML error page, whitespace only, and so on. We called each URL with <code>fetch(url).then(r =&gt; r.json())</code> in Chromium 153 and in Node.js 24, and with Python requests and urllib. We also ran <code>JSON.parse</code> on sample strings in both engines.</p>
+
+<h2>3. Results: cause → exact message</h2>
+<table>
+<tr><th>Cause</th><th>Chromium 153 <code>res.json()</code></th><th>Node 24 <code>res.json()</code></th></tr>
+<tr><td>204 No Content</td><td>SyntaxError: Failed to execute 'json' on 'Response': Unexpected end of JSON input</td><td>SyntaxError: Unexpected end of JSON input</td></tr>
+<tr><td>200 with empty body</td><td>SyntaxError: Failed to execute 'json' on 'Response': Unexpected end of JSON input</td><td>SyntaxError: Unexpected end of JSON input</td></tr>
+<tr><td>HEAD request (server sent a JSON Content-Type)</td><td>SyntaxError: Failed to execute 'json' on 'Response': Unexpected end of JSON input</td><td>SyntaxError: Unexpected end of JSON input</td></tr>
+<tr><td>Body is only whitespace</td><td>SyntaxError: Unexpected end of JSON input</td><td>SyntaxError: Unexpected end of JSON input</td></tr>
+<tr><td>Body truncated: <code>{"items":[1,2,3</code></td><td>SyntaxError: Expected ',' or ']' after array element in JSON at position 15 (line 1 column 16)</td><td>Same</td></tr>
+<tr><td>500 HTML page starting <code>&lt;!DOCTYPE html&gt;</code></td><td>SyntaxError: Unexpected token '&lt;', "&lt;!DOCTYPE "... is not valid JSON</td><td>Same</td></tr>
+<tr><td>404 HTML page starting <code>&lt;html&gt;</code></td><td>SyntaxError: Unexpected token '&lt;', "&lt;html&gt;&lt;bod"... is not valid JSON</td><td>Same</td></tr>
+<tr><td>Connection dropped before Content-Length was reached</td><td>TypeError: Failed to fetch</td><td>TypeError: terminated</td></tr>
+<tr><td>Body is the text <code>undefined</code></td><td>SyntaxError: "undefined" is not valid JSON</td><td>Same</td></tr>
+<tr><td>Opaque response (cross-origin, <code>mode: 'no-cors'</code>)</td><td>SyntaxError: Unexpected end of input</td><td>n/a (Node returned the real body)</td></tr>
+<tr><td>Calling <code>res.json()</code> twice</td><td>TypeError: Failed to execute 'json' on 'Response': body stream already read</td><td>TypeError: Body is unusable: Body has already been read</td></tr>
+</table>
+<p>Notes from the run:</p>
+<ul>
+<li>A 204 does not make <code>res.json()</code> return <code>null</code>. It throws. A body of literally <code>null</code> does parse, to <code>null</code>.</li>
+<li>A cut-off body only gives "Unexpected end of JSON input" if it stops at the right spot. Our <code>{"items":[1,2,3</code> gave the "Expected ',' or ']'" message instead. <code>JSON.parse('{"a":')</code> did give "Unexpected end of JSON input".</li>
+<li>The opaque case is the odd one. A no-cors cross-origin response has <code>type</code> <code>"opaque"</code>, <code>status</code> 0 and an empty body, even though our server sent <code>{"a":1}</code>. The message has no "JSON" in it. No-cors is not a way around CORS; fix the headers instead (see <a href="/guides/cors-allow-multiple-origins/">CORS with multiple origins</a>).</li>
+<li>A UTF-8 BOM before <code>{"a":1}</code> parsed fine in both <code>res.json()</code> implementations.</li>
+</ul>
+
+<h2>4. JSON.parse messages (same in both engines)</h2>
+<table>
+<tr><th>Input</th><th>Message</th></tr>
+<tr><td><code>""</code> or <code>"   "</code></td><td>Unexpected end of JSON input</td></tr>
+<tr><td><code>'{"a":'</code></td><td>Unexpected end of JSON input</td></tr>
+<tr><td><code>"&lt;!DOCTYPE html&gt;"</code></td><td>Unexpected token '&lt;', "&lt;!DOCTYPE html&gt;" is not valid JSON</td></tr>
+<tr><td><code>"OK"</code></td><td>Unexpected token 'O', "OK" is not valid JSON</td></tr>
+<tr><td><code>JSON.parse(undefined)</code></td><td>"undefined" is not valid JSON</td></tr>
+<tr><td><code>"[object Object]"</code> (an object passed through <code>String()</code>)</td><td>"[object Object]" is not valid JSON</td></tr>
+<tr><td><code>"{'a':1}"</code> (single quotes)</td><td>Expected property name or '}' in JSON at position 1 (line 1 column 2)</td></tr>
+<tr><td><code>'{"a":1}x'</code></td><td>Unexpected non-whitespace character after JSON at position 7 (line 1 column 8)</td></tr>
+</table>
+<p>Short inputs are quoted whole. Longer ones are cut to 10 characters plus <code>...</code>, which is why you see <code>"&lt;!DOCTYPE "...</code>.</p>
+
+<h2>5. Python: requests and urllib</h2>
+<p>Python has a different message for all of these. Empty body, 204, HEAD and an HTML page all gave the same text:</p>
+<pre><code>requests.exceptions.JSONDecodeError: Expecting value: line 1 column 1 (char 0)</code></pre>
+<p>The truncated body gave <code>Expecting ',' delimiter: line 1 column 16 (char 15)</code>. requests' <code>JSONDecodeError</code> is a subclass of <code>ValueError</code>, so <code>except ValueError</code> catches it. Unlike fetch, calling <code>r.json()</code> twice worked. With urllib, a 500 raised <code>HTTPError: HTTP Error 500: Internal Server Error</code> before we could parse anything; a 204 or empty 200 gave <code>json.JSONDecodeError: Expecting value: line 1 column 1 (char 0)</code>.</p>
+<pre><code>r = requests.get(url)
+r.raise_for_status()
+if r.status_code == 204 or not r.content.strip():
+    data = None
+else:
+    data = r.json()</code></pre>
+
+<h2>6. The fix: read text, check, then parse</h2>
+<pre><code>async function getJSON(url, init) {
+  const res = await fetch(url, init);
+  const text = await res.text();
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 80)}`);
+  if (!text.trim()) return null;               // 204, HEAD, empty body
+  const type = res.headers.get('content-type') || '';
+  if (!type.includes('application/json'))
+    throw new Error(`Expected JSON, got ${type}: ${text.slice(0, 80)}`);
+  return JSON.parse(text);
+}</code></pre>
+<p>We ran this against our server. A 204 returned <code>null</code>. The 500 page threw <code>HTTP 500: &lt;!DOCTYPE html&gt;...</code>. An SPA fallback (200 <code>text/html</code>) threw <code>Expected JSON, got text/html: ...</code>. Valid JSON parsed as normal. You now see the real problem instead of a parser error.</p>
+<p>Reading the body once with <code>res.text()</code> also avoids the "body stream already read" error. If you need the body twice, use <code>res.clone()</code>.</p>
+
+<h2>7. Where the HTML comes from</h2>
+<ul>
+<li><strong>A server error page.</strong> Your framework or proxy returns an HTML page for a <a href="/guides/500-internal-server-error/">500</a>, <a href="/guides/502-bad-gateway/">502</a> or <a href="/guides/504-gateway-timeout/">504</a>. Check <code>res.status</code> first.</li>
+<li><strong>Wrong URL.</strong> A typo or missing <code>/api</code> prefix hits the SPA catch-all route, which returns <code>index.html</code> with status 200. <code>res.ok</code> is true, so only a Content-Type check catches it.</li>
+<li><strong>Dev server proxy not set up.</strong> The front-end dev server answers <code>/api/...</code> itself with its HTML page.</li>
+<li><strong>Login redirect.</strong> An expired session redirects to an HTML login page. fetch follows the redirect and you parse the login form.</li>
+</ul>
+<p>On the server side, send JSON errors with the right header. See <a href="/guides/content-type-application-json-header/">Content-Type: application/json</a>. For empty answers, return 204 and make the client handle it, or return a JSON body such as <code>{}</code> with 200. A <a href="/guides/304-not-modified/">304 Not Modified</a> also has no body; per the Fetch spec the browser normally serves the cached body for you (not measured here).</p>
+<aside class="cta"><strong>See the status, Content-Type and Content-Length your API really returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does res.json() fail on a 204 response?</summary><p>A 204 has no body, and res.json() tries to parse an empty string. In Chromium 153 we got &quot;Failed to execute &#x27;json&#x27; on &#x27;Response&#x27;: Unexpected end of JSON input&quot;; Node 24 said &quot;Unexpected end of JSON input&quot;. Check res.status === 204 or read res.text() and skip empty bodies.</p></details>
+<details><summary>What does Unexpected token &#x27;&lt;&#x27; mean?</summary><p>The body starts with &lt;, so it is HTML, not JSON. Usually it is an error page, a 404 page or your SPA&#x27;s index.html. Log res.status, the Content-Type and the first 100 characters of res.text() to see which.</p></details>
+<details><summary>Does res.json() check the Content-Type header?</summary><p>No. In Node 24 a valid JSON body sent as text/html parsed fine with res.json(). The parser only looks at the text. That is why you should check the Content-Type yourself before parsing.</p></details>
+<details><summary>Why does fetch with mode no-cors give Unexpected end of input?</summary><p>A cross-origin no-cors response is opaque: status 0 and an empty body. Chromium 153 threw &quot;SyntaxError: Unexpected end of input&quot; on res.json(). You cannot read it. Add CORS headers on the server instead.</p></details>
+<details><summary>What is the Python version of this error?</summary><p>requests raises requests.exceptions.JSONDecodeError: Expecting value: line 1 column 1 (char 0) for an empty body, a 204, a HEAD response or an HTML page. Call raise_for_status() and check r.content before r.json().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright), Node.js 24.21.0 built-in fetch, Python 3.13.5 with requests 2.32.3 and urllib, against a local Node test server. PlainHeaders is our extension; Chromium, Node.js and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

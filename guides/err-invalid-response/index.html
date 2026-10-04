@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ERR_INVALID_RESPONSE vs ERR_INVALID_HTTP_RESPONSE (Tested)</title>
+<meta name="description" content="We sent 60 broken HTTP responses to Chromium 153, curl, Node fetch and Python. Which ones give ERR_INVALID_HTTP_RESPONSE, which load fine, and how to fix each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-invalid-response/">
+<meta property="og:title" content="ERR_INVALID_RESPONSE vs ERR_INVALID_HTTP_RESPONSE (Tested)">
+<meta property="og:description" content="We sent 60 broken HTTP responses to Chromium 153, curl, Node fetch and Python. Which ones give ERR_INVALID_HTTP_RESPONSE, which load fine, and how to fix each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-invalid-response/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between ERR_INVALID_RESPONSE and ERR_INVALID_HTTP_RESPONSE?", "acceptedAnswer": {"@type": "Answer", "text": "Both are Chromium network errors. In our tests with Chromium 153, every unreadable HTTP/1.1 status line or header block (garbage, text before the status line, NUL bytes in headers, a stray 101) gave ERR_INVALID_HTTP_RESPONSE. None of our 60 malformed responses produced ERR_INVALID_RESPONSE."}}, {"@type": "Question", "name": "Does a space before the colon in a header break Chrome?", "acceptedAnswer": {"@type": "Answer", "text": "Not in Chromium 153: X-Test : a loaded fine, and so did curl and Python. Node 24 fetch rejected it with 'Invalid header token'. Fix it anyway, since stricter clients fail."}}, {"@type": "Question", "name": "What happens with two Content-Length headers?", "acceptedAnswer": {"@type": "Answer", "text": "If the values differ, Chromium fails with net::ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_LENGTH. If they are equal, Chromium loads the page, but Node 24 fetch still failed with UND_ERR_RES_CONTENT_LENGTH_MISMATCH."}}, {"@type": "Question", "name": "Does Content-Encoding: gzip with a plain body give ERR_INVALID_RESPONSE?", "acceptedAnswer": {"@type": "Answer", "text": "No. Chromium 153 gave net::ERR_CONTENT_DECODING_FAILED, curl --compressed exited 61 with 'incorrect header check', and Node fetch failed with Z_DATA_ERROR."}}, {"@type": "Question", "name": "How do I see what the server really sent?", "acceptedAnswer": {"@type": "Answer", "text": "Run curl -v against the URL. It prints the status line and headers it received and names the problem, for example 'Nul byte in header' or 'Received HTTP/0.9 when not allowed'. In Chrome, read the net:: code in the DevTools console."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>net::ERR_INVALID_RESPONSE (tested)</h1>
+<p class="lead">Chrome shows <code>net::ERR_INVALID_RESPONSE</code> or <code>net::ERR_INVALID_HTTP_RESPONSE</code> when it cannot make sense of what the server sent. We wrote a raw TCP server that sends broken responses on purpose and recorded the exact error each client gave. Most broken responses get a more specific error code, and many load without any error at all. If the server sends nothing at all, see <a href="/guides/err-empty-response/">ERR_EMPTY_RESPONSE</a>.</p>
+<h2>1. The short answer</h2>
+<p>In our tests, Chromium 153 never returned <code>ERR_INVALID_RESPONSE</code> for a malformed HTTP/1.1 response. When the status line or header block was unreadable it returned <code>ERR_INVALID_HTTP_RESPONSE</code>. Other faults got their own codes: <code>ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_LENGTH</code>, <code>ERR_INVALID_CHUNKED_ENCODING</code>, <code>ERR_CONTENT_DECODING_FAILED</code>, <code>ERR_CONTENT_LENGTH_MISMATCH</code> and others.</p>
+<p>So if you see either name, do not guess. Look at the exact code in DevTools (Network tab, or the console line <code>Failed to load resource: net::...</code>), then find it in the table below. For fetch() the page only gets <code>TypeError: Failed to fetch</code>; the real code is only in the console. See <a href="/guides/typeerror-failed-to-fetch/">TypeError: Failed to fetch</a>.</p>
+
+<h2>2. Our test setup</h2>
+<p>A Node <code>net.createServer</code> read each request and wrote a fixed string back, then closed the socket. No HTTP library touched the response, so we could send anything:</p>
+<pre><code>import net from 'net';
+const C = {
+  dupcl: 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n' +
+         'Connection: close\r\n\r\nhi!',
+  nulvalue: 'HTTP/1.1 200 OK\r\nX-Test: a\0b\r\nContent-Length: 2\r\n\r\nhi',
+  // ... 60 cases
+};
+net.createServer(s =&gt; s.on('data', d =&gt; {
+  const path = String(d).split(' ')[1].slice(1);
+  s.end(C[path]);
+})).listen(8992, '127.0.0.1');</code></pre>
+<p>Chromium loaded each URL as a top-level navigation and as a same-origin <code>fetch()</code>. Both gave the same net error in every failing case. Then we ran the same cases through curl, Node fetch and Python <code>urllib.request</code>.</p>
+
+<h2>3. Chromium 153 results</h2>
+<table>
+<tr><th>What the server sent</th><th>Chromium 153 result</th></tr>
+<tr><td>No bytes, then close</td><td><code>net::ERR_EMPTY_RESPONSE</code></td></tr>
+<tr><td>Garbage instead of a status line (<code>HELLO WORLD</code>)</td><td><code>net::ERR_INVALID_HTTP_RESPONSE</code></td></tr>
+<tr><td>Body with no status line at all (HTTP/0.9 style)</td><td><code>net::ERR_INVALID_HTTP_RESPONSE</code></td></tr>
+<tr><td>Text before the status line (<code>Warning: something</code> then <code>HTTP/1.1 200 OK</code>)</td><td><code>net::ERR_INVALID_HTTP_RESPONSE</code></td></tr>
+<tr><td>NUL byte in a header value or header name</td><td><code>net::ERR_INVALID_HTTP_RESPONSE</code></td></tr>
+<tr><td><code>101 Switching Protocols</code> to a normal request</td><td><code>net::ERR_INVALID_HTTP_RESPONSE</code></td></tr>
+<tr><td><code>103 Early Hints</code> followed by garbage</td><td><code>net::ERR_INVALID_HTTP_RESPONSE</code></td></tr>
+<tr><td>Two <code>Content-Length</code> headers, different values (2 and 3)</td><td><code>net::ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_LENGTH</code></td></tr>
+<tr><td>Two <code>Content-Disposition</code> headers, different values</td><td><code>net::ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_DISPOSITION</code></td></tr>
+<tr><td>302 with two different <code>Location</code> headers</td><td><code>net::ERR_RESPONSE_HEADERS_MULTIPLE_LOCATION</code></td></tr>
+<tr><td>302 with <code>Location: http://[bad</code></td><td><code>net::ERR_INVALID_REDIRECT</code></td></tr>
+<tr><td>One header of 300,000 bytes</td><td><code>net::ERR_RESPONSE_HEADERS_TOO_BIG</code></td></tr>
+<tr><td>Chunk size <code>zz</code>, or a 20-digit hex chunk size</td><td><code>net::ERR_INVALID_CHUNKED_ENCODING</code></td></tr>
+<tr><td>Chunked body cut off before the <code>0</code> chunk</td><td><code>net::ERR_INCOMPLETE_CHUNKED_ENCODING</code></td></tr>
+<tr><td><code>Content-Length: 50</code>, only 2 bytes sent</td><td><code>net::ERR_CONTENT_LENGTH_MISMATCH</code></td></tr>
+<tr><td><code>Content-Encoding: gzip</code> (or <code>br</code>, <code>deflate</code>, <code>gzip, gzip</code>) on a plain-text body</td><td><code>net::ERR_CONTENT_DECODING_FAILED</code></td></tr>
+<tr><td><code>407</code> from a server that is not a proxy</td><td><code>net::ERR_UNEXPECTED_PROXY_AUTH</code></td></tr>
+<tr><td>Only <code>100 Continue</code>, then close</td><td><code>net::ERR_EMPTY_RESPONSE</code></td></tr>
+</table>
+<p>For the body errors (chunked, length, decoding) the navigation committed with status 200 and then failed. The headless page stayed blank and the <code>load</code> event never fired. fetch() rejected.</p>
+
+<h2>4. Broken responses Chromium accepted without error</h2>
+<p>These all loaded with no error in Chromium 153. Other clients were stricter (section 5).</p>
+<ul>
+<li>Status code not a number: <code>HTTP/1.1 abc OK</code> loaded as 200.</li>
+<li>Odd status codes: <code>0</code>, <code>99</code>, <code>600</code> and <code>1000</code> were passed through as-is.</li>
+<li><code>HTTP/2.0 200 OK</code>, <code>HTTP/3 200 OK</code>, lower-case <code>http/1.1</code>, a missing reason phrase, no space after the version (<code>HTTP/1.1200</code>).</li>
+<li>Space before the colon (<code>X-Test : a</code>), a header line with no colon, a bare CR inside a value, LF-only line endings, folded (obs-fold) header lines.</li>
+<li>Two <code>Content-Length</code> headers with the <em>same</em> value.</li>
+<li><code>Content-Length: abc</code>, <code>Content-Length: -1</code> and a 23-digit Content-Length: the body was read until close.</li>
+<li><code>Content-Length</code> and <code>Transfer-Encoding: chunked</code> together: chunked won and the body was correct.</li>
+<li>Unknown <code>Transfer-Encoding: foo</code>, and unknown <code>Content-Encoding: foo</code> (body shown raw).</li>
+<li><code>Content-Encoding: gzip</code> with an empty body (<code>Content-Length: 0</code>).</li>
+<li>500 with an empty body: shown as a normal 500, not a net error.</li>
+<li>A 206 with a garbage or missing <code>Content-Range</code>.</li>
+</ul>
+<p>A 204 or 304 that carries a body made the navigation end in <code>net::ERR_ABORTED</code> (no new page). fetch() returned 204 or 304 with an empty body.</p>
+
+<h2>5. Same cases in curl, Node fetch and Python</h2>
+<table>
+<tr><th>Case</th><th>curl 8.14.1</th><th>Node 24 fetch (error.cause)</th><th>Python 3.13 urllib</th></tr>
+<tr><td>Garbage status line</td><td>exit 1, "Received HTTP/0.9 when not allowed"</td><td>"Response does not match the HTTP/1.1 protocol (Expected HTTP/, RTSP/ or ICE/)"</td><td><code>BadStatusLine</code></td></tr>
+<tr><td>Text before status line</td><td>exit 1, same HTTP/0.9 message</td><td>same as above</td><td><code>BadStatusLine</code></td></tr>
+<tr><td><code>HTTP/1.1 abc OK</code></td><td>exit 1, "Unsupported HTTP/1 subversion in response"</td><td>"(Invalid status code)"</td><td><code>BadStatusLine</code></td></tr>
+<tr><td>Status 1000</td><td>exit 8, "Invalid status line"</td><td>"(Invalid response status)"</td><td><code>BadStatusLine</code></td></tr>
+<tr><td><code>HTTP/2.0</code> status line</td><td>OK 200</td><td>OK 200</td><td><code>UnknownProtocol: HTTP/2.0</code></td></tr>
+<tr><td>Space before colon</td><td>OK 200</td><td>"(Invalid header token)"</td><td>OK 200</td></tr>
+<tr><td>Header line with no colon</td><td>exit 8, "Header without colon"</td><td>"(Invalid header token)"</td><td>OK 200</td></tr>
+<tr><td>NUL in header value</td><td>exit 8, "Nul byte in header"</td><td>"(Invalid header value char)"</td><td>OK 200</td></tr>
+<tr><td>Bare CR in header value</td><td>OK 200</td><td>"(Missing expected LF after header value)"</td><td>OK 200</td></tr>
+<tr><td>LF-only line endings</td><td>OK 200</td><td>"(Missing expected CR after response line)"</td><td>OK 200</td></tr>
+<tr><td>Obs-fold header</td><td>OK 200</td><td>"(Unexpected whitespace after header value)"</td><td>OK 200</td></tr>
+<tr><td>Two Content-Length, 2 and 3</td><td>OK 200, read 3 bytes</td><td><code>UND_ERR_RES_CONTENT_LENGTH_MISMATCH</code></td><td>OK 200, read 2 bytes</td></tr>
+<tr><td>Two Content-Length, both 2</td><td>OK 200</td><td><code>UND_ERR_RES_CONTENT_LENGTH_MISMATCH</code></td><td>OK 200</td></tr>
+<tr><td><code>Content-Length: abc</code></td><td>exit 8, "Invalid Content-Length: value"</td><td>"(Invalid character in Content-Length)"</td><td>OK 200</td></tr>
+<tr><td>Content-Length + chunked</td><td>OK 200</td><td><code>UND_ERR_RES_CONTENT_LENGTH_MISMATCH</code></td><td>OK 200</td></tr>
+<tr><td>Chunk size <code>zz</code></td><td>exit 56, "chunk hex-length char not a hex digit: 0x7a"</td><td>"terminated", cause "(Invalid character in chunk size)"</td><td><code>IncompleteRead(0 bytes read)</code></td></tr>
+<tr><td>Fake gzip body</td><td>with <code>--compressed</code>: exit 61, "Error while processing content unencoding: incorrect header check"</td><td>"terminated", cause <code>Z_DATA_ERROR</code> "incorrect header check"</td><td>OK 200, raw bytes (urllib does not decode)</td></tr>
+<tr><td>101 to a normal GET</td><td>OK, code 101</td><td><code>ERR_ASSERTION</code> "assert(upgrade)"</td><td><code>HTTPError 101</code></td></tr>
+<tr><td>300 KB header</td><td>exit 100, "A value or data field grew larger than allowed"</td><td><code>UND_ERR_HEADERS_OVERFLOW</code></td><td><code>LineTooLong</code> (65536 bytes)</td></tr>
+</table>
+<p>The outer Node error is always <code>TypeError: fetch failed</code> (or <code>terminated</code> if the body broke). Print <code>err.cause</code> to see the real reason.</p>
+
+<h2>6. HEAD response with a body</h2>
+<p>We answered a HEAD request with <code>Content-Length: 2</code> plus the 2 body bytes, and left the connection open. Chromium fetch, Node fetch and curl all returned 200 with an empty body and no error. None of them reused that connection: the next GET arrived on a new TCP connection (curl -v printed "shutting down connection #0"). So a stray HEAD body does not break clients we tested, but it costs a new connection every time. Fix it anyway: never write a body for HEAD.</p>
+
+<h2>7. Fixes</h2>
+<ul>
+<li><strong>ERR_INVALID_HTTP_RESPONSE on every page:</strong> something is writing bytes before the status line. Typical causes: a debug print or warning that reaches the socket before the headers, a plain-HTTP client talking to a TLS or non-HTTP port, or a proxy pointed at the wrong upstream port. Run <code>curl -v http://host/path</code>; curl will say "Received HTTP/0.9 when not allowed" and you can see the first bytes.</li>
+<li><strong>NUL or control characters in a header:</strong> strip them before calling <code>setHeader</code>/<code>header()</code>. Values built from user input or binary data are the usual source. Node's own <code>http</code> module refuses them: <code>res.setHeader('X-T', 'a\0b')</code> threw <code>ERR_INVALID_CHAR</code> "Invalid character in header content" in our test. So this usually comes from hand-built responses or another proxy.</li>
+<li><strong>ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_LENGTH:</strong> two layers are each adding a length (app plus a middleware or proxy). Remove one. Details in <a href="/guides/content-length-header-mismatch/">Content-Length header mismatch</a>.</li>
+<li><strong>Content-Length and Transfer-Encoding together:</strong> Chromium tolerated it but Node fetch failed. Send one or the other. See <a href="/guides/transfer-encoding-chunked-vs-content-length/">Transfer-Encoding: chunked vs Content-Length</a>.</li>
+<li><strong>ERR_CONTENT_DECODING_FAILED:</strong> the header says gzip but the body is not gzip. Usually the body was compressed twice, or not at all, or a proxy decompressed it but kept the header. Check with <code>curl -sS -D - -o body.bin URL</code> and <code>file body.bin</code>. See <a href="/guides/content-encoding-gzip-vs-br-nginx/">Content-Encoding gzip vs br in nginx</a>.</li>
+<li><strong>Multiple Location or Content-Disposition:</strong> make sure only one code path sets the header. Per the PHP docs (not measured), <code>header()</code> replaces an earlier header of the same name by default; passing <code>false</code> as the second argument adds a second one.</li>
+<li><strong>Strange status codes:</strong> Chromium passed <code>0</code> and <code>1000</code> through, but curl, Node and Python rejected them. Use 100 to 599.</li>
+</ul>
+<p>If the connection is cut rather than malformed, see <a href="/guides/err-connection-reset-econnreset/">ERR_CONNECTION_RESET</a>. For HTTP/2 framing errors, see <a href="/guides/err-http2-protocol-error/">ERR_HTTP2_PROTOCOL_ERROR</a>.</p>
+<aside class="cta"><strong>Check the raw status line and headers your server actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between ERR_INVALID_RESPONSE and ERR_INVALID_HTTP_RESPONSE?</summary><p>Both are Chromium network errors. In our tests with Chromium 153, every unreadable HTTP/1.1 status line or header block (garbage, text before the status line, NUL bytes in headers, a stray 101) gave ERR_INVALID_HTTP_RESPONSE. None of our 60 malformed responses produced ERR_INVALID_RESPONSE.</p></details>
+<details><summary>Does a space before the colon in a header break Chrome?</summary><p>Not in Chromium 153: X-Test : a loaded fine, and so did curl and Python. Node 24 fetch rejected it with &#x27;Invalid header token&#x27;. Fix it anyway, since stricter clients fail.</p></details>
+<details><summary>What happens with two Content-Length headers?</summary><p>If the values differ, Chromium fails with net::ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_LENGTH. If they are equal, Chromium loads the page, but Node 24 fetch still failed with UND_ERR_RES_CONTENT_LENGTH_MISMATCH.</p></details>
+<details><summary>Does Content-Encoding: gzip with a plain body give ERR_INVALID_RESPONSE?</summary><p>No. Chromium 153 gave net::ERR_CONTENT_DECODING_FAILED, curl --compressed exited 61 with &#x27;incorrect header check&#x27;, and Node fetch failed with Z_DATA_ERROR.</p></details>
+<details><summary>How do I see what the server really sent?</summary><p>Run curl -v against the URL. It prints the status line and headers it received and names the problem, for example &#x27;Nul byte in header&#x27; or &#x27;Received HTTP/0.9 when not allowed&#x27;. In Chrome, read the net:: code in the DevTools console.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright, navigation and fetch), Node.js 24.21.0 fetch, curl 8.14.1 and Python 3.13.5 urllib, against a raw Node net server on 127.0.0.1 that wrote 60 hand-crafted HTTP/1.1 responses byte by byte. PlainHeaders is our extension; curl, Python, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

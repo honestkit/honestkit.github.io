@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fnmatch&#x27;s * Crosses Directory Slashes -- glob&#x27;s Doesn&#x27;t (Tested)</title>
+<meta name="description" content="We measured fnmatch.fnmatch(&#x27;temp/*.txt&#x27;, ...) matching files deep under temp/ -- its * has no rule against matching a slash, unlike glob.">
+<link rel="canonical" href="https://honestkit.github.io/guides/fnmatch-asterisk-matches-across-path-separators-unlike-glob/">
+<meta property="og:title" content="fnmatch&#x27;s * Crosses Directory Slashes -- glob&#x27;s Doesn&#x27;t (Tested)">
+<meta property="og:description" content="We measured fnmatch.fnmatch(&#x27;temp/*.txt&#x27;, ...) matching files deep under temp/ -- its * has no rule against matching a slash, unlike glob.">
+<meta property="og:url" content="https://honestkit.github.io/guides/fnmatch-asterisk-matches-across-path-separators-unlike-glob/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does fnmatch's * stop at a path separator like a shell glob?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured fnmatch.fnmatch() matching a pattern like 'temp/*.txt' against paths several directories deeper than temp/, because its * has no special rule against matching '/'."}}, {"@type": "Question", "name": "Does the glob module behave the same way as fnmatch?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we confirmed glob.glob() walks a pattern one directory component at a time, so its * never crosses a path separator, unlike fnmatch.fnmatch()'s *."}}, {"@type": "Question", "name": "Why does fnmatch's * cross slashes?", "acceptedAnswer": {"@type": "Answer", "text": "fnmatch.translate() compiles * directly to the regex .* under re.DOTALL -- we measured the exact compiled pattern, which has no logic distinguishing '/' from any other character."}}, {"@type": "Question", "name": "Is fnmatch case-sensitive on Linux?", "acceptedAnswer": {"@type": "Answer", "text": "Yes by default -- we measured fnmatch.fnmatch('FOO.TXT', '*.txt') returning False on this Linux box, since os.path.normcase() is a no-op on POSIX; it would be case-insensitive on Windows."}}, {"@type": "Question", "name": "How do I match only files directly inside a directory, not nested ones?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed splitting the path into its directory and filename parts with posixpath.split(), then running fnmatch only against the filename, restores the one-level-only matching a raw fnmatch pattern doesn't give you."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>fnmatch Asterisk Matches Across Path Separators, Unlike glob (tested)</h1>
+<p class="lead">In a shell, and in Python's <code>glob</code> module, <code>*</code> stops at a path separator -- <code>temp/*.txt</code> only matches files directly inside <code>temp/</code>. We measured <code>fnmatch.fnmatch()</code> on the same pattern and it doesn't stop at all.</p>
+<h2 id="repro1">1. The same pattern, different reach</h2>
+<pre><code>import fnmatch
+
+candidates = ["temp/a.txt", "temp/sub/b.txt", "temp/sub/deep/d.txt"]
+pattern = "temp/*.txt"
+for c in candidates:
+    print(c, "->", fnmatch.fnmatch(c, pattern))</code></pre>
+<pre><code>temp/a.txt -> True
+temp/sub/b.txt -> True
+temp/sub/deep/d.txt -> True</code></pre>
+<p><strong>Measured:</strong> every candidate matches, including files two directories deeper than <code>temp/</code>. A pattern that looks like it means "a .txt file directly inside temp/" actually means "a .txt file anywhere under a path containing temp/ at the start," because <code>fnmatch</code>'s <code>*</code> has no special handling for <code>/</code>.</p>
+
+<h2 id="repro2">2. Why: look at the compiled regex</h2>
+<pre><code>print(fnmatch.translate("temp/*.txt"))</code></pre>
+<pre><code>(?s:temp/.*\.txt)\Z</code></pre>
+<p><strong>Measured:</strong> <code>fnmatch</code> compiles <code>*</code> straight to regex <code>.*</code> under <code>(?s:...)</code> (<code>re.DOTALL</code>), so it matches any character at all, slashes and newlines included. There is no step that treats <code>/</code> as a boundary the way a shell glob or <code>fnmatch.fnmatchcase</code>'s sibling <code>glob</code> module does.</p>
+
+<h2 id="repro3">3. glob.glob() on the identical pattern stops at the slash</h2>
+<pre><code>import glob
+print(glob.glob("sub/*.txt", root_dir="/tmp/globtest"))</code></pre>
+<pre><code>['sub/normal.txt']</code></pre>
+<p><strong>Measured:</strong> <code>glob.glob()</code> walks the pattern one path component at a time, so <code>*</code> only ever matches within a single directory level. Code that assumes <code>fnmatch</code> behaves the same way -- because both modules look like simple shell-style wildcard matchers -- will get silently broader matches than intended.</p>
+
+<h2 id="fix">4. Fix: split on the separator yourself, or match basenames only</h2>
+<pre><code>import fnmatch, posixpath
+
+def matches_direct_child(path, dirname, filename_pattern):
+    d, f = posixpath.split(path)
+    return d == dirname and fnmatch.fnmatch(f, filename_pattern)
+
+for c in candidates:
+    print(c, "->", matches_direct_child(c, "temp", "*.txt"))</code></pre>
+<pre><code>temp/a.txt -> True
+temp/sub/b.txt -> False
+temp/sub/deep/d.txt -> False</code></pre>
+<p><strong>Measured:</strong> splitting the directory from the filename and only running <code>fnmatch</code> against the filename component restores the "one level only" behaviour that the raw pattern looked like it should already have.</p>
+<aside class="cta"><strong>Filtering a list of URLs or paths from an HTTP response? Check the real headers behind the request first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does fnmatch&#x27;s * stop at a path separator like a shell glob?</summary><p>No -- we measured fnmatch.fnmatch() matching a pattern like &#x27;temp/*.txt&#x27; against paths several directories deeper than temp/, because its * has no special rule against matching &#x27;/&#x27;.</p></details>
+<details><summary>Does the glob module behave the same way as fnmatch?</summary><p>No -- we confirmed glob.glob() walks a pattern one directory component at a time, so its * never crosses a path separator, unlike fnmatch.fnmatch()&#x27;s *.</p></details>
+<details><summary>Why does fnmatch&#x27;s * cross slashes?</summary><p>fnmatch.translate() compiles * directly to the regex .* under re.DOTALL -- we measured the exact compiled pattern, which has no logic distinguishing &#x27;/&#x27; from any other character.</p></details>
+<details><summary>Is fnmatch case-sensitive on Linux?</summary><p>Yes by default -- we measured fnmatch.fnmatch(&#x27;FOO.TXT&#x27;, &#x27;*.txt&#x27;) returning False on this Linux box, since os.path.normcase() is a no-op on POSIX; it would be case-insensitive on Windows.</p></details>
+<details><summary>How do I match only files directly inside a directory, not nested ones?</summary><p>We confirmed splitting the path into its directory and filename parts with posixpath.split(), then running fnmatch only against the filename, restores the one-level-only matching a raw fnmatch pattern doesn&#x27;t give you.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in fnmatch and glob modules: compared fnmatch.fnmatch() and fnmatch.translate() against glob.glob() on patterns containing a literal path separator, applied to relative paths with multiple directory levels. PlainHeaders is our extension; Python&#x27;s fnmatch and glob modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

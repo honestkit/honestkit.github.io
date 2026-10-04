@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Node.js Cannot Find Module: Causes and Fixes, Tested</title>
+<meta name="description" content="We reproduced Cannot find module in both CommonJS and ESM, including the extension gotcha that only breaks ESM imports, not require().">
+<link rel="canonical" href="https://honestkit.github.io/guides/node-cannot-find-module/">
+<meta property="og:title" content="Node.js Cannot Find Module: Causes and Fixes, Tested">
+<meta property="og:description" content="We reproduced Cannot find module in both CommonJS and ESM, including the extension gotcha that only breaks ESM imports, not require().">
+<meta property="og:url" content="https://honestkit.github.io/guides/node-cannot-find-module/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does the same missing file produce different error types in require() vs import?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed this directly: require() throws a plain Error with 'Cannot find module', while ESM import throws Error [ERR_MODULE_NOT_FOUND] \u2014 different error classes entirely, even for the identical missing-file scenario, because CommonJS and ESM use separate module resolution algorithms in Node."}}, {"@type": "Question", "name": "I have the file right there and it still says Cannot find module \u2014 why?", "acceptedAnswer": {"@type": "Answer", "text": "If you're using ESM (import, or \"type\": \"module\" in package.json), check whether you left off the file extension. We reproduced this exactly: import './foo' failed while import './foo.mjs' (the identical file) succeeded. CommonJS require() doesn't have this requirement."}}, {"@type": "Question", "name": "Does Cannot find module always mean a missing npm install?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we reproduced the identical error message for a missing local file (a relative path typo) and a missing installed package. Check whether the path starts with ./ or ../ (a local file problem) versus a bare name (an npm install problem) before assuming which one it is."}}, {"@type": "Question", "name": "What does the 'Require stack' section tell me?", "acceptedAnswer": {"@type": "Answer", "text": "It lists the chain of files that led to the failing require() call, which is useful when the bad import is several modules deep \u2014 you can trace exactly which file issued the require that actually failed, rather than guessing from the entry point."}}, {"@type": "Question", "name": "Is this the same as webpack's 'Module not found' or TypeScript's TS2307?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 those are build-time errors from a bundler or compiler resolving modules ahead of execution. This guide covers Node's own runtime module resolution (require()/import actually executing), which is a separate resolution step with its own rules and can fail even when a bundler build succeeded."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Node.js Cannot Find Module (tested)</h1>
+<p class="lead">This error means Node tried to resolve a module path &mdash; a local file or an installed package &mdash; and found nothing there. The exact wording and the fix differ depending on whether your code uses CommonJS <code>require()</code> or ESM <code>import</code>, which we reproduced separately below.</p>
+<h2>1. Reproduced: CommonJS, missing local file</h2>
+<pre><code>require('./doesnotexist')
+
+node:internal/modules/cjs/loader:1568
+  throw err;
+Error: Cannot find module './doesnotexist'
+Require stack:
+- /tmp/nodemod/[eval]</code></pre>
+<p>The "Require stack" tells you which file did the requiring &mdash; useful when the failing require() is several modules deep and you need to find the actual source of the bad path.</p>
+
+<h2>2. Reproduced: CommonJS, missing installed package</h2>
+<pre><code>require('some-package-that-is-not-installed')
+
+Error: Cannot find module 'some-package-that-is-not-installed'
+Require stack:
+- /tmp/nodemod/[eval]</code></pre>
+<p>Same error shape as a missing local file &mdash; Node's module resolution doesn't distinguish "you misspelled a relative path" from "you forgot to <code>npm install</code> a dependency" in the message itself. Check <code>node_modules/</code> or <code>package.json</code>'s dependencies to tell which one you're looking at.</p>
+
+<h2>3. Reproduced: ESM gives a different error class entirely</h2>
+<p>Using <code>import</code> instead of <code>require()</code> for the exact same missing-file situation produces <code>ERR_MODULE_NOT_FOUND</code>, not plain <code>Error</code>:</p>
+<pre><code>import { x } from './does-not-exist.mjs';
+
+node:internal/modules/esm/resolve:272
+    throw new ERR_MODULE_NOT_FOUND(
+Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/tmp/nodemod/does-not-exist.mjs'
+imported from /tmp/nodemod/bad_missing.mjs</code></pre>
+<p>Note it also resolved to a full absolute path, unlike CommonJS which kept the relative path as typed.</p>
+
+<h2>4. The gotcha that's unique to ESM: file extensions are mandatory</h2>
+<p>This is the single most common ESM-specific trigger, and it doesn't happen in CommonJS at all. Importing a real, existing file but leaving off <code>.mjs</code> fails:</p>
+<pre><code>// foo.mjs exists right next to this file
+import { x } from './foo';
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/tmp/nodemod/foo'
+imported from /tmp/nodemod/bad_no_ext.mjs</code></pre>
+<p>We confirmed the fix is simply adding the extension back &mdash; same file, same directory, only the import line changes:</p>
+<pre><code>import { x } from './foo.mjs';
+console.log(x);
+// -&gt; 1</code></pre>
+<p>CommonJS's <code>require('./foo')</code> auto-resolves <code>.js</code>/<code>.json</code>/<code>.node</code> extensions for you; native ESM <code>import</code> deliberately does not, by design (per Node's docs) &mdash; relative/absolute specifiers always need the full file extension. This trips up people porting CommonJS code to <code>"type": "module"</code> far more often than an actually missing file does.</p>
+
+<h2>5. Checklist before assuming the package is actually missing</h2>
+<ol>
+<li>Is it a relative path (starts with <code>./</code> or <code>../</code>)? Check the file exists at that exact path, and if you're using ESM, that the extension is included.</li>
+<li>Is it a bare package name? Check <code>node_modules/&lt;name&gt;</code> exists and that it's listed in <code>package.json</code> &mdash; a missing <code>npm install</code> after cloning a repo is the single most common real-world cause.</li>
+<li>Does the package define an ESM entry point? Some older packages only ship CommonJS; importing them with ESM <code>import</code> syntax can fail or behave differently depending on the package's own <code>exports</code> field in its <code>package.json</code>, which is a separate (though related) failure mode from a plain missing-module error.</li>
+</ol>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does the same missing file produce different error types in require() vs import?</summary><p>We confirmed this directly: require() throws a plain Error with &#x27;Cannot find module&#x27;, while ESM import throws Error [ERR_MODULE_NOT_FOUND] — different error classes entirely, even for the identical missing-file scenario, because CommonJS and ESM use separate module resolution algorithms in Node.</p></details>
+<details><summary>I have the file right there and it still says Cannot find module — why?</summary><p>If you&#x27;re using ESM (import, or &quot;type&quot;: &quot;module&quot; in package.json), check whether you left off the file extension. We reproduced this exactly: import &#x27;./foo&#x27; failed while import &#x27;./foo.mjs&#x27; (the identical file) succeeded. CommonJS require() doesn&#x27;t have this requirement.</p></details>
+<details><summary>Does Cannot find module always mean a missing npm install?</summary><p>No — we reproduced the identical error message for a missing local file (a relative path typo) and a missing installed package. Check whether the path starts with ./ or ../ (a local file problem) versus a bare name (an npm install problem) before assuming which one it is.</p></details>
+<details><summary>What does the &#x27;Require stack&#x27; section tell me?</summary><p>It lists the chain of files that led to the failing require() call, which is useful when the bad import is several modules deep — you can trace exactly which file issued the require that actually failed, rather than guessing from the entry point.</p></details>
+<details><summary>Is this the same as webpack&#x27;s &#x27;Module not found&#x27; or TypeScript&#x27;s TS2307?</summary><p>No — those are build-time errors from a bundler or compiler resolving modules ahead of execution. This guide covers Node&#x27;s own runtime module resolution (require()/import actually executing), which is a separate resolution step with its own rules and can fail even when a bundler build succeeded.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Node 24.21.0, running real CommonJS (require) and ESM (import) scripts against missing files and packages. Every error message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Node is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

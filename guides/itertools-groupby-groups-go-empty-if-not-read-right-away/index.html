@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>itertools.groupby Groups Go Empty If Not Read Right Away</title>
+<meta name="description" content="We measured itertools.groupby in Python 3.13.5: collecting (key, group) pairs first, reading later, returns empty lists, no error -- groups share one iterator.">
+<link rel="canonical" href="https://honestkit.github.io/guides/itertools-groupby-groups-go-empty-if-not-read-right-away/">
+<meta property="og:title" content="itertools.groupby Groups Go Empty If Not Read Right Away">
+<meta property="og:description" content="We measured itertools.groupby in Python 3.13.5: collecting (key, group) pairs first, reading later, returns empty lists, no error -- groups share one iterator.">
+<meta property="og:url" content="https://honestkit.github.io/guides/itertools-groupby-groups-go-empty-if-not-read-right-away/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why do my itertools.groupby groups come back empty?", "acceptedAnswer": {"@type": "Answer", "text": "We measured this: it happens when you store the (key, group) pairs in a list or variable before reading them. All groups returned by groupby() share one underlying source iterator, so advancing to the next key drains the previous group before you ever read it."}}, {"@type": "Question", "name": "Does groupby raise an error when this happens?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we confirmed it fails silently. You get an empty list for every group with no exception, which makes it easy to miss in a script that otherwise runs cleanly."}}, {"@type": "Question", "name": "How do I fix empty groupby groups?", "acceptedAnswer": {"@type": "Answer", "text": "Consume each group inside the same loop iteration that produced it, for example with list(group) or a dict/list comprehension, before the loop advances to the next key."}}, {"@type": "Question", "name": "Does itertools.groupby group all matching items, even if they're not next to each other?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured this directly: groupby() only merges consecutive items with equal keys. Equal keys separated by a different key produce separate groups; sort the data by the key first if you need all matching items together."}}, {"@type": "Question", "name": "Is this specific to groupby, or does it affect other itertools functions?", "acceptedAnswer": {"@type": "Answer", "text": "This particular trap is specific to groupby()'s shared-iterator design per the Python docs -- it's not measured here for other itertools functions like tee() or chain(), which have their own, different gotchas."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>itertools.groupby Groups Go Empty If Not Read Right Away (tested)</h1>
+<p class="lead"><code>itertools.groupby()</code> looks like it returns a list of groups you can read whenever you want. We measured what happens when you store the groups instead of reading them inside the loop, and the result is silent, wrong data with no exception at all.</p>
+<h2 id="repro1">1. Reading each group immediately works fine</h2>
+<pre><code>import itertools
+
+data = [("a", 1), ("a", 2), ("b", 3), ("b", 4)]
+result = []
+for key, group in itertools.groupby(data, key=lambda x: x[0]):
+    result.append((key, list(group)))  # consumed right inside the loop
+print(result)</code></pre>
+<pre><code>[('a', [('a', 1), ('a', 2)]), ('b', [('b', 3), ('b', 4)])]</code></pre>
+<p><strong>Measured:</strong> calling <code>list(group)</code> while the loop is still on that group produces the expected data.</p>
+
+<h2 id="repro2">2. Collecting the pairs first, then reading, silently returns empty groups</h2>
+<pre><code>import itertools
+
+data = [("a", 1), ("a", 2), ("b", 3), ("b", 4)]
+collected = list(itertools.groupby(data, key=lambda x: x[0]))  # store (key, group) pairs
+for key, group in collected:
+    print(key, list(group))</code></pre>
+<pre><code>a []
+b []</code></pre>
+<p><strong>Measured:</strong> both groups come back empty -- no exception, no warning, just silently wrong output. The root cause: <code>groupby()</code> hands out group iterators that all share the same underlying source iterator. Advancing past the first group to find the second one drains whatever was left of the first group's items, and by the time the loop body runs, every group's iterator has already been exhausted by that advancing.</p>
+
+<h2 id="repro3">3. groupby doesn't merge non-adjacent groups with the same key either</h2>
+<pre><code>import itertools
+
+data = [("a", 1), ("b", 2), ("a", 3)]
+print([(k, list(g)) for k, g in itertools.groupby(data, key=lambda x: x[0])])
+
+data_sorted = sorted(data, key=lambda x: x[0])
+print([(k, list(g)) for k, g in itertools.groupby(data_sorted, key=lambda x: x[0])])</code></pre>
+<pre><code>[('a', [('a', 1)]), ('b', [('b', 2)]), ('a', [('a', 3)])]
+[('a', [('a', 1), ('a', 3)]), ('b', [('b', 2)])]</code></pre>
+<p><strong>Measured:</strong> the first run produces three groups, not two -- the two <code>'a'</code> rows are split apart because a <code>'b'</code> row sits between them, and <code>groupby()</code> only ever looks at the immediately preceding key. Sorting by the key first (second run) is what actually merges them. <code>groupby()</code> groups <em>consecutive</em> items with equal keys, not all items with equal keys.</p>
+
+<h2 id="fix">4. Fix: consume each group before moving on, and sort first if keys aren't already contiguous</h2>
+<pre><code>import itertools
+
+data = [("a", 1), ("b", 2), ("a", 3), ("b", 4)]
+data.sort(key=lambda x: x[0])  # make equal keys contiguous
+result = {key: list(group) for key, group in itertools.groupby(data, key=lambda x: x[0])}
+print(result)</code></pre>
+<pre><code>{'a': [('a', 1), ('a', 3)], 'b': [('b', 2), ('b', 4)]}</code></pre>
+<p><strong>Measured:</strong> building the dict (or list) comprehension right inside the same loop that drives <code>groupby()</code> -- never deferring the <code>list(group)</code> call to a later loop -- keeps every group intact.</p>
+<aside class="cta"><strong>Debugging a script that talks to an API? Check the real request/response headers first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why do my itertools.groupby groups come back empty?</summary><p>We measured this: it happens when you store the (key, group) pairs in a list or variable before reading them. All groups returned by groupby() share one underlying source iterator, so advancing to the next key drains the previous group before you ever read it.</p></details>
+<details><summary>Does groupby raise an error when this happens?</summary><p>No -- we confirmed it fails silently. You get an empty list for every group with no exception, which makes it easy to miss in a script that otherwise runs cleanly.</p></details>
+<details><summary>How do I fix empty groupby groups?</summary><p>Consume each group inside the same loop iteration that produced it, for example with list(group) or a dict/list comprehension, before the loop advances to the next key.</p></details>
+<details><summary>Does itertools.groupby group all matching items, even if they&#x27;re not next to each other?</summary><p>No -- we measured this directly: groupby() only merges consecutive items with equal keys. Equal keys separated by a different key produce separate groups; sort the data by the key first if you need all matching items together.</p></details>
+<details><summary>Is this specific to groupby, or does it affect other itertools functions?</summary><p>This particular trap is specific to groupby()&#x27;s shared-iterator design per the Python docs -- it&#x27;s not measured here for other itertools functions like tee() or chain(), which have their own, different gotchas.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in itertools module: ran itertools.groupby() over a small list of (key, value) tuples, once consuming each group immediately with list(g) inside the loop, and once collecting the (key, group) pairs into a list first and reading the groups afterward. PlainHeaders is our extension; Python&#x27;s itertools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

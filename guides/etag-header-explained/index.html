@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ETag Header Explained: Example, Format, 304 Not Modified and Weak ETags (Tested)</title>
+<meta name="description" content="What an ETag is and how If-None-Match turns it into 304 Not Modified, measured on nginx with curl: the ETag format, why gzip adds W/, why a deploy that only touches files changes every ETag, and how to turn ETags off.">
+<link rel="canonical" href="https://honestkit.github.io/guides/etag-header-explained/">
+<meta property="og:title" content="ETag Header Explained: Example, Format, 304 Not Modified and Weak ETags (Tested)">
+<meta property="og:description" content="What an ETag is and how If-None-Match turns it into 304 Not Modified, measured on nginx with curl: the ETag format, why gzip adds W/, why a deploy that only touches files changes every ETag, and how to turn ETags off.">
+<meta property="og:url" content="https://honestkit.github.io/guides/etag-header-explained/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does the ETag header do?", "acceptedAnswer": {"@type": "Answer", "text": "It labels a version of a response. The client sends it back in If-None-Match; if it still matches, the server replies 304 Not Modified with no body. nginx did exactly that in our test."}}, {"@type": "Question", "name": "What does W/ mean in an ETag?", "acceptedAnswer": {"@type": "Answer", "text": "Weak: equivalent content, not necessarily identical bytes. nginx turned the strong ETag into W/\"\u2026\" when it gzipped the file, and still answered 304 to it."}}, {"@type": "Question", "name": "Why did my ETag change when the file didn't?", "acceptedAnswer": {"@type": "Answer", "text": "nginx builds it from modification time and size. A touch with unchanged content changed the ETag in our test."}}, {"@type": "Question", "name": "ETag or Last-Modified?", "acceptedAnswer": {"@type": "Answer", "text": "Both work for revalidation. nginx sends both by default; with 'etag off' it still sent Last-Modified."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ETag header explained: format, 304 responses and the gzip W/ prefix (tested on nginx)</h1>
+<p class="lead">An ETag is a version label for a response. The browser sends it back as If-None-Match, and if nothing changed the server answers 304 with no body. We measured how nginx does it.</p>
+<h2>1. The round trip</h2>
+<pre><code>$ curl -sI https://site/app.js
+HTTP/1.1 200 OK
+Last-Modified: Thu, 01 Oct 2026 12:08:29 GMT
+ETag: "6abe4d3d-1900"
+
+$ curl -sI -H 'If-None-Match: "6abe4d3d-1900"' https://site/app.js
+HTTP/1.1 304 Not Modified</code></pre>
+<p>A different value (<code>"nope"</code>) got a normal 200 with the full file. The 304 saves the body, not the request: the client still asks every time unless <code>Cache-Control</code> lets it reuse its copy without asking.</p>
+<h2>2. What nginx's ETag is made of</h2>
+<p><code>"6abe4d3d-1900"</code> is two hex numbers: <code>6abe4d3d</code> = the file's modification time (1790856509 = 12:08:29 UTC, the Last-Modified above) and <code>1900</code> = its size (6,400 bytes). It is not a hash of the content. Consequence, measured: after <code>touch</code> with the content unchanged, the ETag became <code>"6abe4438-1900"</code> and the old ETag got a full 200. Deploys that rewrite every file, or servers behind a load balancer with different file times, give clients a new ETag for every file even when nothing changed.</p>
+<h2>3. W/ = weak, and gzip adds it</h2>
+<table><thead><tr><th>Request to nginx with <code>gzip on</code></th><th>ETag returned</th></tr></thead><tbody>
+<tr><td>No Accept-Encoding</td><td><code>"6abe4d3d-1900"</code></td></tr>
+<tr><td><code>Accept-Encoding: gzip</code></td><td><code>W/"6abe4d3d-1900"</code> + <code>Content-Encoding: gzip</code></td></tr>
+</tbody></table>
+<p>The compressed bytes differ from the file, so nginx marks the ETag weak ("same meaning, maybe not the same bytes"). Revalidation still worked: <code>If-None-Match: W/"6abe4d3d-1900"</code> got a 304, and so did the weak form sent against the uncompressed URL. If a scanner or CDN reports "weak ETag", gzip is the usual reason, and it is harmless for caching.</p>
+<h2>4. Turning ETags off</h2>
+<pre><code>location /static/ {
+    etag off;   # nginx: no ETag header; Last-Modified is still sent
+}</code></pre>
+<p>With <code>etag off</code> nginx sent no ETag but kept <code>Last-Modified</code>, so browsers can still revalidate with If-Modified-Since. Security scanners sometimes flag ETags as leaking inode numbers: that applies to old Apache defaults (<code>FileETag INode MTime Size</code>), not to nginx, whose ETag holds only time and size as shown above.</p>
+<p>Check any URL's ETag, Last-Modified and Cache-Control with <code>curl -sI</code> or the free <a href="/tools/http-headers/">HTTP headers tool</a>.</p>
+<aside class="cta"><strong>See the ETag and caching headers of any page in the browser:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does the ETag header do?</summary><p>It labels a version of a response. The client sends it back in If-None-Match; if it still matches, the server replies 304 Not Modified with no body. nginx did exactly that in our test.</p></details>
+<details><summary>What does W/ mean in an ETag?</summary><p>Weak: equivalent content, not necessarily identical bytes. nginx turned the strong ETag into W/&quot;…&quot; when it gzipped the file, and still answered 304 to it.</p></details>
+<details><summary>Why did my ETag change when the file didn&#x27;t?</summary><p>nginx builds it from modification time and size. A touch with unchanged content changed the ETag in our test.</p></details>
+<details><summary>ETag or Last-Modified?</summary><p>Both work for revalidation. nginx sends both by default; with &#x27;etag off&#x27; it still sent Last-Modified.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 with curl 8.14.1 against nginx 1.31.6 in a throwaway container serving one 6,400-byte JavaScript file, with gzip on and off and with &#x27;etag off&#x27;. The Apache FileETag remark is from Apache&#x27;s documentation, not this test. PlainHeaders is our extension; curl and the HTTP headers tool are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

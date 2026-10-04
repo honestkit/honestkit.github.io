@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>require is not defined in ES module scope: Fixed (Node 24)</title>
+<meta name="description" content="We reproduced this error and 3 related ones on Node.js 24 and found Node&#x27;s own behaviour has quietly changed: require() of ESM now works in most cases.">
+<link rel="canonical" href="https://honestkit.github.io/guides/require-is-not-defined-in-es-module-scope/">
+<meta property="og:title" content="require is not defined in ES module scope: Fixed (Node 24)">
+<meta property="og:description" content="We reproduced this error and 3 related ones on Node.js 24 and found Node&#x27;s own behaviour has quietly changed: require() of ESM now works in most cases.">
+<meta property="og:url" content="https://honestkit.github.io/guides/require-is-not-defined-in-es-module-scope/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is \"require is not defined in ES module scope\" a bug in my code or in Node?", "acceptedAnswer": {"@type": "Answer", "text": "Neither \u2014 it's Node correctly telling you the file is running as an ES module (because of \"type\": \"module\" or a .mjs extension), so the CommonJS-only require() function doesn't exist in that scope. Switch to import, or force the file back to CommonJS with a .cjs extension."}}, {"@type": "Question", "name": "Why didn't I get \"Cannot use import statement outside a module\" like the error message online says?", "acceptedAnswer": {"@type": "Answer", "text": "On Node 20.19+/22.12+/24, a plain typeless .js file with import/export syntax is now auto-detected as an ES module and silently reparsed, with only a performance warning \u2014 not a thrown error. We confirmed this on Node 24.21.0. The hard SyntaxError still fires if the file has a .cjs extension, which forces CommonJS parsing and skips detection."}}, {"@type": "Question", "name": "Does require() of an ES module still throw ERR_REQUIRE_ESM?", "acceptedAnswer": {"@type": "Answer", "text": "Not by default on current Node (22.12+/24): we required a real ESM package from a .cjs file on Node 24.21.0 and it worked with no error. ERR_REQUIRE_ESM still exists for the --no-experimental-require-module flag, older Node versions, and ESM modules with top-level await (which throw the newer ERR_REQUIRE_ASYNC_MODULE instead)."}}, {"@type": "Question", "name": "What's the one case where require() of an ESM module still fails on current Node?", "acceptedAnswer": {"@type": "Answer", "text": "Top-level await. We measured it: requiring an ESM file containing a top-level await throws Error [ERR_REQUIRE_ASYNC_MODULE]: require() cannot be used on an ESM graph with top-level await. Use import() instead, and that advice is correct \u2014 switch that one call site to a dynamic import()."}}, {"@type": "Question", "name": "How do I tell Node a file must always be CommonJS or always be ESM, regardless of package.json?", "acceptedAnswer": {"@type": "Answer", "text": "Use the file extension: .cjs always forces CommonJS parsing (require/module.exports, no top-level import/export), and .mjs always forces ES module parsing (import/export, no require), no matter what \"type\" says in the nearest package.json."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>require is not defined in ES module scope (tested)</h1>
+<p class="lead"><code>ReferenceError: require is not defined in ES module scope, you can use import instead</code> means a file is running as an ES module (ESM) but calls the CommonJS-only function <code>require()</code>. We reproduced it on Node.js 24.21.0, along with 3 related errors people search for in the same confusion — and found that Node's own rules changed recently enough that a lot of existing advice about them is now out of date.</p><p>If you want the short version: a file is ESM if its nearest <code>package.json</code> has <code>"type": "module"</code>, or the file ends in <code>.mjs</code>. Otherwise it is CommonJS, unless it ends in <code>.cjs</code>, which forces CommonJS no matter what.</p>
+<h2>1. The error, reproduced</h2>
+<p>With <code>package.json</code> containing <code>{"type": "module"}</code>, this file:</p>
+<pre><code>const fs = require('fs');
+console.log(fs);</code></pre>
+<p>fails immediately on Node 24.21.0:</p>
+<pre><code>file:///tmp/esmtest/a/bad.js:1
+const fs = require('fs');
+           ^
+
+ReferenceError: require is not defined in ES module scope, you can use import instead</code></pre>
+<p>The fix is exactly what the message says: use <code>import</code>.</p>
+<pre><code>import fs from 'fs';
+console.log(fs);</code></pre>
+
+<h2>2. The fix depends on why the file is ESM</h2>
+<table>
+<tr><th>Why the file is ESM</th><th>Fix</th></tr>
+<tr><td>Nearest <code>package.json</code> has <code>"type": "module"</code> and you only meant this one file to be CommonJS</td><td>Rename the file to <code>.cjs</code> — that extension forces CommonJS regardless of <code>type</code>.</td></tr>
+<tr><td>File extension is <code>.mjs</code></td><td>Either rename to <code>.cjs</code>/plain <code>.js</code> without <code>type:module</code>, or convert the <code>require()</code> calls to <code>import</code>.</td></tr>
+<tr><td>You actually want ESM everywhere (modern code, tree-shaking, top-level await)</td><td>Convert to <code>import</code>/<code>export</code> throughout. There is no partial mode: a file is fully ESM or fully CommonJS.</td></tr>
+</table>
+
+<h2>3. A related error that no longer reproduces the way you'd expect: "Cannot use import statement outside a module"</h2>
+<p>This is the mirror-image mistake: <code>import</code> syntax in a file Node thinks is CommonJS. On older Node versions this reliably threw <code>SyntaxError: Cannot use import statement outside a module</code>. On Node 24.21.0 with a plain <code>.js</code> file and no <code>"type": "module"</code>, it does <strong>not</strong> throw that error any more:</p>
+<pre><code>$ node bad.js
+(node:2117527) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///tmp/esmtest/b/bad.js is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to /tmp/esmtest/b/package.json.
+{ appendFile: [Function: appendFile], ... }</code></pre>
+<p>Node now auto-detects ESM syntax in typeless <code>.js</code> files and silently reparses the file as a module, only warning about the performance cost. It works, but it is slower to start and the warning will show up in your logs. The classic hard error still happens if you force CommonJS parsing by using a <code>.cjs</code> extension:</p>
+<pre><code>$ node importer.cjs
+/tmp/esmtest/c/importer.cjs:1
+import fs from 'fs';
+^^^^^^
+
+SyntaxError: Cannot use import statement outside a module
+    at wrapSafe (node:internal/modules/cjs/loader:1861:18)</code></pre>
+<p><strong>Takeaway: if you're on Node 20.19+/22.12+/24 and don't see this error where you expected it, that's correct — add <code>"type": "module"</code> to silence the warning rather than chasing an error that won't appear. If you need the strict error (e.g. in a test asserting file type), use <code>.cjs</code>.</strong></p>
+
+<h2>4. ERR_REQUIRE_ESM: also mostly gone on current Node</h2>
+<p>The third error in this family is requiring an ESM package from CommonJS. Historically this always threw <code>Error [ERR_REQUIRE_ESM]</code>. We built a real local ESM package (<code>"type": "module"</code>, exporting a named function) and required it from a <code>.cjs</code> file on Node 24.21.0:</p>
+<pre><code>const { hello } = require('./esm_pkg/index.js');
+console.log(hello());
+// -&gt; prints "hi" -- no error at all</code></pre>
+<p>This works because Node 22.12+ (unflagged; Node 24 included) added synchronous <code>require()</code> support for ES modules. <code>ERR_REQUIRE_ESM</code> still exists, but on current Node it only fires in two cases we could reproduce:</p>
+<ul>
+<li>You explicitly disable the feature: <code>node --no-experimental-require-module entry.cjs</code> brings the classic error back verbatim: <code>Error [ERR_REQUIRE_ESM]: require() of ES Module ... not supported. Instead change the require of index.js in entry.cjs to a dynamic import() ...</code></li>
+<li>You're on an older Node release (before 20.19/22.12) where the feature doesn't exist yet.</li>
+</ul>
+<p>There is a fourth, genuinely current failure mode this uncovers: if the required ESM module has a <strong>top-level <code>await</code></strong>, synchronous <code>require()</code> cannot wait for it, so Node throws a different, newer error:</p>
+<pre><code>Error [ERR_REQUIRE_ASYNC_MODULE]: require() cannot be used on an ESM graph with top-level await. Use import() instead. To see where the top-level await comes from, use --experimental-print-required-tla.</code></pre>
+<p>That one you do still need to fix with a dynamic <code>import()</code> — there's no way to <code>require()</code> your way out of real top-level <code>await</code>.</p>
+
+<h2>5. "SyntaxError: Unexpected token 'export'": usually a tooling/transform problem, not a Node core one</h2>
+<p>This string shows up most in test runners (Jest with the default CommonJS transform is the single biggest source, per the autocomplete data behind this guide) and older bundler setups, when a <code>require()</code>-based tool loads a file that uses <code>export</code> syntax and the tool's own parser (not plain Node) chokes on it. We reproduced the core mechanism without needing Jest installed: requiring any file containing <code>export</code> syntax through a code path that forces CommonJS parsing hits this before Node even gets to module-type detection, since <code>export</code> is as much a syntax error in CommonJS as <code>import</code> is.</p>
+<p>Fixes, in order of how often they apply: (1) for Jest, set <code>"type": "module"</code> in the package under test and use Jest's ESM mode, or add the offending package to <code>transformIgnorePatterns</code> exceptions so Babel/ts-jest transpiles it; (2) for a plain script, make sure the file importing it is itself ESM (<code>type:module</code> or <code>.mjs</code>) so <code>export</code> is valid syntax in context; (3) check you don't have a stray <code>.cjs</code> extension forcing CommonJS on a file that's meant to be ESM.</p>
+
+<h2>6. Quick reference</h2>
+<table>
+<tr><th>Error</th><th>Means</th><th>Still happens on Node 24 by default?</th></tr>
+<tr><td>require is not defined in ES module scope</td><td><code>require()</code> called inside a real ES module</td><td>Yes, always</td></tr>
+<tr><td>Cannot use import statement outside a module</td><td><code>import</code>/<code>export</code> syntax where Node expects CommonJS</td><td>Only with a <code>.cjs</code> file; plain typeless <code>.js</code> now auto-detects and warns instead</td></tr>
+<tr><td>ERR_REQUIRE_ESM</td><td><code>require()</code> of an ESM package</td><td>Only with <code>--no-experimental-require-module</code>, older Node, or packages Node can't load synchronously</td></tr>
+<tr><td>ERR_REQUIRE_ASYNC_MODULE</td><td><code>require()</code> of an ESM module with top-level <code>await</code></td><td>Yes, always — use <code>import()</code></td></tr>
+</table>
+<p>See also <a href="/guides/typescript-cannot-find-module/">TypeScript: Cannot find module</a> and <a href="/guides/vite-failed-to-resolve-import/">Vite: Failed to resolve import</a> for the two most common neighbouring build-tool errors.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is &quot;require is not defined in ES module scope&quot; a bug in my code or in Node?</summary><p>Neither — it&#x27;s Node correctly telling you the file is running as an ES module (because of &quot;type&quot;: &quot;module&quot; or a .mjs extension), so the CommonJS-only require() function doesn&#x27;t exist in that scope. Switch to import, or force the file back to CommonJS with a .cjs extension.</p></details>
+<details><summary>Why didn&#x27;t I get &quot;Cannot use import statement outside a module&quot; like the error message online says?</summary><p>On Node 20.19+/22.12+/24, a plain typeless .js file with import/export syntax is now auto-detected as an ES module and silently reparsed, with only a performance warning — not a thrown error. We confirmed this on Node 24.21.0. The hard SyntaxError still fires if the file has a .cjs extension, which forces CommonJS parsing and skips detection.</p></details>
+<details><summary>Does require() of an ES module still throw ERR_REQUIRE_ESM?</summary><p>Not by default on current Node (22.12+/24): we required a real ESM package from a .cjs file on Node 24.21.0 and it worked with no error. ERR_REQUIRE_ESM still exists for the --no-experimental-require-module flag, older Node versions, and ESM modules with top-level await (which throw the newer ERR_REQUIRE_ASYNC_MODULE instead).</p></details>
+<details><summary>What&#x27;s the one case where require() of an ESM module still fails on current Node?</summary><p>Top-level await. We measured it: requiring an ESM file containing a top-level await throws Error [ERR_REQUIRE_ASYNC_MODULE]: require() cannot be used on an ESM graph with top-level await. Use import() instead, and that advice is correct — switch that one call site to a dynamic import().</p></details>
+<details><summary>How do I tell Node a file must always be CommonJS or always be ESM, regardless of package.json?</summary><p>Use the file extension: .cjs always forces CommonJS parsing (require/module.exports, no top-level import/export), and .mjs always forces ES module parsing (import/export, no require), no matter what &quot;type&quot; says in the nearest package.json.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 on Linux. Every example below is a real run in /tmp, not a quote from docs. Node.js is free and open source.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

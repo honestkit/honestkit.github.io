@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Postgres Connection Refused / Could Not Connect (Tested)</title>
+<meta name="description" content="We measured the exact Node pg driver errors for a closed port, a stopped server, wrong password and a bad hostname, so you can match the message to the fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/postgres-connection-refused-could-not-connect/">
+<meta property="og:title" content="Postgres Connection Refused / Could Not Connect (Tested)">
+<meta property="og:description" content="We measured the exact Node pg driver errors for a closed port, a stopped server, wrong password and a bad hostname, so you can match the message to the fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/postgres-connection-refused-could-not-connect/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the exact error code for a Postgres connection refused in Node?", "acceptedAnswer": {"@type": "Answer", "text": "With the pg npm driver (measured, v8.23.1) the thrown error has code ECONNREFUSED and a message like \"connect ECONNREFUSED 127.0.0.1:5433\". We reproduced this against both a closed port and a Postgres container we stopped mid-test."}}, {"@type": "Question", "name": "Is \"connection refused\" the same as \"password authentication failed\"?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured both: ECONNREFUSED means nothing answered the TCP connection at all. \"password authentication failed for user...\" (code 28P01) means Postgres answered and rejected your credentials. The first is a network/process problem; the second is a config/credentials problem."}}, {"@type": "Question", "name": "Why does my app get connection refused only when started with Docker Compose?", "acceptedAnswer": {"@type": "Answer", "text": "Most likely the startup race: Compose starts the app and Postgres containers together, but Postgres takes time to initialize. We measured 3 seconds for a fresh postgres:16-alpine container to log ready. An app that connects immediately with no retry hits ECONNREFUSED in that window. Per Docker docs, a healthcheck plus depends_on: condition: service_healthy fixes this."}}, {"@type": "Question", "name": "I get ENOTFOUND instead of ECONNREFUSED \u2014 what does that mean?", "acceptedAnswer": {"@type": "Answer", "text": "We measured ENOTFOUND (getaddrinfo ENOTFOUND) when connecting to a hostname that has no DNS record at all, such as a Docker Compose service name used from a container not on that Compose network. ECONNREFUSED means the name resolved but nothing was listening; ENOTFOUND means the name never resolved."}}, {"@type": "Question", "name": "Could Postgres be running but still refuse connections?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, per the PostgreSQL docs (not measured on this box): if listen_addresses is set to only 127.0.0.1, Postgres refuses connections arriving from any other network interface even while the process runs and logs normally. We did measure that a running, reachable Postgres with the wrong password gives a completely different error (28P01), confirming reachability and auth are checked separately."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Postgres connection refused (tested)</h1>
+<p class="lead"><code>connection refused</code> and <code>could not connect to server</code> mean your app reached out for Postgres and found nobody there. We ran a real Postgres in Docker, then killed it, mistyped its password and pointed at a hostname that does not resolve, to capture the exact error for each case.</p>
+<h2>1. The error you are probably seeing</h2>
+<p>In Node, the <code>pg</code> driver throws an <code>Error</code> whose <code>code</code> is <code>ECONNREFUSED</code> when a TCP connection to the given host and port is actively rejected. We measured this directly: connecting to port 5434 (nothing listening) with <code>pg</code> 8.23.1 produced this error 3 ms after the connect call:</p>
+<pre><code>message: connect ECONNREFUSED 127.0.0.1:5434
+code: ECONNREFUSED
+errno: -111
+syscall: connect
+address: 127.0.0.1
+port: 5434</code></pre>
+<p>The same error, same shape, is what psql's <code>could not connect to server: Connection refused</code> message means per the PostgreSQL docs (not measured here, since this box has no <code>psql</code> binary): the OS rejected the TCP connection outright, almost always because nothing is listening on that host/port.</p>
+
+<h2>2. Our test setup</h2>
+<p>This box has Docker but no Postgres client binaries (<code>which psql pg_isready</code> returned nothing). So we ran a real, throwaway Postgres server and drove it with Node's <code>pg</code> driver instead of psql.</p>
+<pre><code>docker run --rm -d --name forever-pgtest -p 5433:5432 \
+  -e POSTGRES_PASSWORD=test postgres:16-alpine</code></pre>
+<p>It logged <code>database system is ready to accept connections</code> 3 seconds after start. We then connected with the correct password, with a wrong password, with a hostname that cannot resolve, and finally stopped the container and reconnected to the same port to capture the exact moment "listening" becomes "refused".</p>
+
+<h2>3. Results: four different errors, four different fixes</h2>
+<table>
+<tr><th>Scenario</th><th>What we did</th><th>Exact error</th><th>code</th><th>Meaning</th></tr>
+<tr><td>Nothing listening on the port</td><td>Connected to closed port 5434</td><td><code>connect ECONNREFUSED 127.0.0.1:5434</code></td><td>ECONNREFUSED</td><td>Postgres is not running, or not on this port</td></tr>
+<tr><td>Server up, correct password</td><td>Connected to live postgres:16-alpine on 5433</td><td>connected in 26 ms, <code>PostgreSQL 16.15</code> returned</td><td>&ndash;</td><td>Happy path, included for comparison</td></tr>
+<tr><td>Server up, wrong password</td><td>Same server, wrong password</td><td><code>password authentication failed for user "postgres"</code></td><td>28P01</td><td>Server reachable, credentials wrong &mdash; not a network problem</td></tr>
+<tr><td>Hostname does not resolve</td><td>Connected to host <code>db</code> (a Docker Compose-style service name), no DNS record for it</td><td><code>getaddrinfo ENOTFOUND db</code></td><td>ENOTFOUND</td><td>App is not on the same Docker network as the one defining that hostname</td></tr>
+<tr><td>Server stopped mid-session</td><td><code>docker stop forever-pgtest</code>, then reconnected to 5433</td><td><code>connect ECONNREFUSED 127.0.0.1:5433</code></td><td>ECONNREFUSED</td><td>Same shape as case 1 &mdash; the driver cannot tell "never started" from "just stopped"</td></tr>
+</table>
+<p>The important distinction: <strong>ECONNREFUSED</strong> and <strong>28P01 (password authentication failed)</strong> are different errors that look similar in a panicked read of the logs but mean opposite things. ECONNREFUSED means nothing answered the TCP connection at all &mdash; the fix is on the network/process side. 28P01 means Postgres answered and rejected your credentials &mdash; the fix is in your connection string or <code>pg_hba.conf</code>, and the network is fine.</p>
+
+<h2>4. The classic Docker Compose race</h2>
+<p>If your app and Postgres are both Docker Compose services, a very common sequence is: Compose starts both containers at once, the app container's process reaches its <code>connect()</code> call in milliseconds, but Postgres takes a few seconds to initialize (we measured <strong>3 seconds</strong> for postgres:16-alpine to log "ready to accept connections" from a cold image pull plus init). During that window the app gets exactly the ECONNREFUSED we measured in case 1, because the TCP listener genuinely does not exist yet.</p>
+<p>This is distinct from a wrong-password failure (case 3), which only happens once Postgres is actually listening. If you see ECONNREFUSED immediately on every container start but it goes away on a manual retry seconds later, that is the startup race, not a configuration bug. Per Docker Compose docs (not measured here), <code>depends_on: condition: service_healthy</code> with a <code>pg_isready</code> healthcheck is the standard fix, since <code>depends_on</code> alone only waits for the container to start, not for Postgres inside it to be ready.</p>
+
+<h2>5. Why a hostname/network mismatch produces a different error</h2>
+<p>We measured that connecting to a hostname with no DNS entry (<code>db</code>, a typical Compose service name) gives <code>ENOTFOUND</code>, not <code>ECONNREFUSED</code>. That distinction matters for diagnosis:</p>
+<ul>
+<li><strong>ENOTFOUND</strong> (measured): the name never resolved to an address at all. This happens when your app container is not on the same Docker network as the Postgres container, so the Compose-internal DNS name for the Postgres service does not exist from the app's point of view.</li>
+<li><strong>ECONNREFUSED</strong> (measured): the name/address resolved fine, but nothing answered on that port. Per Postgres and Docker docs (not measured here), this is what you get if Postgres is bound to <code>127.0.0.1</code> only (the container's own loopback) instead of <code>0.0.0.0</code>, or if the app reaches the right IP over a bridge network but the wrong port was published.</li>
+</ul>
+<p>If you're debugging across a Docker bridge network vs. host networking, per Docker docs (not measured), containers on the default bridge network reach each other by service name and the container's internal port, not by <code>localhost</code>/<code>127.0.0.1</code> &mdash; <code>localhost</code> inside a container refers to that container itself. Using <code>localhost</code> for the Postgres host from inside another container is a common cause of ECONNREFUSED that looks identical to "Postgres isn't running" but is actually a networking-scope mistake.</p>
+
+<h2>6. Common causes, ranked</h2>
+<ul>
+<li><strong>Postgres process not started yet or crashed.</strong> Measured: gives ECONNREFUSED, identical whether it never started or was stopped after running (see case 1 vs. case 5 above).</li>
+<li><strong>Wrong port in the connection string.</strong> Per docs, not measured: produces the same ECONNREFUSED if nothing else is listening on the port you guessed, or a protocol error if something non-Postgres is listening there.</li>
+<li><strong>Docker Compose startup race.</strong> Measured timing: our container took 3 s to become ready; an app that connects at container start with no retry/backoff will hit ECONNREFUSED in that window.</li>
+<li><strong>App and database on different Docker networks, or using <code>localhost</code> across containers.</strong> Measured: gives ENOTFOUND for an unresolvable Compose service name; per docs, gives ECONNREFUSED for a resolvable address with nothing listening (e.g. <code>localhost</code> misuse).</li>
+<li><strong>Postgres bound to 127.0.0.1 only.</strong> Per Postgres docs (<code>listen_addresses</code>), not measured here: a server listening only on loopback refuses connections that arrive from any other interface, including other containers or remote hosts, even though the process is running.</li>
+<li><strong>Firewall dropping the port.</strong> Per general networking knowledge, not measured: a dropped (not rejected) packet usually times out rather than refusing instantly &mdash; a multi-second hang before failure points here rather than at ECONNREFUSED, since our refusals were consistently sub-20&nbsp;ms.</li>
+</ul>
+
+<h2>7. How to fix it, in order</h2>
+<ul>
+<li>Confirm the error code first. ECONNREFUSED and ENOTFOUND are network/DNS problems; 28P01 or similar auth codes are not &mdash; don't restart Postgres for a password typo.</li>
+<li>Check the process is actually up: <code>docker ps</code> for a Postgres container, or <code>docker logs &lt;container&gt;</code> for "ready to accept connections" (what we waited for in our test).</li>
+<li>In Docker Compose, add a healthcheck and <code>depends_on: condition: service_healthy</code> so the app waits for Postgres to be ready, not just started. Add connection retry with backoff in the app regardless &mdash; it's cheap insurance against the exact race we measured.</li>
+<li>Match host and port exactly. Inside Docker, use the service name from <code>docker-compose.yml</code> as the host, never <code>localhost</code>, unless you're using host networking.</li>
+<li>If you get ENOTFOUND, check both containers are on the same Compose network (the default network Compose creates, or one you declared explicitly).</li>
+<li>If you get ECONNREFUSED only from outside the Postgres container, check <code>listen_addresses</code> in <code>postgresql.conf</code> and that the port is actually published (<code>-p</code> in <code>docker run</code>, or <code>ports:</code> in Compose).</li>
+</ul>
+<p>If the DNS name itself is the problem rather than the port, see <a href="/tools/dns-lookup/">DNS lookup</a>. For the general Node.js version of this error outside a database context, see <a href="/guides/err-connection-refused-econnrefused/">ERR_CONNECTION_REFUSED / ECONNREFUSED</a>. If your client gives up before any of this resolves, see <a href="/guides/408-request-timeout/">408 Request Timeout</a>.</p>
+<aside class="cta"><strong>Check the headers and status of any HTTP service sitting in front of your database layer:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the exact error code for a Postgres connection refused in Node?</summary><p>With the pg npm driver (measured, v8.23.1) the thrown error has code ECONNREFUSED and a message like &quot;connect ECONNREFUSED 127.0.0.1:5433&quot;. We reproduced this against both a closed port and a Postgres container we stopped mid-test.</p></details>
+<details><summary>Is &quot;connection refused&quot; the same as &quot;password authentication failed&quot;?</summary><p>No. We measured both: ECONNREFUSED means nothing answered the TCP connection at all. &quot;password authentication failed for user...&quot; (code 28P01) means Postgres answered and rejected your credentials. The first is a network/process problem; the second is a config/credentials problem.</p></details>
+<details><summary>Why does my app get connection refused only when started with Docker Compose?</summary><p>Most likely the startup race: Compose starts the app and Postgres containers together, but Postgres takes time to initialize. We measured 3 seconds for a fresh postgres:16-alpine container to log ready. An app that connects immediately with no retry hits ECONNREFUSED in that window. Per Docker docs, a healthcheck plus depends_on: condition: service_healthy fixes this.</p></details>
+<details><summary>I get ENOTFOUND instead of ECONNREFUSED — what does that mean?</summary><p>We measured ENOTFOUND (getaddrinfo ENOTFOUND) when connecting to a hostname that has no DNS record at all, such as a Docker Compose service name used from a container not on that Compose network. ECONNREFUSED means the name resolved but nothing was listening; ENOTFOUND means the name never resolved.</p></details>
+<details><summary>Could Postgres be running but still refuse connections?</summary><p>Yes, per the PostgreSQL docs (not measured on this box): if listen_addresses is set to only 127.0.0.1, Postgres refuses connections arriving from any other network interface even while the process runs and logs normally. We did measure that a running, reachable Postgres with the wrong password gives a completely different error (28P01), confirming reachability and auth are checked separately.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 and the `pg` npm driver v8.23.1, against a real postgres:16-alpine container (PostgreSQL 16.15) run via Docker on 127.0.0.1:5433, and against a definitely-closed local port 5434. This box has no psql or pg_isready binaries, only Docker. Claims about nginx, multi-OS socket paths or application-level retry logic are labelled as such and were not measured. PlainHeaders is our extension; Node.js, the pg driver and Docker are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>itertools.chain() Silently Skips Flattening a List of Lists</title>
+<meta name="description" content="We measured itertools.chain in Python 3.13.5: a list of lists comes back unflattened, no error -- use chain(*lists) or chain.from_iterable() instead.">
+<link rel="canonical" href="https://honestkit.github.io/guides/itertools-chain-silently-skips-flattening-a-list-of-lists/">
+<meta property="og:title" content="itertools.chain() Silently Skips Flattening a List of Lists">
+<meta property="og:description" content="We measured itertools.chain in Python 3.13.5: a list of lists comes back unflattened, no error -- use chain(*lists) or chain.from_iterable() instead.">
+<meta property="og:url" content="https://honestkit.github.io/guides/itertools-chain-silently-skips-flattening-a-list-of-lists/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does itertools.chain() return my sublists unflattened?", "acceptedAnswer": {"@type": "Answer", "text": "We measured this: if you pass chain() a single variable that holds a list of lists, it treats that whole list as one iterable to chain -- there's nothing else to combine it with, so you get the sublists back exactly as they were, no error."}}, {"@type": "Question", "name": "What's the fix for flattening a list of lists with itertools.chain?", "acceptedAnswer": {"@type": "Answer", "text": "Either unpack it with chain(*lists), or use chain.from_iterable(lists), which is built specifically to take one iterable of iterables. Both produced the identical flattened result when we measured them."}}, {"@type": "Question", "name": "Does itertools.chain() raise an error when given the wrong shape of argument?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we confirmed it fails silently. There's no exception, just an output shape that doesn't match what you probably wanted, which makes it easy to miss in a larger pipeline."}}, {"@type": "Question", "name": "Does itertools.chain.from_iterable() run all the sub-iterables immediately?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured this directly: it only starts each sub-iterable when it's actually reached. Pulling 4 items from 3 generators of 3 items each started the first two generators and never touched the third."}}, {"@type": "Question", "name": "When should I use chain.from_iterable() instead of chain(*lists)?", "acceptedAnswer": {"@type": "Answer", "text": "Use from_iterable() whenever the number of sublists is only known at runtime, or when the sub-iterables are expensive and you want to avoid starting ones you'll never read from. chain(*lists) works fine for a small, fixed number of sublists known in advance."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>itertools.chain() Silently Skips Flattening a List of Lists (tested)</h1>
+<p class="lead"><code>itertools.chain()</code> is the standard way to flatten several lists into one sequence. We measured what happens when you hand it a single variable that already holds a list of lists, instead of the lists themselves, and it quietly does nothing useful -- no error, just the wrong shape back.</p>
+<h2 id="repro1">1. chain() on a single list-of-lists argument does not flatten it</h2>
+<pre><code>import itertools
+
+lists = [[1, 2], [3, 4], [5, 6]]
+print(list(itertools.chain(lists)))</code></pre>
+<pre><code>[[1, 2], [3, 4], [5, 6]]</code></pre>
+<p><strong>Measured:</strong> the result is the same three sublists, completely unflattened -- not the six individual numbers someone merging paginated results would expect. <code>chain()</code> treats its single argument as one iterable to chain "with nothing else," so it just hands back what was already there. No exception is raised; the output simply has the wrong shape.</p>
+
+<h2 id="repro2">2. Unpacking with * or using chain.from_iterable() both flatten correctly</h2>
+<pre><code>import itertools
+
+lists = [[1, 2], [3, 4], [5, 6]]
+print(list(itertools.chain(*lists)))
+print(list(itertools.chain.from_iterable(lists)))</code></pre>
+<pre><code>[1, 2, 3, 4, 5, 6]
+[1, 2, 3, 4, 5, 6]</code></pre>
+<p><strong>Measured:</strong> both give the flattened result. <code>chain(*lists)</code> unpacks the outer list into separate positional arguments first; <code>chain.from_iterable(lists)</code> is built specifically to take one iterable of iterables without unpacking. They produce identical output -- <code>from_iterable()</code> is the better choice when the number of sublists is only known at runtime, since <code>*lists</code> works fine too but a huge number of sublists could in principle hit Python's argument-count limits where <code>from_iterable()</code> never would.</p>
+
+<h2 id="repro3">3. chain.from_iterable() only starts a sub-generator when it's actually needed</h2>
+<pre><code>import itertools
+
+started = []
+def make_gen(label, n):
+    def gen():
+        started.append(label)
+        for i in range(n):
+            yield f"{label}{i}"
+    return gen()
+
+sources = [make_gen("A", 3), make_gen("B", 3), make_gen("C", 3)]
+chained = itertools.chain.from_iterable(sources)
+result = list(itertools.islice(chained, 4))  # only need 4 items total
+print("result:", result)
+print("generators actually started:", started)</code></pre>
+<pre><code>result: ['A0', 'A1', 'A2', 'B0']
+generators actually started: ['A', 'B']</code></pre>
+<p><strong>Measured:</strong> pulling only 4 items starts generator <code>A</code> and <code>B</code>, but generator <code>C</code> never runs at all -- confirmed by the <code>started</code> list only containing two entries. This is the opposite kind of surprise from the flattening bug above: it's good news, not a trap. If your sub-iterables are expensive (API calls, file reads, database queries), <code>chain.from_iterable()</code> won't pay that cost for sources it never ends up reading from.</p>
+<aside class="cta"><strong>Merging paginated API results into one list? Check the real headers behind each page request first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does itertools.chain() return my sublists unflattened?</summary><p>We measured this: if you pass chain() a single variable that holds a list of lists, it treats that whole list as one iterable to chain -- there&#x27;s nothing else to combine it with, so you get the sublists back exactly as they were, no error.</p></details>
+<details><summary>What&#x27;s the fix for flattening a list of lists with itertools.chain?</summary><p>Either unpack it with chain(*lists), or use chain.from_iterable(lists), which is built specifically to take one iterable of iterables. Both produced the identical flattened result when we measured them.</p></details>
+<details><summary>Does itertools.chain() raise an error when given the wrong shape of argument?</summary><p>No -- we confirmed it fails silently. There&#x27;s no exception, just an output shape that doesn&#x27;t match what you probably wanted, which makes it easy to miss in a larger pipeline.</p></details>
+<details><summary>Does itertools.chain.from_iterable() run all the sub-iterables immediately?</summary><p>No -- we measured this directly: it only starts each sub-iterable when it&#x27;s actually reached. Pulling 4 items from 3 generators of 3 items each started the first two generators and never touched the third.</p></details>
+<details><summary>When should I use chain.from_iterable() instead of chain(*lists)?</summary><p>Use from_iterable() whenever the number of sublists is only known at runtime, or when the sub-iterables are expensive and you want to avoid starting ones you&#x27;ll never read from. chain(*lists) works fine for a small, fixed number of sublists known in advance.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in itertools module: called itertools.chain() with a single list-of-lists argument, then compared it against itertools.chain(*lists) and itertools.chain.from_iterable(lists). Separately measured chain.from_iterable()&#x27;s laziness by tracking which of three generators actually started running. PlainHeaders is our extension; Python&#x27;s itertools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

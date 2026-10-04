@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ValueError: Circular Reference Detected — Cause and Real Fix</title>
+<meta name="description" content="We measured why json.dumps() raises this on self-referencing data, why default= can&#x27;t fix it, and the recursive sanitizer that does, in Python 3.13.">
+<link rel="canonical" href="https://honestkit.github.io/guides/json-circular-reference-detected/">
+<meta property="og:title" content="ValueError: Circular Reference Detected — Cause and Real Fix">
+<meta property="og:description" content="We measured why json.dumps() raises this on self-referencing data, why default= can&#x27;t fix it, and the recursive sanitizer that does, in Python 3.13.">
+<meta property="og:url" content="https://honestkit.github.io/guides/json-circular-reference-detected/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does json.dumps() raise \"Circular reference detected\" instead of hanging?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed the encoder tracks which containers are currently being serialized on the active call stack and raises the moment one of them reappears, rather than recursing until it hits a limit or runs out of memory."}}, {"@type": "Question", "name": "Why doesn't a default= callback fix a circular reference error?", "acceptedAnswer": {"@type": "Answer", "text": "Because we measured that default() is only invoked for types json doesn't natively handle \u2014 dict and list are natively supported, so the built-in encoder processes them itself and raises before your callback is ever called."}}, {"@type": "Question", "name": "Does json.dumps() detect indirect cycles, like two dicts referencing each other?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we confirmed a two-object cycle (a['b'] = b, b['a'] = a) raises the identical Circular reference detected error as direct self-reference, with no indication in the message of the cycle's length."}}, {"@type": "Question", "name": "What's the actual fix for serializing a self-referencing structure?", "acceptedAnswer": {"@type": "Answer", "text": "We tested a recursive walker that tracks object ids already seen on the current path and replaces any repeat with a placeholder string before calling json.dumps() on the result \u2014 by the time the encoder runs, there's no cycle left to detect."}}, {"@type": "Question", "name": "Should I use check_circular=False to work around this?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured that it only delays the failure into a generic RecursionError once the call stack overflows, which is slower and a worse error to handle than the clean ValueError the default check gives you; it doesn't make the data any more serializable."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ValueError: Circular Reference Detected (tested)</h1>
+<p class="lead">A dict or list that contains itself, directly or through a chain of references, can't be turned into JSON &mdash; there's no way to represent infinite nesting as text. <code>json.dumps()</code> detects this and raises <code>ValueError: Circular reference detected</code> instead of hanging or crashing. We measured exactly when it fires and what actually fixes it.</p>
+<h2 id="repro1">1. The error, from a dict that references itself</h2>
+<pre><code>import json
+
+d = {"a": 1}
+d["self"] = d
+
+json.dumps(d)
+ValueError: Circular reference detected</code></pre>
+<p><strong>Measured:</strong> this happens the moment the encoder revisits a container it's already in the middle of serializing &mdash; it doesn't wait to hit a recursion limit or run out of memory, it tracks the objects currently being encoded and raises as soon as one repeats.</p>
+
+<h2 id="repro2">2. Same error for a list, and for an indirect two-object cycle</h2>
+<pre><code>l = [1, 2]
+l.append(l)
+json.dumps(l)
+ValueError: Circular reference detected
+
+a = {}; b = {}
+a["b"] = b
+b["a"] = a
+json.dumps(a)
+ValueError: Circular reference detected</code></pre>
+<p><strong>Measured:</strong> the check isn't limited to direct self-reference &mdash; two separate dicts that point back at each other through a chain trigger the exact same error and message, with no indication in the text of how long the cycle is or which object started it.</p>
+
+<h2 id="repro3">3. default= does NOT fix this &mdash; a common dead end</h2>
+<pre><code>seen = set()
+def default(o):
+    if id(o) in seen:
+        return "&lt;circular&gt;"
+    seen.add(id(o))
+    return dict(o) if isinstance(o, dict) else o
+
+json.dumps(d, default=default)
+ValueError: Circular reference detected   # default() was never even called</code></pre>
+<p><strong>Measured:</strong> this is the natural first thing to try, and it doesn't work. <code>default=</code> is only ever called for objects <code>json</code> doesn't natively know how to serialize &mdash; <code>dict</code> and <code>list</code> are natively supported, so the encoder handles them itself and the circular-reference check fires before your callback ever runs. If you're debugging why a <code>default=</code> callback "isn't being called," a circular dict or list is one reason why.</p>
+
+<h2 id="repro4">4. What actually works: break the cycle before calling json.dumps()</h2>
+<pre><code>def break_cycles(obj, seen=None):
+    if seen is None:
+        seen = set()
+    if isinstance(obj, dict):
+        if id(obj) in seen:
+            return "&lt;circular reference&gt;"
+        seen = seen | {id(obj)}
+        return {k: break_cycles(v, seen) for k, v in obj.items()}
+    if isinstance(obj, list):
+        if id(obj) in seen:
+            return "&lt;circular reference&gt;"
+        seen = seen | {id(obj)}
+        return [break_cycles(v, seen) for v in obj]
+    return obj
+
+json.dumps(break_cycles(d))
+{"a": 1, "self": "&lt;circular reference&gt;"}</code></pre>
+<p><strong>Measured:</strong> walking the structure yourself first, replacing anything already seen on the current path with a placeholder, and <em>then</em> calling <code>json.dumps()</code> on the result works, because by the time the encoder sees it, there's no cycle left &mdash; just a plain string marker. This correctly handles both direct self-reference and the indirect two-object cycle above.</p>
+
+<h2 id="repro5">5. The option to avoid, except for debugging: check_circular=False</h2>
+<pre><code>json.dumps(d, check_circular=False)
+RecursionError: maximum recursion depth exceeded while encoding a JSON object</code></pre>
+<p><strong>Measured:</strong> turning off the check doesn't make circular data serializable &mdash; it just replaces a clean <code>ValueError</code> with Python's generic <code>RecursionError</code> once the call stack actually overflows, which is slower and a worse error for anyone catching exceptions downstream. There's no legitimate reason to pass <code>check_circular=False</code> in real code; the default behavior is strictly better.</p>
+
+<h2 id="fix">6. Where this actually comes from</h2>
+<p>In practice this is almost never intentional &mdash; it usually comes from ORM objects with back-references (a parent object holding a list of children, each child holding a reference back to its parent) being passed straight into <code>json.dumps()</code> instead of through a serializer that knows to omit back-references, or a caching/memoization structure that stores a node's own container as part of its state.</p>
+
+<aside class="cta"><strong>Debugging a self-referencing data structure sent over an API instead of stored in a database? Check the real headers behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does json.dumps() raise &quot;Circular reference detected&quot; instead of hanging?</summary><p>We confirmed the encoder tracks which containers are currently being serialized on the active call stack and raises the moment one of them reappears, rather than recursing until it hits a limit or runs out of memory.</p></details>
+<details><summary>Why doesn&#x27;t a default= callback fix a circular reference error?</summary><p>Because we measured that default() is only invoked for types json doesn&#x27;t natively handle — dict and list are natively supported, so the built-in encoder processes them itself and raises before your callback is ever called.</p></details>
+<details><summary>Does json.dumps() detect indirect cycles, like two dicts referencing each other?</summary><p>Yes — we confirmed a two-object cycle (a[&#x27;b&#x27;] = b, b[&#x27;a&#x27;] = a) raises the identical Circular reference detected error as direct self-reference, with no indication in the message of the cycle&#x27;s length.</p></details>
+<details><summary>What&#x27;s the actual fix for serializing a self-referencing structure?</summary><p>We tested a recursive walker that tracks object ids already seen on the current path and replaces any repeat with a placeholder string before calling json.dumps() on the result — by the time the encoder runs, there&#x27;s no cycle left to detect.</p></details>
+<details><summary>Should I use check_circular=False to work around this?</summary><p>No — we measured that it only delays the failure into a generic RecursionError once the call stack overflows, which is slower and a worse error to handle than the clean ValueError the default check gives you; it doesn&#x27;t make the data any more serializable.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in json module, building self-referencing dicts and lists and calling json.dumps() on them directly, printing the exact exception text. Every message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s json module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

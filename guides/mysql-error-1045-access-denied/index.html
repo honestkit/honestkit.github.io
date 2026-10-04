@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MySQL Error 1045 Access Denied for User: Causes and Fixes</title>
+<meta name="description" content="We reproduced MySQL error 1045 four ways: wrong password, no password, unknown user, and an unauthenticated root login. Each exact message and the fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/mysql-error-1045-access-denied/">
+<meta property="og:title" content="MySQL Error 1045 Access Denied for User: Causes and Fixes">
+<meta property="og:description" content="We reproduced MySQL error 1045 four ways: wrong password, no password, unknown user, and an unauthenticated root login. Each exact message and the fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/mysql-error-1045-access-denied/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does \"using password: NO\" mean if I know I typed a password?", "acceptedAnswer": {"@type": "Answer", "text": "It means the client didn't send one to the server at all \u2014 usually because the password argument was empty, omitted, or (in some tools) read from an empty environment variable or config file rather than what you typed interactively. We reproduced this by running the mysql CLI with a username but no -p flag at all."}}, {"@type": "Question", "name": "Why does MySQL give the same error for a wrong password and an unknown user?", "acceptedAnswer": {"@type": "Answer", "text": "By design, so an attacker probing usernames can't tell which ones exist from the error message alone. We confirmed both produce the identical ERROR 1045 (28000): Access denied text, differing only in the username echoed back."}}, {"@type": "Question", "name": "I entered the right password but still get 1045 \u2014 why?", "acceptedAnswer": {"@type": "Answer", "text": "Check the host MySQL thinks you're connecting from (section 3). Grants are per username+host pair; a grant for 'user'@'localhost' won't match a connection from 127.0.0.1 or a different IP, even with the exact right password."}}, {"@type": "Question", "name": "What's the difference between error 1045 and 1044?", "acceptedAnswer": {"@type": "Answer", "text": "1045 means the login itself (username+password+host) failed. 1044 means the login succeeded but that account has no privileges on the specific database you tried to use \u2014 we reproduced ERROR 1044 ... Access denied ... to database 'mysql' with correct credentials but a missing GRANT."}}, {"@type": "Question", "name": "Does restarting MySQL fix 1045?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 in our tests, ALTER USER ... IDENTIFIED BY took effect immediately for the next connection, with no restart needed. If restarting \"fixed\" it for you, something else (like a config file being reloaded) was the actual cause."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>MySQL Error 1045: Access Denied for User (tested)</h1>
+<p class="lead"><code>ERROR 1045 (28000): Access denied for user</code> means the MySQL server rejected the username/password combination itself, before it even looked at what you're trying to do. It's purely an authentication failure. A related but different error, 1044, means the login succeeded but that user isn't authorized for a specific database &mdash; section 4 below shows the difference.</p>
+<h2>1. Reading the error</h2>
+<p>The full message tells you exactly what MySQL tried and what the client sent:</p>
+<pre><code>ERROR 1045 (28000): Access denied for user 'appuser'@'localhost' (using password: YES)</code></pre>
+<p>Three useful facts are packed in here: the username MySQL matched against (<code>'appuser'</code>), the host it thinks you're connecting from (<code>'localhost'</code>), and whether a password was sent at all (<code>using password: YES</code> or <code>NO</code>). That last part is the most useful: it tells you whether your client even tried to authenticate, or sent nothing.</p>
+
+<h2>2. Four reproduced cases (MySQL 8.4.11)</h2>
+<table>
+<tr><th>Scenario</th><th>Exact error</th></tr>
+<tr><td>Correct username, wrong password</td><td><code>ERROR 1045 (28000): Access denied for user 'appuser'@'localhost' (using password: YES)</code></td></tr>
+<tr><td>Correct username, no password supplied at all</td><td><code>ERROR 1045 (28000): Access denied for user 'appuser'@'localhost' (using password: NO)</code></td></tr>
+<tr><td>Username that doesn't exist</td><td><code>ERROR 1045 (28000): Access denied for user 'nouser'@'localhost' (using password: YES)</code></td></tr>
+<tr><td>root login with no password set up for that host</td><td><code>ERROR 1045 (28000): Access denied for user 'root'@'127.0.0.1' (using password: NO)</code></td></tr>
+</table>
+<p>Note the third row: MySQL gives the identical error for a wrong password and for a user that doesn't exist at all. This is deliberate &mdash; it stops an attacker from using the error message to discover which usernames are valid.</p>
+
+<h2>3. The host part matters as much as the username</h2>
+<p>MySQL grants are scoped to a host pattern, not just a username. <code>'appuser'@'localhost'</code> and <code>'appuser'@'127.0.0.1'</code> and <code>'appuser'@'%'</code> are three separate grants as far as MySQL is concerned, even though they look like the same user. In our fourth test case, <code>root</code> had no grant allowing a password-based login from <code>127.0.0.1</code> (only via the local Unix socket), so it failed even with a correct identity and no typo anywhere.</p>
+<p>Check what's actually granted:</p>
+<pre><code>mysql&gt; SELECT user, host FROM mysql.user WHERE user = 'appuser';
+mysql&gt; SHOW GRANTS FOR 'appuser'@'%';</code></pre>
+
+<h2>4. 1045 vs 1044: authentication vs authorization</h2>
+<p>These are commonly confused but different problems. We reproduced both:</p>
+<pre><code>-- 1045: the login itself failed (wrong password, bad user, etc.)
+ERROR 1045 (28000): Access denied for user 'appuser'@'localhost' (using password: YES)
+
+-- 1044: login succeeded, but this user has no grant on this specific database
+ERROR 1044 (42000) at line 1: Access denied for user 'appuser'@'%' to database 'mysql'</code></pre>
+<p>If you see 1044, the username and password are fine &mdash; the fix is a GRANT, not a password change:</p>
+<pre><code>mysql&gt; GRANT SELECT ON mysql.* TO 'appuser'@'%'; FLUSH PRIVILEGES;
+-- after the grant, the same query that failed now works:
+mysql&gt; USE mysql; SELECT 1;
+1</code></pre>
+
+<h2>5. Fixing 1045 itself</h2>
+<ul>
+<li><strong>Reset the password</strong> if you suspect it's simply wrong (tested, works immediately without restarting the server):
+<pre><code>mysql&gt; ALTER USER 'appuser'@'%' IDENTIFIED BY 'newpass123'; FLUSH PRIVILEGES;
+-- connecting with the new password now succeeds:
+$ mysql -uappuser -pnewpass123 -e "SELECT 1;"
+1</code></pre></li>
+<li><strong>Check the host you're connecting as</strong>, not just the username (section 3) &mdash; a grant for <code>'user'@'localhost'</code> will not match a connection that MySQL sees as coming from a different host or IP, even on the same machine.</li>
+<li><strong>Check the user exists at all</strong>: <code>SELECT user, host FROM mysql.user;</code> as root. A typo in the username produces the exact same 1045 as a wrong password (section 2, row 3), so don't assume the password is the problem.</li>
+<li><strong>If this just started happening after an upgrade</strong>, MySQL 8's default authentication plugin (<code>caching_sha2_password</code>) isn't supported by some older client libraries, which can also surface as an access-denied error. Check your client library's MySQL 8 compatibility, or recreate the user with <code>IDENTIFIED WITH mysql_native_password</code> if you can't upgrade the client.</li>
+</ul>
+
+<h2>6. Don't over-fix: avoid blanket solutions</h2>
+<p>A common but risky "fix" circulating online is granting <code>'user'@'%'</code> with all privileges to make the error disappear. That papers over whichever specific mismatch (wrong password, wrong host, missing grant) is actually happening, and widens the account's access far beyond what it needs. Diagnose with section 2's table first &mdash; the <code>(using password: YES/NO)</code> part alone usually tells you whether this is a credentials problem or a configuration problem.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &quot;using password: NO&quot; mean if I know I typed a password?</summary><p>It means the client didn&#x27;t send one to the server at all — usually because the password argument was empty, omitted, or (in some tools) read from an empty environment variable or config file rather than what you typed interactively. We reproduced this by running the mysql CLI with a username but no -p flag at all.</p></details>
+<details><summary>Why does MySQL give the same error for a wrong password and an unknown user?</summary><p>By design, so an attacker probing usernames can&#x27;t tell which ones exist from the error message alone. We confirmed both produce the identical ERROR 1045 (28000): Access denied text, differing only in the username echoed back.</p></details>
+<details><summary>I entered the right password but still get 1045 — why?</summary><p>Check the host MySQL thinks you&#x27;re connecting from (section 3). Grants are per username+host pair; a grant for &#x27;user&#x27;@&#x27;localhost&#x27; won&#x27;t match a connection from 127.0.0.1 or a different IP, even with the exact right password.</p></details>
+<details><summary>What&#x27;s the difference between error 1045 and 1044?</summary><p>1045 means the login itself (username+password+host) failed. 1044 means the login succeeded but that account has no privileges on the specific database you tried to use — we reproduced ERROR 1044 ... Access denied ... to database &#x27;mysql&#x27; with correct credentials but a missing GRANT.</p></details>
+<details><summary>Does restarting MySQL fix 1045?</summary><p>No — in our tests, ALTER USER ... IDENTIFIED BY took effect immediately for the next connection, with no restart needed. If restarting &quot;fixed&quot; it for you, something else (like a config file being reloaded) was the actual cause.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with MySQL 8.4.11 (official Docker image), using the mysql CLI. Every error message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; MySQL and Docker are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

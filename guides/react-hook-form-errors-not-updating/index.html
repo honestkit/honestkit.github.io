@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>react-hook-form errors Empty or Not Updating: Tested Fix</title>
+<meta name="description" content="formState.errors can stay empty after failed validation. We measured why: react-hook-form only tracks a field you actually read in render, and show the fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/react-hook-form-errors-not-updating/">
+<meta property="og:title" content="react-hook-form errors Empty or Not Updating: Tested Fix">
+<meta property="og:description" content="formState.errors can stay empty after failed validation. We measured why: react-hook-form only tracks a field you actually read in render, and show the fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/react-hook-form-errors-not-updating/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is formState.errors empty even though validation failed?", "acceptedAnswer": {"@type": "Answer", "text": "In our test, this happened when the component never read formState.errors in its render output. Per the react-hook-form docs, formState is a Proxy that only tracks a field once you read it during render; reading it only inside a callback or effect does not register that subscription."}}, {"@type": "Question", "name": "Is this a React bug or a react-hook-form behavior?", "acceptedAnswer": {"@type": "Answer", "text": "It is react-hook-form behavior, not a React bug. react-hook-form is a third-party form library; it is unrelated to React's own built-in hooks like useState and useEffect."}}, {"@type": "Question", "name": "Does destructuring formState break tracking?", "acceptedAnswer": {"@type": "Answer", "text": "Destructuring itself is fine. What matters, per the docs, is whether the specific key (for example errors) is actually read somewhere in the render body on a render path RHF can observe, not just inside a nested callback."}}, {"@type": "Question", "name": "What is the simplest fix?", "acceptedAnswer": {"@type": "Answer", "text": "Read formState.errors (or errors.fieldName) directly in the JSX your component returns, the same render pass that uses register and handleSubmit, instead of only inside onSubmit, useEffect, or a conditional branch."}}, {"@type": "Question", "name": "What if a child component needs just one field's error?", "acceptedAnswer": {"@type": "Answer", "text": "Per the react-hook-form docs, use useFormState({ control, name: 'fieldName' }) or Controller in that child so the read happens where RHF expects it, rather than passing down a formState or errors object read by a parent that never touched that key."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>react-hook-form errors not updating (tested)</h1>
+<p class="lead">react-hook-form (RHF) is a separate library from React's own built-in hooks like <code>useState</code> and <code>useEffect</code>. Its <code>formState</code> object, including <code>formState.errors</code>, is wrapped in a Proxy that only starts tracking a given key once your component reads that key during render. We rendered a real form in jsdom to measure what happens when you read <code>errors</code> correctly, and what the validation output looks like when your component never reads it in render at all.</p>
+<h2>1. The symptom</h2>
+<p>You call <code>useForm()</code>, register a required field, submit the form with it empty, and <code>formState.errors</code> is still <code>{}</code> in your component, even though you can see in a callback or in devtools that validation ran and found a problem. The UI never shows the error message.</p>
+
+<h2>2. Why: formState is a lazy Proxy</h2>
+<p>Per the react-hook-form docs, <code>formState</code> is wrapped in a Proxy for performance. RHF does not know which pieces of form state your component actually cares about until you read them. Reading <code>formState.errors</code> inside the component's render body is what tells RHF "subscribe this component to changes in errors." If a key is never read during render, React Hook Form has no reason to re-render that component when the value changes.</p>
+<p>This is easy to break by accident: destructuring <code>formState</code> as a whole object and only drilling into <code>.errors</code> inside a submit handler, a <code>useEffect</code>, or behind a condition that is sometimes false on the first render, means the read that "activates" tracking may never happen where RHF can see it.</p>
+
+<h2>3. What we measured</h2>
+<p>We rendered two components with <code>@testing-library/react</code> + jsdom against RHF 7.89.0. Both register a required <code>name</code> field and submit with it empty.</p>
+<table>
+<tr><th>Component pattern</th><th>Where <code>errors</code> is read</th><th>Validation ran?</th><th>UI showed the error?</th></tr>
+<tr><td>Reads <code>formState: { errors }</code> and renders <code>errors.name.message</code> directly in JSX</td><td>Top-level render body</td><td>Yes</td><td>Yes &mdash; span text was exactly <code>"Name is required"</code></td></tr>
+<tr><td>Destructures <code>formState</code> as a whole, never touches <code>.errors</code> in the returned JSX; a submit-failure callback separately received the error object</td><td>Only inside the <code>handleSubmit</code> error callback, not in render</td><td>Yes &mdash; the callback logged <code>errs.name.message === "Name is required"</code></td><td>No &mdash; the rendered span stayed empty (<code>""</code>)</td></tr>
+</table>
+<p>Both forms ran the exact same validation and produced the exact same error object. The only difference was whether the component's render body read <code>errors</code>. That one difference was the gap between "validation failed" and "the user sees anything."</p>
+
+<h2>4. The fix: read errors where RHF can see it</h2>
+<p>Read <code>formState.errors</code> (or the specific field, <code>errors.fieldName</code>) directly in your component's top-level render code, not only inside a callback, <code>useEffect</code>, or behind a condition that can be false on first render.</p>
+<pre><code>function MyForm() {
+  const { register, handleSubmit, formState: { errors } } = useForm();
+
+  return (
+    &lt;form onSubmit={handleSubmit(onSubmit)}&gt;
+      &lt;input {...register("name", { required: "Name is required" })} /&gt;
+      {errors.name &amp;&amp; &lt;span&gt;{errors.name.message}&lt;/span&gt;}
+      &lt;button type="submit"&gt;Submit&lt;/button&gt;
+    &lt;/form&gt;
+  );
+}</code></pre>
+<p>In our measured run, this exact pattern (reading <code>errors</code> in the JSX returned by the component) was enough: the error text appeared right after submit, with no extra wiring.</p>
+
+<h2>5. If you need errors deep in a tree, use useWatch or useFormState</h2>
+<p>Per the react-hook-form docs, when a nested or memoized component needs just one field's error without re-rendering the whole form, use the library's own subscription hooks (<code>useFormState({ control, name: "fieldName" })</code> or field-level <code>Controller</code>) instead of passing the whole <code>errors</code> object down as a prop from a parent that never read it. That guarantees the read happens where RHF expects it, instead of depending on a prop drilled from a render that may skip touching <code>errors</code> under some conditions.</p>
+
+<h2>6. Common mistakes that cause this</h2>
+<ul>
+<li>Destructuring <code>const { errors } = formState</code> inside <code>onSubmit</code> or a <code>useEffect</code> instead of in the component body.</li>
+<li>Reading <code>errors.someField</code> only inside an <code>if</code> branch that is false on first render, so the first render never touches that key.</li>
+<li>Passing the entire <code>formState</code> object down as a prop and reading <code>.errors</code> only in a child that renders conditionally.</li>
+<li>Mixing up react-hook-form's <code>formState</code> with React's own <code>useState</code>; they have no relation, and the Proxy behavior described here is specific to react-hook-form.</li>
+</ul>
+<aside class="cta"><strong>Check the status and headers your form actually posts to:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is formState.errors empty even though validation failed?</summary><p>In our test, this happened when the component never read formState.errors in its render output. Per the react-hook-form docs, formState is a Proxy that only tracks a field once you read it during render; reading it only inside a callback or effect does not register that subscription.</p></details>
+<details><summary>Is this a React bug or a react-hook-form behavior?</summary><p>It is react-hook-form behavior, not a React bug. react-hook-form is a third-party form library; it is unrelated to React&#x27;s own built-in hooks like useState and useEffect.</p></details>
+<details><summary>Does destructuring formState break tracking?</summary><p>Destructuring itself is fine. What matters, per the docs, is whether the specific key (for example errors) is actually read somewhere in the render body on a render path RHF can observe, not just inside a nested callback.</p></details>
+<details><summary>What is the simplest fix?</summary><p>Read formState.errors (or errors.fieldName) directly in the JSX your component returns, the same render pass that uses register and handleSubmit, instead of only inside onSubmit, useEffect, or a conditional branch.</p></details>
+<details><summary>What if a child component needs just one field&#x27;s error?</summary><p>Per the react-hook-form docs, use useFormState({ control, name: &#x27;fieldName&#x27; }) or Controller in that child so the read happens where RHF expects it, rather than passing down a formState or errors object read by a parent that never touched that key.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Node.js 24.21.0, React 18.3.1, react-dom 18.3.1, react-hook-form 7.89.0, @testing-library/react 16.x and jsdom, rendered with React&#x27;s act(). The general Proxy-based lazy-tracking explanation is per the react-hook-form docs and GitHub issues, not re-derived from source in this test. PlainHeaders is our extension; React, react-hook-form, Testing Library and jsdom are free and open source.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>itertools.islice Start/Stop Are Relative, Not Fixed Indices</title>
+<meta name="description" content="We measured itertools.islice in Python 3.13.5: calling islice(it, 2, 5) twice on one iterator with identical args returns two different slices.">
+<link rel="canonical" href="https://honestkit.github.io/guides/itertools-islice-start-stop-are-relative-not-fixed-indices/">
+<meta property="og:title" content="itertools.islice Start/Stop Are Relative, Not Fixed Indices">
+<meta property="og:description" content="We measured itertools.islice in Python 3.13.5: calling islice(it, 2, 5) twice on one iterator with identical args returns two different slices.">
+<meta property="og:url" content="https://honestkit.github.io/guides/itertools-islice-start-stop-are-relative-not-fixed-indices/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does itertools.islice(it, 2, 5) always return items 2 through 4?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured this directly: start and stop are relative to the iterator's current position when islice() is called, not to its original beginning. Calling it again later with the same numbers returns later items, not the same ones."}}, {"@type": "Question", "name": "Why did my itertools.islice call return different data the second time?", "acceptedAnswer": {"@type": "Answer", "text": "Because the underlying iterator had already advanced past the point you think of as 'the start.' islice() has no way to rewind a plain iterator, so start and stop always count forward from wherever reading last stopped."}}, {"@type": "Question", "name": "Can I use a negative start with itertools.islice like list[-3:]?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we confirmed it raises ValueError: Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize immediately, rather than silently misbehaving."}}, {"@type": "Question", "name": "How do I paginate through an iterator correctly with islice?", "acceptedAnswer": {"@type": "Answer", "text": "Call islice(it, n) with just a count, inside a loop, and let it consume 'the next n items' each time -- don't pass fixed (start, stop) numbers expecting them to index into the original sequence."}}, {"@type": "Question", "name": "Does this affect lists and tuples, or only iterators?", "acceptedAnswer": {"@type": "Answer", "text": "If you pass a list or tuple to islice(), it's still iterated one-way internally and has the same relative-position behavior -- the fixed, repeatable-slice behavior only applies to plain Python slicing syntax like data[2:5], not to islice()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>itertools.islice Start/Stop Are Relative, Not Fixed Indices (tested)</h1>
+<p class="lead"><code>itertools.islice(it, start, stop)</code> reads like <code>list[start:stop]</code>, so it's tempting to assume calling it again with the same numbers gives you the same slice back. We measured what actually happens, and the two calls return entirely different data.</p>
+<h2 id="repro1">1. Calling islice twice with the same arguments gives two different results</h2>
+<pre><code>import itertools
+
+it = iter(range(20))
+slice1 = list(itertools.islice(it, 2, 5))
+print("first call: ", slice1)
+
+slice2 = list(itertools.islice(it, 2, 5))  # same start, same stop
+print("second call:", slice2)</code></pre>
+<pre><code>first call:  [2, 3, 4]
+second call: [7, 8, 9]</code></pre>
+<p><strong>Measured:</strong> the second call does not repeat <code>[2, 3, 4]</code>. <code>islice()</code>'s <code>start</code> and <code>stop</code> are counted from wherever the underlying iterator currently is, not from its original beginning. The first call consumes items 0-4 (skipping 0-1, yielding 2-4); by the time the second call runs, the iterator is already sitting at item 5, so "skip 2, take 3" lands on items 7-9.</p>
+
+<h2 id="repro2">2. A list behaves the way islice looks like it should</h2>
+<pre><code>data = list(range(20))
+print(data[2:5])
+print(data[2:5])  # same slice every time</code></pre>
+<pre><code>[2, 3, 4]
+[2, 3, 4]</code></pre>
+<p><strong>Measured:</strong> ordinary list slicing with <code>[2:5]</code> is a fixed, repeatable window into the sequence -- calling it twice always returns the same items. <code>islice()</code> looks like the same syntax but operates on a one-way iterator, so there's no fixed window to return to; each call picks up exactly where the last one left the iterator.</p>
+
+<h2 id="repro3">3. islice doesn't support negative indices either</h2>
+<pre><code>import itertools
+
+it = iter(range(10))
+list(itertools.islice(it, -3, None))</code></pre>
+<pre><code>ValueError: Indices for islice() must be None or an integer: 0 &lt;= x &lt;= sys.maxsize.</code></pre>
+<p><strong>Measured:</strong> unlike list slicing's <code>data[-3:]</code> for "last 3 items," a negative start raises a clear <code>ValueError</code> immediately -- at least this one fails loudly rather than silently, which makes it easier to catch than the repeated-call surprise above.</p>
+
+<h2 id="fix">4. Fix: treat islice as consuming, and compute real pagination offsets yourself</h2>
+<pre><code>import itertools
+
+it = iter(range(20))
+page_size = 3
+for page_start in range(0, 9, page_size):
+    page = list(itertools.islice(it, page_size))  # always "next N", not "items[start:stop]"
+    print(f"page at {page_start}:", page)</code></pre>
+<pre><code>page at 0: [0, 1, 2]
+page at 3: [3, 4, 5]
+page at 6: [6, 7, 8]</code></pre>
+<p><strong>Measured:</strong> dropping the <code>start</code> argument and only ever passing a count (<code>islice(it, n)</code>) makes the "consume the next N" behavior explicit and avoids the trap of reusing fixed <code>(start, stop)</code> numbers that assume a rewindable sequence.</p>
+<aside class="cta"><strong>Paginating through an API response? Check the real headers it sends first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does itertools.islice(it, 2, 5) always return items 2 through 4?</summary><p>No -- we measured this directly: start and stop are relative to the iterator&#x27;s current position when islice() is called, not to its original beginning. Calling it again later with the same numbers returns later items, not the same ones.</p></details>
+<details><summary>Why did my itertools.islice call return different data the second time?</summary><p>Because the underlying iterator had already advanced past the point you think of as &#x27;the start.&#x27; islice() has no way to rewind a plain iterator, so start and stop always count forward from wherever reading last stopped.</p></details>
+<details><summary>Can I use a negative start with itertools.islice like list[-3:]?</summary><p>No -- we confirmed it raises ValueError: Indices for islice() must be None or an integer: 0 &lt;= x &lt;= sys.maxsize immediately, rather than silently misbehaving.</p></details>
+<details><summary>How do I paginate through an iterator correctly with islice?</summary><p>Call islice(it, n) with just a count, inside a loop, and let it consume &#x27;the next n items&#x27; each time -- don&#x27;t pass fixed (start, stop) numbers expecting them to index into the original sequence.</p></details>
+<details><summary>Does this affect lists and tuples, or only iterators?</summary><p>If you pass a list or tuple to islice(), it&#x27;s still iterated one-way internally and has the same relative-position behavior -- the fixed, repeatable-slice behavior only applies to plain Python slicing syntax like data[2:5], not to islice().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in itertools module: called itertools.islice() twice in a row on the same iterator with identical start/stop arguments, and separately tried a negative start index. PlainHeaders is our extension; Python&#x27;s itertools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

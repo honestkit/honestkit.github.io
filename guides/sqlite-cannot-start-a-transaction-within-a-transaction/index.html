@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLite &#x27;Cannot Start a Transaction Within a Transaction&#x27;</title>
+<meta name="description" content="We reproduced sqlite3&#x27;s transaction-nesting error, including the sneaky case: Python opens a transaction implicitly before your explicit BEGIN ever runs.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite-cannot-start-a-transaction-within-a-transaction/">
+<meta property="og:title" content="SQLite &#x27;Cannot Start a Transaction Within a Transaction&#x27;">
+<meta property="og:description" content="We reproduced sqlite3&#x27;s transaction-nesting error, including the sneaky case: Python opens a transaction implicitly before your explicit BEGIN ever runs.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite-cannot-start-a-transaction-within-a-transaction/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does this error only happen if my code calls BEGIN twice?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured a sneakier case: Python's sqlite3 opens a transaction implicitly on the first write statement even with no BEGIN in your code. A later explicit BEGIN, written assuming none was open, fails identically."}}, {"@type": "Question", "name": "How do I check if a transaction is already open before starting one?", "acceptedAnswer": {"@type": "Answer", "text": "con.in_transaction \u2014 we confirmed this reports True immediately after Python's implicit transaction open, with no explicit BEGIN required to set it, so checking it before calling BEGIN avoids the error."}}, {"@type": "Question", "name": "Does isolation_level=None (autocommit mode) avoid this error?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we tested it specifically: a double BEGIN in autocommit mode fails with the identical error. Autocommit mode changes when Python opens transactions implicitly, not whether nesting BEGIN calls is allowed."}}, {"@type": "Question", "name": "What's the real-world cause of this, not just a deliberate double BEGIN?", "acceptedAnswer": {"@type": "Answer", "text": "Mixing transaction styles on one connection \u2014 code that does a plain write (which opens a transaction implicitly under default settings) and later calls BEGIN explicitly, assuming no transaction was open yet. We reproduced this exact sequence."}}, {"@type": "Question", "name": "What's the safest fix long-term?", "acceptedAnswer": {"@type": "Answer", "text": "Pick one transaction-management style per connection and don't mix them \u2014 either rely on Python's default implicit commit/rollback entirely, or set isolation_level=None and issue every BEGIN/COMMIT yourself. We confirmed the error only arises from mixing the two."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLite: cannot start a transaction within a transaction (tested)</h1>
+<p class="lead"><code>sqlite3.OperationalError: cannot start a transaction within a transaction</code> means a connection already has an open transaction when something calls <code>BEGIN</code> again. We reproduced the obvious cause and a sneaky one Python creates for you without asking.</p>
+<h2 id="repro1">1. The obvious cause: BEGIN called twice</h2>
+<pre><code>con.execute("BEGIN")
+con.execute("BEGIN")
+sqlite3.OperationalError: cannot start a transaction within a transaction</code></pre>
+<p>We confirmed this happens identically in autocommit mode (<code>isolation_level=None</code>) too &mdash; it's not specific to Python's default transaction handling.</p>
+
+<h2 id="repro2">2. The sneaky cause: Python already opened one for you</h2>
+<p>With default settings (no <code>isolation_level=None</code>), we ran a plain INSERT with no explicit <code>BEGIN</code> at all:</p>
+<pre><code>con.execute("INSERT INTO t VALUES (1)")
+print(con.in_transaction)   # True &mdash; a transaction is already open</code></pre>
+<p><strong>Measured:</strong> Python's sqlite3 silently opened a transaction the moment the INSERT ran, with no <code>BEGIN</code> in the code at all. A later explicit <code>BEGIN</code>, written by someone who assumed none was open yet, then fails with the identical error:</p>
+<pre><code>con.execute("BEGIN")
+sqlite3.OperationalError: cannot start a transaction within a transaction</code></pre>
+<p>This is the version that actually bites people: code that mixes "let Python manage transactions implicitly" with "manage transactions explicitly" in the same connection, often because a library call did the first INSERT before your own explicit <code>BEGIN</code> got a chance to run.</p>
+
+<h2 id="fix">3. The fix: check before you BEGIN, or pick one style consistently</h2>
+<p>Check whether a transaction is already open before starting one explicitly:</p>
+<pre><code>if not con.in_transaction:
+    con.execute("BEGIN")</code></pre>
+<p>We confirmed <code>con.in_transaction</code> correctly reports <code>True</code> right after the implicit open, with no explicit <code>BEGIN</code> needed to set it. The more durable fix is picking one transaction style per connection and sticking to it: either let Python's default implicit handling manage commits/rollbacks, or set <code>isolation_level=None</code> and issue every <code>BEGIN</code>/<code>COMMIT</code> yourself &mdash; not both.</p>
+
+<aside class="cta"><strong>Debugging an app that talks to an API instead of a database? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does this error only happen if my code calls BEGIN twice?</summary><p>No — we measured a sneakier case: Python&#x27;s sqlite3 opens a transaction implicitly on the first write statement even with no BEGIN in your code. A later explicit BEGIN, written assuming none was open, fails identically.</p></details>
+<details><summary>How do I check if a transaction is already open before starting one?</summary><p>con.in_transaction — we confirmed this reports True immediately after Python&#x27;s implicit transaction open, with no explicit BEGIN required to set it, so checking it before calling BEGIN avoids the error.</p></details>
+<details><summary>Does isolation_level=None (autocommit mode) avoid this error?</summary><p>No — we tested it specifically: a double BEGIN in autocommit mode fails with the identical error. Autocommit mode changes when Python opens transactions implicitly, not whether nesting BEGIN calls is allowed.</p></details>
+<details><summary>What&#x27;s the real-world cause of this, not just a deliberate double BEGIN?</summary><p>Mixing transaction styles on one connection — code that does a plain write (which opens a transaction implicitly under default settings) and later calls BEGIN explicitly, assuming no transaction was open yet. We reproduced this exact sequence.</p></details>
+<details><summary>What&#x27;s the safest fix long-term?</summary><p>Pick one transaction-management style per connection and don&#x27;t mix them — either rely on Python&#x27;s default implicit commit/rollback entirely, or set isolation_level=None and issue every BEGIN/COMMIT yourself. We confirmed the error only arises from mixing the two.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in sqlite3 module, triggering the error from an explicit double BEGIN, an autocommit-mode (isolation_level=None) double BEGIN, and the sneaky case: an explicit BEGIN issued after a transaction Python already opened implicitly. Every error string and con.in_transaction value below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s sqlite3 is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

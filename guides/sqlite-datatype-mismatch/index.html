@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLite &#x27;Datatype Mismatch&#x27; Error — Tested</title>
+<meta name="description" content="We measured why SQLite accepts text in an INTEGER column everywhere except one place: an INTEGER PRIMARY KEY, where it raises &#x27;datatype mismatch&#x27; instead.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite-datatype-mismatch/">
+<meta property="og:title" content="SQLite &#x27;Datatype Mismatch&#x27; Error — Tested">
+<meta property="og:description" content="We measured why SQLite accepts text in an INTEGER column everywhere except one place: an INTEGER PRIMARY KEY, where it raises &#x27;datatype mismatch&#x27; instead.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite-datatype-mismatch/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does SQLite reject text here but accept it in other INTEGER columns?", "acceptedAnswer": {"@type": "Answer", "text": "We measured the specific reason: INTEGER PRIMARY KEY is a direct alias for the row's internal rowid, which must genuinely be an integer or NULL. SQLite's usual type-affinity behavior (store whatever you're given) is a general rule that this one special column type overrides."}}, {"@type": "Question", "name": "Is 'datatype mismatch' the same error as SQLite's STRICT table type enforcement?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured them as genuinely different: 'datatype mismatch' (IntegrityError) is specifically the INTEGER PRIMARY KEY rowid rule, while a STRICT table's violation gives 'cannot store TEXT value in INTEGER column' (OperationalError) for any column, not just the primary key."}}, {"@type": "Question", "name": "Does passing NULL for an INTEGER PRIMARY KEY cause this error?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed NULL is accepted and triggers SQLite's normal rowid auto-assignment, the same mechanism behind auto-incrementing IDs. The error is specifically about non-NULL, non-integer values like text."}}, {"@type": "Question", "name": "Why would an app accidentally pass text into an integer primary key column?", "acceptedAnswer": {"@type": "Answer", "text": "Commonly, an upstream value that's always a string in your code (form input, a UUID-like string, a value read from an API) gets bound directly without converting to int first \u2014 we reproduced this exact pattern with a plain string literal."}}, {"@type": "Question", "name": "Does this affect a composite or non-rowid primary key the same way?", "acceptedAnswer": {"@type": "Answer", "text": "Not tested here \u2014 we specifically measured the single-column INTEGER PRIMARY KEY rowid-alias case. A composite primary key or a WITHOUT ROWID table follows different rules per SQLite's own docs, not covered by this measurement."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLite: datatype mismatch (tested)</h1>
+<p class="lead"><code>sqlite3.IntegrityError: datatype mismatch</code> is surprising if you know SQLite normally lets any value into any column regardless of its declared type. We measured the one specific place that rule doesn't apply.</p>
+<h2 id="repro1">1. A normal INTEGER column accepts text fine</h2>
+<p>SQLite uses "type affinity," not strict typing, by default: a column declared INTEGER is a hint, not an enforced constraint.</p>
+<pre><code>con.execute("CREATE TABLE t2 (id INTEGER, name TEXT)")
+con.execute("INSERT INTO t2 (id, name) VALUES (?, ?)", ("notanumber", "x"))
+# no error &mdash; row stored exactly as ("notanumber", "x")</code></pre>
+
+<h2 id="repro2">2. The one exception: INTEGER PRIMARY KEY</h2>
+<p>Same non-numeric text, but the target column is specifically <code>INTEGER PRIMARY KEY</code> (SQLite's rowid alias, not just a regular integer-typed column):</p>
+<pre><code>con.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+con.execute("INSERT INTO t (id, name) VALUES (?, ?)", ("notanumber", "x"))
+sqlite3.IntegrityError: datatype mismatch</code></pre>
+<p><strong>Measured:</strong> <code>INTEGER PRIMARY KEY</code> is a special case in SQLite &mdash; it's a direct alias for the row's internal <code>rowid</code>, which must genuinely be an integer (or NULL, to auto-assign one). Type affinity's usual "store whatever you're given" behavior doesn't apply there, which is why this one column type enforces what every other INTEGER-declared column doesn't.</p>
+
+<h2 id="repro3">3. For comparison: a STRICT table gives a different error entirely</h2>
+<p>SQLite 3.37+'s opt-in <code>STRICT</code> tables enforce types on every column, not just the primary key &mdash; and the error text is different:</p>
+<pre><code>con.execute("CREATE TABLE t3 (id INTEGER, age INTEGER) STRICT")
+con.execute("INSERT INTO t3 (id, age) VALUES (1, \'notanumber\')")
+sqlite3.OperationalError: cannot store TEXT value in INTEGER column t3.age</code></pre>
+<p>Don't pattern-match on the exception class or exact wording to diagnose which rule you hit: "datatype mismatch" is specifically the <code>INTEGER PRIMARY KEY</code> rowid rule (an <code>IntegrityError</code>); the STRICT-table message is a different, broader rule (an <code>OperationalError</code>).</p>
+
+<h2 id="fix">4. The fix: pass a real integer, or NULL to auto-assign</h2>
+<p>For an <code>INTEGER PRIMARY KEY</code> column, either supply an actual integer value or <code>NULL</code> (which we confirmed lets SQLite auto-assign the next rowid, the normal auto-increment-like pattern). Convert or validate the value before binding it &mdash; this is a real place where SQLite's normally forgiving typing will reject bad input other columns would have silently accepted.</p>
+
+<aside class="cta"><strong>Debugging an app that talks to an API instead of a database? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does SQLite reject text here but accept it in other INTEGER columns?</summary><p>We measured the specific reason: INTEGER PRIMARY KEY is a direct alias for the row&#x27;s internal rowid, which must genuinely be an integer or NULL. SQLite&#x27;s usual type-affinity behavior (store whatever you&#x27;re given) is a general rule that this one special column type overrides.</p></details>
+<details><summary>Is &#x27;datatype mismatch&#x27; the same error as SQLite&#x27;s STRICT table type enforcement?</summary><p>No — we measured them as genuinely different: &#x27;datatype mismatch&#x27; (IntegrityError) is specifically the INTEGER PRIMARY KEY rowid rule, while a STRICT table&#x27;s violation gives &#x27;cannot store TEXT value in INTEGER column&#x27; (OperationalError) for any column, not just the primary key.</p></details>
+<details><summary>Does passing NULL for an INTEGER PRIMARY KEY cause this error?</summary><p>No — we confirmed NULL is accepted and triggers SQLite&#x27;s normal rowid auto-assignment, the same mechanism behind auto-incrementing IDs. The error is specifically about non-NULL, non-integer values like text.</p></details>
+<details><summary>Why would an app accidentally pass text into an integer primary key column?</summary><p>Commonly, an upstream value that&#x27;s always a string in your code (form input, a UUID-like string, a value read from an API) gets bound directly without converting to int first — we reproduced this exact pattern with a plain string literal.</p></details>
+<details><summary>Does this affect a composite or non-rowid primary key the same way?</summary><p>Not tested here — we specifically measured the single-column INTEGER PRIMARY KEY rowid-alias case. A composite primary key or a WITHOUT ROWID table follows different rules per SQLite&#x27;s own docs, not covered by this measurement.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in sqlite3 module and SQLite 3.46.1, comparing a plain INTEGER column against an INTEGER PRIMARY KEY column, and separately against a STRICT table, all given the same non-numeric text value. Every error string below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s sqlite3 is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

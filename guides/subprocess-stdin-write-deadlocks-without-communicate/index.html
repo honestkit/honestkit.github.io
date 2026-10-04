@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>subprocess: Writing to stdin Directly Can Deadlock Your Program</title>
+<meta name="description" content="We measured writing 1MB to proc.stdin without reading stdout concurrently hanging forever — the child&#x27;s full output pipe blocks it from reading more input.">
+<link rel="canonical" href="https://honestkit.github.io/guides/subprocess-stdin-write-deadlocks-without-communicate/">
+<meta property="og:title" content="subprocess: Writing to stdin Directly Can Deadlock Your Program">
+<meta property="og:description" content="We measured writing 1MB to proc.stdin without reading stdout concurrently hanging forever — the child&#x27;s full output pipe blocks it from reading more input.">
+<meta property="og:url" content="https://honestkit.github.io/guides/subprocess-stdin-write-deadlocks-without-communicate/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does writing to subprocess stdin sometimes hang forever?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it happening when the data is large enough that the child process's own stdout pipe fills up (because nothing is reading it concurrently), causing the child to block on its own output write and stop reading further input \u2014 deadlocking both sides."}}, {"@type": "Question", "name": "Does this deadlock happen with small amounts of data?", "acceptedAnswer": {"@type": "Answer", "text": "Not in our test \u2014 we measured 128KB completing instantly with the same code, while 1MB hung indefinitely. The threshold depends on OS pipe buffer size and the child's own output buffering, which is exactly why this bug often passes small-scale testing and then hangs in production."}}, {"@type": "Question", "name": "How do I avoid subprocess stdin/stdout deadlocks in Python?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed that subprocess.Popen.communicate(input=...) handles the identical case instantly by reading and writing to the child's pipes concurrently on separate threads, which is exactly what the Python docs recommend instead of manual proc.stdin.write()/proc.stdout.read() calls."}}, {"@type": "Question", "name": "Does Python raise an exception or timeout when this deadlock happens?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured proc.stdin.write() simply never returning, with no exception and no built-in timeout. We only recovered control by wrapping the whole script in a shell-level timeout command as an external safety net."}}, {"@type": "Question", "name": "Is this deadlock specific to using the cat command?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 cat just makes the mechanism easy to demonstrate. Any child process that both reads from stdin and writes a large amount to stdout (compilers, image/video tools, data pipelines) can trigger the same deadlock if you write to its stdin and read its stdout separately instead of using communicate()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>subprocess stdin.write() Deadlock Without communicate() (tested)</h1>
+<p class="lead">Writing to <code>proc.stdin</code> and later reading <code>proc.stdout</code> looks like a reasonable way to talk to a subprocess by hand instead of using <code>communicate()</code>. We measured what happens once the data is large enough: the program hangs forever, with no exception, no timeout, and no indication anything is wrong.</p>
+<h2 id="repro1">1. Writing enough data directly to stdin hangs indefinitely</h2>
+<pre><code>import subprocess
+
+proc = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+big_data = b"x" * (1024 * 1024)  # 1MB
+
+proc.stdin.write(big_data)   # never returns
+proc.stdin.close()
+print("done")</code></pre>
+<p><strong>Measured:</strong> run under a shell-level <code>timeout 10</code> as a safety net, this script never reaches <code>print("done")</code> and gets killed by the outer timeout (exit code 124) &mdash; <code>proc.stdin.write()</code> itself never returns. With a smaller amount of data (we measured 128KB working fine), the exact same code completes instantly, which is what makes this bug so easy to ship: it only appears once input crosses a size threshold that depends on the OS pipe buffer and how the child process buffers its own output.</p>
+
+<h2 id="repro2">2. Why: the child's stdout pipe fills up because nobody is reading it</h2>
+<p><code>cat</code> reads from stdin and immediately tries to write the same bytes to stdout. Since this script never reads <code>proc.stdout</code>, that pipe fills to its OS buffer limit, and <code>cat</code>'s own write to stdout blocks. A blocked <code>cat</code> stops reading stdin entirely &mdash; which means <code>proc.stdin.write()</code> on the Python side eventually blocks too, once the stdin pipe's buffer also fills. Both processes end up waiting on each other with no way out: a classic pipe deadlock, not a slow operation that will eventually finish.</p>
+
+<h2 id="repro3">3. communicate() avoids it because it reads and writes concurrently</h2>
+<pre><code>proc = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+out, err = proc.communicate(input=big_data)
+print(len(out))</code></pre>
+<pre><code>1048576</code></pre>
+<p><strong>Measured:</strong> the identical 1MB payload completes in under 3 milliseconds through <code>communicate()</code>. Per the <a href="https://docs.python.org/3/library/subprocess.html#subprocess.Popen.communicate">subprocess docs</a>, <code>communicate()</code> explicitly exists to solve this: it uses separate threads internally to write stdin and read stdout/stderr at the same time, so neither pipe can ever fill up while the other side is blocked waiting.</p>
+
+<h2 id="fix">4. Fix: never write to stdin and read stdout/stderr by hand on the same process</h2>
+<p>Use <code>communicate(input=...)</code> whenever a subprocess needs both stdin data and its stdout/stderr captured &mdash; it is the built-in, deadlock-safe equivalent of manual <code>proc.stdin.write()</code> + <code>proc.stdout.read()</code>. If you genuinely need to stream data in both directions over time (not a single write-then-read), use <code>select</code>/<code>selectors</code> or a background thread per pipe so reads and writes can never block each other. The docs' own warning covers exactly this: "this will deadlock when using <code>stdout=PIPE</code> and/or <code>stderr=PIPE</code> and the child process generates enough output to a pipe such that it blocks waiting for the OS pipe buffer to accept more data."</p>
+
+<aside class="cta"><strong>Debugging a subprocess pipeline that hangs instead of hitting an API or local server? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does writing to subprocess stdin sometimes hang forever?</summary><p>We measured it happening when the data is large enough that the child process&#x27;s own stdout pipe fills up (because nothing is reading it concurrently), causing the child to block on its own output write and stop reading further input — deadlocking both sides.</p></details>
+<details><summary>Does this deadlock happen with small amounts of data?</summary><p>Not in our test — we measured 128KB completing instantly with the same code, while 1MB hung indefinitely. The threshold depends on OS pipe buffer size and the child&#x27;s own output buffering, which is exactly why this bug often passes small-scale testing and then hangs in production.</p></details>
+<details><summary>How do I avoid subprocess stdin/stdout deadlocks in Python?</summary><p>We confirmed that subprocess.Popen.communicate(input=...) handles the identical case instantly by reading and writing to the child&#x27;s pipes concurrently on separate threads, which is exactly what the Python docs recommend instead of manual proc.stdin.write()/proc.stdout.read() calls.</p></details>
+<details><summary>Does Python raise an exception or timeout when this deadlock happens?</summary><p>No — we measured proc.stdin.write() simply never returning, with no exception and no built-in timeout. We only recovered control by wrapping the whole script in a shell-level timeout command as an external safety net.</p></details>
+<details><summary>Is this deadlock specific to using the cat command?</summary><p>No — cat just makes the mechanism easy to demonstrate. Any child process that both reads from stdin and writes a large amount to stdout (compilers, image/video tools, data pipelines) can trigger the same deadlock if you write to its stdin and read its stdout separately instead of using communicate().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in subprocess module on Linux: launched Popen([&#x27;cat&#x27;], stdin=PIPE, stdout=PIPE), wrote 1MB directly to proc.stdin without reading proc.stdout concurrently, bounded the whole script with the shell&#x27;s own `timeout 10` so a true hang couldn&#x27;t actually freeze anything, then repeated with communicate(). PlainHeaders is our extension; Python&#x27;s subprocess module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

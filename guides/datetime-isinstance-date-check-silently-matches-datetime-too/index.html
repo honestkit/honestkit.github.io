@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>isinstance(x, date) Also Matches datetime -- Silently</title>
+<meta name="description" content="We measured isinstance(datetime.now(), date) returning True, so a dispatch function checking date before datetime silently misroutes every datetime value.">
+<link rel="canonical" href="https://honestkit.github.io/guides/datetime-isinstance-date-check-silently-matches-datetime-too/">
+<meta property="og:title" content="isinstance(x, date) Also Matches datetime -- Silently">
+<meta property="og:description" content="We measured isinstance(datetime.now(), date) returning True, so a dispatch function checking date before datetime silently misroutes every datetime value.">
+<meta property="og:url" content="https://honestkit.github.io/guides/datetime-isinstance-date-check-silently-matches-datetime-too/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is datetime.datetime a subclass of datetime.date in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- per the datetime docs, datetime is a subclass of date that adds time-of-day fields. We confirmed isinstance(a_datetime, date) returns True."}}, {"@type": "Question", "name": "Why did my function treat a datetime value as a plain date?", "acceptedAnswer": {"@type": "Answer", "text": "We measured a dispatch function that checks isinstance(x, date) before isinstance(x, datetime) silently matching datetime values on the date branch, since the subclass check succeeds for both."}}, {"@type": "Question", "name": "Does isinstance(a_date, datetime) also return True for a plain date?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we confirmed the relationship only goes one way: a plain date object does not pass an isinstance check against datetime."}}, {"@type": "Question", "name": "How do I check for an exact date, excluding datetime instances?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed type(x) is date returns False for a datetime instance, where isinstance(x, date) returns True -- use type() for an exact match if that distinction matters."}}, {"@type": "Question", "name": "What's the safe order for isinstance checks on date and datetime?", "acceptedAnswer": {"@type": "Answer", "text": "We verified checking isinstance(x, datetime) first, then isinstance(x, date) as a fallback, correctly routes both types -- the more specific subclass needs to be checked before the more general base class."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>isinstance(x, date) Silently Matches datetime Too (tested)</h1>
+<p class="lead"><code>datetime.datetime</code> is a subclass of <code>datetime.date</code>. We measured what that means for an <code>isinstance()</code> check meant to tell them apart: a datetime value passes an <code>isinstance(x, date)</code> test too, with nothing to signal that the match was the wrong one.</p>
+<h2 id="repro1">1. A datetime instance passes isinstance(x, date)</h2>
+<pre><code>from datetime import date, datetime
+
+dt = datetime(2026, 6, 15, 14, 30, 0)
+print(isinstance(dt, date))       # checking for a plain date
+print(isinstance(dt, datetime))   # checking for a datetime</code></pre>
+<pre><code>True
+True</code></pre>
+<p><strong>Measured:</strong> the same object answers <code>True</code> to both checks. Per the docs, <code>datetime.datetime</code> is implemented as a subclass of <code>datetime.date</code>, adding time-of-day fields. There's no exception or warning &mdash; <code>isinstance(x, date)</code> simply can't distinguish "this is a plain date" from "this is a datetime, which is also a date."</p>
+
+<h2 id="repro2">2. Why order matters in a dispatch function</h2>
+<pre><code>def describe(x):
+    if isinstance(x, date):
+        return "date-only: " + x.isoformat()
+    return "datetime: " + x.isoformat()
+
+print(describe(dt))</code></pre>
+<pre><code>date-only: 2026-06-15T14:30:00</code></pre>
+<p><strong>Measured:</strong> a function written to check "is this a plain date" first catches the <code>datetime</code> value too, and labels it <code>date-only</code> &mdash; even though the exact same object's <code>.isoformat()</code> call still prints the full time of day. The label and the data disagree, silently, because the branch that ran was never meant to handle a value with a time component.</p>
+
+<h2 id="repro3">3. The reverse check doesn't have this problem</h2>
+<pre><code>d = date(2026, 6, 15)
+print(isinstance(d, datetime))</code></pre>
+<pre><code>False</code></pre>
+<p><strong>Measured:</strong> a plain <code>date</code> does <em>not</em> pass an <code>isinstance(x, datetime)</code> check &mdash; the subclass relationship only goes one direction. This asymmetry is exactly why check order matters: testing for <code>datetime</code> first is safe, testing for <code>date</code> first is not.</p>
+
+<h2 id="fix">4. Fix: check the more specific type first, or use type() for exact matching</h2>
+<pre><code>def describe_fixed(x):
+    if isinstance(x, datetime):      # check the subclass FIRST
+        return "datetime: " + x.isoformat()
+    if isinstance(x, date):
+        return "date-only: " + x.isoformat()
+    return "not a date/datetime"
+
+print(describe_fixed(dt))
+print(describe_fixed(date(2026, 6, 15)))</code></pre>
+<pre><code>datetime: 2026-06-15T14:30:00
+date-only: 2026-06-15</code></pre>
+<p><strong>Measured:</strong> checking <code>isinstance(x, datetime)</code> before <code>isinstance(x, date)</code> correctly routes both values. If you specifically need to exclude <code>datetime</code> instances from a "plain date" branch, <code>type(x) is date</code> (confirmed <code>False</code> for our <code>dt</code> instance above) is the exact-type check that <code>isinstance()</code> alone can't give you.</p>
+<aside class="cta"><strong>Debugging an API field that silently dropped a timestamp&#x27;s time of day? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is datetime.datetime a subclass of datetime.date in Python?</summary><p>Yes -- per the datetime docs, datetime is a subclass of date that adds time-of-day fields. We confirmed isinstance(a_datetime, date) returns True.</p></details>
+<details><summary>Why did my function treat a datetime value as a plain date?</summary><p>We measured a dispatch function that checks isinstance(x, date) before isinstance(x, datetime) silently matching datetime values on the date branch, since the subclass check succeeds for both.</p></details>
+<details><summary>Does isinstance(a_date, datetime) also return True for a plain date?</summary><p>No -- we confirmed the relationship only goes one way: a plain date object does not pass an isinstance check against datetime.</p></details>
+<details><summary>How do I check for an exact date, excluding datetime instances?</summary><p>We confirmed type(x) is date returns False for a datetime instance, where isinstance(x, date) returns True -- use type() for an exact match if that distinction matters.</p></details>
+<details><summary>What&#x27;s the safe order for isinstance checks on date and datetime?</summary><p>We verified checking isinstance(x, datetime) first, then isinstance(x, date) as a fallback, correctly routes both types -- the more specific subclass needs to be checked before the more general base class.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in datetime module: ran isinstance() of a datetime.datetime instance against datetime.date, and against a date-vs-datetime dispatch function that checks isinstance(x, date) before isinstance(x, datetime). PlainHeaders is our extension; Python&#x27;s datetime module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

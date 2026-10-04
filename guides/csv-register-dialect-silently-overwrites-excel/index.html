@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>csv.register_dialect() Can Silently Overwrite &#x27;excel&#x27; (Tested)</title>
+<meta name="description" content="We measured csv.register_dialect(&#x27;excel&#x27;, ...) silently replacing the built-in dialect process-wide — but only some csv callers actually pick up the change.">
+<link rel="canonical" href="https://honestkit.github.io/guides/csv-register-dialect-silently-overwrites-excel/">
+<meta property="og:title" content="csv.register_dialect() Can Silently Overwrite &#x27;excel&#x27; (Tested)">
+<meta property="og:description" content="We measured csv.register_dialect(&#x27;excel&#x27;, ...) silently replacing the built-in dialect process-wide — but only some csv callers actually pick up the change.">
+<meta property="og:url" content="https://honestkit.github.io/guides/csv-register-dialect-silently-overwrites-excel/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can csv.register_dialect() overwrite the built-in 'excel' dialect?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we measured it directly. csv.register_dialect(\"excel\", delimiter=\";\") silently replaces the built-in dialect with no error or warning, for the rest of the process."}}, {"@type": "Question", "name": "If 'excel' gets overwritten, does plain csv.reader(f) with no dialect argument change too?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured that csv.reader(f) and csv.writer(f) called with no dialect argument keep using a comma regardless, because their no-argument default is a separate hardcoded value, not a lookup of the string \"excel\"."}}, {"@type": "Question", "name": "Does DictReader get affected by overwriting the 'excel' dialect?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we measured DictReader() and DictWriter() with no dialect argument picking up the overwritten delimiter immediately, because they default their dialect parameter to the literal string \"excel\", which is resolved through the registry."}}, {"@type": "Question", "name": "Is csv.register_dialect()'s global registry shared across a whole program?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 it's one module-level dict for the entire process, the same pattern as csv.field_size_limit(). Any code that registers over a built-in name affects every other piece of code in that process using that name, including third-party libraries."}}, {"@type": "Question", "name": "How do I avoid this problem in my own code?", "acceptedAnswer": {"@type": "Answer", "text": "We'd never register a custom dialect under a built-in name like \"excel\", \"excel-tab\", or \"unix\" \u2014 use a unique, clearly custom name instead, and check csv.list_dialects() / csv.get_dialect(\"excel\").delimiter if parsing behaves inconsistently across a codebase."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>csv.register_dialect() Overwrites &#x27;excel&#x27; (tested)</h1>
+<p class="lead"><code>csv.register_dialect()</code> lets you give a dialect any name you want &mdash; including <code>'excel'</code>, the name of the built-in default. Nothing stops you, and nothing warns you. We measured what actually breaks afterward, and it's not what you'd expect.</p>
+<h2 id="repro1">1. Overwriting the built-in 'excel' dialect raises no error</h2>
+<pre><code>import csv
+
+csv.get_dialect("excel").delimiter
+','
+csv.register_dialect("excel", delimiter=";")
+csv.get_dialect("excel").delimiter
+';'</code></pre>
+<p><strong>Measured:</strong> <code>csv.register_dialect()</code> has no protection for built-in names. Re-registering <code>"excel"</code> silently replaces it in the global dialect registry for the rest of the process &mdash; same "one global mutable setting" shape as <code>csv.field_size_limit()</code>, but applied to the dialect every piece of code assumes is the stable default.</p>
+
+<h2 id="repro2">2. Code that names "excel" explicitly breaks immediately</h2>
+<pre><code>import io
+
+f = io.StringIO("a;b\n1;2\n")
+list(csv.reader(f, "excel"))
+[['a', 'b'], ['1', '2']]
+
+f2 = io.StringIO()
+csv.DictWriter(f2, fieldnames=["x", "y"]).writeheader()
+f2.getvalue()
+'x;y\r\n'</code></pre>
+<p><strong>Measured:</strong> <code>csv.reader(f, "excel")</code> and <code>DictWriter</code>/<code>DictReader</code> with no dialect argument both resolve the string <code>"excel"</code> through the registry at call time, so they pick up the overwritten delimiter immediately. <code>DictReader</code>/<code>DictWriter</code> default their <code>dialect</code> parameter to the literal string <code>"excel"</code>, which is why they're affected even though you never named a dialect.</p>
+
+<h2 id="repro3">3. Plain csv.reader()/csv.writer() with no dialect argument are unaffected</h2>
+<pre><code>f3 = io.StringIO("a;b\n1;2\n")
+r = csv.reader(f3)
+r.dialect.delimiter
+','
+list(r)
+[['a;b'], ['1;2']]
+
+f4 = io.StringIO()
+csv.writer(f4).writerow(["x", "y"])
+f4.getvalue()
+'x,y\r\n'</code></pre>
+<p><strong>Measured:</strong> this is the surprising part. <code>csv.reader(f)</code> and <code>csv.writer(f)</code> called with <em>no</em> dialect argument at all still use a comma, completely ignoring the overwritten <code>"excel"</code> registration. Their no-argument default isn't a lookup of the string <code>"excel"</code> in the registry &mdash; it's a separate hardcoded default baked into the C implementation. So the exact same overwrite silently changes the behavior of <code>DictReader</code>/<code>DictWriter</code> and anything that writes <code>dialect="excel"</code> explicitly, while leaving plain no-argument <code>reader()</code>/<code>writer()</code> calls completely untouched &mdash; in the same process, with the same registry.</p>
+
+<h2 id="fix">4. What to actually do</h2>
+<p>Never register a custom dialect under <code>"excel"</code>, <code>"excel-tab"</code>, or <code>"unix"</code> &mdash; pick a name nobody else could plausibly be using, like a module-prefixed string (<code>"myapp-pipe-delim"</code>). If you're debugging inconsistent CSV parsing across one codebase and suspect this, check <code>csv.list_dialects()</code> and <code>csv.get_dialect("excel").delimiter</code> early &mdash; a built-in dialect that doesn't match its own default is a sign some import-time code registered over it. Because the registry is global and process-wide, a single third-party library doing this at import time can change <code>DictReader</code> behavior anywhere else in the same process without ever touching your code directly.</p>
+
+<aside class="cta"><strong>Debugging why a CSV an API streams back parses differently across your own code? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can csv.register_dialect() overwrite the built-in &#x27;excel&#x27; dialect?</summary><p>Yes — we measured it directly. csv.register_dialect(&quot;excel&quot;, delimiter=&quot;;&quot;) silently replaces the built-in dialect with no error or warning, for the rest of the process.</p></details>
+<details><summary>If &#x27;excel&#x27; gets overwritten, does plain csv.reader(f) with no dialect argument change too?</summary><p>No — we measured that csv.reader(f) and csv.writer(f) called with no dialect argument keep using a comma regardless, because their no-argument default is a separate hardcoded value, not a lookup of the string &quot;excel&quot;.</p></details>
+<details><summary>Does DictReader get affected by overwriting the &#x27;excel&#x27; dialect?</summary><p>Yes — we measured DictReader() and DictWriter() with no dialect argument picking up the overwritten delimiter immediately, because they default their dialect parameter to the literal string &quot;excel&quot;, which is resolved through the registry.</p></details>
+<details><summary>Is csv.register_dialect()&#x27;s global registry shared across a whole program?</summary><p>Yes — it&#x27;s one module-level dict for the entire process, the same pattern as csv.field_size_limit(). Any code that registers over a built-in name affects every other piece of code in that process using that name, including third-party libraries.</p></details>
+<details><summary>How do I avoid this problem in my own code?</summary><p>We&#x27;d never register a custom dialect under a built-in name like &quot;excel&quot;, &quot;excel-tab&quot;, or &quot;unix&quot; — use a unique, clearly custom name instead, and check csv.list_dialects() / csv.get_dialect(&quot;excel&quot;).delimiter if parsing behaves inconsistently across a codebase.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in csv module: called csv.register_dialect(&#x27;excel&#x27;, delimiter=&#x27;;&#x27;) to overwrite the built-in &#x27;excel&#x27; dialect, then compared csv.reader()/csv.writer() with no dialect argument against csv.reader(f, &#x27;excel&#x27;)/DictReader()/DictWriter() in the same process, recording which ones picked up the change. PlainHeaders is our extension; Python&#x27;s csv module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

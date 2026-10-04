@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Age HTTP Header: How Caches Count Freshness (Tested)</title>
+<meta name="description" content="We read Age from five big sites twice, 5 seconds apart, and ran Chromium against a server that sent Age: 50 and Age: 100 with max-age=60. Age eats into max-age, and Age above max-age means no caching at all.">
+<link rel="canonical" href="https://honestkit.github.io/guides/age-header-http-cache/">
+<meta property="og:title" content="The Age HTTP Header: How Caches Count Freshness (Tested)">
+<meta property="og:description" content="We read Age from five big sites twice, 5 seconds apart, and ran Chromium against a server that sent Age: 50 and Age: 100 with max-age=60. Age eats into max-age, and Age above max-age means no caching at all.">
+<meta property="og:url" content="https://honestkit.github.io/guides/age-header-http-cache/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does the Age header mean?", "acceptedAnswer": {"@type": "Answer", "text": "It is the number of seconds since the response was generated or last validated at the origin. Caches add it. In our test, Age on five-second-apart requests to jQuery's CDN went from 4122607 to 4122613."}}, {"@type": "Question", "name": "Does the browser subtract Age from max-age?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. In Chromium, max-age=60 with Age: 50 stayed cached for about 10 seconds; at 12 seconds Chromium fetched from the server again."}}, {"@type": "Question", "name": "What happens if Age is bigger than max-age?", "acceptedAnswer": {"@type": "Answer", "text": "The response is stale on arrival. With max-age=60 and Age: 100, Chromium hit our server on all three fetches and never used the cache."}}, {"@type": "Question", "name": "Should my origin server send an Age header?", "acceptedAnswer": {"@type": "Answer", "text": "No. Age is for caches to set. If your origin sends it, caches and browsers count it against max-age and can stop caching your pages."}}, {"@type": "Question", "name": "Why is Age missing on some sites?", "acceptedAnswer": {"@type": "Answer", "text": "Either no shared cache stored the response (for example BBC's homepage is private with max-age=0) or the response came straight from the origin. A fresh origin fetch may also show Age: 0."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Age header (tested)</h1>
+<p class="lead"><code>Age</code> says how many seconds a response has already sat in a cache. Browsers subtract it from <code>max-age</code>. We measured real CDNs and Chromium to show what that means in practice.</p>
+<h2>1. What Age means</h2>
+<p>RFC 9111 (section 5.1) defines <code>Age</code> as the sender's estimate of the time since the response was generated or last validated at the origin. The value is whole seconds. A cache adds it when it serves a stored response.</p>
+<p>The rule that matters: a response is fresh while its current age is less than its freshness lifetime. In plain terms, <strong>freshness left = max-age &minus; Age</strong>.</p>
+<p>A response fetched straight from the origin usually has no Age header, or <code>Age: 0</code>. The spec says a cache that sends a just-fetched response may send <code>Age: 0</code>.</p>
+
+<h2>2. Real CDNs: two curl runs 5 seconds apart</h2>
+<pre><code>curl -sI https://code.jquery.com/jquery-3.7.1.min.js | grep -iE '^(age|cache-control|x-cache)'
+sleep 5
+curl -sI https://code.jquery.com/jquery-3.7.1.min.js | grep -iE '^(age|cache-control|x-cache)'</code></pre>
+<p>This is what we got:</p>
+<table>
+<tr><th>URL</th><th>Cache-Control</th><th>Age run 1</th><th>Age run 2</th><th>X-Cache</th></tr>
+<tr><td>www.wikipedia.org/</td><td>s-maxage=86400, must-revalidate, max-age=3600</td><td>18700</td><td>18706</td><td>cp3069 miss, cp3069 hit</td></tr>
+<tr><td>code.jquery.com jquery-3.7.1.min.js</td><td>public, max-age=31536000, stale-while-revalidate=604800</td><td>4122607</td><td>4122613</td><td>HIT, HIT</td></tr>
+<tr><td>cdn.jsdelivr.net react@18/package.json</td><td>public, max-age=604800, s-maxage=43200</td><td>33152</td><td>33157</td><td>HIT, HIT</td></tr>
+<tr><td>developer.mozilla.org/</td><td>max-age=3600,public</td><td>1329</td><td>1334</td><td>MISS, HIT, HIT</td></tr>
+<tr><td>www.bbc.co.uk/</td><td>private, ..., max-age=0, must-revalidate</td><td>(none)</td><td>(none)</td><td>(none)</td></tr>
+</table>
+<p>Age went up by 5 or 6 seconds between runs, as expected. The same cached copy was served both times. None of the five sent <code>CF-Cache-Status</code>; the <code>X-Cache</code> and <code>X-Served-By: cache-...</code> headers on jQuery, jsDelivr and MDN are the Fastly style. jQuery and MDN also showed <code>Via: 1.1 varnish</code>. BBC sends <code>private</code> with <code>max-age=0</code>, so no shared cache stores it and there is no Age.</p>
+
+<h2>3. Do the subtraction</h2>
+<table>
+<tr><th>URL</th><th>max-age</th><th>Age</th><th>Freshness left in your browser</th></tr>
+<tr><td>jquery-3.7.1.min.js</td><td>31536000</td><td>4122607</td><td>27413393 s (about 317 days)</td></tr>
+<tr><td>react@18/package.json</td><td>604800</td><td>33152</td><td>571648 s (about 6.6 days)</td></tr>
+<tr><td>developer.mozilla.org/</td><td>3600</td><td>1329</td><td>2271 s (about 38 min)</td></tr>
+<tr><td>www.wikipedia.org/</td><td>3600</td><td>18700</td><td>none: already stale</td></tr>
+</table>
+<p>Wikipedia is the interesting row. The CDN keeps the page for <code>s-maxage=86400</code> (a day), but the browser uses <code>max-age=3600</code>. Age 18700 is more than 3600, so the browser gets a response that is already stale. With <code>must-revalidate</code> it has to check back next time. For jsDelivr the CDN's own limit is <code>s-maxage=43200</code>, so the CDN copy has 43200 &minus; 33152 = 10048 s left.</p>
+
+<h2>4. Chromium test: Age eats into max-age</h2>
+<p>We ran a tiny Node.js server on port 8986. Every response had <code>Cache-Control: max-age=60</code>. Three URLs sent different Age values. The server counted each request. Chromium fetched all three at t=0, t=5 s and t=12 s.</p>
+<pre><code>res.writeHead(200, {'cache-control': 'max-age=60', 'age': age});
+// page: fetch('/a50'), fetch('/a100'), fetch('/a0') at t=0, 5, 12 s</code></pre>
+<table>
+<tr><th>Headers</th><th>Freshness left</th><th>t=0</th><th>t=5 s</th><th>t=12 s</th><th>Server hits</th></tr>
+<tr><td>max-age=60, Age: 0</td><td>60 s</td><td>server</td><td>cache</td><td>cache</td><td>1</td></tr>
+<tr><td>max-age=60, Age: 50</td><td>10 s</td><td>server</td><td>cache</td><td>server</td><td>2</td></tr>
+<tr><td>max-age=60, Age: 100</td><td>none</td><td>server</td><td>server</td><td>server</td><td>3</td></tr>
+</table>
+<p>With Age: 50 the copy stayed fresh at 5 s and expired before 12 s, so Chromium went back to the server. With Age: 100 the response was stale on arrival and Chromium never served it from cache. With Age: 0 one request covered all three fetches.</p>
+
+<h2>5. Age is set by caches, not your origin</h2>
+<p>Caches such as Varnish, Fastly and Cloudflare add or update Age when they serve a stored copy. Per their docs, Varnish sets Age from the time the object has been in its cache. Fastly, which is built on Varnish, does the same and adds the age it received from upstream. Cloudflare sends Age on cache hits.</p>
+<p>If your origin sends an <code>Age</code> header itself, caches and browsers will trust it. An origin that sends <code>Age: 3600</code> with <code>max-age=3600</code> makes its own pages uncacheable, as our Age: 100 test shows. This often happens by accident when one cache sits behind another, or when a framework copies headers from an upstream response. Check for it and remove it at the origin.</p>
+<p>When several caches are stacked, each one adds its own time. That is why the Age you see at the edge can be far larger than how long the edge itself held the copy. The <a href="/guides/via-header/">Via header</a> shows how many hops there were.</p>
+
+<h2>6. Quick checklist</h2>
+<ul>
+<li>See an Age value? A cache served this response. Compare it to <code>max-age</code> (browser) or <code>s-maxage</code> (CDN).</li>
+<li>If Age is greater than max-age, browsers treat the response as stale. Use <a href="/guides/stale-while-revalidate-cache-control-immutable/">stale-while-revalidate</a> or a bigger max-age if that is not what you want.</li>
+<li>Stale is not the same as re-downloaded: with an ETag or Last-Modified, the browser can get a <a href="/guides/304-not-modified/">304 Not Modified</a>.</li>
+<li>No Age on a page marked <code>private</code> is normal. See <a href="/guides/cache-control-private-vs-public/">private vs public</a>.</li>
+</ul>
+<aside class="cta"><strong>See the Age, Cache-Control and X-Cache headers on any page you open:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does the Age header mean?</summary><p>It is the number of seconds since the response was generated or last validated at the origin. Caches add it. In our test, Age on five-second-apart requests to jQuery&#x27;s CDN went from 4122607 to 4122613.</p></details>
+<details><summary>Does the browser subtract Age from max-age?</summary><p>Yes. In Chromium, max-age=60 with Age: 50 stayed cached for about 10 seconds; at 12 seconds Chromium fetched from the server again.</p></details>
+<details><summary>What happens if Age is bigger than max-age?</summary><p>The response is stale on arrival. With max-age=60 and Age: 100, Chromium hit our server on all three fetches and never used the cache.</p></details>
+<details><summary>Should my origin server send an Age header?</summary><p>No. Age is for caches to set. If your origin sends it, caches and browsers count it against max-age and can stop caching your pages.</p></details>
+<details><summary>Why is Age missing on some sites?</summary><p>Either no shared cache stored the response (for example BBC&#x27;s homepage is private with max-age=0) or the response came straight from the origin. A fresh origin fetch may also show Age: 0.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with curl 8.14.1 against Wikipedia, code.jquery.com, jsDelivr, BBC and MDN (two runs about 5 seconds apart), and with headless Chromium 153 (Playwright) plus a Node.js 24.21.0 test server that counted every request. PlainHeaders is our extension; curl, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

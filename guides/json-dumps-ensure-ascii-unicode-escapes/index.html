@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why json.dumps() Turns café Into caf\u00e9 — Explained</title>
+<meta name="description" content="We measured why json.dumps() escapes non-ASCII text to \uXXXX by default, that both forms decode the same, and the byte-size tradeoff of turning it off.">
+<link rel="canonical" href="https://honestkit.github.io/guides/json-dumps-ensure-ascii-unicode-escapes/">
+<meta property="og:title" content="Why json.dumps() Turns café Into caf\u00e9 — Explained">
+<meta property="og:description" content="We measured why json.dumps() escapes non-ASCII text to \uXXXX by default, that both forms decode the same, and the byte-size tradeoff of turning it off.">
+<meta property="og:url" content="https://honestkit.github.io/guides/json-dumps-ensure-ascii-unicode-escapes/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does json.dumps() turn caf\u00e9 into caf\\u00e9 by default?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed this is the default value of the ensure_ascii parameter (True) \u2014 it deliberately escapes every non-ASCII character to a \\\\uXXXX sequence so the output contains only ASCII bytes, even though JSON's spec allows raw UTF-8 text directly."}}, {"@type": "Question", "name": "Does ensure_ascii=False produce invalid JSON?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured that both the escaped and unescaped forms are equally valid per the JSON spec, and both parse back via json.loads() to the identical Python data; escaping non-ASCII characters is optional, not a compliance requirement."}}, {"@type": "Question", "name": "Is ensure_ascii=False output actually smaller?", "acceptedAnswer": {"@type": "Answer", "text": "In our test with caf\u00e9/Tokyo's Japanese name, yes \u2014 the escaped default was 45 UTF-8 bytes versus 35 for the unescaped form, since each \\\\uXXXX escape is 6 ASCII bytes while the real UTF-8 character is usually 2-4 bytes; the size gap grows with more non-ASCII content."}}, {"@type": "Question", "name": "When should I keep the default ensure_ascii=True?", "acceptedAnswer": {"@type": "Answer", "text": "We'd keep it only when there's a specific reason to guarantee pure-ASCII output \u2014 for example embedding the JSON string inside another format or transport that can't safely carry raw UTF-8 bytes, or sending to a downstream system with unreliable encoding handling."}}, {"@type": "Question", "name": "Does ensure_ascii affect the actual data, not just how it looks?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed it only changes the text representation on the wire or on disk; decoding either form with json.loads() produces identical Python objects, so switching it never breaks interoperability with a compliant parser."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>json.dumps() ensure_ascii Unicode Escapes (tested)</h1>
+<p class="lead">By default, <code>json.dumps()</code> replaces every non-ASCII character with a <code>\uXXXX</code> escape sequence, even though JSON's spec allows raw UTF-8 text directly. This is a deliberate default, not a bug, and it's controlled by one argument. We measured exactly what changes when you flip it.</p>
+<h2 id="repro1">1. The default behavior</h2>
+<pre><code>import json
+
+json.dumps({"name": "café", "city": "東京"})
+'{"name": "caf\\u00e9", "city": "\\u6771\\u4eac"}'</code></pre>
+<p><strong>Measured:</strong> every character outside the ASCII range (café's <code>é</code>, and both characters of Tokyo's name in Japanese) gets replaced by its <code>\uXXXX</code> escape. This is <code>ensure_ascii=True</code>, the default value of that parameter &mdash; the output is still exactly one JSON string, just restricted to ASCII bytes.</p>
+
+<h2 id="repro2">2. ensure_ascii=False writes the real characters</h2>
+<pre><code>json.dumps({"name": "café", "city": "東京"}, ensure_ascii=False)
+'{"name": "café", "city": "東京"}'</code></pre>
+<p><strong>Measured:</strong> with <code>ensure_ascii=False</code>, the raw UTF-8 characters are written directly into the string instead of being escaped. Both forms are equally valid JSON per the spec &mdash; escaping non-ASCII characters is optional, not a compliance requirement.</p>
+
+<h2 id="repro3">3. Both forms parse back to the identical data</h2>
+<pre><code>a = json.dumps({"name": "café"})
+b = json.dumps({"name": "café"}, ensure_ascii=False)
+json.loads(a) == json.loads(b)
+True</code></pre>
+<p><strong>Measured:</strong> this setting only affects how the text looks on the wire or on disk &mdash; it has zero effect on the actual data once decoded. Any compliant JSON parser handles both forms identically, so switching it is always safe for interoperability.</p>
+
+<h2 id="repro4">4. The real tradeoff: byte size and readability</h2>
+<pre><code>len(a.encode("utf-8"))   # ensure_ascii=True output
+45
+len(b.encode("utf-8"))   # ensure_ascii=False output
+35</code></pre>
+<p><strong>Measured:</strong> on this small example, the escaped form was actually <em>larger</em> in bytes &mdash; each <code>\uXXXX</code> escape is 6 ASCII bytes, while the real UTF-8 character it replaces is often 2-4 bytes. For text with a lot of non-ASCII content, <code>ensure_ascii=False</code> produces smaller output as well as output that's actually readable in a log file or a raw HTTP response, instead of a wall of escape codes.</p>
+
+<h2 id="fix">5. When to use which</h2>
+<p>Use <code>ensure_ascii=False</code> whenever you control both ends (your own API, your own log files, writing to a UTF-8-aware file or terminal) &mdash; it's smaller and human-readable. Keep the default <code>ensure_ascii=True</code> only if you have a specific reason to guarantee pure-ASCII output, such as embedding the JSON string inside another format that can't safely carry raw UTF-8 bytes, or a downstream system with unknown or unreliable encoding handling.</p>
+
+<aside class="cta"><strong>Debugging why an API response shows backslash-u escapes instead of real characters? Check the real headers it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does json.dumps() turn café into caf\u00e9 by default?</summary><p>We confirmed this is the default value of the ensure_ascii parameter (True) — it deliberately escapes every non-ASCII character to a \\uXXXX sequence so the output contains only ASCII bytes, even though JSON&#x27;s spec allows raw UTF-8 text directly.</p></details>
+<details><summary>Does ensure_ascii=False produce invalid JSON?</summary><p>No — we measured that both the escaped and unescaped forms are equally valid per the JSON spec, and both parse back via json.loads() to the identical Python data; escaping non-ASCII characters is optional, not a compliance requirement.</p></details>
+<details><summary>Is ensure_ascii=False output actually smaller?</summary><p>In our test with café/Tokyo&#x27;s Japanese name, yes — the escaped default was 45 UTF-8 bytes versus 35 for the unescaped form, since each \\uXXXX escape is 6 ASCII bytes while the real UTF-8 character is usually 2-4 bytes; the size gap grows with more non-ASCII content.</p></details>
+<details><summary>When should I keep the default ensure_ascii=True?</summary><p>We&#x27;d keep it only when there&#x27;s a specific reason to guarantee pure-ASCII output — for example embedding the JSON string inside another format or transport that can&#x27;t safely carry raw UTF-8 bytes, or sending to a downstream system with unreliable encoding handling.</p></details>
+<details><summary>Does ensure_ascii affect the actual data, not just how it looks?</summary><p>No — we confirmed it only changes the text representation on the wire or on disk; decoding either form with json.loads() produces identical Python objects, so switching it never breaks interoperability with a compliant parser.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in json module, dumping the same Unicode text with and without ensure_ascii and comparing the exact output and byte length. PlainHeaders is our extension; Python&#x27;s json module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

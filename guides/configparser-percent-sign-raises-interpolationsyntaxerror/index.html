@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>configparser Raises InterpolationSyntaxError on a Plain % Sign</title>
+<meta name="description" content="We measured configparser.ConfigParser() raising InterpolationSyntaxError on an ordinary value like &#x27;50% off&#x27; — the default interpolation treats % as special.">
+<link rel="canonical" href="https://honestkit.github.io/guides/configparser-percent-sign-raises-interpolationsyntaxerror/">
+<meta property="og:title" content="configparser Raises InterpolationSyntaxError on a Plain % Sign">
+<meta property="og:description" content="We measured configparser.ConfigParser() raising InterpolationSyntaxError on an ordinary value like &#x27;50% off&#x27; — the default interpolation treats % as special.">
+<meta property="og:url" content="https://honestkit.github.io/guides/configparser-percent-sign-raises-interpolationsyntaxerror/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does configparser raise an error on a value with a percent sign?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it happening because ConfigParser's default BasicInterpolation reserves the % character for %(key)s-style value substitution \u2014 any % not followed by % or ( raises InterpolationSyntaxError when the value is read, even though the file parses without error."}}, {"@type": "Question", "name": "Does the error happen when reading the config file or when accessing the value?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed it happens on access, not on read_string()/read() \u2014 the file loads successfully, and the exception only appears the moment you index into the section to get the value."}}, {"@type": "Question", "name": "How do I put a literal percent sign in a configparser value?", "acceptedAnswer": {"@type": "Answer", "text": "We verified doubling it to %% in the source file (e.g. '50%% off') produces a single literal % once read back through the default ConfigParser."}}, {"@type": "Question", "name": "How do I avoid escaping percent signs in configparser values entirely?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed that both configparser.ConfigParser(interpolation=None) and configparser.RawConfigParser() read a literal, unescaped % correctly with no exception \u2014 use either if your config doesn't rely on %(key)s-style interpolation."}}, {"@type": "Question", "name": "Is this specific to the % character, or do other characters cause similar errors?", "acceptedAnswer": {"@type": "Answer", "text": "Based on the docs and what we measured, this is specific to % because it's the interpolation marker for BasicInterpolation; ordinary characters like $ or # don't trigger any equivalent parsing behavior in configparser values."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>configparser Percent Sign InterpolationSyntaxError (tested)</h1>
+<p class="lead">A config file value like <code>discount = 50% off</code> looks completely ordinary. We measured Python's default <code>configparser.ConfigParser()</code> refusing to read it at all, raising an exception on a plain percent sign that has nothing to do with string formatting.</p>
+<h2 id="repro1">1. A literal % in a value raises an exception on read</h2>
+<pre><code>import configparser
+
+c = configparser.ConfigParser()
+c.read_string("""
+[section]
+discount = 50% off
+""")
+c["section"]["discount"]</code></pre>
+<pre><code>Traceback (most recent call last):
+  ...
+configparser.InterpolationSyntaxError: '%' must be followed by '%' or '(', found: '% off'</code></pre>
+<p><strong>Measured:</strong> the file parses fine &mdash; <code>read_string()</code> itself raises no error. The exception only happens when the value is actually accessed, and it comes from <code>ConfigParser</code>'s default <strong>interpolation</strong> feature, not from anything wrong with the INI syntax. A <code>%</code> not immediately followed by another <code>%</code> or a <code>(</code> is invalid under that feature, because plain <code>%</code> is reserved for <code>%(other_key)s</code>-style substitutions.</p>
+
+<h2 id="repro2">2. Why: ConfigParser defaults to %-style interpolation, like old-style string formatting</h2>
+<p>Per the <a href="https://docs.python.org/3/library/configparser.html#configparser.BasicInterpolation">configparser docs</a>, <code>ConfigParser()</code> defaults to <code>BasicInterpolation</code>, which lets one value reference another via <code>%(key)s</code> syntax (similar to old <code>%</code>-style string formatting). That feature reserves every <code>%</code> character, so any value containing a real, literal percent sign &mdash; a discount rate, a CPU usage threshold, a URL-encoded <code>%20</code> &mdash; needs to escape it, or interpolation has to be turned off entirely.</p>
+
+<h2 id="repro3">3. Fix 1: escape the percent sign as %%</h2>
+<pre><code>c.read_string("""
+[section]
+discount = 50%% off
+""")
+c["section"]["discount"]
+'50% off'</code></pre>
+<p><strong>Measured:</strong> doubling the <code>%</code> to <code>%%</code> in the source file produces a single literal <code>%</code> once read. This works, but means the file on disk doesn't show the value a human would actually type or expect &mdash; anyone hand-editing the config needs to know this rule.</p>
+
+<h2 id="fix">4. Fix 2: disable interpolation entirely if you don't use it</h2>
+<pre><code>c2 = configparser.ConfigParser(interpolation=None)
+c2.read_string("""
+[section]
+discount = 50% off
+""")
+c2["section"]["discount"]
+'50% off'
+
+c3 = configparser.RawConfigParser()  # also defaults to no interpolation
+c3.read_string("""
+[section]
+discount = 50% off
+""")
+c3["section"]["discount"]
+'50% off'</code></pre>
+<p><strong>Measured:</strong> both <code>ConfigParser(interpolation=None)</code> and <code>RawConfigParser()</code> read the unescaped, literal <code>50% off</code> correctly with no exception. Per the docs, <code>RawConfigParser</code> exists specifically for configs that don't use value interpolation. If your config doesn't reference other keys via <code>%(key)s</code>, either option avoids this entirely &mdash; only reach for <code>%%</code>-escaping if you're actively relying on interpolation elsewhere in the same file.</p>
+
+<aside class="cta"><strong>Debugging a config value an API client reads before making a request? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does configparser raise an error on a value with a percent sign?</summary><p>We measured it happening because ConfigParser&#x27;s default BasicInterpolation reserves the % character for %(key)s-style value substitution — any % not followed by % or ( raises InterpolationSyntaxError when the value is read, even though the file parses without error.</p></details>
+<details><summary>Does the error happen when reading the config file or when accessing the value?</summary><p>We confirmed it happens on access, not on read_string()/read() — the file loads successfully, and the exception only appears the moment you index into the section to get the value.</p></details>
+<details><summary>How do I put a literal percent sign in a configparser value?</summary><p>We verified doubling it to %% in the source file (e.g. &#x27;50%% off&#x27;) produces a single literal % once read back through the default ConfigParser.</p></details>
+<details><summary>How do I avoid escaping percent signs in configparser values entirely?</summary><p>We confirmed that both configparser.ConfigParser(interpolation=None) and configparser.RawConfigParser() read a literal, unescaped % correctly with no exception — use either if your config doesn&#x27;t rely on %(key)s-style interpolation.</p></details>
+<details><summary>Is this specific to the % character, or do other characters cause similar errors?</summary><p>Based on the docs and what we measured, this is specific to % because it&#x27;s the interpolation marker for BasicInterpolation; ordinary characters like $ or # don&#x27;t trigger any equivalent parsing behavior in configparser values.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in configparser module: read a config value containing a literal &#x27;%&#x27; with the default ConfigParser, then with RawConfigParser and with interpolation=None. PlainHeaders is our extension; Python&#x27;s configparser module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

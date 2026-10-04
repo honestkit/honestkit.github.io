@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TypeError: Failed to fetch: 15 Causes Tested in Chrome</title>
+<meta name="description" content="We broke fetch 15 ways in Chromium 153: CORS, DNS, refused, cert, mixed content, ad block, reset. Each gave the same message. Here is how to tell them apart.">
+<link rel="canonical" href="https://honestkit.github.io/guides/typeerror-failed-to-fetch/">
+<meta property="og:title" content="TypeError: Failed to fetch: 15 Causes Tested in Chrome">
+<meta property="og:description" content="We broke fetch 15 ways in Chromium 153: CORS, DNS, refused, cert, mixed content, ad block, reset. Each gave the same message. Here is how to tell them apart.">
+<meta property="og:url" content="https://honestkit.github.io/guides/typeerror-failed-to-fetch/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does fetch say 'Failed to fetch' with no details?", "acceptedAnswer": {"@type": "Answer", "text": "Browsers hide the reason from JavaScript so pages cannot probe networks. In our Chromium 153 tests, 15 different causes gave the same message and e.cause was undefined. The real reason is in the DevTools console and Network tab."}}, {"@type": "Question", "name": "Is 'Failed to fetch' always a CORS error?", "acceptedAnswer": {"@type": "Answer", "text": "No. CORS is common, but we got the identical error from a server that was down, a DNS failure, a bad certificate, mixed content, an ad blocker, CSP, being offline and a dropped connection. Read the console line to tell them apart."}}, {"@type": "Question", "name": "Why does the request work in curl or Postman but fail in the browser?", "acceptedAnswer": {"@type": "Answer", "text": "CORS, mixed content and CSP are browser rules. In our CORS test the server received the request and answered 200, but Chromium refused to give the response to the page. curl does not apply those rules."}}, {"@type": "Question", "name": "Does a 404 or 500 cause 'Failed to fetch'?", "acceptedAnswer": {"@type": "Answer", "text": "Not by itself. With CORS headers present, fetch resolved and response.ok was false. But a 500 without CORS headers threw 'Failed to fetch' with a CORS message, because error pages often skip the CORS headers."}}, {"@type": "Question", "name": "What is the Node.js version of this error?", "acceptedAnswer": {"@type": "Answer", "text": "Node 24 throws 'TypeError: fetch failed'. Unlike the browser, it puts the reason in e.cause: for example code ECONNREFUSED, ENOTFOUND, ECONNRESET, UND_ERR_SOCKET or DEPTH_ZERO_SELF_SIGNED_CERT."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TypeError: Failed to fetch (tested)</h1>
+<p class="lead"><code>TypeError: Failed to fetch</code> is what Chrome's <code>fetch()</code> throws when no usable response came back. We reproduced 15 different causes in Chromium 153. Every one of them produced exactly the same message. The real reason is only in the DevTools console and Network tab, never in the error object.</p>
+<h2>1. The short answer</h2>
+<p>The message tells you almost nothing. In our tests CORS errors, a server that was down, a DNS failure, a bad certificate, mixed content, an ad-blocker block, a CSP block, an offline browser and a dropped connection all threw the same thing:</p>
+<pre><code>TypeError: Failed to fetch</code></pre>
+<p>The error had no <code>cause</code> (it was <code>undefined</code>). Your JavaScript cannot see which case it was. That is on purpose: if a page could tell "CORS blocked" from "host does not exist", it could scan networks it should not see.</p>
+<p>To find the cause, open DevTools. The <strong>Console</strong> shows a line like <code>Failed to load resource: net::ERR_CONNECTION_REFUSED</code> or a CORS message. The <strong>Network</strong> tab shows the same code in the Status column.</p>
+
+<h2>2. Our test setup</h2>
+<p>A page on <code>http://app.test:8983</code> called <code>fetch()</code> on <code>http://api.test:8983</code> (a different origin), or on HTTPS port 8984 with a self-signed certificate. Both names pointed to 127.0.0.1 through Chromium's <code>--host-resolver-rules</code>. For each case we logged the thrown error, the console lines and Playwright's <code>requestfailed</code> reason. The server logged which requests actually arrived.</p>
+<pre><code>try {
+  await fetch('http://api.test:8983/nocors');
+} catch (e) {
+  console.log(e.name, e.message, e.cause); // TypeError Failed to fetch undefined
+}</code></pre>
+
+<h2>3. Results: cause, message, console line</h2>
+<table>
+<tr><th>Cause</th><th>fetch() threw</th><th>Console / Network shows</th><th>Reached server?</th></tr>
+<tr><td>CORS: no Access-Control-Allow-Origin</td><td>TypeError: Failed to fetch</td><td>"has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource." then <code>net::ERR_FAILED</code></td><td>Yes, server sent 200</td></tr>
+<tr><td>CORS preflight gets 404</td><td>TypeError: Failed to fetch</td><td>"Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header..." then <code>net::ERR_FAILED</code></td><td>Only the OPTIONS request</td></tr>
+<tr><td>CORS preflight: method not allowed</td><td>TypeError: Failed to fetch</td><td>"Method DELETE is not allowed by Access-Control-Allow-Methods in preflight response."</td><td>Only OPTIONS</td></tr>
+<tr><td>Server returns 500 without CORS headers</td><td>TypeError: Failed to fetch</td><td>Same "No 'Access-Control-Allow-Origin' header" CORS line</td><td>Yes</td></tr>
+<tr><td>Server down (connection refused)</td><td>TypeError: Failed to fetch</td><td><code>net::ERR_CONNECTION_REFUSED</code></td><td>No</td></tr>
+<tr><td>DNS name does not exist</td><td>TypeError: Failed to fetch</td><td><code>net::ERR_NAME_NOT_RESOLVED</code></td><td>No</td></tr>
+<tr><td>Self-signed / untrusted certificate</td><td>TypeError: Failed to fetch</td><td><code>net::ERR_CERT_AUTHORITY_INVALID</code></td><td>No HTTP request (TLS failed)</td></tr>
+<tr><td>Mixed content (https page, http API)</td><td>TypeError: Failed to fetch</td><td>"Mixed Content: The page at 'https://app.test:8984/' was loaded over HTTPS, but requested an insecure resource '...'. This request has been blocked"</td><td>No</td></tr>
+<tr><td>Ad blocker / extension (route.abort('blockedbyclient'))</td><td>TypeError: Failed to fetch</td><td><code>net::ERR_BLOCKED_BY_CLIENT</code></td><td>No</td></tr>
+<tr><td>Generic block (route.abort() default)</td><td>TypeError: Failed to fetch</td><td><code>net::ERR_FAILED</code></td><td>No</td></tr>
+<tr><td>Page CSP <code>connect-src 'self'</code></td><td>TypeError: Failed to fetch</td><td>"violates the following Content Security Policy directive: "connect-src 'self'"" and "Refused to connect because it violates the document's Content Security Policy."</td><td>No</td></tr>
+<tr><td>Browser offline</td><td>TypeError: Failed to fetch</td><td><code>net::ERR_INTERNET_DISCONNECTED</code></td><td>No</td></tr>
+<tr><td>Server closes socket with no response</td><td>TypeError: Failed to fetch</td><td><code>net::ERR_EMPTY_RESPONSE</code></td><td>Yes</td></tr>
+<tr><td>Server sends TCP reset</td><td>TypeError: Failed to fetch</td><td><code>net::ERR_CONNECTION_RESET</code></td><td>Yes</td></tr>
+<tr><td>Unsafe port (fetch to port 6000)</td><td>TypeError: Failed to fetch</td><td><code>net::ERR_UNSAFE_PORT</code></td><td>No (blocked before connecting)</td></tr>
+</table>
+<p>Two things to note. First, with a missing CORS header the request <em>did</em> reach the server and the server answered 200. The browser just would not hand the answer to your code. So "it works in curl / Postman" is normal for a CORS bug. Second, a server-side 500 without CORS headers looks exactly like a CORS problem. Add CORS headers to error responses too, or you will chase the wrong bug.</p>
+
+<h2>4. Errors that look similar but have other wording</h2>
+<p>These did <em>not</em> say "Failed to fetch" in Chromium 153:</p>
+<table>
+<tr><th>Situation</th><th>What was thrown</th></tr>
+<tr><td>HTTP 404 or 500 with CORS headers</td><td>Nothing. fetch() resolved; <code>response.ok</code> was <code>false</code></td></tr>
+<tr><td>AbortController.abort()</td><td>DOMException AbortError: "signal is aborted without reason"</td></tr>
+<tr><td>AbortSignal.timeout(200)</td><td>DOMException TimeoutError: "signal timed out"</td></tr>
+<tr><td>Invalid URL</td><td>TypeError: "Failed to execute 'fetch' on 'Window': Failed to parse URL from ..."</td></tr>
+<tr><td>HTML returned instead of JSON</td><td>SyntaxError: "Unexpected token '&lt;', "&lt;!doctype "... is not valid JSON"</td></tr>
+<tr><td><code>mode: 'no-cors'</code></td><td>Nothing. You get an opaque response: type "opaque", status 0, empty body</td></tr>
+</table>
+<p>One more trap: when the body was cut short (Content-Length 100, only 3 bytes sent), <code>fetch()</code> itself resolved with status 200. The error came later, from <code>await response.text()</code>, as <code>TypeError: Failed to fetch</code> with <code>net::ERR_CONTENT_LENGTH_MISMATCH</code> in the console. If the stack trace points at <code>.json()</code> or <code>.text()</code>, suspect a dropped connection mid-body.</p>
+
+<h2>5. The same causes in Node.js fetch</h2>
+<p>Node 24's built-in fetch uses a different message, <code>TypeError: fetch failed</code>, but it does give you the real reason in <code>error.cause</code>. There is no CORS in Node: the no-CORS-header request simply returned 200.</p>
+<pre><code>try { await fetch(url); }
+catch (e) { console.log(e.message, e.cause?.code, e.cause?.message); }</code></pre>
+<table>
+<tr><th>Cause</th><th>e.message</th><th>e.cause.code</th><th>e.cause.message</th></tr>
+<tr><td>Connection refused</td><td>fetch failed</td><td>ECONNREFUSED</td><td>connect ECONNREFUSED 127.0.0.1:8984</td></tr>
+<tr><td>DNS failure</td><td>fetch failed</td><td>ENOTFOUND</td><td>getaddrinfo ENOTFOUND does-not-exist.invalid</td></tr>
+<tr><td>Self-signed certificate</td><td>fetch failed</td><td>DEPTH_ZERO_SELF_SIGNED_CERT</td><td>self-signed certificate; if the root CA is installed locally, try running Node.js with --use-system-ca</td></tr>
+<tr><td>Server closes socket</td><td>fetch failed</td><td>UND_ERR_SOCKET</td><td>other side closed</td></tr>
+<tr><td>TCP reset</td><td>fetch failed</td><td>ECONNRESET</td><td>read ECONNRESET</td></tr>
+<tr><td>Body cut short (on .text())</td><td>terminated</td><td>UND_ERR_SOCKET</td><td>other side closed</td></tr>
+<tr><td>Port 6000</td><td>fetch failed</td><td>(none)</td><td>bad port</td></tr>
+<tr><td>AbortSignal.timeout(200)</td><td colspan="3">TimeoutError: "The operation was aborted due to timeout" (no cause)</td></tr>
+<tr><td>Invalid URL</td><td>Failed to parse URL from ...</td><td>ERR_INVALID_URL</td><td>Invalid URL</td></tr>
+</table>
+<p>So in Node, always log <code>e.cause</code>. Logging only <code>e.message</code> throws the useful part away.</p>
+
+<h2>6. How to tell them apart and fix each one</h2>
+<table>
+<tr><th>Console shows</th><th>Cause</th><th>Fix</th></tr>
+<tr><td>"blocked by CORS policy: No 'Access-Control-Allow-Origin'"</td><td>API does not allow your origin</td><td>Send <code>Access-Control-Allow-Origin</code> from the API, on every response including errors. For more than one site see <a href="/guides/cors-allow-multiple-origins/">CORS: allow multiple origins</a>.</td></tr>
+<tr><td>"Response to preflight request doesn't pass access control check"</td><td>OPTIONS request fails or lacks CORS headers</td><td>Answer OPTIONS with 204 and CORS headers before auth or routing rejects it.</td></tr>
+<tr><td>"Method X is not allowed by Access-Control-Allow-Methods"</td><td>Preflight does not list the method</td><td>Add it to <a href="/guides/access-control-allow-methods/">Access-Control-Allow-Methods</a> (or headers to <a href="/guides/access-control-allow-headers/">Access-Control-Allow-Headers</a>).</td></tr>
+<tr><td>net::ERR_CONNECTION_REFUSED</td><td>Nothing listening on that host/port</td><td>Start the server; check the port and that it binds to the right interface (not only 127.0.0.1 in a container).</td></tr>
+<tr><td>net::ERR_NAME_NOT_RESOLVED</td><td>Hostname typo or missing DNS record</td><td>Fix the URL or DNS. Check the record exists with <code>dig</code> or <code>nslookup</code>.</td></tr>
+<tr><td>net::ERR_CERT_*</td><td>Untrusted, expired or wrong-name certificate</td><td>Use a valid certificate. Open the API URL directly in a tab to see the cert warning. See <a href="/guides/check-ssl-certificate-expiry/">check SSL certificate expiry</a>.</td></tr>
+<tr><td>"Mixed Content ... This request has been blocked"</td><td>https page calling an http URL</td><td>Serve the API over HTTPS and use an https:// URL.</td></tr>
+<tr><td>net::ERR_BLOCKED_BY_CLIENT</td><td>Ad blocker or privacy extension</td><td>Test in a clean profile. Avoid URL paths like <code>/ads/</code>, <code>/track</code>, <code>/analytics</code>, which filter lists often block.</td></tr>
+<tr><td>"violates the following Content Security Policy directive"</td><td>Your page's CSP <code>connect-src</code></td><td>Add the API origin to <code>connect-src</code>. See <a href="/guides/content-security-policy-header-example/">CSP header examples</a>.</td></tr>
+<tr><td>net::ERR_INTERNET_DISCONNECTED</td><td>User is offline</td><td>Show an offline message; retry later.</td></tr>
+<tr><td>net::ERR_EMPTY_RESPONSE / ERR_CONNECTION_RESET</td><td>Server crashed or a proxy dropped the connection</td><td>Check server logs for a crash at that time. See <a href="/guides/err-connection-reset-econnreset/">ERR_CONNECTION_RESET / ECONNRESET</a>.</td></tr>
+<tr><td>net::ERR_CONTENT_LENGTH_MISMATCH</td><td>Response cut off mid-body</td><td>Find what kills the response (timeouts, crashes, a wrong <a href="/guides/content-length-header-mismatch/">Content-Length</a>).</td></tr>
+</table>
+
+<h2>7. A quick debugging order</h2>
+<ol>
+<li>Open DevTools &gt; Console and read the line just before or after the error. It names the real cause.</li>
+<li>Open the Network tab, click the failed request, and look at the Status column (e.g. <code>(failed) net::ERR_...</code> or <code>CORS error</code>).</li>
+<li>Run the same request with <code>curl -i</code>. If curl gets a normal answer, it is a browser-side rule: CORS, mixed content, CSP or an extension.</li>
+<li>If curl fails too, it is the network or server: DNS, refused, cert or reset.</li>
+<li>Check the API's response headers with <a href="/tools/http-headers/">our HTTP header checker</a> to see if CORS headers are there.</li>
+</ol>
+<aside class="cta"><strong>Check whether your API actually sends CORS headers:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does fetch say &#x27;Failed to fetch&#x27; with no details?</summary><p>Browsers hide the reason from JavaScript so pages cannot probe networks. In our Chromium 153 tests, 15 different causes gave the same message and e.cause was undefined. The real reason is in the DevTools console and Network tab.</p></details>
+<details><summary>Is &#x27;Failed to fetch&#x27; always a CORS error?</summary><p>No. CORS is common, but we got the identical error from a server that was down, a DNS failure, a bad certificate, mixed content, an ad blocker, CSP, being offline and a dropped connection. Read the console line to tell them apart.</p></details>
+<details><summary>Why does the request work in curl or Postman but fail in the browser?</summary><p>CORS, mixed content and CSP are browser rules. In our CORS test the server received the request and answered 200, but Chromium refused to give the response to the page. curl does not apply those rules.</p></details>
+<details><summary>Does a 404 or 500 cause &#x27;Failed to fetch&#x27;?</summary><p>Not by itself. With CORS headers present, fetch resolved and response.ok was false. But a 500 without CORS headers threw &#x27;Failed to fetch&#x27; with a CORS message, because error pages often skip the CORS headers.</p></details>
+<details><summary>What is the Node.js version of this error?</summary><p>Node 24 throws &#x27;TypeError: fetch failed&#x27;. Unlike the browser, it puts the reason in e.cause: for example code ECONNREFUSED, ENOTFOUND, ECONNRESET, UND_ERR_SOCKET or DEPTH_ZERO_SELF_SIGNED_CERT.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright) and Node.js 24.21.0 against local Node HTTP and HTTPS (self-signed) test servers. Hostnames were mapped with --host-resolver-rules so the page and API were different origins. Ad blockers were simulated with Playwright route.abort(). PlainHeaders is our extension; Chromium, Playwright and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

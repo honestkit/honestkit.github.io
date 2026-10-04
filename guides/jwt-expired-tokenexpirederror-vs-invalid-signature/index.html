@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JWT Expired vs Invalid Signature Errors in Node (Tested)</title>
+<meta name="description" content="We tested Node&#x27;s jsonwebtoken: TokenExpiredError vs JsonWebTokenError &#x27;invalid signature&#x27;, clockTolerance, and why a tampered payload often throws neither.">
+<link rel="canonical" href="https://honestkit.github.io/guides/jwt-expired-tokenexpirederror-vs-invalid-signature/">
+<meta property="og:title" content="JWT Expired vs Invalid Signature Errors in Node (Tested)">
+<meta property="og:description" content="We tested Node&#x27;s jsonwebtoken: TokenExpiredError vs JsonWebTokenError &#x27;invalid signature&#x27;, clockTolerance, and why a tampered payload often throws neither.">
+<meta property="og:url" content="https://honestkit.github.io/guides/jwt-expired-tokenexpirederror-vs-invalid-signature/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between TokenExpiredError and JsonWebTokenError?", "acceptedAnswer": {"@type": "Answer", "text": "TokenExpiredError means the token was valid but its exp time has passed; it carries err.expiredAt, a real Date. JsonWebTokenError (as 'invalid signature') means the token's signature doesn't match, from a wrong secret or an edited payload. In jsonwebtoken, TokenExpiredError is a subclass of JsonWebTokenError, so a generic instanceof check catches both."}}, {"@type": "Question", "name": "Can I tell a tampered token from one signed with the wrong secret?", "acceptedAnswer": {"@type": "Answer", "text": "Not from the message. We signed a token with one secret and verified it with another, then separately tampered one byte of a valid token's payload. Both can throw JsonWebTokenError: 'invalid signature'. Treat any 'invalid signature' the same way: reject it."}}, {"@type": "Question", "name": "Does catching JsonWebTokenError also catch expired tokens?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We checked the prototype chain directly: jwt.TokenExpiredError.prototype instanceof jwt.JsonWebTokenError is true, and so is jwt.NotBeforeError.prototype. If you need to treat expiry differently (e.g. tell the client to refresh), check err.name === 'TokenExpiredError' before your generic catch, not after."}}, {"@type": "Question", "name": "How do I allow for clock drift between servers when checking expiry?", "acceptedAnswer": {"@type": "Answer", "text": "Pass clockTolerance (seconds) to jwt.verify. We signed a token that expired 2 seconds ago: verifying with no options threw TokenExpiredError, and verifying with { clockTolerance: 5 } returned the decoded payload successfully. PyJWT's equivalent option is leeway, tested the same way."}}, {"@type": "Question", "name": "Does a tampered JWT payload always produce an 'invalid signature' error?", "acceptedAnswer": {"@type": "Answer", "text": "No, and this is easy to miss. We flipped one base64 character at every position of a payload and verified each result: only 22% produced JsonWebTokenError 'invalid signature'. The rest threw a raw SyntaxError from JSON.parse, because jsonwebtoken decodes the payload as JSON before it checks the signature. That SyntaxError is not a JsonWebTokenError and will slip past an instanceof check that only tests for that class."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>JWT: TokenExpiredError vs invalid signature (tested)</h1>
+<p class="lead"><code>jsonwebtoken</code> throws two different errors that get lumped together: <code>TokenExpiredError</code> ("jwt expired") and <code>JsonWebTokenError</code> ("invalid signature"). They are not the same problem, and a generic catch block can hide which one you hit. We signed, expired, and tampered with real tokens on this box to see exactly what each failure looks like.</p>
+<h2>1. Two different failures, one error family</h2>
+<p>A JWT can fail verification for unrelated reasons. The token can be <strong>expired</strong> (it was valid, time ran out) or the token can be <strong>invalid</strong> (wrong secret, tampered payload, wrong algorithm). <code>jsonwebtoken</code> models this as a class hierarchy: <code>TokenExpiredError</code> and <code>NotBeforeError</code> both extend <code>JsonWebTokenError</code>. That inheritance is convenient for a catch-all, and a trap if you need to tell them apart.</p>
+<p>If you need to decode a token by hand while debugging this, our <a href="/tools/jwt-decoder/">JWT Decoder</a> shows the header, payload and expiry without sending the token anywhere.</p>
+
+<h2>2. What we ran</h2>
+<p>Four scripts against <code>jsonwebtoken</code> 9.0.3 on Node 24.21.0: an expired token, a token verified with the wrong secret, a token with one base64 character flipped in the payload, and a <code>clockTolerance</code> check. We also installed PyJWT 2.15.1 to compare.</p>
+
+<h2>3. Exact errors, as thrown</h2>
+<table>
+<tr><th>Scenario</th><th>err.name</th><th>err.message</th><th>err.expiredAt</th><th>instanceof TokenExpiredError</th><th>instanceof JsonWebTokenError</th></tr>
+<tr><td>Signed with <code>expiresIn: '-10s'</code>, verified now</td><td>TokenExpiredError</td><td>"jwt expired"</td><td>real <code>Date</code>, e.g. <code>2026-10-02T12:40:46.000Z</code></td><td>true</td><td>true</td></tr>
+<tr><td>Signed with secret A, verified with secret B</td><td>JsonWebTokenError</td><td>"invalid signature"</td><td>undefined</td><td>false</td><td>true</td></tr>
+<tr><td>Signed with <code>notBefore: '10s'</code>, verified now</td><td>NotBeforeError</td><td>"jwt not active"</td><td>undefined</td><td>false</td><td>true</td></tr>
+<tr><td>Payload tampered, 1 base64 char flipped (lucky case)</td><td>JsonWebTokenError</td><td>"invalid signature"</td><td>undefined</td><td>false</td><td>true</td></tr>
+<tr><td>Payload tampered, 1 base64 char flipped (unlucky case)</td><td>SyntaxError</td><td>"Bad control character in string literal in JSON at position 4 (line 1 column 5)"</td><td>undefined</td><td>false</td><td><strong>false</strong></td></tr>
+</table>
+<p><code>err.expiredAt</code> is a genuine <code>Date</code> instance (<code>instanceof Date</code> is true), not a string or timestamp, so you can format it directly.</p>
+
+<h2>4. Wrong secret vs tampered payload: same message, until it isn't</h2>
+<p>We confirmed the known trap: verifying with the wrong secret and verifying a token whose payload was edited both throw <code>JsonWebTokenError: "invalid signature"</code>. From that message alone you cannot tell "someone used the wrong key" from "someone edited the claims". Treat both the same way: reject the token, do not try to recover data from it.</p>
+<p>What we found that goes further: tampering the payload does not reliably produce "invalid signature" at all. We flipped one character at every position of a real payload segment (63 positions) and verified each result. Only 14 of 63 flips (22%) produced <code>JsonWebTokenError: "invalid signature"</code>. The other 49 (78%) produced a raw, unwrapped <code>SyntaxError</code> from <code>JSON.parse</code> &mdash; not a <code>JsonWebTokenError</code>, not caught by <code>instanceof jwt.JsonWebTokenError</code> at all:</p>
+<pre><code>// idx=3 flipped: still valid JSON after decoding
+JsonWebTokenError: invalid signature
+
+// idx=5 flipped: no longer valid JSON
+SyntaxError: Bad control character in string literal in JSON at position 4 (line 1 column 5)
+  err instanceof jwt.JsonWebTokenError  // false
+  err instanceof SyntaxError            // true</code></pre>
+<p>The reason is in <code>jsonwebtoken</code>'s own source (<code>verify.js</code>): it calls <code>decode(jwtString, {complete: true})</code>, which JSON-parses the payload, <em>before</em> it calls <code>jws.verify()</code> to check the signature. If your tampering happens to break JSON syntax, the parse throws first and that raw error is returned as-is &mdash; the signature is never even checked. Only when the mangled bytes still happen to decode to syntactically valid JSON does the code reach the signature check and report "invalid signature". A <code>catch (err) { if (err instanceof jwt.JsonWebTokenError) ... }</code> will miss roughly three-quarters of single-byte payload tampering in our sample, and let a native <code>SyntaxError</code> escape instead.</p>
+
+<h2>5. Clock skew: clockTolerance works as documented</h2>
+<p>We signed a token that expired 2 seconds ago and verified it twice: once with no options (fails), once with <code>clockTolerance: 5</code> (succeeds).</p>
+<pre><code>jwt.verify(token, secret);
+// -&gt; TokenExpiredError: jwt expired
+
+jwt.verify(token, secret, { clockTolerance: 5 });
+// -&gt; returns the decoded payload, no error</code></pre>
+<p>5 seconds of tolerance covered the 2-second-expired token, as expected. Use a small <code>clockTolerance</code> (a few seconds) if your servers' clocks can drift, instead of padding every token's <code>exp</code>.</p>
+
+<h2>6. Why a generic catch still sees "expired"</h2>
+<p>We checked the prototype chain directly:</p>
+<pre><code>jwt.TokenExpiredError.prototype instanceof jwt.JsonWebTokenError  // true
+jwt.NotBeforeError.prototype instanceof jwt.JsonWebTokenError     // true</code></pre>
+<p>So this common pattern catches expired tokens too, silently:</p>
+<pre><code>try {
+  jwt.verify(token, secret);
+} catch (err) {
+  if (err instanceof jwt.JsonWebTokenError) {
+    // true for TokenExpiredError AND NotBeforeError AND "invalid signature"
+    return res.status(401).send('invalid token');
+  }
+}</code></pre>
+<p>That isn't wrong, but it throws away information a client could use (an expired token usually means "refresh and retry"; an invalid signature usually means "log out, something is wrong"). To tell them apart, check the specific name or class <em>first</em>, before the generic fallback:</p>
+<pre><code>try {
+  jwt.verify(token, secret);
+} catch (err) {
+  if (err.name === 'TokenExpiredError') {
+    return res.status(401).json({ error: 'token_expired', expiredAt: err.expiredAt });
+  }
+  if (err.name === 'NotBeforeError') {
+    return res.status(401).json({ error: 'token_not_active' });
+  }
+  if (err instanceof jwt.JsonWebTokenError) {
+    // covers wrong secret, tampered payload that still parses, wrong algorithm, "jwt malformed"
+    return res.status(401).json({ error: 'invalid_token' });
+  }
+  // a raw SyntaxError or other unexpected error reaches here - see section 4
+  console.error('unexpected jwt verify error', err);
+  return res.status(401).json({ error: 'invalid_token' });
+}</code></pre>
+<p>For the broader set of malformed-token shapes (missing segments, bad base64, non-JSON header), see <a href="/guides/jwt-malformed-invalid-signature-expired/">JWT malformed vs invalid signature vs expired</a>. For how the token gets to the server in the first place, see <a href="/guides/bearer-token-authorization-header/">Bearer token in the Authorization header</a>.</p>
+
+<h2>7. Cross-language check: PyJWT (tested)</h2>
+<p>We installed PyJWT 2.15.1 on Python 3.13 and ran the same cases.</p>
+<table>
+<tr><th>Scenario</th><th>jsonwebtoken (Node)</th><th>PyJWT (Python)</th></tr>
+<tr><td>Expired token</td><td><code>TokenExpiredError</code>: "jwt expired"</td><td><code>ExpiredSignatureError</code>: "Signature has expired"</td></tr>
+<tr><td>Wrong secret</td><td><code>JsonWebTokenError</code>: "invalid signature"</td><td><code>InvalidSignatureError</code>: "Signature verification failed"</td></tr>
+<tr><td>Tampered payload (same byte flip that broke Node's JSON parse)</td><td><code>SyntaxError</code> (not a JsonWebTokenError, see section 4)</td><td><code>InvalidSignatureError</code>: "Signature verification failed", consistently</td></tr>
+<tr><td>Clock skew allowance</td><td><code>clockTolerance: 5</code> (seconds)</td><td><code>leeway=5</code> (seconds)</td></tr>
+<tr><td>Expired/invalid share a base class?</td><td>Yes: both extend <code>JsonWebTokenError</code></td><td>Yes: both extend <code>InvalidTokenError</code></td></tr>
+</table>
+<p>The one real difference we measured: PyJWT gave the same "Signature verification failed" for the tampered payload every time we tried it, because it checks the HMAC signature before it parses the payload as JSON. Node's <code>jsonwebtoken</code> does it the other way around (section 4), so tampering can surface a raw <code>SyntaxError</code> instead of a library error. If you run both a Node and a Python service behind the same auth, don't assume identical error shapes from identical tampering.</p>
+
+<h2>8. Checklist</h2>
+<ul>
+<li>Check <code>err.name === 'TokenExpiredError'</code> (or <code>err instanceof jwt.TokenExpiredError</code>) <em>before</em> a generic <code>JsonWebTokenError</code> check, or you'll never see it separately.</li>
+<li>Don't try to distinguish "wrong secret" from "tampered payload" from the message. You can't; both say "invalid signature" when they say anything coherent at all.</li>
+<li>Add a fallback branch for errors that are neither &mdash; a flipped byte in the payload can throw a plain <code>SyntaxError</code> that skips your <code>JsonWebTokenError</code> check entirely.</li>
+<li>Use a small <code>clockTolerance</code> (seconds, not minutes) if your servers' clocks aren't synced, rather than issuing longer-lived tokens.</li>
+<li>Never branch application logic on the error <em>message</em> string; use <code>err.name</code> or <code>instanceof</code>, since messages aren't a stable API across versions.</li>
+</ul>
+<aside class="cta"><strong>Check the Authorization header your client is actually sending:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between TokenExpiredError and JsonWebTokenError?</summary><p>TokenExpiredError means the token was valid but its exp time has passed; it carries err.expiredAt, a real Date. JsonWebTokenError (as &#x27;invalid signature&#x27;) means the token&#x27;s signature doesn&#x27;t match, from a wrong secret or an edited payload. In jsonwebtoken, TokenExpiredError is a subclass of JsonWebTokenError, so a generic instanceof check catches both.</p></details>
+<details><summary>Can I tell a tampered token from one signed with the wrong secret?</summary><p>Not from the message. We signed a token with one secret and verified it with another, then separately tampered one byte of a valid token&#x27;s payload. Both can throw JsonWebTokenError: &#x27;invalid signature&#x27;. Treat any &#x27;invalid signature&#x27; the same way: reject it.</p></details>
+<details><summary>Does catching JsonWebTokenError also catch expired tokens?</summary><p>Yes. We checked the prototype chain directly: jwt.TokenExpiredError.prototype instanceof jwt.JsonWebTokenError is true, and so is jwt.NotBeforeError.prototype. If you need to treat expiry differently (e.g. tell the client to refresh), check err.name === &#x27;TokenExpiredError&#x27; before your generic catch, not after.</p></details>
+<details><summary>How do I allow for clock drift between servers when checking expiry?</summary><p>Pass clockTolerance (seconds) to jwt.verify. We signed a token that expired 2 seconds ago: verifying with no options threw TokenExpiredError, and verifying with { clockTolerance: 5 } returned the decoded payload successfully. PyJWT&#x27;s equivalent option is leeway, tested the same way.</p></details>
+<details><summary>Does a tampered JWT payload always produce an &#x27;invalid signature&#x27; error?</summary><p>No, and this is easy to miss. We flipped one base64 character at every position of a payload and verified each result: only 22% produced JsonWebTokenError &#x27;invalid signature&#x27;. The rest threw a raw SyntaxError from JSON.parse, because jsonwebtoken decodes the payload as JSON before it checks the signature. That SyntaxError is not a JsonWebTokenError and will slip past an instanceof check that only tests for that class.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 and jsonwebtoken 9.0.3 (npm), plus Python 3.13 and PyJWT 2.15.1 for the cross-language table. All error strings and instanceof results below are from running the code, not the docs. PlainHeaders is our extension; Node.js, jsonwebtoken and PyJWT are free. The JWT Decoder tool is ours too.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

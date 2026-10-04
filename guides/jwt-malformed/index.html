@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>&quot;jwt malformed&quot; Error: Exact Causes, by Library (Tested)</title>
+<meta name="description" content="We fed broken JWT strings to jsonwebtoken 9.0.3 and PyJWT 2.15.1 and recorded the exact error text each one throws, segment by segment.">
+<link rel="canonical" href="https://honestkit.github.io/guides/jwt-malformed/">
+<meta property="og:title" content="&quot;jwt malformed&quot; Error: Exact Causes, by Library (Tested)">
+<meta property="og:description" content="We fed broken JWT strings to jsonwebtoken 9.0.3 and PyJWT 2.15.1 and recorded the exact error text each one throws, segment by segment.">
+<meta property="og:url" content="https://honestkit.github.io/guides/jwt-malformed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does jsonwebtoken ever say \"not enough segments\"?", "acceptedAnswer": {"@type": "Answer", "text": "Not in version 9.0.3, which we tested directly. Every wrong segment count (1, 2, or 4) produced \"jwt malformed\" instead. \"Not enough segments\" is the message PyJWT 2.15.1 uses for the same situation in Python, so if you see that exact phrase you're very likely debugging a Python stack, not Node."}}, {"@type": "Question", "name": "Is \"jwt malformed\" the same error as \"invalid signature\"?", "acceptedAnswer": {"@type": "Answer", "text": "No. Both are JsonWebTokenError in jsonwebtoken, but they mean different things. \"jwt malformed\" means the string doesn't have three valid segments. \"invalid signature\" means it does, but the signature doesn't match the payload and secret &mdash; we measured both by deliberately breaking each case."}}, {"@type": "Question", "name": "What if the token has exactly 3 segments but still fails?", "acceptedAnswer": {"@type": "Answer", "text": "Then it's not a segment-count problem. In our tests, invalid base64 inside a segment produced \"invalid token\", and a tampered or truncated signature produced \"invalid signature\" &mdash; both distinct from \"jwt malformed\"."}}, {"@type": "Question", "name": "Does jwt.decode() throw on a malformed token?", "acceptedAnswer": {"@type": "Answer", "text": "No, in our test jwt.decode() (jsonwebtoken 9.0.3, no secret passed) returned null for a 2-segment string instead of throwing. Only jwt.verify() and jwt.decode() with options that require parsing throw JsonWebTokenError; use our jwt-decoder tool if you just want to inspect a token's shape without writing code."}}, {"@type": "Question", "name": "Why does my token look fine but still say malformed?", "acceptedAnswer": {"@type": "Answer", "text": "A common cause we didn't have to simulate: the caller sent the full Authorization header value, like \"Bearer eyJhbGc...\", straight into verify(). That string has the right segments after \"Bearer \" but jsonwebtoken sees the \"Bearer \" prefix stuck to the first segment and the whole thing fails the shape check. Strip the prefix first."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>jwt malformed (tested)</h1>
+<p class="lead"><code>JsonWebTokenError: jwt malformed</code> comes from the Node.js <code>jsonwebtoken</code> library. It means the string you handed to <code>verify()</code> or <code>decode()</code> is not shaped like a JWT at all &mdash; usually the wrong number of dot-separated segments. We broke tokens in four specific ways and recorded the exact message jsonwebtoken 9.0.3 gives for each, then ran the same strings through Python's PyJWT to show the wording is not standard across libraries.</p>
+<h2>1. What "jwt malformed" means</h2>
+<p>A JWT is three base64url segments joined by dots: <code>header.payload.signature</code>. Before jsonwebtoken checks a signature or an expiry, it checks that the string has that shape. If it doesn't, you get a <code>JsonWebTokenError</code> with the message <code>jwt malformed</code>, regardless of what else might be wrong with the string.</p>
+<p>This is different from <a href="/guides/jwt-expired-tokenexpirederror-vs-invalid-signature/">TokenExpiredError</a> (right shape, bad timestamp) and from an invalid-signature error (right shape, wrong secret or tampered payload). "Malformed" means the parser never got far enough to check either of those.</p>
+
+<h2>2. Our test setup</h2>
+<p>We called <code>jwt.verify(token, secret)</code> from jsonwebtoken 9.0.3 on nine broken or borderline strings, then called <code>jwt.decode(token, secret, algorithms=["HS256"])</code> from PyJWT 2.15.1 on the same strings. Versions:</p>
+<pre><code>$ node -e "console.log(require('jsonwebtoken/package.json').version)"
+9.0.3
+$ /tmp/py415venv/bin/python3 -c "import jwt; print(jwt.__version__)"
+2.15.1</code></pre>
+
+<h2>3. Wrong number of segments: jsonwebtoken says "jwt malformed", not "not enough segments"</h2>
+<p>Older JWT tooling (and some other libraries, see section 5) used the message <code>not enough segments</code>. We tested that phrase directly against jsonwebtoken 9.0.3 and it does not appear anywhere in its output. Any wrong segment count &mdash; too few or too many &mdash; collapses to the same generic message.</p>
+<table>
+<tr><th>Input</th><th>jsonwebtoken 9.0.3 <code>verify()</code></th></tr>
+<tr><td><code>"abcdefgh"</code> (no dots, 1 segment)</td><td><code>JsonWebTokenError: "jwt malformed"</code></td></tr>
+<tr><td><code>"abc.def"</code> (2 segments)</td><td><code>JsonWebTokenError: "jwt malformed"</code></td></tr>
+<tr><td><code>"abc.def.ghi.jkl"</code> (4 segments)</td><td><code>JsonWebTokenError: "jwt malformed"</code></td></tr>
+<tr><td><code>""</code> (empty string)</td><td><code>JsonWebTokenError: "jwt must be provided"</code></td></tr>
+</table>
+<p>The empty-string case is its own message, checked before the segment count. Everything else with the wrong number of segments &mdash; one, two, or four &mdash; produces the identical <code>"jwt malformed"</code> text. You cannot tell from the message alone how many segments the caller actually sent.</p>
+
+<h2>4. Invalid base64 and a corrupted signature give different messages again</h2>
+<p>Once a string has exactly three segments, jsonwebtoken moves past the shape check and into decoding. Bad base64 content and a tampered signature each produce their own distinct wording:</p>
+<table>
+<tr><th>Input (3 segments, one part broken)</th><th>jsonwebtoken 9.0.3 message</th></tr>
+<tr><td>Header segment is <code>!!!notbase64!!!</code></td><td><code>JsonWebTokenError: "invalid token"</code></td></tr>
+<tr><td>Payload segment is <code>!!!notbase64!!!</code></td><td><code>JsonWebTokenError: "invalid token"</code></td></tr>
+<tr><td>Header decodes but isn't JSON</td><td><code>JsonWebTokenError: "invalid token"</code></td></tr>
+<tr><td>Valid token, last 4 chars of signature swapped</td><td><code>JsonWebTokenError: "invalid signature"</code></td></tr>
+<tr><td>Valid token, signature truncated to 5 chars</td><td><code>JsonWebTokenError: "invalid signature"</code></td></tr>
+</table>
+<p>So there are three distinct jsonwebtoken error strings you'll actually see for a broken token, each meaning something different: <code>jwt malformed</code> (wrong segment count), <code>invalid token</code> (right segment count, unparseable base64/JSON in header or payload), and <code>invalid signature</code> (everything parses, but the signature doesn't match &mdash; this is also what you get for a wrong secret, see the <a href="/guides/jwt-expired-tokenexpirederror-vs-invalid-signature/">expired-vs-invalid-signature guide</a>). All three are instances of the same <code>JsonWebTokenError</code> class, so catching by class alone won't distinguish them &mdash; check <code>error.message</code>.</p>
+<p>Also worth knowing: <code>jwt.decode()</code> (no secret, no verification) just returns <code>null</code> on a bad-shape string instead of throwing. It never checks the signature, so don't use it to validate input.</p>
+<pre><code>&gt; jwt.decode("abc.def")
+null</code></pre>
+
+<h2>5. PyJWT uses completely different wording for the same inputs</h2>
+<p>We ran the identical nine strings through PyJWT 2.15.1's <code>jwt.decode()</code>. The error class is <code>DecodeError</code> instead of <code>JsonWebTokenError</code>, and critically, PyJWT <em>does</em> say "Not enough segments" &mdash; the exact phrase that jsonwebtoken 9.0.3 does not produce.</p>
+<table>
+<tr><th>Input</th><th>jsonwebtoken 9.0.3</th><th>PyJWT 2.15.1</th></tr>
+<tr><td>1 segment, no dots</td><td><code>jwt malformed</code></td><td><code>DecodeError: Not enough segments</code></td></tr>
+<tr><td>2 segments</td><td><code>jwt malformed</code></td><td><code>DecodeError: Not enough segments</code></td></tr>
+<tr><td>Empty string</td><td><code>jwt must be provided</code></td><td><code>DecodeError: Not enough segments</code></td></tr>
+<tr><td>4 segments</td><td><code>jwt malformed</code></td><td><code>DecodeError: Invalid header string: 'utf-8' codec can't decode byte 0xb7 in position 1: invalid start byte</code></td></tr>
+<tr><td>Invalid base64 in header</td><td><code>invalid token</code></td><td><code>DecodeError: Invalid header padding</code></td></tr>
+<tr><td>Invalid base64 in payload</td><td><code>invalid token</code></td><td><code>DecodeError: Invalid payload padding</code></td></tr>
+<tr><td>Corrupted signature (same length)</td><td><code>invalid signature</code></td><td><code>DecodeError: Invalid crypto padding</code></td></tr>
+<tr><td>Truncated signature</td><td><code>invalid signature</code></td><td><code>DecodeError: Invalid crypto padding</code></td></tr>
+</table>
+<p>Two things fall out of this side by side: first, if you're searching an error message verbatim, search for the library, not just "jwt malformed" &mdash; "not enough segments" is real, current, and comes from PyJWT, not from jsonwebtoken. Second, PyJWT's 4-segment case isn't caught by a segment-count check at all; it only checks for fewer than three, then tries to base64-decode whatever it has, so an over-long token surfaces as a confusing unicode-decode error instead of a clean "too many segments" message.</p>
+
+<h2>6. How to fix it</h2>
+<ul>
+<li><strong>Confirm which library threw it.</strong> <code>JsonWebTokenError</code> + "jwt malformed" is jsonwebtoken (Node). <code>DecodeError</code> + "Not enough segments" is PyJWT (Python). Same underlying problem, different library, different wording &mdash; don't assume the message is a web standard.</li>
+<li><strong>Check what you're actually passing in.</strong> The most common real-world cause is passing the whole <code>Authorization</code> header (<code>"Bearer eyJ..."</code>) instead of just the token, or passing <code>undefined</code>/<code>null</code> because the token never arrived. Strip the <code>Bearer </code> prefix before calling <code>verify()</code>.</li>
+<li><strong>Count the dots yourself before verifying</strong> if you want a clearer error than the library gives: a valid compact JWT has exactly two dots and three non-empty segments.</li>
+<li><strong>Inspect the actual string.</strong> Paste it into our <a href="/tools/jwt-decoder/">jwt-decoder tool</a> to see the segment count and decoded header/payload without needing the secret &mdash; it will show you exactly where the shape breaks instead of just the generic library message.</li>
+<li><strong>Don't confuse "malformed" with "invalid signature".</strong> A malformed error means the string isn't shaped like a JWT. An invalid-signature error (section 4) means it is shaped correctly but was tampered with or signed with a different secret &mdash; see our <a href="/guides/jwt-malformed-invalid-signature-expired/">malformed vs. invalid-signature vs. expired</a> comparison for that case specifically.</li>
+</ul>
+<aside class="cta"><strong>Paste the token and see which part is actually broken:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does jsonwebtoken ever say &quot;not enough segments&quot;?</summary><p>Not in version 9.0.3, which we tested directly. Every wrong segment count (1, 2, or 4) produced &quot;jwt malformed&quot; instead. &quot;Not enough segments&quot; is the message PyJWT 2.15.1 uses for the same situation in Python, so if you see that exact phrase you&#x27;re very likely debugging a Python stack, not Node.</p></details>
+<details><summary>Is &quot;jwt malformed&quot; the same error as &quot;invalid signature&quot;?</summary><p>No. Both are JsonWebTokenError in jsonwebtoken, but they mean different things. &quot;jwt malformed&quot; means the string doesn&#x27;t have three valid segments. &quot;invalid signature&quot; means it does, but the signature doesn&#x27;t match the payload and secret &amp;mdash; we measured both by deliberately breaking each case.</p></details>
+<details><summary>What if the token has exactly 3 segments but still fails?</summary><p>Then it&#x27;s not a segment-count problem. In our tests, invalid base64 inside a segment produced &quot;invalid token&quot;, and a tampered or truncated signature produced &quot;invalid signature&quot; &amp;mdash; both distinct from &quot;jwt malformed&quot;.</p></details>
+<details><summary>Does jwt.decode() throw on a malformed token?</summary><p>No, in our test jwt.decode() (jsonwebtoken 9.0.3, no secret passed) returned null for a 2-segment string instead of throwing. Only jwt.verify() and jwt.decode() with options that require parsing throw JsonWebTokenError; use our jwt-decoder tool if you just want to inspect a token&#x27;s shape without writing code.</p></details>
+<details><summary>Why does my token look fine but still say malformed?</summary><p>A common cause we didn&#x27;t have to simulate: the caller sent the full Authorization header value, like &quot;Bearer eyJhbGc...&quot;, straight into verify(). That string has the right segments after &quot;Bearer &quot; but jsonwebtoken sees the &quot;Bearer &quot; prefix stuck to the first segment and the whole thing fails the shape check. Strip the prefix first.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with jsonwebtoken 9.0.3 on Node.js 24.21.0, and PyJWT 2.15.1 on Python 3.13, run against the same set of broken token strings. The jwt-decoder tool is ours and free; jsonwebtoken and PyJWT are open source.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

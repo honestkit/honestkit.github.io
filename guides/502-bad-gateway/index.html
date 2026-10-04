@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>502 Bad Gateway: Causes and Fixes, Reproduced Locally (Tested)</title>
+<meta name="description" content="We built a reverse proxy and broke its upstream four ways: refused connection, reset socket, mid-response crash and garbage reply. Here is what curl and fetch() showed, and how to fix each cause.">
+<link rel="canonical" href="https://honestkit.github.io/guides/502-bad-gateway/">
+<meta property="og:title" content="502 Bad Gateway: Causes and Fixes, Reproduced Locally (Tested)">
+<meta property="og:description" content="We built a reverse proxy and broke its upstream four ways: refused connection, reset socket, mid-response crash and garbage reply. Here is what curl and fetch() showed, and how to fix each cause.">
+<meta property="og:url" content="https://honestkit.github.io/guides/502-bad-gateway/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is a 502 a client or a server problem?", "acceptedAnswer": {"@type": "Answer", "text": "A server-side problem. The proxy or gateway could not get a valid response from the server behind it. In our test the proxy was fine; the upstream was stopped, reset the socket, or sent invalid HTTP."}}, {"@type": "Question", "name": "Does fetch() throw on a 502?", "acceptedAnswer": {"@type": "Answer", "text": "No. In Node 24, fetch() resolved with status 502, statusText \"Bad Gateway\" and ok false. You must check res.ok or res.status. fetch() only throws on network failures, like a body cut off mid-stream (TypeError: terminated)."}}, {"@type": "Question", "name": "Why did my client get a 200 with a truncated body instead of a 502?", "acceptedAnswer": {"@type": "Answer", "text": "Because the upstream crashed after the proxy had already forwarded the status and headers. In our test curl showed 200 OK, 7 of 100 bytes, and exit code 18. The proxy can only drop the connection at that point."}}, {"@type": "Question", "name": "What does nginx 'connect() failed (111: Connection refused)' mean?", "acceptedAnswer": {"@type": "Answer", "text": "From the docs: errno 111 is ECONNREFUSED. Nothing accepted the connection on the address in proxy_pass. Start the app, fix the port, or bind the app to 0.0.0.0 if it runs in a container."}}, {"@type": "Question", "name": "What is the difference between 502 and 504?", "acceptedAnswer": {"@type": "Answer", "text": "502 means the upstream answered badly or not at all (refused, reset, invalid). 504 Gateway Timeout means the proxy gave up waiting for an upstream that was still connected but too slow."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>502 Bad Gateway (tested)</h1>
+<p class="lead">A <code>502 Bad Gateway</code> means a proxy or gateway could not get a valid response from the server behind it. The proxy itself is up. The problem is the hop to the upstream: nothing listening, the connection was reset, or the reply was not valid HTTP.</p>
+<h2>1. The test setup</h2>
+<p>We wrote a 20-line reverse proxy with Node's <code>http</code> module. It forwards each request to the upstream. If <code>http.request</code> emits an <code>error</code> before any headers were sent, it answers <code>502</code> with the error code in the body. This is roughly what nginx, HAProxy and cloud load balancers do, but they write their own error pages.</p>
+<pre><code>const p = http.request({host: '127.0.0.1', port: 8984, path: req.url,
+                        method: req.method, headers: req.headers}, up =&gt; {
+  res.writeHead(up.statusCode, up.headers);
+  up.pipe(res);
+});
+p.on('error', e =&gt; {
+  if (!res.headersSent) {
+    res.writeHead(502, {'Content-Type': 'text/plain'});
+    res.end('502 Bad Gateway: ' + e.code + '\n');
+  } else {
+    res.destroy();   // too late for a 502: headers already went out
+  }
+});</code></pre>
+
+<h2>2. Upstream not listening (ECONNREFUSED)</h2>
+<p>With nothing on port 8984, the proxy's connect failed at once with <code>ECONNREFUSED</code> (message: <code>connect ECONNREFUSED 127.0.0.1:8984</code>). The client got a clean 502:</p>
+<pre><code>$ curl -si http://127.0.0.1:8983/ok
+HTTP/1.1 502 Bad Gateway
+Content-Type: text/plain
+Connection: keep-alive
+Keep-Alive: timeout=5
+Transfer-Encoding: chunked
+
+502 Bad Gateway: ECONNREFUSED</code></pre>
+<p>Once we started the upstream, the same request returned <code>200 OK</code> with <code>hello</code>. A refused connection is the most common 502: the app is down, restarting, or on another port or address.</p>
+
+<h2>3. Upstream resets the socket before replying</h2>
+<p>The upstream accepted the request and then called <code>socket.destroy()</code> without writing anything. Node reported <code>ECONNRESET</code> with the message <code>socket hang up</code>. The proxy had not sent headers yet, so the client again saw a normal 502:</p>
+<pre><code>$ curl -si http://127.0.0.1:8983/early
+HTTP/1.1 502 Bad Gateway
+...
+502 Bad Gateway: ECONNRESET</code></pre>
+
+<h2>4. Upstream crashes mid-response: no 502 at all</h2>
+<p>Here the upstream sent <code>200</code> with <code>Content-Length: 100</code>, wrote 7 bytes (<code>partial</code>), then destroyed the socket. The proxy had already forwarded the 200 headers. It cannot change the status any more. Node fired <code>aborted</code> and then an <code>ECONNRESET</code> (<code>aborted</code>) error on the upstream response, and our proxy cut the client connection.</p>
+<pre><code>$ curl -si http://127.0.0.1:8983/mid
+HTTP/1.1 200 OK
+content-length: 100
+...
+
+partial
+$ echo $?
+18</code></pre>
+<p>curl exit code 18 means "partial file": fewer bytes than <code>Content-Length</code> promised. With Node's <code>fetch()</code>, <code>res.status</code> was 200 and <code>res.ok</code> was <code>true</code>, but <code>await res.text()</code> threw <code>TypeError: terminated</code> with <code>cause.code</code> = <code>UND_ERR_SOCKET</code>. So a crash after the headers looks like a broken download, not a 502.</p>
+
+<h2>5. Upstream sends invalid HTTP</h2>
+<p>A raw TCP server on 8985 answered every request with <code>HELLO THIS IS NOT HTTP</code>. Node's HTTP parser rejected it with code <code>HPE_INVALID_CONSTANT</code> and message <code>Parse Error: Expected HTTP/, RTSP/ or ICE/</code>. The client got:</p>
+<pre><code>$ curl -si http://127.0.0.1:8983/g
+HTTP/1.1 502 Bad Gateway
+...
+502 Bad Gateway: HPE_INVALID_CONSTANT</code></pre>
+<p>Real-world versions of this: pointing an HTTP proxy at a TLS port, a database port, or a FastCGI socket.</p>
+
+<h2>6. How fetch() sees a 502</h2>
+<p>A 502 is a normal HTTP response. <code>fetch()</code> does not throw. In Node 24 we got:</p>
+<pre><code>const r = await fetch('http://127.0.0.1:8983/g');
+console.log(r.status, r.statusText, r.ok);
+// 502 Bad Gateway false
+await r.text();   // "502 Bad Gateway: HPE_INVALID_CONSTANT\n"</code></pre>
+<p>Check <code>res.ok</code> or <code>res.status</code> yourself. A <code>try/catch</code> around <code>fetch()</code> only catches network failures, like the mid-response crash above. A 502 is often temporary (an app restart), so a short retry with backoff is reasonable for idempotent requests. See <a href="/guides/retry-after-header-429/">Retry-After</a> for retry timing.</p>
+
+<h2>7. Summary of what we measured</h2>
+<table>
+<tr><th>Upstream failure</th><th>Node error code</th><th>Client saw</th></tr>
+<tr><td>Nothing listening</td><td><code>ECONNREFUSED</code></td><td>502</td></tr>
+<tr><td>Socket destroyed before reply</td><td><code>ECONNRESET</code> (socket hang up)</td><td>502</td></tr>
+<tr><td>Socket destroyed after headers</td><td><code>ECONNRESET</code> (aborted)</td><td>200, truncated body, curl exit 18</td></tr>
+<tr><td>Non-HTTP reply</td><td><code>HPE_INVALID_CONSTANT</code></td><td>502</td></tr>
+</table>
+
+<h2>8. Common real-world causes (from the docs, not measured)</h2>
+<p><strong>nginx: <code>connect() failed (111: Connection refused) while connecting to upstream</code>.</strong> This is the same as our ECONNREFUSED case. Errno 111 is ECONNREFUSED on Linux. The app is down, or <code>proxy_pass</code> points at the wrong host or port. Check with <code>curl -i http://127.0.0.1:PORT/</code> from the proxy host itself.</p>
+<p><strong>nginx: <code>upstream prematurely closed connection while reading response header from upstream</code>.</strong> This matches our "reset before reply" case. The app crashed, was killed (for example by the OOM killer), or a worker hit its own timeout and closed the socket. Look at the app's logs at the same timestamp.</p>
+<p><strong>php-fpm socket.</strong> With <code>fastcgi_pass unix:/run/php/php-fpm.sock;</code> nginx logs errors like <code>connect() to unix:/run/php/... failed (2: No such file or directory)</code> when php-fpm is stopped or the socket path differs between versions, and <code>(13: Permission denied)</code> when the nginx user cannot open the socket. Fix the path, start php-fpm, or set <code>listen.owner</code>/<code>listen.group</code>/<code>listen.mode</code> in the pool config.</p>
+<p><strong>App listens on 127.0.0.1 inside a container.</strong> Inside a Docker container, <code>127.0.0.1</code> is the container's own loopback. A proxy in another container, or on the host via a published port, cannot reach it, and you get connection refused or reset. Bind the app to <code>0.0.0.0</code> and point the proxy at the service name (for example <code>http://app:3000</code>) on a shared network.</p>
+<p><strong>Other causes.</strong> HTTP proxy pointed at an HTTPS port (invalid response, like our garbage test). Response headers larger than the proxy's buffer (nginx: <code>upstream sent too big header</code>). Idle keep-alive connections closed by the upstream just as the proxy reuses them; see <a href="/guides/keep-alive-header-connection/">Keep-Alive</a>. A slow upstream usually gives <code>504 Gateway Timeout</code> instead, not 502; for client-side timeouts see <a href="/guides/408-request-timeout/">408 Request Timeout</a>.</p>
+
+<h2>9. Fix checklist</h2>
+<ol>
+<li>Read the proxy's error log first. The exact message tells you which case you have.</li>
+<li>From the proxy host, curl the upstream address directly. Refused means the app is down or on another address.</li>
+<li>Check the app logs and <code>dmesg</code> for crashes and OOM kills at the same time.</li>
+<li>Confirm the protocol: HTTP vs HTTPS, HTTP vs FastCGI, correct socket path.</li>
+<li>In containers, bind to <code>0.0.0.0</code> and use the service name, not <code>localhost</code>.</li>
+<li>Make sure your proxy sets the right forwarding headers; see <a href="/guides/x-forwarded-for-real-ip-nginx/">X-Forwarded-For</a> and <a href="/guides/via-header/">Via</a>.</li>
+</ol>
+<aside class="cta"><strong>See the status and headers your proxy really returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is a 502 a client or a server problem?</summary><p>A server-side problem. The proxy or gateway could not get a valid response from the server behind it. In our test the proxy was fine; the upstream was stopped, reset the socket, or sent invalid HTTP.</p></details>
+<details><summary>Does fetch() throw on a 502?</summary><p>No. In Node 24, fetch() resolved with status 502, statusText &quot;Bad Gateway&quot; and ok false. You must check res.ok or res.status. fetch() only throws on network failures, like a body cut off mid-stream (TypeError: terminated).</p></details>
+<details><summary>Why did my client get a 200 with a truncated body instead of a 502?</summary><p>Because the upstream crashed after the proxy had already forwarded the status and headers. In our test curl showed 200 OK, 7 of 100 bytes, and exit code 18. The proxy can only drop the connection at that point.</p></details>
+<details><summary>What does nginx &#x27;connect() failed (111: Connection refused)&#x27; mean?</summary><p>From the docs: errno 111 is ECONNREFUSED. Nothing accepted the connection on the address in proxy_pass. Start the app, fix the port, or bind the app to 0.0.0.0 if it runs in a container.</p></details>
+<details><summary>What is the difference between 502 and 504?</summary><p>502 means the upstream answered badly or not at all (refused, reset, invalid). 504 Gateway Timeout means the proxy gave up waiting for an upstream that was still connected but too slow.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with curl 8.14.1 and Node.js 24.21.0: a small Node reverse proxy (plain http module) on 127.0.0.1:8983 in front of a Node upstream on 127.0.0.1:8984 and a raw TCP server on 127.0.0.1:8985. We tested a stopped upstream, a reset socket before and during the response, and a non-HTTP reply. The nginx, php-fpm and Docker notes are from the docs, not measured. PlainHeaders is our extension; curl and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

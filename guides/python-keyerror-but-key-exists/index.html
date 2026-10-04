@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python KeyError When the Key Looks Like It Should Exist</title>
+<meta name="description" content="KeyError even though the key is right there in the dict? We reproduced 5 causes: type mismatch, whitespace, case, wrong dict object, Unicode normalization.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-keyerror-but-key-exists/">
+<meta property="og:title" content="Python KeyError When the Key Looks Like It Should Exist">
+<meta property="og:description" content="KeyError even though the key is right there in the dict? We reproduced 5 causes: type mismatch, whitespace, case, wrong dict object, Unicode normalization.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-keyerror-but-key-exists/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does KeyError happen when I can see the key in the dict?", "acceptedAnswer": {"@type": "Answer", "text": "Because dict lookup compares with == and hash(), not by how the key looks when printed. Two values can render identical text and still differ - common causes are an int/str type mismatch, a trailing newline from a file read, a case difference, indexing a different dict object than the one you printed, or (rarely) different Unicode normalization of the same accented characters."}}, {"@type": "Question", "name": "Why does d[1] work but d['1'] raise KeyError, or the reverse?", "acceptedAnswer": {"@type": "Answer", "text": "Because 1 and '1' are different objects with different hashes - dict lookup is exact-type equality, not a loose match. This is especially common with JSON: json.loads() always produces string keys, even for fields that look numeric, so code written assuming int keys fails against JSON-sourced data."}}, {"@type": "Question", "name": "Why does a key from readlines() not match the same text typed literally?", "acceptedAnswer": {"@type": "Answer", "text": "readlines() keeps the trailing newline character on every line except sometimes the last, so 'name\\n' != 'name' even though a terminal may not visibly show the difference. Call .strip() on lines read from a file before using them as dict keys or lookup values."}}, {"@type": "Question", "name": "Are dict keys case-sensitive in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, always - 'Name' and 'name' are different strings and therefore different keys, with no built-in case-insensitive mode. If keys might arrive in inconsistent casing, normalize with .lower() (or .upper()) consistently on both the write and the read side."}}, {"@type": "Question", "name": "Can the same accented word be two different dict keys?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Unicode allows composed (NFC) and decomposed (NFD) forms of accented characters that print identically but are different code point sequences, so == and dict lookup treat them as unequal. We measured len() differing (4 vs 5) for the same visible word in NFC vs NFD. Normalize with unicodedata.normalize('NFC', key) consistently to avoid this."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>KeyError when the key looks present (tested)</h1>
+<p class="lead">If <code>print(d)</code> shows the key sitting right there and <code>d[key]</code> still raises <code>KeyError</code>, the key you're looking up isn't actually equal to the key that's stored &mdash; even though they look identical when printed. Dict lookup uses <code>==</code> and <code>hash()</code>, not a visual match, so two values that render the same text can still be different objects. We reproduced five distinct ways this happens.</p>
+<h2>1. Five reproduced causes, same visual trap</h2>
+<p>Each of these prints as if the key is there, then raises anyway:</p>
+<table>
+<tr><th>Code</th><th>Exact error (Python 3.13.5)</th></tr>
+<tr><td><code>d = {1: 'a'}; d['1']</code> (int key, str lookup)</td><td><code>KeyError: '1'</code></td></tr>
+<tr><td><code>d[lines[0]]</code> where <code>lines[0]</code> is <code>'name\n'</code> from <code>readlines()</code></td><td><code>KeyError: 'name\n'</code></td></tr>
+<tr><td><code>d = {'Name': 1}; d['name']</code> (case mismatch)</td><td><code>KeyError: 'name'</code></td></tr>
+<tr><td><code>snapshot['b']</code> where <code>snapshot</code> was copied before <code>'b'</code> was added to the original</td><td><code>KeyError: 'b'</code></td></tr>
+<tr><td><code>d[nfd]</code> where <code>d</code>'s key is NFC-normalized and <code>nfd</code> is the same text NFD-normalized</td><td><code>KeyError: 'café'</code></td></tr>
+</table>
+<p>In every case the printed representation of the two keys is indistinguishable. The fix is always to find the invisible difference, not to assume the key is simply missing &mdash; see <a href="/guides/python-keyerror/">Python KeyError: causes and fixes</a> for the plain missing-key case instead.</p>
+
+<h2>2. Cause 1: int keys, string lookup (or vice versa)</h2>
+<p><code>1</code> and <code>'1'</code> print differently if you look closely, but it's easy to miss in a wall of output, and JSON makes it worse: <code>json.loads()</code> always produces string keys, even for numeric-looking ones.</p>
+<pre><code>&gt;&gt;&gt; d = {1: 'a', 2: 'b'}
+&gt;&gt;&gt; d['1']
+Traceback (most recent call last):
+  ...
+KeyError: '1'</code></pre>
+<pre><code>&gt;&gt;&gt; import json
+&gt;&gt;&gt; d = json.loads('{"1": "a"}')
+&gt;&gt;&gt; d
+{'1': 'a'}
+&gt;&gt;&gt; d[1]
+Traceback (most recent call last):
+  ...
+KeyError: 1</code></pre>
+<p>Fix: check <code>type(key)</code> against the actual keys (<code>list(d.keys())[0].__class__</code>), and cast explicitly &mdash; <code>d[int(key)]</code> or <code>d[str(key)]</code>. CSV rows and JSON objects are the two most common sources of this mismatch, since both can produce string keys for data that looks numeric.</p>
+
+<h2>3. Cause 2: trailing whitespace or newline from file reads</h2>
+<p><code>readlines()</code> (and iterating a file object directly) keeps the trailing <code>\n</code> on every line. Printed, <code>'name\n'</code> and <code>'name'</code> can look the same in a terminal that just eats the newline visually.</p>
+<pre><code>&gt;&gt;&gt; lines = open('keys.txt').readlines()
+&gt;&gt;&gt; lines
+['name\n', 'age\n']
+&gt;&gt;&gt; key = lines[0]
+&gt;&gt;&gt; key == 'name'
+False
+&gt;&gt;&gt; d = {'name': 'Alice', 'age': 30}
+&gt;&gt;&gt; d[key]
+Traceback (most recent call last):
+  ...
+KeyError: 'name\n'</code></pre>
+<p>Fix: <code>.strip()</code> every line pulled from a file before using it as a key (or a lookup value) &mdash; <code>key = line.strip()</code>. If the traceback's key has a visible <code>\n</code> or extra spaces inside the quotes, this is the cause.</p>
+
+<h2>4. Cause 3: case sensitivity</h2>
+<p>Dict keys are ordinary strings underneath, and string comparison in Python is always case-sensitive &mdash; there's no special-casing for dict keys.</p>
+<pre><code>&gt;&gt;&gt; d = {'Name': 'Alice'}
+&gt;&gt;&gt; d['name']
+Traceback (most recent call last):
+  ...
+KeyError: 'name'</code></pre>
+<p>Fix: normalize case on the way in and out &mdash; store and look up with <code>key.lower()</code> consistently, or build the dict with a case-insensitive wrapper if the keys come from user input or an external API that doesn't guarantee casing.</p>
+
+<h2>5. Cause 4: looking at a different dict object than the one you're indexing</h2>
+<p>If a copy was taken before a mutation, or a variable got reassigned between the <code>print()</code> and the lookup, the two can diverge even though they share a name or started out equal.</p>
+<pre><code>&gt;&gt;&gt; original = {'a': 1}
+&gt;&gt;&gt; snapshot = dict(original)
+&gt;&gt;&gt; original['b'] = 2
+&gt;&gt;&gt; print(original)
+{'a': 1, 'b': 2}
+&gt;&gt;&gt; snapshot['b']
+Traceback (most recent call last):
+  ...
+KeyError: 'b'</code></pre>
+<p><code>dict(original)</code> (and <code>.copy()</code>) makes a shallow copy at that moment &mdash; later changes to <code>original</code> don't propagate to <code>snapshot</code>. The same confusion happens when a function parameter shadows an outer-scope variable of the same name: printing the outer one and indexing the parameter looks like the same object in the source code, but isn't. Fix: check <code>id(d)</code> at both the print and the lookup if you suspect this &mdash; if the ids differ, they're not the same object, no matter what the variable is named.</p>
+
+<h2>6. Cause 5: Unicode normalization (accented characters)</h2>
+<p>Some characters have more than one valid Unicode representation: an accented letter can be a single composed code point (NFC) or a base letter plus a separate combining accent mark (NFD). Both print identically; neither <code>==</code> nor dict lookup treats them as equal.</p>
+<pre><code>&gt;&gt;&gt; import unicodedata
+&gt;&gt;&gt; nfc = unicodedata.normalize('NFC', 'café')
+&gt;&gt;&gt; nfd = unicodedata.normalize('NFD', 'café')
+&gt;&gt;&gt; nfc == nfd
+False
+&gt;&gt;&gt; len(nfc), len(nfd)
+(4, 5)
+&gt;&gt;&gt; d = {nfc: 'drink'}
+&gt;&gt;&gt; d[nfd]
+Traceback (most recent call last):
+  ...
+KeyError: 'café'</code></pre>
+<p>This is rare but real &mdash; it shows up when keys come from different sources (one typed on macOS, which tends to produce NFD, versus one from a web form or API that sends NFC). Fix: normalize every key to the same form before using it, e.g. <code>unicodedata.normalize('NFC', key)</code>, consistently on both the write and read side.</p>
+
+<h2>7. Fix checklist</h2>
+<ul>
+<li>Print <code>repr(key)</code>, not <code>key</code> &mdash; <code>repr()</code> shows quotes, <code>\n</code>, and other invisible characters that plain printing hides.</li>
+<li>Compare types: <code>type(key)</code> vs. <code>type(list(d.keys())[0])</code>. A silent int/str mismatch is the single most common version of this.</li>
+<li>If the key came from a file line, <code>.strip()</code> it. If it came from user input or an external API, consider <code>.lower()</code> and <code>unicodedata.normalize()</code> on both sides.</li>
+<li>If you printed one dict and indexed another, check <code>id()</code> on both at the point of failure &mdash; the same variable name does not guarantee the same object.</li>
+<li>For the plain "key is genuinely absent" case (typos, optional fields, unset env vars), see <a href="/guides/python-keyerror/">Python KeyError: causes and fixes</a>.</li>
+</ul>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does KeyError happen when I can see the key in the dict?</summary><p>Because dict lookup compares with == and hash(), not by how the key looks when printed. Two values can render identical text and still differ - common causes are an int/str type mismatch, a trailing newline from a file read, a case difference, indexing a different dict object than the one you printed, or (rarely) different Unicode normalization of the same accented characters.</p></details>
+<details><summary>Why does d[1] work but d[&#x27;1&#x27;] raise KeyError, or the reverse?</summary><p>Because 1 and &#x27;1&#x27; are different objects with different hashes - dict lookup is exact-type equality, not a loose match. This is especially common with JSON: json.loads() always produces string keys, even for fields that look numeric, so code written assuming int keys fails against JSON-sourced data.</p></details>
+<details><summary>Why does a key from readlines() not match the same text typed literally?</summary><p>readlines() keeps the trailing newline character on every line except sometimes the last, so &#x27;name\n&#x27; != &#x27;name&#x27; even though a terminal may not visibly show the difference. Call .strip() on lines read from a file before using them as dict keys or lookup values.</p></details>
+<details><summary>Are dict keys case-sensitive in Python?</summary><p>Yes, always - &#x27;Name&#x27; and &#x27;name&#x27; are different strings and therefore different keys, with no built-in case-insensitive mode. If keys might arrive in inconsistent casing, normalize with .lower() (or .upper()) consistently on both the write and the read side.</p></details>
+<details><summary>Can the same accented word be two different dict keys?</summary><p>Yes. Unicode allows composed (NFC) and decomposed (NFD) forms of accented characters that print identically but are different code point sequences, so == and dict lookup treat them as unequal. We measured len() differing (4 vs 5) for the same visible word in NFC vs NFD. Normalize with unicodedata.normalize(&#x27;NFC&#x27;, key) consistently to avoid this.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5 on Linux using plain python3 one-liners. Every traceback below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

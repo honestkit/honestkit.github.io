@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>500 Internal Server Error: Causes, Logs and Fixes (Tested)</title>
+<meta name="description" content="We threw uncaught errors in Express, plain Node, Flask and FastAPI and logged what each one sent. The 500 body hides the cause. The real error is in the server log. Here is where to find it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/500-internal-server-error/">
+<meta property="og:title" content="500 Internal Server Error: Causes, Logs and Fixes (Tested)">
+<meta property="og:description" content="We threw uncaught errors in Express, plain Node, Flask and FastAPI and logged what each one sent. The 500 body hides the cause. The real error is in the server log. Here is where to find it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/500-internal-server-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is a 500 error my fault or the server's?", "acceptedAnswer": {"@type": "Answer", "text": "The server's. The request reached the app and the app failed. As a visitor you can only retry later or report it. As the owner, read the server log."}}, {"@type": "Question", "name": "Why does the 500 page not show the error?", "acceptedAnswer": {"@type": "Answer", "text": "On purpose. In our test, Express with NODE_ENV=production, Flask with debug off and FastAPI all sent a short generic body. The full stack trace went to stderr, which ends up in your log."}}, {"@type": "Question", "name": "Does Express 5 catch errors in async handlers?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. In our test with Express 5.2.1, a rejected promise in an async handler gave a 500 and reached the custom (err, req, res, next) handler, the same as a sync throw."}}, {"@type": "Question", "name": "Why do I get an empty reply instead of a 500?", "acceptedAnswer": {"@type": "Answer", "text": "Something crashed before a response was sent. Our plain Node http server crashed on a thrown error, and curl exited with code 52 (empty reply). Behind a proxy that often shows as a 502."}}, {"@type": "Question", "name": "Should I retry a 500?", "acceptedAnswer": {"@type": "Answer", "text": "Once or twice at most, with a delay. curl --retry 3 sent 4 requests in about 7 seconds in our test. Most 500s are bugs, so retries give the same result until the code is fixed."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>500 Internal Server Error (tested)</h1>
+<p class="lead">A <code>500 Internal Server Error</code> means the server code failed while handling your request. The response almost never says why. The stack trace goes to the server's log, so the fix starts there.</p>
+<h2>1. What a 500 means</h2>
+<p>The request reached the app. The app crashed or threw an error it did not handle. The framework then sent a generic 500. It is a server-side bug or a server-side config problem. Retrying the same request usually gives the same 500.</p>
+<p>It is different from the gateway errors. A <a href="/guides/502-bad-gateway/">502</a> means a proxy got a bad reply from the app. A <a href="/guides/503-service-unavailable/">503</a> means the service is down or overloaded. A <a href="/guides/504-gateway-timeout/">504</a> means the proxy gave up waiting.</p>
+
+<h2>2. What each framework sent in our test</h2>
+<p>Each handler threw an error. We called it with <code>curl -i</code>.</p>
+<table>
+<tr><th>Setup</th><th>Status</th><th>Body</th><th>Stack trace went to</th></tr>
+<tr><td>Express 5, NODE_ENV unset (sync throw and async rejected promise)</td><td>500</td><td>HTML page with the full stack trace and file paths</td><td>Response body and stderr</td></tr>
+<tr><td>Express 5, NODE_ENV=production</td><td>500</td><td>HTML <code>&lt;pre&gt;Internal Server Error&lt;/pre&gt;</code> (148 bytes)</td><td>stderr only</td></tr>
+<tr><td>Express 5 with custom error middleware</td><td>500</td><td>Whatever you send, e.g. JSON</td><td>Wherever you log it</td></tr>
+<tr><td>Plain Node <code>http</code> server, throw in handler</td><td>none</td><td>Empty reply, curl exit 52</td><td>stderr, then the process exited with code 1</td></tr>
+<tr><td>Flask, debug off</td><td>500</td><td>Generic "Internal Server Error" HTML</td><td>stderr (<code>ERROR in app: Exception on /x [GET]</code>)</td></tr>
+<tr><td>Flask, debug on</td><td>500</td><td>Werkzeug debugger page with the traceback (13 KB)</td><td>Response body and stderr</td></tr>
+<tr><td>FastAPI on uvicorn</td><td>500</td><td><code>Internal Server Error</code>, text/plain, 21 bytes</td><td>stderr (<code>ERROR: Exception in ASGI application</code>)</td></tr>
+</table>
+<p>Two lessons. First, the log has the real error in every case. Second, Express without <code>NODE_ENV=production</code> and Flask with debug on leak the stack trace to anyone who calls the URL. Do not run them that way in public.</p>
+
+<h2>3. Express 5: async errors are caught now</h2>
+<p>In Express 5, a thrown error and a rejected promise in an <code>async</code> handler both reached the error handler. Both gave a 500. Here is a custom handler. It must have four arguments, and it goes after your routes.</p>
+<pre><code>app.get('/async', async (req, res) =&gt; {
+  throw new Error('boom async');
+});
+
+app.use((err, req, res, next) =&gt; {
+  console.error(err);            // keep the stack in your logs
+  res.status(500).json({ error: 'Internal Server Error' });
+});</code></pre>
+<p>With this handler, both routes returned <code>{"error":"Internal Server Error"}</code> as JSON. The default HTML page was gone.</p>
+
+<h2>4. Plain Node: no 500 at all</h2>
+<p>A bare <code>http.createServer</code> handler that throws does not send a 500. In our test the whole process crashed. curl printed nothing and exited with code 52 (empty reply). Behind a proxy, this shows up as a <a href="/guides/502-bad-gateway/">502</a> or a <a href="/guides/err-connection-reset-econnreset/">connection reset</a>. Wrap handler code in <code>try/catch</code> and send the 500 yourself.</p>
+
+<h2>5. Clients and retries</h2>
+<p>In Node.js 24, <code>fetch</code> did not throw on a 500. It resolved with <code>status 500</code> and <code>ok false</code>. Check <code>res.ok</code> yourself.</p>
+<p><code>curl --retry 3</code> does retry a 500. Our test server counted 4 requests in about 7 seconds (1, 2 and 4 second waits). The server sent no <code>Retry-After</code> header. A retry only helps if the error is temporary.</p>
+<pre><code>curl -s -o /dev/null -w '%{http_code}\n' --retry 3 https://example.com/api</code></pre>
+
+<h2>6. PHP, Apache and WordPress (from the docs)</h2>
+<p>We did not test these. This is what their docs say.</p>
+<ul>
+<li><strong>PHP:</strong> with <code>display_errors=Off</code>, a fatal error can give a blank page with a 500 status. The message goes to the PHP error log (<code>error_log</code> in php.ini).</li>
+<li><strong>Apache:</strong> a typo or an unknown directive in <code>.htaccess</code> makes Apache return 500 for that directory. The Apache error log names the bad line.</li>
+<li><strong>WordPress:</strong> a fatal PHP error shows "There has been a critical error on this website." Set <code>WP_DEBUG</code> and <code>WP_DEBUG_LOG</code> to true to write <code>wp-content/debug.log</code>.</li>
+<li><strong>File permissions:</strong> a script or file the server user cannot read or run can cause a 500.</li>
+<li><strong>Memory limits:</strong> hitting PHP's <code>memory_limit</code> is a fatal error, so it can also end as a 500.</li>
+</ul>
+
+<h2>7. Where to find the log</h2>
+<pre><code># nginx (as a proxy it logs upstream problems here)
+tail -n 50 /var/log/nginx/error.log
+
+# Apache
+tail -n 50 /var/log/apache2/error.log   # Debian/Ubuntu
+tail -n 50 /var/log/httpd/error_log     # RHEL/Fedora
+
+# systemd service
+journalctl -u myapp -n 100 --no-pager
+
+# Docker container
+docker logs --tail 100 mycontainer</code></pre>
+<p>Reproduce the request, then read the newest lines. Look for the first traceback or "ERROR" line near the request time.</p>
+
+<h2>8. Fix checklist</h2>
+<ol>
+<li>Reproduce with <code>curl -i</code> and note the time.</li>
+<li>Read the app log or stderr from that moment.</li>
+<li>Fix the code or config the trace points to.</li>
+<li>Add an error handler that logs the error and returns a short, safe 500 body.</li>
+<li>In production, set <code>NODE_ENV=production</code> and keep Flask debug off.</li>
+</ol>
+<aside class="cta"><strong>See the status code and every response header your server sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is a 500 error my fault or the server&#x27;s?</summary><p>The server&#x27;s. The request reached the app and the app failed. As a visitor you can only retry later or report it. As the owner, read the server log.</p></details>
+<details><summary>Why does the 500 page not show the error?</summary><p>On purpose. In our test, Express with NODE_ENV=production, Flask with debug off and FastAPI all sent a short generic body. The full stack trace went to stderr, which ends up in your log.</p></details>
+<details><summary>Does Express 5 catch errors in async handlers?</summary><p>Yes. In our test with Express 5.2.1, a rejected promise in an async handler gave a 500 and reached the custom (err, req, res, next) handler, the same as a sync throw.</p></details>
+<details><summary>Why do I get an empty reply instead of a 500?</summary><p>Something crashed before a response was sent. Our plain Node http server crashed on a thrown error, and curl exited with code 52 (empty reply). Behind a proxy that often shows as a 502.</p></details>
+<details><summary>Should I retry a 500?</summary><p>Once or twice at most, with a delay. curl --retry 3 sent 4 requests in about 7 seconds in our test. Most 500s are bugs, so retries give the same result until the code is fixed.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Express 5.2.1 on Node.js 24.21.0, a plain Node http server, Flask (Werkzeug 3.1.9), FastAPI on uvicorn (Python 3.13.5) and curl 8.14.1. The PHP, Apache and WordPress notes come from their docs, not from our run. PlainHeaders is our extension; curl, Node.js and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

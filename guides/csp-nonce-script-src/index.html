@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSP Nonce: How script-src &#x27;nonce-...&#x27; Works, With Express + Helmet (Tested)</title>
+<meta name="description" content="Chromium 153: an inline script with the matching nonce ran; wrong or missing nonce was blocked; &#x27;unsafe-inline&#x27; was ignored next to a nonce; onclick stayed blocked; getAttribute(&#x27;nonce&#x27;) returned &quot;&quot;. Express 5 + helmet 8 setup.">
+<link rel="canonical" href="https://honestkit.github.io/guides/csp-nonce-script-src/">
+<meta property="og:title" content="CSP Nonce: How script-src &#x27;nonce-...&#x27; Works, With Express + Helmet (Tested)">
+<meta property="og:description" content="Chromium 153: an inline script with the matching nonce ran; wrong or missing nonce was blocked; &#x27;unsafe-inline&#x27; was ignored next to a nonce; onclick stayed blocked; getAttribute(&#x27;nonce&#x27;) returned &quot;&quot;. Express 5 + helmet 8 setup.">
+<meta property="og:url" content="https://honestkit.github.io/guides/csp-nonce-script-src/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is a CSP nonce?", "acceptedAnswer": {"@type": "Answer", "text": "A random, single-use value sent in the Content-Security-Policy header as 'nonce-VALUE' and on each trusted script tag as nonce=\"VALUE\". In Chromium 153 only scripts with the matching nonce ran; wrong or missing nonces were blocked."}}, {"@type": "Question", "name": "Does 'unsafe-inline' still work with a nonce?", "acceptedAnswer": {"@type": "Answer", "text": "No. With script-src 'nonce-abc' 'unsafe-inline', Chromium 153 blocked an inline script with no nonce and logged that 'unsafe-inline' is ignored if a hash or nonce is present."}}, {"@type": "Question", "name": "Does a nonce allow onclick handlers?", "acceptedAnswer": {"@type": "Answer", "text": "No. Chromium 153 blocked an onclick handler under script-src 'nonce-...'. Move the handler into a nonced script with addEventListener."}}, {"@type": "Question", "name": "Why does getAttribute('nonce') return an empty string?", "acceptedAnswer": {"@type": "Answer", "text": "Chromium hides the nonce from the attribute after load. In our test getAttribute('nonce') returned \"\" while script.nonce returned the real value."}}, {"@type": "Question", "name": "How do I generate a nonce in Express?", "acceptedAnswer": {"@type": "Answer", "text": "Set res.locals.nonce = crypto.randomBytes(16).toString('base64') in a middleware, then in helmet use scriptSrc: [\"'self'\", (req, res) => `'nonce-${res.locals.nonce}'`]. Measured with Express 5.2.1 and helmet 8.3.0: a new nonce every request."}}, {"@type": "Question", "name": "Can I use the same nonce on every page load?", "acceptedAnswer": {"@type": "Answer", "text": "No. A fixed nonce can be read by anyone and copied into injected script tags, so it gives no protection. Generate a new one for every response."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>CSP nonce: script-src &#x27;nonce-...&#x27; (tested)</h1>
+<p class="lead">A CSP nonce is a random value you put in the header (<code>script-src 'nonce-R4nd0m'</code>) and on each <code>&lt;script nonce="R4nd0m"&gt;</code> tag you trust. The browser runs only the scripts whose nonce matches. An attacker who injects HTML cannot guess it, so their script is blocked. It only works if the nonce is new on every response. We tested each rule below in Chromium 153 and wired it up in Express 5 with helmet. For the full policy, see our <a href="/guides/content-security-policy-header-example/">Content-Security-Policy header example</a>.</p>
+<h2>1. What Chromium 153 did (measured)</h2>
+<p>Each page was served by Express on localhost with the header shown. We read the console in headless Chromium 153.</p>
+<table>
+<tr><th>Policy</th><th>Script</th><th>Result</th></tr>
+<tr><td><code>script-src 'nonce-abc'</code></td><td><code>&lt;script nonce="abc"&gt;</code> inline</td><td>Ran</td></tr>
+<tr><td><code>script-src 'nonce-abc'</code></td><td><code>&lt;script nonce="wrong"&gt;</code> inline</td><td>Blocked</td></tr>
+<tr><td><code>script-src 'nonce-abc'</code></td><td><code>&lt;script&gt;</code> with no nonce</td><td>Blocked</td></tr>
+<tr><td><code>script-src 'nonce-abc' 'unsafe-inline'</code></td><td><code>&lt;script&gt;</code> with no nonce</td><td>Blocked (<code>'unsafe-inline'</code> ignored)</td></tr>
+<tr><td><code>script-src 'unsafe-inline'</code> (no nonce)</td><td><code>&lt;script&gt;</code> with no nonce</td><td>Ran</td></tr>
+<tr><td><code>script-src 'nonce-abc'</code></td><td><code>&lt;button onclick="..."&gt;</code></td><td>Blocked on click</td></tr>
+<tr><td><code>script-src 'nonce-abc'</code></td><td>nonced script adds <code>createElement('script')</code> with <code>src=/ext.js</code></td><td>Blocked</td></tr>
+<tr><td><code>script-src 'nonce-abc' 'strict-dynamic'</code></td><td>same as above</td><td>Loaded and ran</td></tr>
+<tr><td><code>script-src 'nonce-abc' 'strict-dynamic'</code></td><td><code>&lt;script src="/ext.js"&gt;</code> in the HTML, no nonce</td><td>Blocked</td></tr>
+</table>
+<p>The console error for a missing or wrong nonce, word for word:</p>
+<pre><code>Executing inline script violates the following Content Security Policy directive 'script-src 'nonce-abc123fixed''. Either the 'unsafe-inline' keyword, a hash ('sha256-...'), or a nonce ('nonce-...') is required to enable inline execution. The action has been blocked.</code></pre>
+<p>With <code>'unsafe-inline'</code> next to the nonce, Chromium added: <code>Note that 'unsafe-inline' is ignored if either a hash or nonce value is present in the source list.</code></p>
+<p>For a blocked <code>onclick</code> the message starts with <code>Executing inline event handler violates ...</code>.</p>
+
+<h2>2. Add a per-request nonce in Express 5 with helmet (measured)</h2>
+<pre><code>const express = require('express');
+const helmet = require('helmet');
+const crypto = require('crypto');
+const app = express();
+
+app.use((req, res, next) =&gt; {
+  res.locals.nonce = crypto.randomBytes(16).toString('base64');
+  next();
+});
+
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      scriptSrc: ["'self'", (req, res) =&gt; `'nonce-${res.locals.nonce}'`],
+    },
+  },
+}));
+
+app.get('/', (req, res) =&gt; {
+  res.send(`&lt;script nonce="${res.locals.nonce}"&gt;console.log('ok')&lt;/script&gt;`);
+});</code></pre>
+<p>With Express 5.2.1 and helmet 8.3.0, two <code>curl -I</code> requests got two different nonces, for example:</p>
+<pre><code>script-src 'self' 'nonce-hZHIvPuqvmEHq91qIlUg0A=='
+script-src 'self' 'nonce-UDI8y0TJJhHXuk9IjQS6cQ=='</code></pre>
+<p>In Chromium the nonced inline script ran and a plain <code>&lt;script&gt;</code> on the same page was blocked. Helmet also sent its other defaults, including <code>script-src-attr 'none'</code>, which blocks <code>onclick</code>-style handlers too.</p>
+<p>If you use a template engine, pass <code>res.locals.nonce</code> into every <code>&lt;script&gt;</code> tag you own. 16 random bytes is 128 bits; the spec asks for at least 128 bits (from the spec, not measured).</p>
+
+<h2>3. The nonce is hidden from the DOM (measured)</h2>
+<p>Inside the page, <code>script.getAttribute('nonce')</code> returned <code>""</code> and <code>outerHTML</code> showed <code>nonce=""</code>. The real value was still on the <code>script.nonce</code> property. Chromium hides it so injected CSS selectors cannot read it out of the attribute. If your code copies nonces to new scripts, read <code>.nonce</code>, not <code>getAttribute</code>.</p>
+
+<h2>4. 'strict-dynamic': when to add it</h2>
+<p>Without <code>'strict-dynamic'</code>, a nonced script that loads another script (analytics tags, lazy loaders) is blocked unless that URL is also allowed. With it, trust passes to scripts a nonced script creates. Measured above: the <code>createElement</code> script loaded, while a plain un-nonced <code>&lt;script src&gt;</code> in the HTML was still blocked.</p>
+<p>From the spec, not measured: when <code>'strict-dynamic'</code> is present, browsers that support it ignore host lists and <code>'self'</code> in <code>script-src</code>, so older browsers fall back to those.</p>
+
+<h2>5. Do not reuse the nonce</h2>
+<p>A nonce that stays the same across page loads gives no protection: an attacker loads your page once, reads the nonce from the header, and adds it to their injected <code>&lt;script&gt;</code>. Generate a new one per response. This also means a page with a nonce cannot be served as a single cached copy to everyone (a CDN cache would serve one nonce to every visitor). For fully static pages, hashes (<code>'sha256-...'</code>) are the usual choice (from the docs, not measured).</p>
+
+<h2>6. Roll it out safely</h2>
+<ul>
+<li>Ship the policy first as <a href="/guides/content-security-policy-report-only/">Content-Security-Policy-Report-Only</a> and read the reports.</li>
+<li>Move <code>onclick=</code> and other inline handlers into <code>addEventListener</code> in a nonced script. A nonce does not cover them.</li>
+<li>Remove <code>'unsafe-inline'</code> once nonces work, or keep it only as a fallback for very old browsers (newer ones ignore it, as measured).</li>
+<li>A strict CSP replaces the old <a href="/guides/x-xss-protection-header/">X-XSS-Protection header</a>, which modern browsers ignore.</li>
+</ul>
+<aside class="cta"><strong>Check the Content-Security-Policy header your pages actually send:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is a CSP nonce?</summary><p>A random, single-use value sent in the Content-Security-Policy header as &#x27;nonce-VALUE&#x27; and on each trusted script tag as nonce=&quot;VALUE&quot;. In Chromium 153 only scripts with the matching nonce ran; wrong or missing nonces were blocked.</p></details>
+<details><summary>Does &#x27;unsafe-inline&#x27; still work with a nonce?</summary><p>No. With script-src &#x27;nonce-abc&#x27; &#x27;unsafe-inline&#x27;, Chromium 153 blocked an inline script with no nonce and logged that &#x27;unsafe-inline&#x27; is ignored if a hash or nonce is present.</p></details>
+<details><summary>Does a nonce allow onclick handlers?</summary><p>No. Chromium 153 blocked an onclick handler under script-src &#x27;nonce-...&#x27;. Move the handler into a nonced script with addEventListener.</p></details>
+<details><summary>Why does getAttribute(&#x27;nonce&#x27;) return an empty string?</summary><p>Chromium hides the nonce from the attribute after load. In our test getAttribute(&#x27;nonce&#x27;) returned &quot;&quot; while script.nonce returned the real value.</p></details>
+<details><summary>How do I generate a nonce in Express?</summary><p>Set res.locals.nonce = crypto.randomBytes(16).toString(&#x27;base64&#x27;) in a middleware, then in helmet use scriptSrc: [&quot;&#x27;self&#x27;&quot;, (req, res) =&gt; `&#x27;nonce-${res.locals.nonce}&#x27;`]. Measured with Express 5.2.1 and helmet 8.3.0: a new nonce every request.</p></details>
+<details><summary>Can I use the same nonce on every page load?</summary><p>No. A fixed nonce can be read by anyone and copied into injected script tags, so it gives no protection. Generate a new one for every response.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright) against Express 5.2.1 and helmet 8.3.0 on Node.js 24.21.0 (localhost:8985), headers checked with curl. Points marked as from the spec are quoted from the CSP Level 3 spec and MDN, not measured. PlainHeaders is our extension; Chromium, Node.js, Express and helmet are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

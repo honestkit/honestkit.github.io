@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>409 Conflict: Duplicates, Version Clashes and Races (Tested)</title>
+<meta name="description" content="We built a small API that returns 409 for duplicate emails and stale versions, then raced two updates. Exactly one won each time. We also show 409 vs 412, what fetch() and curl do, and when to use 400 or 422.">
+<link rel="canonical" href="https://honestkit.github.io/guides/409-conflict/">
+<meta property="og:title" content="409 Conflict: Duplicates, Version Clashes and Races (Tested)">
+<meta property="og:description" content="We built a small API that returns 409 for duplicate emails and stale versions, then raced two updates. Exactly one won each time. We also show 409 vs 412, what fetch() and curl do, and when to use 400 or 422.">
+<meta property="og:url" content="https://honestkit.github.io/guides/409-conflict/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does 409 Conflict mean?", "acceptedAnswer": {"@type": "Answer", "text": "The request is valid, but it clashes with the current state of the resource. Typical causes are creating something that already exists or updating with a stale version."}}, {"@type": "Question", "name": "Should I return 409 or 412 for a stale version?", "acceptedAnswer": {"@type": "Answer", "text": "If the client sent If-Match and it does not match the ETag, return 412. If the version is a field in the body checked by your app, return 409. In our test the same stale update gave 412 via If-Match and 409 via a body field."}}, {"@type": "Question", "name": "Does fetch() throw on a 409?", "acceptedAnswer": {"@type": "Answer", "text": "No. In Node.js 24, fetch() resolved normally with res.ok false and res.status 409. You must check the status yourself."}}, {"@type": "Question", "name": "Does curl --retry retry a 409?", "acceptedAnswer": {"@type": "Answer", "text": "No. With curl 8.14.1, --retry 3 made zero retries on 409. Only --retry-all-errors together with --fail made it retry, and it still got 409 each time."}}, {"@type": "Question", "name": "Is a duplicate email a 409 or a 422?", "acceptedAnswer": {"@type": "Answer", "text": "Use 409. The email is valid on its own; it only fails because another user already has it. Use 422 when the value itself is invalid, like an email with no @."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>409 Conflict (tested)</h1>
+<p class="lead"><code>409 Conflict</code> means your request is valid, but it clashes with the current state of the resource. Two common cases: you try to create something that already exists, or you update something that someone else changed first. The fix is usually to re-read the resource, then decide what to do.</p>
+<h2>1. Duplicate create: POST an email that already exists</h2>
+<p>Our API already had a user with <code>ann@example.com</code>. Creating it again returned 409 with an RFC 9457 problem body:</p>
+<pre><code>$ curl -si -X POST localhost:8983/users -H 'Content-Type: application/json' \
+    -d '{"email":"ann@example.com","name":"Ann2"}'
+HTTP/1.1 409 Conflict
+Content-Type: application/problem+json
+
+{"type":"https://example.com/probs/duplicate-email","title":"Email already registered",
+ "status":409,"detail":"A user with email ann@example.com already exists.","instance":"/users"}</code></pre>
+<p>Use <code>application/problem+json</code> so clients can read <code>type</code> and <code>detail</code> in a standard way. Say what clashed. Do not leak other users' data in the message.</p>
+
+<h2>2. Optimistic concurrency: 412 with If-Match, 409 with a version field</h2>
+<p>A GET returns the current version as an <a href="/guides/etag-header-explained/">ETag</a>:</p>
+<pre><code>$ curl -si localhost:8983/users/1
+HTTP/1.1 200 OK
+ETag: "v1"
+
+{"id":1,"email":"ann@example.com","name":"Ann","version":1}</code></pre>
+<p>An update with the right <code>If-Match</code> worked and the ETag moved to <code>"v2"</code>. Sending the old <code>If-Match: "v1"</code> again gave 412:</p>
+<pre><code>$ curl -si -X PUT localhost:8983/users/1 -H 'If-Match: "v1"' \
+    -H 'Content-Type: application/json' -d '{"name":"Ann C"}'
+HTTP/1.1 412 Precondition Failed
+Content-Type: application/problem+json
+
+{"type":"about:blank","title":"Precondition Failed","status":412,
+ "detail":"If-Match \"v1\" does not match current ETag \"v2\""}</code></pre>
+<p>The same stale update, but with the version inside the JSON body instead of a header, gave 409:</p>
+<pre><code>$ curl -si -X PUT localhost:8983/users/1 \
+    -H 'Content-Type: application/json' -d '{"name":"Ann C","version":1}'
+HTTP/1.1 409 Conflict
+Content-Type: application/problem+json
+
+{"type":"https://example.com/probs/version-conflict","title":"Version conflict",
+ "status":409,"detail":"You sent version 1, current is 2.","currentVersion":2}</code></pre>
+<table>
+<tr><th>How the client sends the version</th><th>Stale result</th><th>Why</th></tr>
+<tr><td><code>If-Match</code> header (HTTP precondition)</td><td>412 Precondition Failed</td><td>RFC 9110 says a failed precondition is 412.</td></tr>
+<tr><td><code>version</code> field in the body (app logic)</td><td>409 Conflict</td><td>The request is fine; it clashes with current state.</td></tr>
+</table>
+<p>Which to use? If you already send ETags, use <code>If-Match</code> and 412. It is standard, and caches and tools understand it. Use a body version and 409 when clients cannot set headers easily, or when the conflict is about business rules, not bytes. Pick one per API and document it.</p>
+
+<h2>3. A race: two updates with the same version</h2>
+<p>We read the current version, then fired two PUTs with that same version at the same time. We did this 5 times with parallel curl and once with Node <code>Promise.all</code>:</p>
+<pre><code>$ for i in 1 2; do curl -s -o /dev/null -w "%{http_code} " -X PUT localhost:8983/users/1 \
+    -H 'Content-Type: application/json' -d "{\"name\":\"R$i\",\"version\":$v}" &amp; done; wait
+200 409
+# 5 of 5 curl runs: 200 409
+# Node fetch with Promise.all: [ 200, 409 ]</code></pre>
+<p>Exactly one write won every time. The loser got 409 and can re-read. Be honest about why it worked here: our server is one Node process, and the check-and-write runs with no <code>await</code> in between, so it cannot interleave. With a database you need the check and the write in one step, for example <code>UPDATE users SET ... , version = version + 1 WHERE id = ? AND version = ?</code>, then return 409 if zero rows changed.</p>
+
+<h2>4. How clients see a 409</h2>
+<table>
+<tr><th>Client</th><th>What we measured</th></tr>
+<tr><td><code>fetch()</code> in Node 24</td><td>Did not throw. <code>res.ok</code> was <code>false</code>, <code>res.status</code> 409, <code>statusText</code> "Conflict".</td></tr>
+<tr><td><code>curl</code> (no flags)</td><td>Exit code 0. You must check the status yourself.</td></tr>
+<tr><td><code>curl --fail</code></td><td>Exit code 22.</td></tr>
+<tr><td><code>curl --retry 3</code></td><td>No retries (<code>num_retries</code> = 0). curl does not treat 409 as transient.</td></tr>
+<tr><td><code>curl --retry 2 --retry-all-errors --fail</code></td><td>Retried 2 times, still 409, exit 22.</td></tr>
+</table>
+<pre><code>const res = await fetch(url, { method: "POST", headers, body });
+if (res.status === 409) {
+  const problem = await res.json();   // application/problem+json
+  // re-read the resource, merge or ask the user, then try again
+}</code></pre>
+<p>Do not blindly retry a 409. The same request will clash again. Re-read first. This is different from <a href="/guides/retry-after-header-429/">429 with Retry-After</a>, where waiting does help.</p>
+
+<h2>5. 409 in well-known systems (from their docs, not measured)</h2>
+<table>
+<tr><th>System</th><th>When it returns 409</th></tr>
+<tr><td>Kubernetes API</td><td>Create of an object that already exists (<code>AlreadyExists</code>), or an update with a stale <code>resourceVersion</code> ("the object has been modified").</td></tr>
+<tr><td>Elasticsearch</td><td><code>version_conflict_engine_exception</code> when <code>if_seq_no</code>/<code>if_primary_term</code> do not match, or <code>op_type=create</code> on an existing id.</td></tr>
+<tr><td>CouchDB</td><td>"Document update conflict" when the <code>_rev</code> you send is not the current one.</td></tr>
+<tr><td>Amazon S3</td><td><code>BucketAlreadyExists</code> (name taken by another account) and <code>BucketAlreadyOwnedByYou</code> in most regions.</td></tr>
+<tr><td>Git hosting APIs</td><td>GitHub's contents API returns 409 when the file <code>sha</code> you send is stale, and on some merge conflicts.</td></tr>
+</table>
+
+<h2>6. 409 vs 400 vs 422 (and 415)</h2>
+<table>
+<tr><th>Code</th><th>Use it when</th><th>Example</th></tr>
+<tr><td>400 Bad Request</td><td>The request is broken: bad JSON, missing fields.</td><td><code>{"email":</code></td></tr>
+<tr><td>415 Unsupported Media Type</td><td>Wrong body format. See <a href="/guides/415-unsupported-media-type/">415</a>.</td><td>Form data sent to a JSON-only API</td></tr>
+<tr><td>422 Unprocessable Content</td><td>Well-formed, but the values fail validation on their own.</td><td>Email has no @</td></tr>
+<tr><td>409 Conflict</td><td>Valid on its own, but clashes with current state.</td><td>Email already taken; stale version</td></tr>
+<tr><td>412 Precondition Failed</td><td>An <code>If-Match</code> / <code>If-Unmodified-Since</code> header failed.</td><td>Stale ETag</td></tr>
+</table>
+<p>A simple test: would the same request succeed against an empty database? If yes, it is a 409, not a 400 or 422.</p>
+<aside class="cta"><strong>See the exact status line, ETag and Content-Type your API sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does 409 Conflict mean?</summary><p>The request is valid, but it clashes with the current state of the resource. Typical causes are creating something that already exists or updating with a stale version.</p></details>
+<details><summary>Should I return 409 or 412 for a stale version?</summary><p>If the client sent If-Match and it does not match the ETag, return 412. If the version is a field in the body checked by your app, return 409. In our test the same stale update gave 412 via If-Match and 409 via a body field.</p></details>
+<details><summary>Does fetch() throw on a 409?</summary><p>No. In Node.js 24, fetch() resolved normally with res.ok false and res.status 409. You must check the status yourself.</p></details>
+<details><summary>Does curl --retry retry a 409?</summary><p>No. With curl 8.14.1, --retry 3 made zero retries on 409. Only --retry-all-errors together with --fail made it retry, and it still got 409 each time.</p></details>
+<details><summary>Is a duplicate email a 409 or a 422?</summary><p>Use 409. The email is valid on its own; it only fails because another user already has it. Use 422 when the value itself is invalid, like an email with no @.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with curl 8.14.1 and Node.js 24.21.0: a small Node http API on 127.0.0.1:8983 that returns 409 for a duplicate email and for a stale version field, and 412 for a stale If-Match. We ran 6 parallel update races (5 with curl, 1 with fetch) and checked fetch(), curl --fail and curl --retry against a real 409. PlainHeaders is our extension; curl and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

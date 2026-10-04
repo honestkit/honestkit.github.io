@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>csv QUOTE_NONNUMERIC Writes Booleans Unquoted, Breaks on Read</title>
+<meta name="description" content="We measured csv.writer(quoting=QUOTE_NONNUMERIC) writing True/False unquoted since bool is a number subtype — reading that same file back then crashes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/csv-quote-nonnumeric-writes-booleans-unquoted-breaks-reading/">
+<meta property="og:title" content="csv QUOTE_NONNUMERIC Writes Booleans Unquoted, Breaks on Read">
+<meta property="og:description" content="We measured csv.writer(quoting=QUOTE_NONNUMERIC) writing True/False unquoted since bool is a number subtype — reading that same file back then crashes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/csv-quote-nonnumeric-writes-booleans-unquoted-breaks-reading/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does csv.writer with QUOTE_NONNUMERIC write True/False without quotes?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it because Python's bool type is a subclass of int, so QUOTE_NONNUMERIC's 'is this a number' check treats booleans as numeric and leaves them unquoted \u2014 but it still writes the word True/False via str(), not the digit 1/0."}}, {"@type": "Question", "name": "Why does reading a CSV with QUOTE_NONNUMERIC fail on a field that says True?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed csv.reader(quoting=QUOTE_NONNUMERIC) calls float() on every unquoted field, and float('True') raises ValueError \u2014 this happens specifically when the file was written with an unconverted Python bool under the same quoting mode."}}, {"@type": "Question", "name": "Does csv.writer raise any error when writing a bool under QUOTE_NONNUMERIC?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured the write succeeding silently with no exception or warning. The resulting file looks fine until something tries to read it back with QUOTE_NONNUMERIC set."}}, {"@type": "Question", "name": "How do I fix booleans breaking CSV round-trips under QUOTE_NONNUMERIC?", "acceptedAnswer": {"@type": "Answer", "text": "We verified that converting booleans to int (e.g. int(True) -> 1) before calling writerow() produces output that both writes correctly and reads back without error under the same QUOTE_NONNUMERIC setting."}}, {"@type": "Question", "name": "Does this same problem happen with QUOTE_MINIMAL or QUOTE_ALL?", "acceptedAnswer": {"@type": "Answer", "text": "We didn't measure those directly here, but the failure is specific to QUOTE_NONNUMERIC's reader-side float() conversion \u2014 QUOTE_MINIMAL and QUOTE_ALL readers don't attempt any type conversion, so an unquoted or quoted 'True' string reads back as the plain string 'True' without error."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>csv QUOTE_NONNUMERIC Booleans Round-Trip Failure (tested)</h1>
+<p class="lead"><code>csv.QUOTE_NONNUMERIC</code> is meant to quote every field except actual numbers, so a reader using the same setting can safely parse unquoted fields as floats. We measured what happens when one of your values is a Python <code>bool</code>: the writer treats it as a number, and the matching reader can't read its own output back.</p>
+<h2 id="repro1">1. The writer leaves True/False unquoted</h2>
+<pre><code>import csv, io
+
+buf = io.StringIO()
+w = csv.writer(buf, quoting=csv.QUOTE_NONNUMERIC)
+w.writerow([1, "text", True, None, 3.14])
+
+buf.getvalue()
+'1,"text",True,"",3.14\r\n'</code></pre>
+<p><strong>Measured:</strong> <code>"text"</code> and the empty string from <code>None</code> are quoted, as expected under <code>QUOTE_NONNUMERIC</code>. But <code>True</code> comes out completely unquoted, written as the literal word <code>True</code> &mdash; not the number <code>1</code>, and not quoted like the string fields. No error or warning is raised; the writer considers this correct output.</p>
+
+<h2 id="repro2">2. Reading the same file back with the same setting crashes</h2>
+<pre><code>buf.seek(0)
+r = csv.reader(buf, quoting=csv.QUOTE_NONNUMERIC)
+list(r)</code></pre>
+<pre><code>Traceback (most recent call last):
+  ...
+ValueError: could not convert string to float: 'True'</code></pre>
+<p><strong>Measured:</strong> <code>csv.reader</code> with <code>QUOTE_NONNUMERIC</code> tries to <code>float()</code> every unquoted field &mdash; that's the whole point of the setting. Since the writer left <code>True</code> unquoted, the reader tries <code>float("True")</code> and raises. The file the writer produced cannot be read back by the exact matching reader configuration that's supposed to round-trip it.</p>
+
+<h2 id="repro3">3. Why: Python's bool is a subclass of int</h2>
+<p>Per the <a href="https://docs.python.org/3/library/csv.html#csv.QUOTE_NONNUMERIC">csv docs</a>, <code>QUOTE_NONNUMERIC</code> tells the writer to leave a field unquoted when it's an instance of a numeric type. Because <code>bool</code> is a subclass of <code>int</code> in Python (<code>isinstance(True, int)</code> is <code>True</code>), the writer's numeric check passes for booleans too &mdash; but it writes the field using <code>str(value)</code>, which turns <code>True</code> into the word <code>"True"</code>, not the digit <code>"1"</code>. The writer's "is this numeric" check and its "how do I render this" step use different logic, and nothing reconciles them for the one type where that distinction matters.</p>
+
+<h2 id="fix">4. Fix: convert bools to int before writing under QUOTE_NONNUMERIC</h2>
+<pre><code>buf2 = io.StringIO()
+w2 = csv.writer(buf2, quoting=csv.QUOTE_NONNUMERIC)
+w2.writerow([1, "text", int(True), None, 3.14])
+
+buf2.getvalue()
+'1,"text",1,"",3.14\r\n'
+
+buf2.seek(0)
+list(csv.reader(buf2, quoting=csv.QUOTE_NONNUMERIC))
+[[1.0, 'text', 1.0, '', 3.14]]</code></pre>
+<p><strong>Measured:</strong> explicitly converting any boolean values to <code>int</code> before passing them to <code>writerow()</code> produces <code>1</code> instead of <code>True</code>, which both writes and reads back cleanly under <code>QUOTE_NONNUMERIC</code> (note the round trip turns it into <code>1.0</code>, a float, not <code>1</code> &mdash; a separate, already-documented quirk of this quoting mode). If you don't control every value going into a row, don't assume <code>QUOTE_NONNUMERIC</code> output is readable by the matching reader setting without checking for stray booleans first.</p>
+
+<aside class="cta"><strong>Debugging a CSV export an API is supposed to accept back? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does csv.writer with QUOTE_NONNUMERIC write True/False without quotes?</summary><p>We measured it because Python&#x27;s bool type is a subclass of int, so QUOTE_NONNUMERIC&#x27;s &#x27;is this a number&#x27; check treats booleans as numeric and leaves them unquoted — but it still writes the word True/False via str(), not the digit 1/0.</p></details>
+<details><summary>Why does reading a CSV with QUOTE_NONNUMERIC fail on a field that says True?</summary><p>We confirmed csv.reader(quoting=QUOTE_NONNUMERIC) calls float() on every unquoted field, and float(&#x27;True&#x27;) raises ValueError — this happens specifically when the file was written with an unconverted Python bool under the same quoting mode.</p></details>
+<details><summary>Does csv.writer raise any error when writing a bool under QUOTE_NONNUMERIC?</summary><p>No — we measured the write succeeding silently with no exception or warning. The resulting file looks fine until something tries to read it back with QUOTE_NONNUMERIC set.</p></details>
+<details><summary>How do I fix booleans breaking CSV round-trips under QUOTE_NONNUMERIC?</summary><p>We verified that converting booleans to int (e.g. int(True) -&gt; 1) before calling writerow() produces output that both writes correctly and reads back without error under the same QUOTE_NONNUMERIC setting.</p></details>
+<details><summary>Does this same problem happen with QUOTE_MINIMAL or QUOTE_ALL?</summary><p>We didn&#x27;t measure those directly here, but the failure is specific to QUOTE_NONNUMERIC&#x27;s reader-side float() conversion — QUOTE_MINIMAL and QUOTE_ALL readers don&#x27;t attempt any type conversion, so an unquoted or quoted &#x27;True&#x27; string reads back as the plain string &#x27;True&#x27; without error.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in csv module: wrote a row containing a Python bool under csv.QUOTE_NONNUMERIC, inspected the raw output bytes, then read that same file back with csv.reader(quoting=QUOTE_NONNUMERIC). PlainHeaders is our extension; Python&#x27;s csv module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>401 vs 403: Unauthorized vs Forbidden, Explained (Tested)</title>
+<meta name="description" content="401 means we don&#x27;t know who you are. 403 means we know, and the answer is no. We ran a real API with curl, fetch() and headless Chromium to show the headers, the retries and a 404 that hides a 403.">
+<link rel="canonical" href="https://honestkit.github.io/guides/401-vs-403-unauthorized-forbidden/">
+<meta property="og:title" content="401 vs 403: Unauthorized vs Forbidden, Explained (Tested)">
+<meta property="og:description" content="401 means we don&#x27;t know who you are. 403 means we know, and the answer is no. We ran a real API with curl, fetch() and headless Chromium to show the headers, the retries and a 404 that hides a 403.">
+<meta property="og:url" content="https://honestkit.github.io/guides/401-vs-403-unauthorized-forbidden/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between 401 and 403?", "acceptedAnswer": {"@type": "Answer", "text": "401 means the server has no valid credentials for you, so logging in may fix it. 403 means the server refuses even though it knows who you are (or does not care), so logging in again will not help."}}, {"@type": "Question", "name": "Does a 401 need a WWW-Authenticate header?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. RFC 9110 says a 401 must include WWW-Authenticate. Our Node server sent 'Bearer realm=\"api\"'. curl --anyauth used the Basic challenge to retry and got a 200."}}, {"@type": "Question", "name": "Is a wrong password a 401 or a 403?", "acceptedAnswer": {"@type": "Answer", "text": "A 401. The server can't confirm who you are, so other credentials might work. In our test, curl -u alice:bad got 401 Unauthorized."}}, {"@type": "Question", "name": "Why does fetch() not throw on a 401?", "acceptedAnswer": {"@type": "Answer", "text": "fetch only rejects on network failures. In Node 24 a 401 and a 403 both resolved with res.ok = false. Check res.status yourself."}}, {"@type": "Question", "name": "Why do I get 404 when I expected 403?", "acceptedAnswer": {"@type": "Answer", "text": "Some servers hide forbidden things as 404. Python's http.server returned '404 File not found' for a chmod 000 file. GitHub returns 404 for private repos you can't access."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>401 vs 403: Unauthorized vs Forbidden (tested)</h1>
+<p class="lead"><code>401 Unauthorized</code> means the request has no valid credentials. Send good ones and it may work. <code>403 Forbidden</code> means the server knows who you are (or does not care) and still says no. Logging in again will not help. We ran both against a real server.</p>
+<h2>1. The short rule</h2>
+<table>
+<tr><th></th><th>401 Unauthorized</th><th>403 Forbidden</th></tr>
+<tr><td>Meaning</td><td>Not authenticated (missing, bad or expired credentials)</td><td>Authenticated or not, you are not allowed</td></tr>
+<tr><td>Will new credentials help?</td><td>Yes, maybe</td><td>No (RFC 9110)</td></tr>
+<tr><td><code>WWW-Authenticate</code></td><td>Required by RFC 9110</td><td>Not needed</td></tr>
+<tr><td>Typical cause</td><td>No token, expired token, wrong password</td><td>Wrong role, IP block, WAF rule, file permissions</td></tr>
+<tr><td>What the client should do</td><td>Log in / refresh the token, then retry</td><td>Show "no access"; do not loop on login</td></tr>
+</table>
+
+<h2>2. A real API: no token gives 401, wrong role gives 403</h2>
+<p>Our Node server protects <code>/admin</code>. It accepts <code>admin-token</code>. It knows <code>user-token</code> but that user is not an admin. Here is what curl showed.</p>
+<pre><code>$ curl -i http://127.0.0.1:8993/admin
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer realm="api"
+Content-Type: application/json
+
+{"error":"no token"}
+
+$ curl -i -H "Authorization: Bearer user-token" http://127.0.0.1:8993/admin
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{"error":"admin role required"}
+
+$ curl -i -H "Authorization: Bearer admin-token" http://127.0.0.1:8993/admin
+HTTP/1.1 200 OK
+
+$ curl -i -H "Authorization: Bearer junk" http://127.0.0.1:8993/admin
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer error="invalid_token"</code></pre>
+<p>A token we don't recognise is still a 401. Only a valid token with too few rights is a 403. The core of the handler:</p>
+<pre><code>if (!auth.startsWith('Bearer ')) {
+  res.writeHead(401, {'WWW-Authenticate': 'Bearer realm="api"'});
+  return res.end('{"error":"no token"}');
+}
+const user = lookup(auth.slice(7));
+if (!user) {
+  res.writeHead(401, {'WWW-Authenticate': 'Bearer error="invalid_token"'});
+  return res.end('{"error":"bad token"}');
+}
+if (user.role !== 'admin') {
+  res.writeHead(403);   // no WWW-Authenticate: a new login won't help
+  return res.end('{"error":"admin role required"}');
+}</code></pre>
+<p>More on the token format in <a href="/guides/bearer-token-authorization-header/">the Bearer token guide</a>.</p>
+
+<h2>3. Basic auth: curl and the retry</h2>
+<p>A second route sends <code>WWW-Authenticate: Basic realm="demo"</code> until it gets <code>alice:s3cret</code>.</p>
+<pre><code>$ curl -i http://127.0.0.1:8993/basic
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Basic realm="demo"
+
+need login
+
+$ curl -i -u alice:s3cret http://127.0.0.1:8993/basic
+HTTP/1.1 200 OK
+
+hello alice
+
+$ curl -i -u alice:bad http://127.0.0.1:8993/basic
+HTTP/1.1 401 Unauthorized</code></pre>
+<p>With <code>-u</code> curl sends Basic right away. With <code>--anyauth</code> it first sends no credentials, reads the challenge, and retries. The <code>-v</code> output showed two requests:</p>
+<pre><code>$ curl -v --anyauth -u alice:s3cret http://127.0.0.1:8993/basic
+&gt; GET /basic HTTP/1.1
+&lt; HTTP/1.1 401 Unauthorized
+&lt; WWW-Authenticate: Basic realm="demo"
+&gt; GET /basic HTTP/1.1
+&gt; Authorization: Basic YWxpY2U6czNjcmV0
+&lt; HTTP/1.1 200 OK
+hello alice</code></pre>
+<p>A wrong password is a 401, not a 403. The server can't tell who you are, so new credentials might still work. For nginx setup see <a href="/guides/www-authenticate-header-basic-nginx/">WWW-Authenticate Basic in nginx</a>. Proxies use a different pair, 407 and <code>Proxy-Authorization</code>: see <a href="/guides/proxy-authorization-header/">the Proxy-Authorization guide</a>.</p>
+
+<h2>4. Browsers: the login prompt</h2>
+<p>From the docs: a desktop browser shows its own username/password dialog when a page navigation gets a 401 with <code>WWW-Authenticate: Basic</code>. A 401 without that header (or with <code>Bearer</code>) gets no dialog; the page body is shown.</p>
+<p>What we measured in headless Chromium 153 (Playwright), where no dialog can appear:</p>
+<pre><code>goto /basic   (401 + Basic challenge)  -&gt; status 401, body "need login"
+goto /noauth  (401, no challenge)      -&gt; status 401, body "401 no challenge"
+goto /basic with httpCredentials alice -&gt; status 200, body "hello alice"</code></pre>
+<p>Headless did not hang. It just showed the 401 body. When credentials were set on the context, Chromium answered the challenge and got 200.</p>
+
+<h2>5. fetch() does not throw on 401 or 403</h2>
+<p>We called the API from Node 24's built-in <code>fetch</code>:</p>
+<pre><code>const r = await fetch('http://127.0.0.1:8993/admin');
+console.log(r.status, r.ok, r.headers.get('www-authenticate'));
+// 401 false Bearer realm="api"
+
+const r2 = await fetch(url, {headers: {Authorization: 'Bearer user-token'}});
+// 403 false null</code></pre>
+<p>No exception either time. <code>fetch</code> only rejects on network errors. Check <code>res.ok</code> or <code>res.status</code> yourself. From the docs: in a browser, cookies are not sent on a cross-origin <code>fetch</code> unless you pass <code>credentials: 'include'</code> (and the server allows it with CORS). A missing cookie often looks like a 401. Also check the cookie's SameSite value: <a href="/guides/samesite-cookie-lax-strict-none/">SameSite Lax, Strict and None</a>.</p>
+
+<h2>6. Sometimes a 403 is dressed up as a 404</h2>
+<p>We served a folder with <code>python3 -m http.server</code> and ran <code>chmod 000 locked.txt</code>. The server process could not read the file.</p>
+<pre><code>$ curl -i http://127.0.0.1:8994/locked.txt
+HTTP/1.0 404 File not found
+Server: SimpleHTTP/0.6 Python/3.13.5
+
+$ curl -i http://127.0.0.1:8994/missing.txt
+HTTP/1.0 404 File not found</code></pre>
+<p>A file that exists but can't be read and a file that doesn't exist got the same answer. So a 404 does not prove the thing is missing. From the docs: GitHub does this on purpose. It returns 404 for a private repo you can't see, so it doesn't reveal that the repo exists.</p>
+
+<h2>7. Other common 403 sources (from the docs)</h2>
+<ul>
+<li><b>nginx</b>: a directory with no index file and <code>autoindex off</code> gives 403. So does a file the nginx worker user can't read.</li>
+<li><b>Cloudflare or another WAF</b>: a firewall rule, bot check or IP block gives 403 before your app sees the request.</li>
+<li><b>Cloud storage</b>: a bucket policy or a signed URL that doesn't match.</li>
+</ul>
+<p>In all of these, logging in again does nothing. Look at the response body and the <code>Server</code> header to see who sent the 403.</p>
+
+<h2>8. Which one should my API send?</h2>
+<ul>
+<li>No token, bad token, expired token: <b>401</b> with <code>WWW-Authenticate</code>.</li>
+<li>Good token, not allowed: <b>403</b>.</li>
+<li>Don't want to admit the thing exists: <b>404</b>.</li>
+</ul>
+<aside class="cta"><strong>See the status code and WWW-Authenticate header your API really sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between 401 and 403?</summary><p>401 means the server has no valid credentials for you, so logging in may fix it. 403 means the server refuses even though it knows who you are (or does not care), so logging in again will not help.</p></details>
+<details><summary>Does a 401 need a WWW-Authenticate header?</summary><p>Yes. RFC 9110 says a 401 must include WWW-Authenticate. Our Node server sent &#x27;Bearer realm=&quot;api&quot;&#x27;. curl --anyauth used the Basic challenge to retry and got a 200.</p></details>
+<details><summary>Is a wrong password a 401 or a 403?</summary><p>A 401. The server can&#x27;t confirm who you are, so other credentials might work. In our test, curl -u alice:bad got 401 Unauthorized.</p></details>
+<details><summary>Why does fetch() not throw on a 401?</summary><p>fetch only rejects on network failures. In Node 24 a 401 and a 403 both resolved with res.ok = false. Check res.status yourself.</p></details>
+<details><summary>Why do I get 404 when I expected 403?</summary><p>Some servers hide forbidden things as 404. Python&#x27;s http.server returned &#x27;404 File not found&#x27; for a chmod 000 file. GitHub returns 404 for private repos you can&#x27;t access.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with curl 8.14.1, Node.js 24.21.0 (built-in fetch), Python 3.13.5 http.server and headless Chromium 153 via Playwright: a small Node API on 127.0.0.1:8993 that checks a Bearer token and a role, plus a Basic-auth route, and a Python static server on 127.0.0.1:8994 serving a chmod 000 file. RFC, GitHub, nginx and Cloudflare notes are from their docs, not measured. PlainHeaders is our extension; curl, Python, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

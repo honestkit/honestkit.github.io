@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>npm error code ENOENT: Real Cause and Fix (Tested)</title>
+<meta name="description" content="We reproduced npm&#x27;s exact ENOENT error, plus 3 lookalikes (Missing script, MODULE_NOT_FOUND, EUSAGE) it&#x27;s often confused with.">
+<link rel="canonical" href="https://honestkit.github.io/guides/npm-error-code-enoent/">
+<meta property="og:title" content="npm error code ENOENT: Real Cause and Fix (Tested)">
+<meta property="og:description" content="We reproduced npm&#x27;s exact ENOENT error, plus 3 lookalikes (Missing script, MODULE_NOT_FOUND, EUSAGE) it&#x27;s often confused with.">
+<meta property="og:url" content="https://honestkit.github.io/guides/npm-error-code-enoent/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does npm error code ENOENT always mean package.json is missing?", "acceptedAnswer": {"@type": "Answer", "text": "In every case we reproduced, yes: it was npm failing to open package.json in the current directory. The `path` field in the error output tells you the exact file npm tried to open, so always check that line rather than assuming."}}, {"@type": "Question", "name": "Why does npm say ENOENT instead of a plain 'file not found' message?", "acceptedAnswer": {"@type": "Answer", "text": "ENOENT is the raw errno name for the POSIX/libuv syscall error 'no such file or directory' (errno -2 on Linux/macOS). npm surfaces the underlying Node.js filesystem error code directly instead of translating it into plain English, which is why the message references an OS-level syscall (`open`) rather than package.json by name up front."}}, {"@type": "Question", "name": "I ran npm run start and got 'Cannot find module', is that the same bug?", "acceptedAnswer": {"@type": "Answer", "text": "No. We confirmed npm successfully found and executed the start script; the failure is Node's own module resolver reporting MODULE_NOT_FOUND after npm already handed off control. Fix the path in the script string or make sure the file is built before the script runs."}}, {"@type": "Question", "name": "Why does npm ci fail differently than npm install when a file is missing?", "acceptedAnswer": {"@type": "Answer", "text": "We measured npm ci specifically checking for package-lock.json / npm-shrinkwrap.json as a precondition and failing with a usage error (EUSAGE) plus a help dump, rather than the lower-level filesystem ENOENT that a missing package.json produces for ordinary commands."}}, {"@type": "Question", "name": "What's the fastest way to tell which of these four errors I actually have?", "acceptedAnswer": {"@type": "Answer", "text": "Look at the first two lines npm prints. `npm error code ENOENT` with a `path` line pointing at package.json is case 1. `npm error Missing script` is case 2. A Node stack trace with no `npm error` prefix and `code: 'MODULE_NOT_FOUND'` is case 3. `npm error code EUSAGE` is case 4."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>npm error code ENOENT (tested)</h1>
+<p class="lead"><code>npm error code ENOENT</code> means npm tried to open a file that isn't there &mdash; almost always your <code>package.json</code>, because you ran npm in the wrong directory or it was never created. The confusing part is that several other common npm/Node failures get lumped in with it by memory or by blog posts, but they're different error classes with different fixes. We reproduced all four on npm 11.19.0 to show exactly which is which.</p>
+<h2>1. The real ENOENT: no package.json in this directory</h2>
+<p>We ran <code>npm install</code> in an empty directory with no <code>package.json</code> at all:</p>
+<pre><code>$ npm install
+npm error code ENOENT
+npm error syscall open
+npm error path /tmp/npmenoent/s1/package.json
+npm error errno -2
+npm error enoent Could not read package.json: Error: ENOENT: no such file or directory, open '/tmp/npmenoent/s1/package.json'
+npm error enoent This is related to npm not being able to find a file.
+npm error enoent
+npm error A complete log of this run can be found in: /home/jacque/.npm/_logs/2026-10-03T09_13_42_716Z-debug-0.log</code></pre>
+<p>This is the one true <code>npm error code ENOENT</code>. The <code>path</code> line tells you exactly which file npm wanted and couldn't open &mdash; here, <code>package.json</code> in the current directory. We confirmed this isn't install-specific: running <code>npm run build</code> in the same empty directory produced the byte-for-byte identical error, because every npm command needs to read <code>package.json</code> first, before it even looks at what you asked it to do.</p>
+<h3>Fix</h3>
+<ul>
+<li><strong>Check you're in the right directory.</strong> Run <code>pwd</code> and <code>ls package.json</code>. The most common real-world cause is <code>cd</code>-ing into a parent folder, a sibling project, or a freshly cloned repo's root when the actual Node project is in a subfolder (<code>cd my-app</code> first).</li>
+<li><strong>If the project really has no package.json yet</strong>, create one with <code>npm init -y</code> before installing anything.</li>
+<li><strong>In CI/scripts</strong>, print <code>pwd</code> right before the failing npm step &mdash; a wrong working directory after a bad <code>cd</code> or a monorepo path change is the usual culprit, not a corrupted install.</li>
+</ul>
+<h2>2. Lookalike #1: "Missing script" is NOT ENOENT</h2>
+<p>We made a <code>package.json</code> with only a <code>build</code> script, then ran a script name that isn't defined:</p>
+<pre><code>$ npm run dev
+npm error Missing script: "dev"
+npm error
+npm error To see a list of scripts, run:
+npm error   npm run
+npm error A complete log of this run can be found in: /home/jacque/.npm/_logs/2026-10-03T09_13_46_080Z-debug-0.log</code></pre>
+<p>No <code>ENOENT</code>, no error code line at all here &mdash; just <code>npm error Missing script: "&lt;name&gt;"</code>. This fires when <code>package.json</code> exists and parses fine, but its <code>scripts</code> object has no key matching what you typed. People searching for ENOENT often mean this error instead, because both come from "running the wrong npm command."</p>
+<h3>Fix</h3>
+<ul>
+<li>Run <code>npm run</code> with no script name to list every script actually defined in <code>package.json</code>.</li>
+<li>Check for a typo (<code>dev</code> vs <code>start</code> vs <code>serve</code> are the most commonly confused trio) or a missing <code>npm install</code> step that was supposed to scaffold the scripts block (e.g. a framework CLI that writes <code>package.json</code> on first run).</li>
+</ul>
+<h2>3. Lookalike #2: a script's target file missing is a Node error, not an npm one</h2>
+<p>We pointed the <code>start</code> script at a file that doesn't exist:</p>
+<pre><code>// package.json
+"scripts": { "start": "node ./missing-file.js" }</code></pre>
+<pre><code>$ npm run start
+
+&gt; s3-missing-file@1.0.0 start
+&gt; node ./missing-file.js
+
+node:internal/modules/cjs/loader:1568
+  throw err;
+  ^
+
+Error: Cannot find module '/tmp/npmenoent/s3/missing-file.js'
+    at Module._resolveFilename (node:internal/modules/cjs/loader:1564:15)
+    at wrapResolveFilename (node:internal/modules/cjs/loader:1118:27)
+    ...
+  code: 'MODULE_NOT_FOUND',
+  requireStack: []
+}
+
+Node.js v24.21.0</code></pre>
+<p>This is the one we expected to also say <code>npm error code ENOENT</code> before testing it &mdash; it doesn't. npm successfully found and ran the <code>start</code> script; the failure happens one level down, inside Node's own module resolver, and Node reports it as <code>Error: Cannot find module</code> with <code>code: 'MODULE_NOT_FOUND'</code>, printed straight to the terminal with no <code>npm error</code> prefix at all. The exit code bubbles up through npm, but the error text and code are Node's, not npm's.</p>
+<h3>Fix</h3>
+<ul>
+<li>Check the path in the script string is correct relative to the project root (where <code>package.json</code> lives), not relative to some other working directory.</li>
+<li>If the file is generated by a build step (e.g. a <code>dist/</code> output), make sure that build actually ran and produced the file before the script executes &mdash; a skipped or failed build step silently leaves the entry file missing.</li>
+</ul>
+<h2>4. Lookalike #3: npm ci without a lockfile is EUSAGE, not ENOENT</h2>
+<p>We ran <code>npm ci</code> in a directory with a valid <code>package.json</code> but no <code>package-lock.json</code>:</p>
+<pre><code>$ npm ci
+npm error code EUSAGE
+npm error
+npm error The `npm ci` command can only install with an existing package-lock.json or
+npm error npm-shrinkwrap.json with lockfileVersion &gt;= 1. Run an install with npm@5 or
+npm error later to generate a package-lock.json file, then try again.
+npm error
+npm error Clean install a project
+...
+npm error A complete log of this run can be found in: /home/jacque/.npm/_logs/2026-10-03T09_13_48_843Z-debug-0.log</code></pre>
+<p>Different code again: <code>EUSAGE</code>, with a usage/help dump attached. Even though the underlying problem is also "a file npm needed isn't there," npm classifies a missing lockfile under <code>npm ci</code> specifically as a usage error, not a filesystem ENOENT.</p>
+<h3>Fix</h3>
+<ul>
+<li>Run <code>npm install</code> once (which creates/updates <code>package-lock.json</code>), commit the lockfile, then switch CI back to <code>npm ci</code>.</li>
+<li>If the lockfile should exist but doesn't, check your <code>.gitignore</code> &mdash; lockfiles are sometimes ignored by mistake, especially when copying a <code>.gitignore</code> template meant for libraries rather than apps.</li>
+</ul>
+<h2>5. Quick reference: which error is which</h2>
+<table>
+<tr><th>What you ran</th><th>Real error</th><th>Fix</th></tr>
+<tr><td>Any npm command, no package.json present</td><td><code>npm error code ENOENT</code></td><td>cd to the right folder, or <code>npm init -y</code></td></tr>
+<tr><td><code>npm run &lt;name&gt;</code>, script not defined</td><td><code>npm error Missing script: "&lt;name&gt;"</code></td><td><code>npm run</code> to list real scripts</td></tr>
+<tr><td>Script's target file doesn't exist</td><td>Node's <code>Error: Cannot find module</code> / <code>MODULE_NOT_FOUND</code></td><td>fix the path, or run the build step that creates it</td></tr>
+<tr><td><code>npm ci</code>, no package-lock.json</td><td><code>npm error code EUSAGE</code></td><td><code>npm install</code> once, commit the lockfile</td></tr>
+</table>
+
+<aside class="cta"><strong>Check the headers your own Node app&#x27;s server actually serves:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does npm error code ENOENT always mean package.json is missing?</summary><p>In every case we reproduced, yes: it was npm failing to open package.json in the current directory. The `path` field in the error output tells you the exact file npm tried to open, so always check that line rather than assuming.</p></details>
+<details><summary>Why does npm say ENOENT instead of a plain &#x27;file not found&#x27; message?</summary><p>ENOENT is the raw errno name for the POSIX/libuv syscall error &#x27;no such file or directory&#x27; (errno -2 on Linux/macOS). npm surfaces the underlying Node.js filesystem error code directly instead of translating it into plain English, which is why the message references an OS-level syscall (`open`) rather than package.json by name up front.</p></details>
+<details><summary>I ran npm run start and got &#x27;Cannot find module&#x27;, is that the same bug?</summary><p>No. We confirmed npm successfully found and executed the start script; the failure is Node&#x27;s own module resolver reporting MODULE_NOT_FOUND after npm already handed off control. Fix the path in the script string or make sure the file is built before the script runs.</p></details>
+<details><summary>Why does npm ci fail differently than npm install when a file is missing?</summary><p>We measured npm ci specifically checking for package-lock.json / npm-shrinkwrap.json as a precondition and failing with a usage error (EUSAGE) plus a help dump, rather than the lower-level filesystem ENOENT that a missing package.json produces for ordinary commands.</p></details>
+<details><summary>What&#x27;s the fastest way to tell which of these four errors I actually have?</summary><p>Look at the first two lines npm prints. `npm error code ENOENT` with a `path` line pointing at package.json is case 1. `npm error Missing script` is case 2. A Node stack trace with no `npm error` prefix and `code: &#x27;MODULE_NOT_FOUND&#x27;` is case 3. `npm error code EUSAGE` is case 4.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Node.js v24.21.0 and npm 11.19.0 on Linux. Every error block below is verbatim terminal output we captured, not copied from docs. npm&#x27;s exact wording for these errors has changed across major versions in the past; we tested only 11.19.0. curl and the headers tool are free; Node.js and npm are free and open source.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

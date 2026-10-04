@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESLint: &#x27;process&#x27; is not defined — Fixed (v9, Flat Config)</title>
+<meta name="description" content="We reproduced ESLint&#x27;s &#x27;process&#x27;/&#x27;require&#x27;/&#x27;module&#x27; is not defined no-undef errors on v9 and measured the exact flat-config and .eslintrc fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/eslint-process-require-module-is-not-defined/">
+<meta property="og:title" content="ESLint: &#x27;process&#x27; is not defined — Fixed (v9, Flat Config)">
+<meta property="og:description" content="We reproduced ESLint&#x27;s &#x27;process&#x27;/&#x27;require&#x27;/&#x27;module&#x27; is not defined no-undef errors on v9 and measured the exact flat-config and .eslintrc fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/eslint-process-require-module-is-not-defined/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does ESLint flag 'process' or 'require' as undefined when my code runs fine in Node?", "acceptedAnswer": {"@type": "Answer", "text": "ESLint only performs static analysis on the syntax you write \u2014 it doesn't execute your code or know which runtime will run it. The no-undef rule flags any identifier that isn't declared locally and isn't in ESLint's configured list of known globals. We measured that an empty config has zero Node globals configured, so process, require and module all fail, even though they work perfectly at runtime under Node.js."}}, {"@type": "Question", "name": "What's the fastest fix for a Node.js project on ESLint v9?", "acceptedAnswer": {"@type": "Answer", "text": "Add languageOptions.globals: globals.node to your eslint.config.js (install the globals npm package, or hand-write the object). We confirmed this changes the exit code from 1 (3 errors) to 0 on the identical file."}}, {"@type": "Question", "name": "I'm still on .eslintrc.json \u2014 do I need to migrate to fix this?", "acceptedAnswer": {"@type": "Answer", "text": "No. Add \"env\": { \"node\": true } to your .eslintrc.json (or .eslintrc.js/.yml). We measured this resolves the same 3 errors on ESLint v9.39.5 running in legacy mode, without migrating to flat config. Migration will eventually be required since ESLint plans to remove eslintrc support in v10, but it isn't required to fix this specific error today."}}, {"@type": "Question", "name": "Why did I also get a 'Parsing error: the keyword const is reserved' message?", "acceptedAnswer": {"@type": "Answer", "text": "That's a separate issue layered on top: an .eslintrc.json with no parserOptions.ecmaVersion defaults to an old ECMAScript target (ES5) that doesn't support const. We measured this as a distinct parse-time failure, before no-undef even runs. Set parserOptions.ecmaVersion (e.g. 2021) or switch to flat config, which defaults to a modern parser target."}}, {"@type": "Question", "name": "Does the same fix apply to browser globals like window or document?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 it's the same no-undef mechanism. Use globals.browser (flat config) or \"env\": { \"browser\": true } (legacy) in place of the Node equivalents. If one config file lints both a Node build script and browser-run client code, use separate config blocks scoped by file glob rather than one global setting for everything."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ESLint &#x27;process&#x27;/&#x27;require&#x27;/&#x27;module&#x27; is not defined (tested)</h1>
+<p class="lead"><code>error 'process' is not defined no-undef</code> (and its siblings <code>'require' is not defined</code>, <code>'module' is not defined</code>) means ESLint parsed your file as plain JavaScript with no knowledge that it runs in Node.js. ESLint does not assume any runtime by default &mdash; it has no idea <code>process</code>, <code>require</code>, <code>module</code>, <code>__dirname</code> or <code>exports</code> exist unless you tell it. We reproduced this on ESLint v9.39.5 and measured the exact fix for both config formats in use today.</p>
+<h2 id="repro">1. The exact error we reproduced</h2>
+<p>A minimal CommonJS file:</p>
+<pre><code>const fs = require(&#39;fs&#39;);
+
+function readEnv() {
+  return process.env.NODE_ENV;
+}
+
+module.exports = readEnv;</code></pre>
+<p>Running <code>npx eslint bad.js</code> with a bare flat config (<code>eslint.config.js</code> exporting <code>[{ rules: { "no-undef": "error" } }]</code>, no globals set) on ESLint v9.39.5 produced:</p>
+<pre><code>/tmp/eslint-repro/bad.js
+  1:12  error  &#39;require&#39; is not defined  no-undef
+  4:10  error  &#39;process&#39; is not defined  no-undef
+  7:1   error  &#39;module&#39; is not defined   no-undef
+
+&#x2716; 3 problems (3 errors, 0 warnings)</code></pre>
+<p>Exit code 1. All three globals are genuinely undefined as far as ESLint's static analysis is concerned &mdash; it never loads Node.js, so it has no built-in list of Node globals unless one is configured.</p>
+
+<h2 id="why">2. Why this happens: ESLint has zero environment knowledge by default</h2>
+<p>ESLint lints JavaScript syntax and the <code>no-undef</code> rule flags any identifier that isn't a declared variable, a function parameter, or a <strong>known global</strong>. "Known global" is not auto-detected from your runtime &mdash; ESLint ships with no preset environment at all. Browser code gets the same treatment: an undeclared <code>window</code> or <code>document</code> fails the identical way. The fix in both cases is the same: tell ESLint which globals exist for the environment you're actually targeting.</p>
+
+<h2 id="fix-flat">3. The fix on ESLint v9+ (flat config)</h2>
+<p>ESLint 9 uses flat config (<code>eslint.config.js</code>) by default. Add Node's globals via the <code>languageOptions.globals</code> key. We installed the <code>globals</code> npm package (the same list ESLint's own docs point to) and confirmed the fix:</p>
+<pre><code>// eslint.config.js
+const globals = require(&quot;globals&quot;);
+
+module.exports = [
+  {
+    languageOptions: {
+      globals: globals.node
+    },
+    rules: {
+      &quot;no-undef&quot;: &quot;error&quot;
+    }
+  }
+];</code></pre>
+<p>Re-running <code>npx eslint --config eslint.config.js bad.js</code> on the same <code>bad.js</code>: <strong>exit code 0, zero errors.</strong> <code>globals.node</code> is a plain object (keys are the global names, e.g. <code>process</code>, <code>require</code>, <code>module</code>, <code>__dirname</code>, <code>exports</code>) &mdash; you can also hand-write the same object yourself without the dependency if you only need a handful of names.</p>
+
+<h2 id="fix-legacy">4. The fix on legacy .eslintrc (pre-v9 / ESLINT_USE_FLAT_CONFIG=false)</h2>
+<p>Projects still on the old <code>.eslintrc.json</code> format use the <code>env</code> key instead. We confirmed both states on the same v9.39.5 install by forcing legacy mode:</p>
+<pre><code>// .eslintrc.json — WITHOUT env.node: same 3 errors as flat config
+{
+  "parserOptions": { "ecmaVersion": 2021, "sourceType": "script" },
+  "rules": { "no-undef": "error" }
+}</code></pre>
+<pre><code>// .eslintrc.json — WITH env.node: exit code 0
+{
+  "env": { "node": true },
+  "parserOptions": { "ecmaVersion": 2021, "sourceType": "script" },
+  "rules": { "no-undef": "error" }
+}</code></pre>
+<p>Adding <code>"env": { "node": true }</code> alone resolved all three errors &mdash; measured exit code changed from 1 to 0 with no other change. Note ESLint v9.39.5 still runs eslintrc mode when forced, but prints a deprecation warning that it will be removed in v10.</p>
+
+<h2 id="gotcha">5. A gotcha we hit while reproducing this: parserOptions matters too</h2>
+<p>With a totally empty <code>.eslintrc.json</code> (no <code>env</code>, no <code>parserOptions</code>), the same file failed earlier &mdash; at parse time, not lint time:</p>
+<pre><code>/tmp/eslint-repro/bad.js
+  1:1  error  Parsing error: The keyword &#39;const&#39; is reserved</code></pre>
+<p>That happens because legacy config defaults <code>ecmaVersion</code> to a very old ES version (ES5) when nothing else specifies it, and <code>const</code> isn't valid ES5 syntax. This is a different failure from <code>no-undef</code> and is easy to mistake for the same misconfiguration &mdash; the fix is a <code>parserOptions.ecmaVersion</code> bump (or switching to flat config, where the default parser target is modern JS and this doesn't come up).</p>
+
+<h2 id="browser">6. Same error, browser globals instead of Node</h2>
+<p>The identical <code>no-undef</code> mechanism fires for frontend code missing browser globals &mdash; <code>'window' is not defined</code>, <code>'document' is not defined</code>, <code>'fetch' is not defined</code>. The fix is the same shape, just <code>globals.browser</code> (flat config) or <code>"env": { "browser": true }</code> (legacy) instead of the Node equivalents. Mixed projects (a Node build script alongside browser-run client code) commonly need per-file-glob config blocks, one targeting each environment, rather than a single global setting.</p>
+
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does ESLint flag &#x27;process&#x27; or &#x27;require&#x27; as undefined when my code runs fine in Node?</summary><p>ESLint only performs static analysis on the syntax you write — it doesn&#x27;t execute your code or know which runtime will run it. The no-undef rule flags any identifier that isn&#x27;t declared locally and isn&#x27;t in ESLint&#x27;s configured list of known globals. We measured that an empty config has zero Node globals configured, so process, require and module all fail, even though they work perfectly at runtime under Node.js.</p></details>
+<details><summary>What&#x27;s the fastest fix for a Node.js project on ESLint v9?</summary><p>Add languageOptions.globals: globals.node to your eslint.config.js (install the globals npm package, or hand-write the object). We confirmed this changes the exit code from 1 (3 errors) to 0 on the identical file.</p></details>
+<details><summary>I&#x27;m still on .eslintrc.json — do I need to migrate to fix this?</summary><p>No. Add &quot;env&quot;: { &quot;node&quot;: true } to your .eslintrc.json (or .eslintrc.js/.yml). We measured this resolves the same 3 errors on ESLint v9.39.5 running in legacy mode, without migrating to flat config. Migration will eventually be required since ESLint plans to remove eslintrc support in v10, but it isn&#x27;t required to fix this specific error today.</p></details>
+<details><summary>Why did I also get a &#x27;Parsing error: the keyword const is reserved&#x27; message?</summary><p>That&#x27;s a separate issue layered on top: an .eslintrc.json with no parserOptions.ecmaVersion defaults to an old ECMAScript target (ES5) that doesn&#x27;t support const. We measured this as a distinct parse-time failure, before no-undef even runs. Set parserOptions.ecmaVersion (e.g. 2021) or switch to flat config, which defaults to a modern parser target.</p></details>
+<details><summary>Does the same fix apply to browser globals like window or document?</summary><p>Yes — it&#x27;s the same no-undef mechanism. Use globals.browser (flat config) or &quot;env&quot;: { &quot;browser&quot;: true } (legacy) in place of the Node equivalents. If one config file lints both a Node build script and browser-run client code, use separate config blocks scoped by file glob rather than one global setting for everything.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with ESLint v9.39.5 and Node.js v24.21.0, running npx eslint directly on a CommonJS file, both with flat config (eslint.config.js, the v9 default) and with legacy .eslintrc.json (ESLINT_USE_FLAT_CONFIG=false). Every message, line:column and exit code below is copy-pasted output, not paraphrased. PlainHeaders is our extension; ESLint is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

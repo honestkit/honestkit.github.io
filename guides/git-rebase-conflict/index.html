@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Git Rebase Conflict: How to Read and Resolve It (Tested)</title>
+<meta name="description" content="We triggered a real git rebase conflict and captured the exact markers, git status wording, and the difference between --abort, --skip, and --continue.">
+<link rel="canonical" href="https://honestkit.github.io/guides/git-rebase-conflict/">
+<meta property="og:title" content="Git Rebase Conflict: How to Read and Resolve It (Tested)">
+<meta property="og:description" content="We triggered a real git rebase conflict and captured the exact markers, git status wording, and the difference between --abort, --skip, and --continue.">
+<meta property="og:url" content="https://honestkit.github.io/guides/git-rebase-conflict/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How is a git rebase conflict different from a merge conflict?", "acceptedAnswer": {"@type": "Answer", "text": "The three markers (<<<<<<<, =======, >>>>>>>) are identical, but the closing label differs. We measured it: a merge's >>>>>>> marker names the branch being merged in (>>>>>>> feature); a rebase's >>>>>>> marker names the abbreviated hash and subject of the specific commit being replayed (>>>>>>> 286b0aa (feature: change line2)), since a multi-commit rebase can conflict on a different commit each time."}}, {"@type": "Question", "name": "Does a rebase conflict put me in detached HEAD?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, mechanically. We confirmed git branch --show-current printed nothing and .git/HEAD held a raw commit SHA during the conflict, same as a plain detached checkout. But git status's wording is rebase-specific (\"You are currently rebasing branch 'feature' on '<sha>'\") rather than the generic \"HEAD detached at <sha>\" message, and it hands you the exact --continue/--skip/--abort options."}}, {"@type": "Question", "name": "What's the difference between git rebase --skip and --abort?", "acceptedAnswer": {"@type": "Answer", "text": "We tested both. --abort fully restores the branch and history to exactly how they were before the rebase started, with the original commit intact. --skip instead discards the conflicting commit's change completely and continues the rebase without it; that change does not reappear later."}}, {"@type": "Question", "name": "Does git rebase --continue create a new commit?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. In our test the resolved commit got a new hash (6a7763d) different from the original (fa34f88), because rebase always rewrites the commits it replays. git itself labeled the intermediate state [detached HEAD 6a7763d] in its own output before printing \"Successfully rebased and updated refs/heads/feature.\""}}, {"@type": "Question", "name": "Why does git status say \"interactive rebase in progress\" when I ran a plain git rebase?", "acceptedAnswer": {"@type": "Answer", "text": "We saw this exact wording after a plain, non-interactive git rebase main on git 2.47.3. Git uses the same sequencer-based backend for both interactive and non-interactive rebases internally, so the status message doesn't distinguish them."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Git Rebase Conflict: How to Resolve (Tested)</h1>
+<p class="lead">A git rebase conflict happens when the commit git is replaying changes a line that the branch you're rebasing onto already changed differently. git marks the spot in the file with <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code>, <code>=======</code>, and <code>&gt;&gt;&gt;&gt;&gt;&gt;&gt;</code> &mdash; the same three markers a <a href="/guides/git-merge-conflict-how-to-resolve/">merge conflict</a> uses, but labeled differently. We reproduced one from scratch and recorded exactly what git prints and writes.</p>
+<h2>1. How we reproduced it</h2>
+<p>We made one file, committed it, then branched and edited the same line differently on <code>main</code> and on <code>feature</code> before rebasing <code>feature</code> onto <code>main</code>.</p>
+<pre><code>git init -b main
+git config user.email "test@example.com"
+git config user.name "Test User"
+printf "line1\nline2\nline3\n" &gt; file.txt
+git add file.txt
+git commit -m "base commit"
+
+git checkout -b feature
+printf "line1\nFEATURE-CHANGE\nline3\n" &gt; file.txt
+git commit -am "feature: change line2"
+
+git checkout main
+printf "line1\nMAIN-CHANGE\nline3\n" &gt; file.txt
+git commit -am "main: change line2"
+
+git checkout feature
+git rebase main</code></pre>
+<p><code>git rebase main</code> printed exactly:</p>
+<pre><code>Rebasing (1/1)Auto-merging file.txt
+CONFLICT (content): Merge conflict in file.txt
+error: could not apply 286b0aa... feature: change line2
+hint: Resolve all conflicts manually, mark them as resolved with
+hint: "git add/rm &lt;conflicted_files&gt;", then run "git rebase --continue".
+hint: You can instead skip this commit: run "git rebase --skip".
+hint: To abort and get back to the state before "git rebase", run "git rebase --abort".
+hint: Disable this message with "git config advice.mergeConflict false"
+Could not apply 286b0aa... feature: change line2</code></pre>
+<p><code>git rebase</code> exited with status 1.</p>
+
+<h2>2. The markers look different from a merge conflict &mdash; here's exactly how</h2>
+<p>Here is the full content of <code>file.txt</code> after the conflicting rebase, byte for byte:</p>
+<pre><code>line1
+&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD
+MAIN-CHANGE
+=======
+FEATURE-CHANGE
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; 286b0aa (feature: change line2)
+line3</code></pre>
+<p>We ran the exact same two-line conflict through <code>git merge</code> instead, for comparison. Its markers:</p>
+<pre><code>line1
+&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD
+MAIN-CHANGE
+=======
+FEATURE-CHANGE
+&gt;&gt;&gt;&gt;&gt;&gt;&gt; feature
+line3</code></pre>
+<p>The opening <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD</code> line looks identical, but <strong>it means something different in each case</strong>:</p>
+<ul>
+<li><strong>In a merge</strong>, we ran <code>git merge feature</code> while checked out on <code>main</code>, so <code>HEAD</code> is <code>main</code>, your current branch. The closing marker is labeled with the <strong>branch name</strong> being merged in: <code>&gt;&gt;&gt;&gt;&gt;&gt;&gt; feature</code>.</li>
+<li><strong>In a rebase</strong>, git had already moved <code>HEAD</code> onto <code>main</code>'s tip before replaying <code>feature</code>'s commit on top, so <code>HEAD</code> here means the branch being rebased <em>onto</em> &mdash; <code>main</code>, same content, different reason. The closing marker is labeled with the <strong>abbreviated commit hash and subject line of the commit being replayed</strong>, not a branch name: <code>&gt;&gt;&gt;&gt;&gt;&gt;&gt; 286b0aa (feature: change line2)</code>.</li>
+</ul>
+<p>That's the one thing worth remembering: a merge's closing marker names a branch; a rebase's closing marker names the specific commit (hash + message) currently being replayed, because a multi-commit rebase can conflict on each commit in turn with a different hash each time.</p>
+
+<h2>3. What git status says during a rebase conflict</h2>
+<p>We ran <code>git status</code> while the conflict was open. Exact output:</p>
+<pre><code>interactive rebase in progress; onto a267195
+Last command done (1 command done):
+   pick 286b0aa feature: change line2
+No commands remaining.
+You are currently rebasing branch 'feature' on 'a267195'.
+  (fix conflicts and then run "git rebase --continue")
+  (use "git rebase --skip" to skip this patch)
+  (use "git rebase --abort" to check out the original branch)
+
+Unmerged paths:
+  (use "git restore --staged &lt;file&gt;..." to unstage)
+  (use "git add &lt;file&gt;..." to mark resolution)
+	both modified:   file.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")</code></pre>
+<p>Note it says <strong>"interactive rebase in progress"</strong> even though we ran a plain, non-interactive <code>git rebase main</code> &mdash; git 2.47.3 uses the same sequencer-based machinery for both, so the message is identical either way. The <code>both modified</code> line is the same wording a merge conflict uses.</p>
+
+<h2>4. Is this a "detached HEAD"? Yes, but git tells you exactly what's going on</h2>
+<p>We checked directly: during the conflict, <code>git branch --show-current</code> printed nothing, and <code>git symbolic-ref HEAD</code> failed with <code>fatal: ref HEAD is not a symbolic ref</code> (exit 128). <code>.git/HEAD</code> held a raw commit SHA, not a ref name. Mechanically that is the same <a href="/guides/git-detached-head/">detached HEAD</a> state you get from checking out a commit directly.</p>
+<p>The difference is what git tells you. A plain detached checkout's <code>git status</code> just says <code>HEAD detached at &lt;sha&gt;</code> with generic advice. Mid-rebase, <code>git status</code> instead says <em>"You are currently rebasing branch 'feature' on '&lt;sha&gt;'"</em> and gives rebase-specific next steps (<code>--continue</code>/<code>--skip</code>/<code>--abort</code>). You're detached either way, but a rebase in progress is self-documenting, so you don't need to recognize detached HEAD yourself to know how to get out.</p>
+
+<h2>5. Resolving it: edit, add, --continue</h2>
+<p>We edited the file to the content we wanted, removing all three marker lines ourselves (git does not do this for you):</p>
+<pre><code>printf "line1\nRESOLVED-LINE\nline3\n" &gt; file.txt
+git add file.txt
+git rebase --continue</code></pre>
+<p>Exact output:</p>
+<pre><code>[detached HEAD 6a7763d] feature: change line2
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+Successfully rebased and updated refs/heads/feature.</code></pre>
+<p>Exit code was 0. Git itself labels the intermediate commit <code>[detached HEAD ...]</code>, confirming the state from section 4. The resulting commit has a <strong>new hash</strong> (<code>6a7763d</code>, not the original <code>fa34f88</code>) because rebase rewrites every commit it replays. <code>git log --oneline</code> afterward showed a clean, linear history: <code>feature</code>'s commit now sits directly on top of <code>main</code>'s, with no merge commit.</p>
+
+<h2>6. git rebase --skip: drops the commit entirely</h2>
+<p>Instead of resolving, we ran <code>git rebase --skip</code> on the same conflict. Exact output:</p>
+<pre><code>Successfully rebased and updated refs/heads/feature.</code></pre>
+<p>Exit code 0 &mdash; but the conflicting commit's change is simply discarded, not applied in any form. <code>git log</code> afterward no longer contained the <code>feature: change line2</code> commit at all, and <code>file.txt</code> matched <code>main</code>'s version exactly (<code>MAIN-CHANGE</code>), with no trace of <code>FEATURE-CHANGE</code> anywhere. Use <code>--skip</code> only when you're sure that commit's change is no longer needed; there's no silent recovery of it afterward other than finding the original commit hash via <code>git reflog</code>.</p>
+
+<h2>7. git rebase --abort: full rollback</h2>
+<p>We also triggered the conflict and ran <code>git rebase --abort</code> instead. Exit code 0, no other output. <code>git status</code> immediately showed <code>On branch feature / nothing to commit, working tree clean</code>, <code>git branch --show-current</code> printed <code>feature</code> again (HEAD reattached), and <code>git log --oneline</code> showed the branch's single original commit, unchanged. <code>--abort</code> is a complete, exact restore to the state right before the rebase started &mdash; unlike <code>--skip</code>, nothing is lost.</p>
+
+<h2>8. Quick comparison</h2>
+<table>
+<tr><th>Command</th><th>Exit code</th><th>Result</th></tr>
+<tr><td><code>git rebase --abort</code></td><td>0</td><td>Full rollback. Branch and history exactly as before the rebase.</td></tr>
+<tr><td><code>git rebase --skip</code></td><td>0</td><td>The conflicting commit's change is dropped entirely. History continues without it.</td></tr>
+<tr><td>Resolve + <code>git add</code> + <code>git rebase --continue</code></td><td>0</td><td>A new commit (new hash) with your resolved content, rebase continues linearly.</td></tr>
+</table>
+<p>Quick checklist: run <code>git status</code> to see which command you're mid-rebase and which file is <code>both modified</code>; open it, delete the <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code>/<code>=======</code>/<code>&gt;&gt;&gt;&gt;&gt;&gt;&gt;</code> markers by hand after picking the content you want; <code>git add</code> each resolved file; then <code>git rebase --continue</code>. Changed your mind entirely? <code>git rebase --abort</code> restores the pre-rebase state exactly.</p>
+<aside class="cta"><strong>Checking an API your rebase tooling talks to? Inspect the headers and status it actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How is a git rebase conflict different from a merge conflict?</summary><p>The three markers (&lt;&lt;&lt;&lt;&lt;&lt;&lt;, =======, &gt;&gt;&gt;&gt;&gt;&gt;&gt;) are identical, but the closing label differs. We measured it: a merge&#x27;s &gt;&gt;&gt;&gt;&gt;&gt;&gt; marker names the branch being merged in (&gt;&gt;&gt;&gt;&gt;&gt;&gt; feature); a rebase&#x27;s &gt;&gt;&gt;&gt;&gt;&gt;&gt; marker names the abbreviated hash and subject of the specific commit being replayed (&gt;&gt;&gt;&gt;&gt;&gt;&gt; 286b0aa (feature: change line2)), since a multi-commit rebase can conflict on a different commit each time.</p></details>
+<details><summary>Does a rebase conflict put me in detached HEAD?</summary><p>Yes, mechanically. We confirmed git branch --show-current printed nothing and .git/HEAD held a raw commit SHA during the conflict, same as a plain detached checkout. But git status&#x27;s wording is rebase-specific (&quot;You are currently rebasing branch &#x27;feature&#x27; on &#x27;&lt;sha&gt;&#x27;&quot;) rather than the generic &quot;HEAD detached at &lt;sha&gt;&quot; message, and it hands you the exact --continue/--skip/--abort options.</p></details>
+<details><summary>What&#x27;s the difference between git rebase --skip and --abort?</summary><p>We tested both. --abort fully restores the branch and history to exactly how they were before the rebase started, with the original commit intact. --skip instead discards the conflicting commit&#x27;s change completely and continues the rebase without it; that change does not reappear later.</p></details>
+<details><summary>Does git rebase --continue create a new commit?</summary><p>Yes. In our test the resolved commit got a new hash (6a7763d) different from the original (fa34f88), because rebase always rewrites the commits it replays. git itself labeled the intermediate state [detached HEAD 6a7763d] in its own output before printing &quot;Successfully rebased and updated refs/heads/feature.&quot;</p></details>
+<details><summary>Why does git status say &quot;interactive rebase in progress&quot; when I ran a plain git rebase?</summary><p>We saw this exact wording after a plain, non-interactive git rebase main on git 2.47.3. Git uses the same sequencer-based backend for both interactive and non-interactive rebases internally, so the status message doesn&#x27;t distinguish them.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with git 2.47.3 on Linux, plain CLI only (no GUI tool), in disposable /tmp repos. PlainHeaders is our extension; git is free and open source.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

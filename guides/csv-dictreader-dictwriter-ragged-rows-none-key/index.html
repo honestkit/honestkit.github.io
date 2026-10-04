@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>csv DictReader Ragged Rows: the Silent None Dict Key (Tested)</title>
+<meta name="description" content="We measured csv on ragged rows: DictReader never raises (short rows get None, long rows nest under a literal None key) but DictWriter raises on an extra key.">
+<link rel="canonical" href="https://honestkit.github.io/guides/csv-dictreader-dictwriter-ragged-rows-none-key/">
+<meta property="og:title" content="csv DictReader Ragged Rows: the Silent None Dict Key (Tested)">
+<meta property="og:description" content="We measured csv on ragged rows: DictReader never raises (short rows get None, long rows nest under a literal None key) but DictWriter raises on an extra key.">
+<meta property="og:url" content="https://honestkit.github.io/guides/csv-dictreader-dictwriter-ragged-rows-none-key/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What happens if a CSV row has fewer fields than the header in DictReader?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that csv.DictReader fills the missing column(s) with the Python value None by default (not an empty string) \u2014 no exception is raised. Pass restval=\\\"something\\\" to change that fill value."}}, {"@type": "Question", "name": "What happens if a CSV row has more fields than the header in DictReader?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that the extra fields are collected into a list and stored under the dict key None (the literal None object, not the string \\\"None\\\") \u2014 again with no exception. Pass restkey=\\\"something\\\" to use a named key instead."}}, {"@type": "Question", "name": "Does json.dumps() handle a dict with a None key from DictReader?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we confirmed json.dumps() silently converts the None key to the string \\\"null\\\" with no error, the same coercion behavior that applies to int/float/bool/None dict keys generally in Python's json module."}}, {"@type": "Question", "name": "Does csv.DictWriter raise an error for ragged dict rows the same way DictReader doesn't?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured the opposite: DictWriter raises ValueError immediately if a row dict has a key not in fieldnames, but silently writes an empty string with no error at all if a row dict is missing a key that is in fieldnames."}}, {"@type": "Question", "name": "How do I stop DictWriter from raising on extra dict keys?", "acceptedAnswer": {"@type": "Answer", "text": "We tested extrasaction=\\\"ignore\\\" on csv.DictWriter, which silently drops any keys not in fieldnames instead of raising ValueError: dict contains fields not in fieldnames."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>csv DictReader/DictWriter Ragged Rows: the None Key (tested)</h1>
+<p class="lead">A CSV row with fewer or more fields than the header doesn't raise an error in <code>csv.DictReader</code> &mdash; it silently fills gaps with <code>None</code> or stashes extras under a dict key that is the literal <code>None</code> object, not the string <code>"None"</code>. We measured exactly what each side of <code>csv</code> does with ragged data, and found the read and write sides don't even agree on whether a mismatch should raise.</p>
+<h2 id="repro1">1. A short row: missing values become None, not empty string</h2>
+<pre><code>import csv, io
+
+f = io.StringIO("a,b,c\n1,2\n")
+list(csv.DictReader(f))
+[{\'a\': \'1\', \'b\': \'2\', \'c\': None}]</code></pre>
+<p><strong>Measured:</strong> a row with one fewer field than the header raises nothing &mdash; the missing column's value is the Python object <code>None</code>, by default. This is easy to miss if code later does <code>row["c"].strip()</code> expecting a string like <code>csv</code> normally returns for every other field; a ragged row is the one case where a field can be a non-string <code>None</code>.</p>
+
+<h2 id="repro2">2. A long row: extras nest under a literal None key, as a list</h2>
+<pre><code>f = io.StringIO("a,b,c\n1,2,3,4,5\n")
+list(csv.DictReader(f))
+[{\'a\': \'1\', \'b\': \'2\', \'c\': \'3\', None: [\'4\', \'5\']}]</code></pre>
+<p><strong>Measured:</strong> extra fields beyond the header are collected into a <code>list</code> and stored under the dict key <code>None</code> &mdash; the actual <code>None</code> object, not the string <code>"None"</code>. <code>row.get("None")</code> returns nothing; only <code>row.get(None)</code> or <code>row[None]</code> finds it. This also means <code>list(row.keys())</code> contains a non-string entry, which is easy to miss when iterating keys and assuming they're all column names.</p>
+
+<h2 id="repro3">3. That None key still serializes through json.dumps() without error</h2>
+<pre><code>import json
+json.dumps({"a": "1", "b": "2", "c": "3", None: ["4", "5"]})
+\'{"a": "1", "b": "2", "c": "3", "null": ["4", "5"]}\'</code></pre>
+<p><strong>Measured:</strong> <code>json.dumps()</code> silently coerces the <code>None</code> key to the string <code>"null"</code> &mdash; the same int/float/bool/None key coercion covered in our <a href="/guides/json-object-not-json-serializable/">json serialization guide</a>. So a ragged CSV row piped straight into <code>json.dumps()</code> produces a JSON object with a real <code>"null"</code> key holding the overflow fields, with no error anywhere in the pipeline to flag that the source row was malformed.</p>
+
+<h2 id="repro4">4. You can replace both defaults with restkey and restval</h2>
+<pre><code>csv.DictReader(f, restkey="EXTRA", restval="MISSING")
+# short row -> {\'a\': \'1\', \'b\': \'2\', \'c\': \'MISSING\'}
+# long row  -> {\'a\': \'1\', \'b\': \'2\', \'c\': \'3\', \'EXTRA\': [\'4\', \'5\']}</code></pre>
+<p><strong>Measured:</strong> setting <code>restkey</code> to any string replaces the <code>None</code> key with that string, and <code>restval</code> replaces the <code>None</code> fill value for short rows. Neither is required, and both default to values (<code>None</code>, <code>None</code>) that are easy to overlook since they never raise.</p>
+
+<h2 id="repro5">5. DictWriter disagrees: an extra key raises by default</h2>
+<pre><code>w = csv.DictWriter(f, fieldnames=["a", "b"])
+w.writerow({"a": 1, "b": 2, "c": 3})
+ValueError: dict contains fields not in fieldnames: \'c\'
+
+w2 = csv.DictWriter(f, fieldnames=["a", "b", "c"])
+w2.writerow({"a": 1, "b": 2})   # missing \'c\'
+# writes "1,2," -- no error, empty string used</code></pre>
+<p><strong>Measured:</strong> the write side is asymmetric with the read side and with itself: an unexpected extra key raises <code>ValueError</code> immediately, while a missing key raises nothing at all and silently writes an empty string. Pass <code>extrasaction="ignore"</code> to silently drop extra keys instead of raising, or <code>restval=...</code> to control what a missing key writes instead of the default empty string.</p>
+
+<h2 id="fix">6. What to actually check</h2>
+<p>When reading, check for a <code>None</code> key or a <code>None</code> value in each row before passing it downstream &mdash; both indicate the source row didn't match the header's column count, and neither raises on its own. When writing, decide and set <code>extrasaction</code> explicitly (<code>"raise"</code> is the default, <code>"ignore"</code> silently drops) rather than relying on whichever happens to match your data today, since adding one new key to the dicts you're writing later will suddenly start raising on every row.</p>
+
+<aside class="cta"><strong>Debugging a ragged CSV export an API streams back instead of a database dump? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What happens if a CSV row has fewer fields than the header in DictReader?</summary><p>We measured that csv.DictReader fills the missing column(s) with the Python value None by default (not an empty string) — no exception is raised. Pass restval=\&quot;something\&quot; to change that fill value.</p></details>
+<details><summary>What happens if a CSV row has more fields than the header in DictReader?</summary><p>We measured that the extra fields are collected into a list and stored under the dict key None (the literal None object, not the string \&quot;None\&quot;) — again with no exception. Pass restkey=\&quot;something\&quot; to use a named key instead.</p></details>
+<details><summary>Does json.dumps() handle a dict with a None key from DictReader?</summary><p>Yes — we confirmed json.dumps() silently converts the None key to the string \&quot;null\&quot; with no error, the same coercion behavior that applies to int/float/bool/None dict keys generally in Python&#x27;s json module.</p></details>
+<details><summary>Does csv.DictWriter raise an error for ragged dict rows the same way DictReader doesn&#x27;t?</summary><p>No — we measured the opposite: DictWriter raises ValueError immediately if a row dict has a key not in fieldnames, but silently writes an empty string with no error at all if a row dict is missing a key that is in fieldnames.</p></details>
+<details><summary>How do I stop DictWriter from raising on extra dict keys?</summary><p>We tested extrasaction=\&quot;ignore\&quot; on csv.DictWriter, which silently drops any keys not in fieldnames instead of raising ValueError: dict contains fields not in fieldnames.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in csv module: fed csv.DictReader() rows with fewer and more fields than the header, with and without restkey/restval set, and fed csv.DictWriter() dicts with extra and missing keys, with and without extrasaction/restval set, recording the exact dict/row output and exceptions. PlainHeaders is our extension; Python&#x27;s csv module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

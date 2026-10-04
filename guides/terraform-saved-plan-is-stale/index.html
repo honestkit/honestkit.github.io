@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terraform: &#x27;Saved Plan Is Stale&#x27; — Fixed (Tested)</title>
+<meta name="description" content="We reproduced Terraform&#x27;s &#x27;Saved plan is stale&#x27; error by applying an out-of-date plan file and measured the exact fix: regenerate the plan.">
+<link rel="canonical" href="https://honestkit.github.io/guides/terraform-saved-plan-is-stale/">
+<meta property="og:title" content="Terraform: &#x27;Saved Plan Is Stale&#x27; — Fixed (Tested)">
+<meta property="og:description" content="We reproduced Terraform&#x27;s &#x27;Saved plan is stale&#x27; error by applying an out-of-date plan file and measured the exact fix: regenerate the plan.">
+<meta property="og:url" content="https://honestkit.github.io/guides/terraform-saved-plan-is-stale/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes 'Saved plan is stale' in practice?", "acceptedAnswer": {"@type": "Answer", "text": "Any change to the real state between saving a plan (terraform plan -out=file) and applying it: a teammate's apply, a separate CI pipeline run, a manual terraform apply without the saved file, or even your own later command. We reproduced this directly by applying an unrelated change before applying the saved plan."}}, {"@type": "Question", "name": "Can I force-apply a stale plan anyway?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we found no flag that overrides this check, and that's deliberate: the point of a saved plan is to guarantee the exact change you reviewed is what gets applied. Regenerating the plan (terraform plan -out=...) against current state is the only path forward; we confirmed this works cleanly."}}, {"@type": "Question", "name": "Does regenerating the plan always show the same changes?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 it reflects reality as it stands now, which may differ from what the original stale plan intended. We measured this directly: in our repro, the real state had already reached the value the stale plan was trying to set, so the regenerated plan correctly reported 'No changes' instead of repeating a change that was no longer needed."}}, {"@type": "Question", "name": "Is this the same error as the state lock error?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 a lock error blocks a concurrent run from touching the state at the same time as another run; a stale-plan error is caught later, when an apply discovers the state no longer matches what its saved plan assumed. See our separate guide on terraform error acquiring the state lock for that one."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Terraform: Saved plan is stale (tested)</h1>
+<p class="lead"><code>Error: Saved plan is stale</code> means the <code>.tfplan</code> file you're applying no longer matches the real state &mdash; something else changed the infrastructure after the plan was saved. We reproduced it on Terraform v1.16.5 and measured the exact fix.</p>
+<h2 id="repro">1. The exact error, from a genuinely stale plan</h2>
+<p>We saved a plan changing a value from <code>v1</code> to <code>v2</code>:</p>
+<pre><code>terraform plan -out=saved.tfplan</code></pre>
+<p>Then, before applying it, ran a <strong>different</strong> change directly (<code>v2</code> &rarr; <code>v3</code>), which updated the real state out from under the saved plan. Applying the now-outdated plan file gave:</p>
+<pre><code>Error: Saved plan is stale
+
+The given plan file can no longer be applied because the state was changed
+by another operation after the plan was created.</code></pre>
+<p><strong>Why:</strong> a saved plan file is a snapshot of both the intended changes <em>and</em> the state it was computed against. If the real state moves on &mdash; a teammate's apply, a separate CI run, even your own later command &mdash; applying the old plan could silently produce the wrong result. Terraform refuses rather than guess.</p>
+
+<h2 id="fix">2. The fix: regenerate the plan against current state</h2>
+<p>We confirmed the fix is simply to re-run <code>plan</code> and apply the fresh output:</p>
+<pre><code>terraform plan -out=saved2.tfplan
+terraform apply saved2.tfplan</code></pre>
+<p>In our case the real state had already reached the intended value from the other change, so the regenerated plan correctly reported <strong>"No changes"</strong> and the apply completed as a no-op. If the real state had diverged in a way that still required changes, the regenerated plan would show exactly those, computed fresh against what's actually there now &mdash; there's no way to "patch" a stale plan file; it has to be recomputed.</p>
+
+<h2 id="related">3. How this differs from "Error acquiring the state lock"</h2>
+<p>This is a different failure from the <a href="/guides/terraform-error-acquiring-the-state-lock/">state lock error</a>: a lock blocks a <em>concurrent</em> run from touching the state at the same time, while a stale plan is caught <em>after the fact</em> &mdash; the apply runs, finds the state doesn't match what the plan assumed, and refuses. Both exist to stop the same class of mistake (acting on infrastructure information that's no longer current), just at different points in the pipeline.</p>
+
+<aside class="cta"><strong>Debugging infra that talks to an API? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes &#x27;Saved plan is stale&#x27; in practice?</summary><p>Any change to the real state between saving a plan (terraform plan -out=file) and applying it: a teammate&#x27;s apply, a separate CI pipeline run, a manual terraform apply without the saved file, or even your own later command. We reproduced this directly by applying an unrelated change before applying the saved plan.</p></details>
+<details><summary>Can I force-apply a stale plan anyway?</summary><p>No — we found no flag that overrides this check, and that&#x27;s deliberate: the point of a saved plan is to guarantee the exact change you reviewed is what gets applied. Regenerating the plan (terraform plan -out=...) against current state is the only path forward; we confirmed this works cleanly.</p></details>
+<details><summary>Does regenerating the plan always show the same changes?</summary><p>No — it reflects reality as it stands now, which may differ from what the original stale plan intended. We measured this directly: in our repro, the real state had already reached the value the stale plan was trying to set, so the regenerated plan correctly reported &#x27;No changes&#x27; instead of repeating a change that was no longer needed.</p></details>
+<details><summary>Is this the same error as the state lock error?</summary><p>No — a lock error blocks a concurrent run from touching the state at the same time as another run; a stale-plan error is caught later, when an apply discovers the state no longer matches what its saved plan assumed. See our separate guide on terraform error acquiring the state lock for that one.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Terraform v1.16.5 on Linux, local backend, using a terraform_data resource and a saved plan file (terraform plan -out=...). Every message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Terraform is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

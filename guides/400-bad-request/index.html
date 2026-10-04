@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>400 Bad Request: What Triggers It and How to Fix It (Tested)</title>
+<meta name="description" content="We sent broken requests to Node.js, Express and Flask and recorded the exact 400 responses: bad request lines, bad header names, missing Host, spaces in URLs and malformed JSON. Plus the fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/400-bad-request/">
+<meta property="og:title" content="400 Bad Request: What Triggers It and How to Fix It (Tested)">
+<meta property="og:description" content="We sent broken requests to Node.js, Express and Flask and recorded the exact 400 responses: bad request lines, bad header names, missing Host, spaces in URLs and malformed JSON. Plus the fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/400-bad-request/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is 400 Bad Request my fault or the server's?", "acceptedAnswer": {"@type": "Answer", "text": "Usually the request is the problem. The server could not parse it or decode its body. Retrying the same request will fail again; change the request."}}, {"@type": "Question", "name": "Does Node.js return 400 when the Host header is missing?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, in our test on Node.js 24.21.0 an HTTP/1.1 request with no Host got 400. HTTP/1.0 without Host got 200, and the server option requireHostHeader: false turns the check off."}}, {"@type": "Question", "name": "Why does Flask return 400 for my JSON?", "acceptedAnswer": {"@type": "Answer", "text": "request.json raises a 400 when the body is not valid JSON. In our test the page only said 'The browser (or proxy) sent a request that this server could not understand.' Use request.get_json(silent=True) to handle it yourself."}}, {"@type": "Question", "name": "What is entity.parse.failed in Express?", "acceptedAnswer": {"@type": "Answer", "text": "It is the error type express.json() sets when the body is not valid JSON. The error has status 400 and a message such as 'Expected double-quoted property name in JSON at position 7'."}}, {"@type": "Question", "name": "How do I fix a 400 error in my browser?", "acceptedAnswer": {"@type": "Answer", "text": "Clear cookies for that site and reload, or try a private window. Also check the URL for spaces or stray % signs. Oversized cookies are a common cause on nginx sites."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>400 Bad Request (tested)</h1>
+<p class="lead"><code>400 Bad Request</code> means the server could not parse or accept the request itself. It is the generic &quot;your request is broken&quot; code. We sent broken requests to real servers and wrote down exactly what came back.</p>
+<h2>1. What a 400 means</h2>
+<p>The server got your request but refused it because something in it was malformed. It is a client-side error: retrying the same request gives the same 400. The fix is to change the request.</p>
+<p>A 400 can come from two layers. The HTTP parser rejects bytes it cannot read, before your code runs. The framework rejects a body it cannot decode, such as broken JSON. Validation errors in your own code often use <a href="/guides/422-unprocessable-entity/">422 Unprocessable Entity</a> instead.</p>
+
+<h2>2. Parser-level 400s in Node.js 24 (measured)</h2>
+<p>We sent raw bytes to a plain <code>http.createServer()</code> on Node.js 24.21.0. For every broken request below, Node replied with exactly this and closed the connection. There is no body, and your request handler never runs.</p>
+<pre><code>HTTP/1.1 400 Bad Request
+Connection: close
+</code></pre>
+<table>
+<tr><th>What we sent</th><th>Node.js 24 result</th></tr>
+<tr><td><code>GARBAGE</code> as the request line</td><td>400, connection closed</td></tr>
+<tr><td>Header name with a space: <code>Bad Header: v</code></td><td>400, connection closed</td></tr>
+<tr><td>Control byte (0x01) in a header value</td><td>400, connection closed</td></tr>
+<tr><td>Space in the path: <code>GET /a b HTTP/1.1</code></td><td>400, connection closed</td></tr>
+<tr><td>DEL byte (0x7F) in the path</td><td>400, connection closed</td></tr>
+<tr><td>Two different <code>Content-Length</code> headers (5 and 6)</td><td>400, connection closed</td></tr>
+<tr><td>HTTP/1.1 with no <code>Host</code> header</td><td>400 (with <code>Date</code> and an empty chunked body)</td></tr>
+<tr><td>HTTP/1.1, no <code>Host</code>, server option <code>requireHostHeader: false</code></td><td>200 OK</td></tr>
+<tr><td>HTTP/1.0 with no <code>Host</code> header</td><td>200 OK</td></tr>
+</table>
+<p>So Node.js 24 does reject HTTP/1.1 requests without <code>Host</code> by default. You can turn that off with <code>http.createServer({ requireHostHeader: false })</code>, but real clients always send <code>Host</code>, so a missing one usually means a broken hand-written client.</p>
+<p>Headers that are too large get a different code. See <a href="/guides/431-request-header-fields-too-large/">431 Request Header Fields Too Large</a>.</p>
+
+<h2>3. Malformed JSON in Express (measured)</h2>
+<p>With <code>app.use(express.json())</code> on Express 5.2.1, we posted <code>{"a":1,}</code> (trailing comma) with <code>Content-Type: application/json</code>. The parser raised an error with status 400. Our error handler printed its fields:</p>
+<pre><code>HTTP/1.1 400 Bad Request
+Content-Type: application/json; charset=utf-8
+
+{"type":"entity.parse.failed","message":"Expected double-quoted property name in JSON at position 7 (line 1 column 8)","status":400}
+</code></pre>
+<p>Check <code>err.type === 'entity.parse.failed'</code> in your error handler to return a clean message instead of a stack trace.</p>
+
+<h2>4. Malformed JSON in Flask (measured)</h2>
+<p>On Flask 3.1.3, reading <code>request.json</code> on the same broken body returned:</p>
+<pre><code>400 BAD REQUEST
+&lt;title&gt;400 Bad Request&lt;/title&gt;
+&lt;h1&gt;Bad Request&lt;/h1&gt;
+&lt;p&gt;The browser (or proxy) sent a request that this server could not understand.&lt;/p&gt;
+</code></pre>
+<p>The page does not say the JSON was the problem. Two more results from the same run:</p>
+<ul>
+<li>Valid JSON sent as <code>text/plain</code> gave <code>415 Unsupported Media Type</code>, not 400: &quot;Did not attempt to load JSON data because the request Content-Type was not 'application/json'.&quot; See <a href="/guides/415-unsupported-media-type/">415 Unsupported Media Type</a>.</li>
+<li><code>request.get_json(silent=True)</code> on broken JSON returned <code>None</code> and our route answered 200. Use it when you want to send your own error.</li>
+</ul>
+
+<h2>5. What clients do before the server sees anything (measured)</h2>
+<table>
+<tr><th>Client and input</th><th>Result</th></tr>
+<tr><td>curl 8.14.1, URL <code>http://localhost:8986/a b</code></td><td>Not sent. <code>curl: (3) URL rejected: Malformed input to a URL function</code>, exit code 3</td></tr>
+<tr><td>curl, URL with <code>%20</code> instead of the space</td><td>Sent, server saw <code>/a%20b</code>, 200</td></tr>
+<tr><td>curl, header value with a 0x01 byte</td><td>Sent as-is; Node replied 400</td></tr>
+<tr><td>Node 24 <code>fetch()</code>, header value with a newline</td><td><code>TypeError: Headers.append: "a\nb" is an invalid header value.</code></td></tr>
+<tr><td>Node 24 <code>fetch()</code>, header name <code>Bad Header</code></td><td><code>TypeError: Headers.append: "Bad Header" is an invalid header name.</code></td></tr>
+<tr><td>Node 24 <code>fetch()</code>, header value with <code>&#10003;</code></td><td><code>TypeError: Cannot convert argument to a ByteString because the character at index 5 has a value of 10003 which is greater than 255.</code></td></tr>
+<tr><td>Node 24 <code>fetch()</code>, URL with a space</td><td>Encoded to <code>/a%20b</code> and sent, 200</td></tr>
+</table>
+<p>So curl and <code>fetch()</code> catch many mistakes on your side. Raw sockets, old libraries and hand-built requests do not, and the server answers 400.</p>
+
+<h2>6. 400s you see in the browser (from documentation, not measured)</h2>
+<ul>
+<li><strong>nginx &quot;400 Bad Request – Request Header Or Cookie Too Large&quot;.</strong> The cookies for that site grew past nginx's header buffer. Clear cookies for the site. Full fix: <a href="/guides/request-header-or-cookie-too-large/">Request Header Or Cookie Too Large</a>.</li>
+<li><strong>Google or YouTube &quot;400. That's an error.&quot;</strong> Usually a bad or oversized cookie, or a broken URL. Clearing cookies for google.com or youtube.com, or trying a private window, is the usual fix.</li>
+<li><strong>Broken URL encoding.</strong> A stray <code>%</code> not followed by two hex digits, or unencoded spaces and quotes, can make a server reject the URL. Encode query values with <code>encodeURIComponent()</code> or your library's equivalent.</li>
+</ul>
+
+<h2>7. Quick fix checklist</h2>
+<ol>
+<li>Browser: clear cookies for the site, then reload. Try a private window.</li>
+<li>Check the URL for spaces, stray <code>%</code> signs or pasted junk.</li>
+<li>API client: validate your JSON (a trailing comma is enough to fail) and send <code>Content-Type: application/json</code>.</li>
+<li>Check header names and values for spaces, newlines or non-ASCII characters.</li>
+<li>Hand-built HTTP/1.1 requests: always send <code>Host</code> and one <code>Content-Length</code>.</li>
+</ol>
+<aside class="cta"><strong>See the exact request headers your browser sends before a 400:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is 400 Bad Request my fault or the server&#x27;s?</summary><p>Usually the request is the problem. The server could not parse it or decode its body. Retrying the same request will fail again; change the request.</p></details>
+<details><summary>Does Node.js return 400 when the Host header is missing?</summary><p>Yes, in our test on Node.js 24.21.0 an HTTP/1.1 request with no Host got 400. HTTP/1.0 without Host got 200, and the server option requireHostHeader: false turns the check off.</p></details>
+<details><summary>Why does Flask return 400 for my JSON?</summary><p>request.json raises a 400 when the body is not valid JSON. In our test the page only said &#x27;The browser (or proxy) sent a request that this server could not understand.&#x27; Use request.get_json(silent=True) to handle it yourself.</p></details>
+<details><summary>What is entity.parse.failed in Express?</summary><p>It is the error type express.json() sets when the body is not valid JSON. The error has status 400 and a message such as &#x27;Expected double-quoted property name in JSON at position 7&#x27;.</p></details>
+<details><summary>How do I fix a 400 error in my browser?</summary><p>Clear cookies for that site and reload, or try a private window. Also check the URL for spaces or stray % signs. Oversized cookies are a common cause on nginx sites.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 (http module), Express 5.2.1, Flask 3.1.3 / Werkzeug 3.1.9 and curl 8.14.1. Raw requests were sent with a Python socket so nothing fixed them on the way. The nginx, Google and cookie notes come from documentation, not our runs. PlainHeaders is our extension; curl, Node.js, Express and Flask are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

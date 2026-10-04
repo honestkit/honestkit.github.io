@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker Compose Up Errors: Causes and Exact Fixes (Tested)</title>
+<meta name="description" content="We reproduced 4 real docker compose up errors on Docker 29.8.1 and captured the exact error text, so you can match yours and fix it fast.">
+<link rel="canonical" href="https://honestkit.github.io/guides/docker-compose-up-error/">
+<meta property="og:title" content="Docker Compose Up Errors: Causes and Exact Fixes (Tested)">
+<meta property="og:description" content="We reproduced 4 real docker compose up errors on Docker 29.8.1 and captured the exact error text, so you can match yours and fix it fast.">
+<meta property="og:url" content="https://honestkit.github.io/guides/docker-compose-up-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why do I get invalid reference format but my image name looks fine?", "acceptedAnswer": {"@type": "Answer", "text": "Check for hidden issues: a trailing space, an environment variable that expanded to an empty or odd string, or uppercase letters in the repository path (only the tag may have uppercase). Run `docker compose config` to see the exact resolved value Compose will send to the daemon."}}, {"@type": "Question", "name": "I fixed the typo but still get no such service, why?", "acceptedAnswer": {"@type": "Answer", "text": "Compose may be reading a different file than you think, especially with multiple -f flags, a committed override file, or COMPOSE_FILE set in your environment. Run `docker compose config --services` to see the service list Compose actually resolved."}}, {"@type": "Question", "name": "Is manifest unknown the same as image not found?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Both mean the registry has no image+tag matching what you asked for. On Docker 29.8.1 we measured the daemon reporting it as \"failed to resolve reference ... not found\"; older Docker versions and some registries report it as \"manifest unknown\" or \"manifest for IMAGE:TAG not found\". The fix is the same either way: check the tag actually exists."}}, {"@type": "Question", "name": "Does upgrading from docker-compose v1 to docker compose v2 fix ContainerConfig KeyError?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, per the public bug reports this error is specific to the old Python v1 CLI's container-recreate logic. The v2 plugin (invoked as `docker compose`, no hyphen) rewrote that logic in Go and does not have this code path. We could not reproduce the bug at all on this box because only v2 is installed, which is itself evidence the issue is v1-specific."}}, {"@type": "Question", "name": "My port error says a different message than 'port is already allocated', what now?", "acceptedAnswer": {"@type": "Answer", "text": "\"Error response from daemon\" is a generic prefix; everything after the colon is the real reason, and the daemon uses it for many unrelated failures (bad bind-mount paths, permission errors, out-of-memory kills). Read the text after \"Error response from daemon:\" literally &mdash; it names the actual subsystem (networking, storage driver, OOM killer) that rejected the request."}}, {"@type": "Question", "name": "What does 'error getting credentials' actually mean?", "acceptedAnswer": {"@type": "Answer", "text": "We measured this three ways: your Docker config's credsStore or credHelpers points at a docker-credential-* helper binary that either doesn't exist (\"executable file not found in $PATH\") or exists but fails internally when run (\"exit status 1\"). It's unrelated to whether your username/password are correct \u2014 that's a separate \"unauthorized\" error from the daemon, not a credentials-helper error at all."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>docker compose up error (tested)</h1>
+<p class="lead"><code>docker compose up</code> fails for a handful of recurring reasons: a bad image reference, a typo in a service name, a tag that does not exist, or a port someone else is already using. We reproduced four of the most common errors ourselves on a live box running Docker 29.8.1 / Compose v5.5.1 and recorded the exact text each one prints, so you can match your error below instead of guessing.</p>
+<h2>1. Quick lookup: match your error text</h2>
+<table>
+<tr><th>What you see</th><th>Meaning</th><th>Jump to</th></tr>
+<tr><td><code>invalid reference format</code></td><td>Bad characters/syntax in an <code>image:</code> value</td><td>Section 2</td></tr>
+<tr><td><code>no such service</code></td><td>You named a service that isn't in the compose file</td><td>Section 3</td></tr>
+<tr><td><code>manifest unknown</code> / <code>not found</code></td><td>The image tag doesn't exist in the registry</td><td>Section 4</td></tr>
+<tr><td><code>port is already allocated</code></td><td>Something else on the host is using that port</td><td>Section 5</td></tr>
+<tr><td><code>error getting credentials</code></td><td>Broken or missing Docker credential helper</td><td>Section 6</td></tr>
+<tr><td><code>ContainerConfig</code> KeyError</td><td>Legacy bug in the old Python <code>docker-compose</code> v1</td><td>Section 7</td></tr>
+</table>
+
+<h2>2. "invalid reference format"</h2>
+<p>This means the <code>image:</code> value in your compose file isn't a syntactically valid image reference &mdash; usually a stray space, an unescaped special character, or a missing quote that merges two YAML values together. We put this in a compose file:</p>
+<pre><code>services:
+  web:
+    image: "bad image name with spaces"</code></pre>
+<p>Running <code>docker compose -p forever-guidetest up</code> gave exactly:</p>
+<pre><code>unable to get image 'bad image name with spaces': Error response from daemon: invalid reference format</code></pre>
+<p><strong>Fix:</strong> image names can only contain lowercase letters, digits, and <code>. _ - /</code> (plus a <code>:tag</code> or <code>@digest</code> suffix). Spaces, uppercase letters in the repository path, and most punctuation are invalid. Print the resolved value with <code>docker compose config</code> to see exactly what YAML produced &mdash; this also catches cases where a missing quote or a bad environment variable substitution (<code>${VAR}</code> expanding to something odd) silently built a malformed string.</p>
+
+<h2>3. "no such service"</h2>
+<p>This fires when you tell Compose to start a service name that doesn't exist in the file, for example a typo or a service you renamed. With a compose file defining only <code>web</code>, we ran:</p>
+<pre><code>$ docker compose -p forever-guidetest up nonexistent-service-name
+no such service: nonexistent-service-name</code></pre>
+<p><strong>Fix:</strong> run <code>docker compose config --services</code> to list the service names Compose actually sees (useful if you're merging multiple <code>-f</code> files or using an <code>extends:</code>/profile setup, where a service can silently disappear). Then correct the name in your command or your override file.</p>
+
+<h2>4. "manifest unknown" / "failed to resolve reference ... not found"</h2>
+<p>This means the image exists but the <strong>tag</strong> you asked for does not, in the registry you're pulling from. We referenced a tag that doesn't exist:</p>
+<pre><code>services:
+  web:
+    image: alpine:this-tag-does-not-exist-12345</code></pre>
+<p>On this box (Docker 29.8.1, containerd image store), <code>docker compose -p forever-guidetest up</code> printed:</p>
+<pre><code>Error response from daemon: failed to resolve reference "docker.io/library/alpine:this-tag-does-not-exist-12345": docker.io/library/alpine:this-tag-does-not-exist-12345: not found</code></pre>
+<p>A plain <code>docker pull</code> of the same bad tag gave the identical message. Older Docker versions (and the classic image store) report this same condition as <code>manifest unknown</code> or <code>manifest for IMAGE:TAG not found</code> &mdash; the wording changed with newer Docker releases, but the cause is the same: the tag isn't in the registry.</p>
+<p><strong>Fix:</strong> check the real tags on the registry (for Docker Hub, the image's "Tags" page), fix typos (<code>lts</code> vs <code>latest</code> is a common one), and confirm you're pointed at the right registry if you use a private one &mdash; a missing registry prefix silently falls back to Docker Hub.</p>
+
+<h2>5. "error response from daemon": port is already allocated</h2>
+<p>This is the generic wrapper Docker uses for daemon-side failures; the specific reason is in the rest of the message. The most common one is a host port collision. We defined two services both publishing host port 8902:</p>
+<pre><code>services:
+  web1:
+    image: httpd:alpine
+    ports: ["8902:80"]
+  web2:
+    image: httpd:alpine
+    ports: ["8902:80"]</code></pre>
+<p><code>docker compose -p forever-guidetest up</code> started <code>web1</code> fine, then failed on <code>web2</code> with:</p>
+<pre><code>Error response from daemon: failed to set up container networking: driver failed programming external connectivity on endpoint forever-guidetest-web2-1 (...): Bind for :::8902 failed: port is already allocated</code></pre>
+<p><strong>Fix:</strong> run <code>ss -ltn</code> or <code>docker ps --format '{{.Names}}: {{.Ports}}'</code> to see what already holds the port, then change your mapping (e.g. <code>"8903:80"</code>) or stop the conflicting container. The same "Error response from daemon" wrapper also appears for other daemon-side problems (invalid bind-mount source paths, out-of-memory, permission errors on volumes) &mdash; the text after the colon tells you which one you hit.</p>
+
+<h2>6. "error getting credentials" (tested)</h2>
+<p>This means your Docker config points at a credential helper binary that Docker can't successfully run. We reproduced it three distinct ways using a throwaway <code>DOCKER_CONFIG</code> directory (so no real login state was touched):</p>
+<pre><code>$ cat config.json
+{"credsStore": "nonexistenthelper"}
+$ DOCKER_CONFIG=/tmp/dockercredtest docker pull alpine:latest
+error getting credentials - err: exec: "docker-credential-nonexistenthelper": executable file not found in $PATH, out: ``</code></pre>
+<p>That's a global <code>credsStore</code> pointing at a helper that was never installed. A per-registry <code>credHelpers</code> entry fails identically, just scoped to the one registry:</p>
+<pre><code>$ cat config.json
+{"credHelpers": {"ghcr.io": "nonexistenthelper2"}}
+$ DOCKER_CONFIG=/tmp/dockercredtest docker pull ghcr.io/nonexistent/nonexistent:latest
+error getting credentials - err: exec: "docker-credential-nonexistenthelper2": executable file not found in $PATH, out: ``</code></pre>
+<p>The third case is different: the helper binary exists and is on <code>PATH</code>, but it exits with an error of its own (a common real cause &mdash; a credential-helper binary that's installed but misconfigured, e.g. pointing at a keychain/vault it can't reach):</p>
+<pre><code>$ cat config.json
+{"credsStore": "broken"}
+$ PATH=/tmp/dockercredtest/bin:$PATH DOCKER_CONFIG=/tmp/dockercredtest docker pull alpine:latest
+error getting credentials - err: exit status 1, out: ``</code></pre>
+<p>Note the different wording: <code>executable file not found in $PATH</code> (cases 1-2, the binary doesn't exist) versus <code>exit status 1</code> (case 3, the binary exists but failed internally) &mdash; useful for telling the two apart. We also confirmed the lookalike NOT to confuse this with: a real wrong username/password on <code>docker login</code> gives a completely different message, <code>Error response from daemon: Get "https://registry-1.docker.io/v2/": unauthorized: incorrect username or password</code> &mdash; no mention of "credentials" or a helper at all, since that's an auth failure, not a credential-helper failure.</p>
+<p><strong>Fix:</strong> check the <code>"credsStore"</code> / <code>"credHelpers"</code> keys in <code>~/.docker/config.json</code>. Confirm the referenced <code>docker-credential-*</code> binary is actually installed and on <code>PATH</code> (run <code>which docker-credential-&lt;name&gt;</code>); if it exists, run it directly to see its own error. If you don't need a helper at all, remove the key entirely to fall back to Docker's built-in (unencrypted) credential store.</p>
+
+<h2>7. "ContainerConfig" KeyError (legacy docker-compose v1 only)</h2>
+<p>This is a known bug in the old Python-based <code>docker-compose</code> v1 (not the <code>docker compose</code> v2 plugin used throughout this guide): after pulling a new image for a service, recreating the container could crash with a Python traceback ending in <code>KeyError: 'ContainerConfig'</code>, because v1 tried to read fields from the old container's inspect data that no longer matched the new image's metadata format. This box only has Compose v2 installed, where this code path doesn't exist, so we could not reproduce it &mdash; this section is from the public GitHub issues describing the bug, not measured here.</p>
+<p><strong>Fix:</strong> this bug is specific to the unmaintained v1 CLI. The real fix is to stop using it: install the <code>docker compose</code> v2 plugin (run <code>docker compose version</code> to confirm you have it) and use <code>docker compose</code> with a space instead of the hyphenated <code>docker-compose</code> binary. If you're stuck on v1 for now, a manual workaround is <code>docker compose rm -fsv &lt;service&gt;</code> followed by <code>docker compose up -d &lt;service&gt;</code> to force a clean recreate instead of an in-place update.</p>
+
+<h2>8. General debugging approach</h2>
+<ul>
+<li>Run <code>docker compose config</code> first. It resolves all your YAML, environment variables, and includes/extends into the final config Compose will actually use &mdash; most "invalid reference" and silent-typo bugs show up here before you even try to start anything.</li>
+<li>Add <code>--progress plain</code> (or set <code>COMPOSE_PROGRESS=plain</code>) if the default spinner output hides details on a pull or build failure.</li>
+<li>For networking errors, check <code>docker ps</code> and <code>ss -ltn</code> for what's already bound before assuming Docker itself is broken.</li>
+<li>If you only have DNS/header-level symptoms once the container is up (wrong headers, caching, HTTPS mismatches), check what your container's web server is actually sending with <a href="/tools/http-headers/">our HTTP header checker</a>, not the compose logs.</li>
+</ul>
+<aside class="cta"><strong>Check the exact headers and status your container&#x27;s web server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why do I get invalid reference format but my image name looks fine?</summary><p>Check for hidden issues: a trailing space, an environment variable that expanded to an empty or odd string, or uppercase letters in the repository path (only the tag may have uppercase). Run `docker compose config` to see the exact resolved value Compose will send to the daemon.</p></details>
+<details><summary>I fixed the typo but still get no such service, why?</summary><p>Compose may be reading a different file than you think, especially with multiple -f flags, a committed override file, or COMPOSE_FILE set in your environment. Run `docker compose config --services` to see the service list Compose actually resolved.</p></details>
+<details><summary>Is manifest unknown the same as image not found?</summary><p>Yes. Both mean the registry has no image+tag matching what you asked for. On Docker 29.8.1 we measured the daemon reporting it as &quot;failed to resolve reference ... not found&quot;; older Docker versions and some registries report it as &quot;manifest unknown&quot; or &quot;manifest for IMAGE:TAG not found&quot;. The fix is the same either way: check the tag actually exists.</p></details>
+<details><summary>Does upgrading from docker-compose v1 to docker compose v2 fix ContainerConfig KeyError?</summary><p>Yes, per the public bug reports this error is specific to the old Python v1 CLI&#x27;s container-recreate logic. The v2 plugin (invoked as `docker compose`, no hyphen) rewrote that logic in Go and does not have this code path. We could not reproduce the bug at all on this box because only v2 is installed, which is itself evidence the issue is v1-specific.</p></details>
+<details><summary>My port error says a different message than &#x27;port is already allocated&#x27;, what now?</summary><p>&quot;Error response from daemon&quot; is a generic prefix; everything after the colon is the real reason, and the daemon uses it for many unrelated failures (bad bind-mount paths, permission errors, out-of-memory kills). Read the text after &quot;Error response from daemon:&quot; literally &amp;mdash; it names the actual subsystem (networking, storage driver, OOM killer) that rejected the request.</p></details>
+<details><summary>What does &#x27;error getting credentials&#x27; actually mean?</summary><p>We measured this three ways: your Docker config&#x27;s credsStore or credHelpers points at a docker-credential-* helper binary that either doesn&#x27;t exist (&quot;executable file not found in $PATH&quot;) or exists but fails internally when run (&quot;exit status 1&quot;). It&#x27;s unrelated to whether your username/password are correct — that&#x27;s a separate &quot;unauthorized&quot; error from the daemon, not a credentials-helper error at all.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Docker 29.8.1 and Docker Compose v5.5.1 (the `docker compose` plugin, not the old Python `docker-compose`) on Linux. All commands used project name forever-guidetest and small/cached images (busybox:latest, httpd:alpine). Updated 2026-10-03: the credential-helper section is now measured too, using a scoped DOCKER_CONFIG pointed at a throwaway directory so no real Docker login state was touched. The ContainerConfig section remains from Docker&#x27;s own docs and GitHub issues, not measured (only Compose v2 is installed on this box, which doesn&#x27;t have that code path). PlainHeaders is our extension; Docker and Docker Compose are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

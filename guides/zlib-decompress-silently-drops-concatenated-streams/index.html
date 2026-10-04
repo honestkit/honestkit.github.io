@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zlib.decompress() Silently Drops Concatenated zlib Streams</title>
+<meta name="description" content="We measured zlib.decompress() on two concatenated zlib streams silently returning only the first one&#x27;s data — the second stream is discarded with no error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/zlib-decompress-silently-drops-concatenated-streams/">
+<meta property="og:title" content="zlib.decompress() Silently Drops Concatenated zlib Streams">
+<meta property="og:description" content="We measured zlib.decompress() on two concatenated zlib streams silently returning only the first one&#x27;s data — the second stream is discarded with no error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/zlib-decompress-silently-drops-concatenated-streams/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does zlib.decompress() handle multiple concatenated zlib streams?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured it silently returning only the first stream's decompressed data and discarding everything after that stream's end, with no exception or warning."}}, {"@type": "Question", "name": "How can I tell if zlib.decompress() dropped data from a concatenated stream?", "acceptedAnswer": {"@type": "Answer", "text": "Plain zlib.decompress() gives no signal at all \u2014 we confirmed it has no attribute exposing leftover bytes. You'd need to use zlib.decompressobj() instead, whose .unused_data attribute holds exactly the undecompressed bytes left over."}}, {"@type": "Question", "name": "Is this the same issue as zlib's unconsumed_tail gotcha?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we distinguished them: unconsumed_tail is about output being cut short within a single stream when max_length limits a decompressobj() call. This is about multiple independent zlib streams concatenated together, where only the first one gets decompressed at all."}}, {"@type": "Question", "name": "How do I decompress multiple zlib streams that were concatenated together?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed looping with a fresh zlib.decompressobj() each pass, feeding it the previous pass's .unused_data, and concatenating each pass's output recovers every stream completely."}}, {"@type": "Question", "name": "Does gzip have the same silent-drop problem with concatenated streams?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured gzip.decompress() and gzip.open() correctly decompressing concatenated gzip members (a standard multi-member .gz file) into the full combined data with no data loss, unlike raw zlib.compress() output."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>zlib decompress() Drops Concatenated Streams (tested)</h1>
+<p class="lead">If two separately <code>zlib.compress()</code>'d byte strings get concatenated (e.g. two chunks compressed independently then joined into one blob), decompressing the combined bytes in one call looks like it should give both back. We measured what actually happens: only the first stream's data comes back, and the rest vanishes without a trace.</p>
+<h2 id="repro1">1. zlib.decompress() stops after the first stream</h2>
+<pre><code>import zlib
+
+c1 = zlib.compress(b"first stream data")
+c2 = zlib.compress(b"second stream data")
+combined = c1 + c2
+
+zlib.decompress(combined)
+b'first stream data'</code></pre>
+<p><strong>Measured:</strong> <code>zlib.decompress(combined)</code> returns only <code>b"first stream data"</code> &mdash; "second stream data" is gone. No exception, no truncation warning, and no way to tell from the return value alone that there was more compressed data after the first stream ended.</p>
+
+<h2 id="repro2">2. The leftover bytes exist, but only decompressobj() exposes them</h2>
+<pre><code>d = zlib.decompressobj()
+out = d.decompress(combined)
+out
+b'first stream data'
+d.unused_data
+b'x\x9c+NM\xce\xcfKQ(.)JM\xccUHI,I\x04\x00B\x9a\x06\xe3'</code></pre>
+<p><strong>Measured:</strong> <code>decompressobj()</code> produces the identical first-stream-only output as the one-shot <code>decompress()</code> function, but it also populates <code>.unused_data</code> with the exact compressed bytes of the second stream that it didn't touch. The plain <code>zlib.decompress()</code> function has no equivalent attribute &mdash; those bytes are simply discarded when you use it, with nothing left to recover them from.</p>
+
+<h2 id="repro3">3. Why: a zlib stream has a defined end, and decompress() stops there</h2>
+<p>Per the <a href="https://docs.python.org/3/library/zlib.html#zlib.decompressobj">Python zlib docs</a>, each zlib-compressed stream ends with a checksum trailer that marks where that stream's data stops. <code>decompress()</code>/<code>decompressobj().decompress()</code> correctly recognize that boundary and stop there &mdash; they were never designed to concatenate multiple independent streams, so anything after the first stream's end is leftover input, not part of the same message. This is a different (and much quieter) failure mode than the already-documented <code>unconsumed_tail</code> gotcha, which is about <em>output</em> buffer limits within one stream; this one is about multiple independent streams being silently merged into one input.</p>
+
+<h2 id="fix">4. Fix: loop on unused_data to recover every concatenated stream</h2>
+<pre><code>remaining = combined
+full = b""
+while remaining:
+    d = zlib.decompressobj()
+    full += d.decompress(remaining)
+    remaining = d.unused_data
+
+full
+b'first stream datasecond stream data'</code></pre>
+<p><strong>Measured:</strong> creating a fresh <code>decompressobj()</code> for each pass and feeding it whatever <code>unused_data</code> is left over from the previous pass recovers both streams completely. This only matters if something in your pipeline concatenates independently-compressed zlib streams (gzip handles this case correctly on its own for multi-member <code>.gz</code> files &mdash; this gap is specific to raw <code>zlib.compress()</code> output, not <code>gzip</code>).</p>
+
+<aside class="cta"><strong>Debugging a compressed payload an API streams back in pieces? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does zlib.decompress() handle multiple concatenated zlib streams?</summary><p>No — we measured it silently returning only the first stream&#x27;s decompressed data and discarding everything after that stream&#x27;s end, with no exception or warning.</p></details>
+<details><summary>How can I tell if zlib.decompress() dropped data from a concatenated stream?</summary><p>Plain zlib.decompress() gives no signal at all — we confirmed it has no attribute exposing leftover bytes. You&#x27;d need to use zlib.decompressobj() instead, whose .unused_data attribute holds exactly the undecompressed bytes left over.</p></details>
+<details><summary>Is this the same issue as zlib&#x27;s unconsumed_tail gotcha?</summary><p>No — we distinguished them: unconsumed_tail is about output being cut short within a single stream when max_length limits a decompressobj() call. This is about multiple independent zlib streams concatenated together, where only the first one gets decompressed at all.</p></details>
+<details><summary>How do I decompress multiple zlib streams that were concatenated together?</summary><p>We confirmed looping with a fresh zlib.decompressobj() each pass, feeding it the previous pass&#x27;s .unused_data, and concatenating each pass&#x27;s output recovers every stream completely.</p></details>
+<details><summary>Does gzip have the same silent-drop problem with concatenated streams?</summary><p>No — we measured gzip.decompress() and gzip.open() correctly decompressing concatenated gzip members (a standard multi-member .gz file) into the full combined data with no data loss, unlike raw zlib.compress() output.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in zlib module: compressed two separate messages independently with zlib.compress(), concatenated the two compressed byte strings, then decompressed the combined bytes with zlib.decompress() and separately with zlib.decompressobj(). PlainHeaders is our extension; Python&#x27;s zlib module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

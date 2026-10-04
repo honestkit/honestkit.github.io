@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python RecursionError: Maximum Recursion Depth Exceeded</title>
+<meta name="description" content="We reproduced RecursionError 5 ways on Python 3.13.5: no base case, mutual recursion, comparison/repr recursion. Exact messages and fixes for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-recursionerror-maximum-recursion-depth-exceeded/">
+<meta property="og:title" content="Python RecursionError: Maximum Recursion Depth Exceeded">
+<meta property="og:description" content="We reproduced RecursionError 5 ways on Python 3.13.5: no base case, mutual recursion, comparison/repr recursion. Exact messages and fixes for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-recursionerror-maximum-recursion-depth-exceeded/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does RecursionError: maximum recursion depth exceeded mean?", "acceptedAnswer": {"@type": "Answer", "text": "A function called itself, directly or through other functions, more times than Python's recursion limit (1000 by default) allows without ever hitting a condition that stops the recursion. It is almost always caused by a missing or unreachable base case."}}, {"@type": "Question", "name": "Why doesn't my function's base case stop the recursion?", "acceptedAnswer": {"@type": "Answer", "text": "The base case may be unreachable for the actual inputs reaching it - for example checking n == 0 while calling with negative numbers, which count past zero forever, or using == on floats that never land exactly on the base value."}}, {"@type": "Question", "name": "Is it safe to just raise the recursion limit with sys.setrecursionlimit()?", "acceptedAnswer": {"@type": "Answer", "text": "Only a little, and not as a real fix. It raises Python's own counter but does not add actual C stack space, so setting it too high risks a hard segmentation fault instead of a catchable RecursionError. Prefer an iterative rewrite for genuinely deep recursion."}}, {"@type": "Question", "name": "Can a class's __eq__ or __repr__ method cause this error?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. If __eq__ compares self == other instead of specific attributes, or __repr__ calls repr(self) instead of formatting fields, each call triggers another call to the same method, recursing until the limit is hit. We reproduced both on Python 3.13.5."}}, {"@type": "Question", "name": "Should I catch RecursionError inside the recursive function itself?", "acceptedAnswer": {"@type": "Answer", "text": "No - we tested this and the except block re-runs once per stack frame as the exception unwinds, not once total, producing repeated output. Catch it once at the outermost, non-recursive caller instead."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>RecursionError: maximum recursion depth exceeded (tested)</h1>
+<p class="lead"><code>RecursionError: maximum recursion depth exceeded</code> means a function called itself (directly or indirectly) more times than Python's recursion limit allows, almost always because it's missing a base case that would stop the recursion, or the base case is unreachable for the input given.</p>
+<h2>1. The default limit and five ways to hit it</h2>
+<p>Python's default recursion limit on this interpreter (3.13.5) is 1000 stack frames, checked with <code>sys.getrecursionlimit()</code>. We triggered the same error five different ways; the message text is identical across all of them in this Python version:</p>
+<table>
+<tr><th>Code pattern</th><th>Exact error</th></tr>
+<tr><td><code>def f(): f()</code> &mdash; no base case at all</td><td><code>RecursionError: maximum recursion depth exceeded</code></td></tr>
+<tr><td><code>def fact(n): return n * fact(n-1)</code> &mdash; missing <code>if n == 0: return 1</code></td><td><code>RecursionError: maximum recursion depth exceeded</code></td></tr>
+<tr><td>Two functions calling each other (<code>a()</code> calls <code>b()</code> calls <code>a()</code>), neither has a base case</td><td><code>RecursionError: maximum recursion depth exceeded</code></td></tr>
+<tr><td>A class whose <code>__eq__</code> compares <code>self == other</code> instead of a real field</td><td><code>RecursionError: maximum recursion depth exceeded</code></td></tr>
+<tr><td>A class whose <code>__repr__</code> calls <code>repr(self)</code> instead of formatting fields</td><td><code>RecursionError: maximum recursion depth exceeded</code></td></tr>
+</table>
+<p>Older Python versions and many existing tutorials show longer messages with a suffix, like "...exceeded while calling a Python object" or "...exceeded in comparison". On this interpreter (3.13.5) every case above produced the same plain message with no suffix &mdash; if you're on an older Python and see a suffixed version, it's the same error, just older wording.</p>
+
+<h2>2. The real bug is almost always a missing or unreachable base case</h2>
+<p>A working recursive function needs a condition that stops it without calling itself again:</p>
+<pre><code># broken: no base case, recurses forever
+def fact(n):
+    return n * fact(n - 1)
+
+# fixed: base case stops the recursion at n == 0
+def fact(n):
+    if n == 0:
+        return 1
+    return n * fact(n - 1)</code></pre>
+<p>A base case that exists but is unreachable causes the same error &mdash; for example checking <code>if n == 0</code> but calling with a negative number, which counts down past zero forever (<code>-1, -2, -3, ...</code>), or a float input that never exactly equals an integer base case.</p>
+
+<h2>3. Mutual recursion hides the problem across two functions</h2>
+<p>The same missing-base-case bug, split across two functions, is harder to spot because neither one looks recursive on its own:</p>
+<pre><code>def is_even(n):
+    if n == 0: return True
+    return is_odd(n - 1)
+def is_odd(n):
+    if n == 0: return False      # base case present here
+    return is_even(n - 1)        # but called with n &lt; 0, it never hits either base case</code></pre>
+<p>Fix: trace the actual call chain, not just one function, and check that every path through <em>both</em> functions terminates.</p>
+
+<h2>4. Dunder methods can recurse invisibly</h2>
+<p>A subtle variant: implementing <code>__eq__</code>, <code>__repr__</code>, or <code>__str__</code> in a way that calls itself instead of a real attribute. This is easy to miss because the recursive call doesn't look like a function call &mdash; it's triggered by <code>==</code>, <code>print()</code>, or f-strings:</p>
+<pre><code>class Bad:
+    def __eq__(self, other):
+        return self == other   # calls __eq__ again, forever
+&gt;&gt;&gt; Bad() == Bad()
+RecursionError: maximum recursion depth exceeded</code></pre>
+<p>Fix: compare specific attributes (<code>self.value == other.value</code>), never <code>self</code> against <code>other</code> directly inside <code>__eq__</code> itself.</p>
+
+<h2>5. Deep-but-legitimate recursion: raise the limit, or don't</h2>
+<p>A genuinely large but finite recursion (deep tree traversal, unmemoized Fibonacci) can also exceed the default 1000-frame limit even with a correct base case. <code>sys.setrecursionlimit(n)</code> raises the ceiling, but it does not create more actual C stack space &mdash; set it too high and you risk a real segmentation fault instead of a catchable Python exception, which is strictly worse.</p>
+<pre><code>import sys
+sys.setrecursionlimit(5000)  # raises the ceiling, doesn't add real stack space</code></pre>
+<p>For deep-but-legitimate recursion, prefer converting to an iterative loop with an explicit stack/queue, or add memoization (<code>functools.lru_cache</code>) if the same calls repeat, which often reduces both the depth and the total work.</p>
+
+<h2>6. You can catch it, but reconsider doing so inside the recursive function itself</h2>
+<p><code>RecursionError</code> is a regular exception, catchable with <code>except RecursionError:</code>. But catching it inside the same recursive function re-triggers the handler at every stack level as the exception unwinds, which we confirmed: a <code>try/except RecursionError: raise</code> wrapped around the recursive call printed its handler once per unwound frame, not once total. Catch it at the top-level caller instead, not inside the recursive function.</p>
+<h2>7. Fix checklist</h2>
+<ul>
+<li>Every recursive function needs a base case that is actually reachable from every valid input, including edge cases like negative numbers or empty input.</li>
+<li>For mutual recursion, trace the call chain across both functions, not just one.</li>
+<li>Check <code>__eq__</code>/<code>__repr__</code>/<code>__str__</code> for comparisons or formatting that reference <code>self</code> recursively instead of a concrete field.</li>
+<li>For deep-but-correct recursion, prefer an iterative rewrite or <code>functools.lru_cache</code> over raising <code>sys.setrecursionlimit()</code>, which trades a safe Python exception for a riskier hard crash.</li>
+<li>Catch <code>RecursionError</code> at the outermost call, not inside the recursive function.</li>
+</ul>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does RecursionError: maximum recursion depth exceeded mean?</summary><p>A function called itself, directly or through other functions, more times than Python&#x27;s recursion limit (1000 by default) allows without ever hitting a condition that stops the recursion. It is almost always caused by a missing or unreachable base case.</p></details>
+<details><summary>Why doesn&#x27;t my function&#x27;s base case stop the recursion?</summary><p>The base case may be unreachable for the actual inputs reaching it - for example checking n == 0 while calling with negative numbers, which count past zero forever, or using == on floats that never land exactly on the base value.</p></details>
+<details><summary>Is it safe to just raise the recursion limit with sys.setrecursionlimit()?</summary><p>Only a little, and not as a real fix. It raises Python&#x27;s own counter but does not add actual C stack space, so setting it too high risks a hard segmentation fault instead of a catchable RecursionError. Prefer an iterative rewrite for genuinely deep recursion.</p></details>
+<details><summary>Can a class&#x27;s __eq__ or __repr__ method cause this error?</summary><p>Yes. If __eq__ compares self == other instead of specific attributes, or __repr__ calls repr(self) instead of formatting fields, each call triggers another call to the same method, recursing until the limit is hit. We reproduced both on Python 3.13.5.</p></details>
+<details><summary>Should I catch RecursionError inside the recursive function itself?</summary><p>No - we tested this and the except block re-runs once per stack frame as the exception unwinds, not once total, producing repeated output. Catch it once at the outermost, non-recursive caller instead.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5 on Linux using plain python3 one-liners. Every error below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>
