@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>heapq Breaks Silently on NaN -- Even Other Values Get Misordered</title>
+<meta name="description" content="We measured Python 3.13.5: heapify()/heappush() with one NaN gives no error, but heappop() can return even the non-NaN values out of order.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-heapq-nan-silently-corrupts-heap-invariant/">
+<meta property="og:title" content="heapq Breaks Silently on NaN -- Even Other Values Get Misordered">
+<meta property="og:description" content="We measured Python 3.13.5: heapify()/heappush() with one NaN gives no error, but heappop() can return even the non-NaN values out of order.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-heapq-nan-silently-corrupts-heap-invariant/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does heapq raise an error or warning if you heapify a list containing NaN?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it with warnings.simplefilter('error') active (which turns warnings into exceptions) around heapify(), heappush() and heappop() calls on data containing one float('nan'), and none of them raised anything."}}, {"@type": "Question", "name": "If I put one NaN in my data, does only the NaN end up out of place?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured a case where popping a heap containing [28, 42, 32, 6, nan, 10] returned the non-NaN values in the order [10, 28, 32, 6, 42], which is not sorted; 6 came out after 32 even though that comparison never involved NaN."}}, {"@type": "Question", "name": "Can I fix a NaN-corrupted heap by just popping until the NaN comes out?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured that popping elements before reaching the NaN doesn't repair the heap; the elements that pop out after it were still measurably out of order, because the structural corruption happened during heapify()/heappush(), not at pop time."}}, {"@type": "Question", "name": "How do I avoid this?", "acceptedAnswer": {"@type": "Answer", "text": "Filter out NaN (and anything else that isn't comparable with your other data under a single total order, like mixing NaN into float data) before calling heapify() or heappush() -- heapq never checks this for you, and we measured zero errors or warnings when it's violated."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>heapq: A Single NaN Silently Corrupts the Whole Heap Invariant (tested)</h1>
+<p class="lead"><code>heapq</code> maintains its invariant with comparisons like <code>child &lt; parent</code>, which only works if every element in the heap is comparable with every other element under a consistent total order. <code>float('nan')</code> breaks that assumption: <code>nan &lt; x</code> and <code>x &lt; nan</code> are both always <code>False</code>, for every <code>x</code>, including <code>nan</code> itself. We measured what one stray NaN does to <code>heapify()</code>, <code>heappush()</code> and <code>heappop()</code> on otherwise-ordinary numeric data.</p>
+<h2 id="repro1">1. One NaN in the input is enough -- with no error and no warning</h2>
+<pre><code>import heapq, math, warnings
+warnings.simplefilter("error")   # turn warnings into exceptions, to prove none fire
+
+data = [5, 3, math.nan, 1, 4, 2]
+heapq.heapify(data)
+print("heapified:", data)
+print("popped:   ", [heapq.heappop(data) for _ in range(len(data))])</code></pre>
+<pre><code>heapified: [1, 3, 2, 5, 4, nan]
+popped:    [1, 2, nan, 3, 4, 5]</code></pre>
+<p><strong>Measured:</strong> the call ran to completion with <code>warnings.simplefilter("error")</code> active, so if Python had raised so much as a warning it would have become a visible exception -- it didn't. The result isn't just "NaN ends up somewhere odd": <code>nan</code> pops out <em>before</em> <code>3</code>, <code>4</code> and <code>5</code>, which makes the whole sequence not sorted by any definition, silently.</p>
+
+<h2 id="repro2">2. The corruption isn't limited to NaN -- other values get misordered too</h2>
+<pre><code>import heapq, math
+
+data = [28, 42, 32, 6, math.nan, 10]
+h = list(data)
+heapq.heapify(h)
+popped = [heapq.heappop(h) for _ in range(len(h))]
+non_nan = [x for x in popped if not (isinstance(x, float) and math.isnan(x))]
+
+print("popped:            ", popped)
+print("non-NaN pop order: ", non_nan)
+print("correct sorted order:", sorted(x for x in data if x == x))</code></pre>
+<pre><code>popped:             [10, 28, 32, 6, nan, 42]
+non-NaN pop order:  [10, 28, 32, 6, 42]
+correct sorted order: [6, 10, 28, 32, 42]</code></pre>
+<p><strong>Measured:</strong> <code>6</code> comes out <em>after</em> <code>32</code> -- a comparison that never even involves <code>nan</code> directly. One unorderable element anywhere in the data silently poisons the sift-up/sift-down logic enough to misplace unrelated real numbers too, not just the NaN itself.</p>
+
+<h2 id="repro3">3. Removing the NaN doesn't undo the damage already done</h2>
+<pre><code>import heapq, math
+
+data = [28, 42, 32, 6, math.nan, 10]
+h = list(data)
+heapq.heapify(h)
+
+first = heapq.heappop(h)          # happens to be the correct minimum, 10
+rest = [heapq.heappop(h) for _ in range(len(h))]
+
+print("first pop:", first)
+print("remaining pops:", rest)</code></pre>
+<pre><code>first pop: 10
+remaining pops: [28, 32, 6, nan, 42]</code></pre>
+<p><strong>Measured:</strong> the very first pop happened to return the correct minimum -- but the heap was already structurally corrupted by the earlier <code>heapify()</code>, so every pop after it is still wrong (<code>6</code> still surfaces after <code>32</code>). <code>nan</code> is still sitting unresolved in the middle of the structure; nothing about popping other elements around it repairs the invariant. The moment a NaN is sifted into a heap, the breakage outlives any single comparison involving it.</p>
+<aside class="cta"><strong>Pushing floats onto a heapq heap and one might come from a division or average that could be NaN? Check for that first -- heapq won&#x27;t:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does heapq raise an error or warning if you heapify a list containing NaN?</summary><p>No -- we measured it with warnings.simplefilter(&#x27;error&#x27;) active (which turns warnings into exceptions) around heapify(), heappush() and heappop() calls on data containing one float(&#x27;nan&#x27;), and none of them raised anything.</p></details>
+<details><summary>If I put one NaN in my data, does only the NaN end up out of place?</summary><p>No -- we measured a case where popping a heap containing [28, 42, 32, 6, nan, 10] returned the non-NaN values in the order [10, 28, 32, 6, 42], which is not sorted; 6 came out after 32 even though that comparison never involved NaN.</p></details>
+<details><summary>Can I fix a NaN-corrupted heap by just popping until the NaN comes out?</summary><p>No -- we measured that popping elements before reaching the NaN doesn&#x27;t repair the heap; the elements that pop out after it were still measurably out of order, because the structural corruption happened during heapify()/heappush(), not at pop time.</p></details>
+<details><summary>How do I avoid this?</summary><p>Filter out NaN (and anything else that isn&#x27;t comparable with your other data under a single total order, like mixing NaN into float data) before calling heapify() or heappush() -- heapq never checks this for you, and we measured zero errors or warnings when it&#x27;s violated.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in heapq module: heapified and pushed lists containing one float(&#x27;nan&#x27;) among ordinary numbers, popped everything back out, and compared against sorted(); also ran the same calls with warnings.simplefilter(&#x27;error&#x27;) active to confirm nothing is raised. PlainHeaders is our extension; Python&#x27;s heapq module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

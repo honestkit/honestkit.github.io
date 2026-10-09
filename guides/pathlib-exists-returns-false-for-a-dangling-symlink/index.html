@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Path.exists() Is False for a Dangling Symlink -- It&#x27;s Still There</title>
+<meta name="description" content="We measured Path.exists() returning False for a symlink whose target is missing, even though is_symlink() is True and the entry still shows up in os.listdir().">
+<link rel="canonical" href="https://honestkit.github.io/guides/pathlib-exists-returns-false-for-a-dangling-symlink/">
+<meta property="og:title" content="Path.exists() Is False for a Dangling Symlink -- It&#x27;s Still There">
+<meta property="og:description" content="We measured Path.exists() returning False for a symlink whose target is missing, even though is_symlink() is True and the entry still shows up in os.listdir().">
+<meta property="og:url" content="https://honestkit.github.io/guides/pathlib-exists-returns-false-for-a-dangling-symlink/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Path.exists() follow symlinks?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured it following the link and checking whether the target exists, not whether the symlink itself is present. A dangling symlink's target check comes back False."}}, {"@type": "Question", "name": "How do I detect a symlink whose target is missing?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed path.is_symlink() and not path.exists() together identify a dangling symlink -- is_symlink() doesn't follow the link, so it stays True even when the target is gone."}}, {"@type": "Question", "name": "Does a dangling symlink raise an exception when checked?", "acceptedAnswer": {"@type": "Answer", "text": "Not with .exists() or .is_symlink() -- both return plain booleans silently. We confirmed .stat() (which follows the link) is what raises FileNotFoundError."}}, {"@type": "Question", "name": "Will a cleanup loop based on path.exists() find broken symlinks?", "acceptedAnswer": {"@type": "Answer", "text": "We measured a dangling symlink being treated the same as a nonexistent path by a .exists() check, so a loop that only acts when .exists() is True will silently skip every broken symlink without removing or flagging it."}}, {"@type": "Question", "name": "Is there a version of exists() that doesn't follow symlinks?", "acceptedAnswer": {"@type": "Answer", "text": "os.path.lexists() is the equivalent that checks the link itself rather than its target -- we confirmed it returns True for a dangling symlink where Path.exists() returns False."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pathlib Path.exists() Returns False for a Dangling Symlink (tested)</h1>
+<p class="lead">A symlink can exist on disk while pointing at a target that doesn't. We measured what <code>pathlib.Path.exists()</code> reports for exactly that case: <code>False</code> &mdash; even though the symlink itself is a real directory entry.</p>
+<h2 id="repro1">1. A symlink pointing at nothing</h2>
+<pre><code>from pathlib import Path
+import os
+
+p = Path("/tmp/dangling_link")
+p.symlink_to("/tmp/nonexistent_target")
+
+print("is_symlink:", p.is_symlink())
+print("exists:", p.exists())
+print("os.path.lexists:", os.path.lexists(p))
+print("in os.listdir:", p.name in os.listdir("/tmp"))</code></pre>
+<pre><code>is_symlink: True
+exists: False
+os.path.lexists: True
+in os.listdir: True</code></pre>
+<p><strong>Measured:</strong> the symlink is real &mdash; <code>is_symlink()</code> is <code>True</code>, <code>os.path.lexists()</code> (which doesn't follow links) is <code>True</code>, and it shows up in a plain directory listing. But <code>.exists()</code> follows the link to check the <em>target</em>, finds nothing there, and reports <code>False</code> &mdash; no exception, no distinction in the return value between "nothing here" and "a broken link is here."</p>
+
+<h2 id="repro2">2. Where this silently breaks code</h2>
+<pre><code>def process_if_present(path):
+    if path.exists():
+        return path.stat().st_size
+    return None   # intended for "nothing to do here"
+
+print(process_if_present(p))</code></pre>
+<pre><code>None</code></pre>
+<p><strong>Measured:</strong> a dangling symlink is treated identically to "this path doesn't exist at all," silently taking the same branch as a genuinely absent file. A cleanup script written as <code>for f in dir.iterdir(): if f.exists(): keep(f)</code> will skip every broken symlink without logging anything, leaving them behind indefinitely instead of flagging or removing them.</p>
+
+<h2 id="fix">3. Fix: check is_symlink() separately, or use lexists</h2>
+<pre><code>if p.is_symlink() and not p.exists():
+    print(p, "is a broken symlink")
+    # p.unlink() to remove it, or re-point it, depending on intent</code></pre>
+<pre><code>/tmp/dangling_link is a broken symlink</code></pre>
+<p><strong>Measured:</strong> checking <code>is_symlink()</code> alongside <code>exists()</code> distinguishes "never existed" from "exists as a link, but the target is gone" &mdash; the two cases <code>.exists()</code> alone can't tell apart. <code>p.unlink()</code> removes the dangling link itself (it does not need to follow the link to work, unlike <code>.exists()</code>).</p>
+<aside class="cta"><strong>Debugging a cleanup script that keeps skipping a file? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Path.exists() follow symlinks?</summary><p>Yes -- we measured it following the link and checking whether the target exists, not whether the symlink itself is present. A dangling symlink&#x27;s target check comes back False.</p></details>
+<details><summary>How do I detect a symlink whose target is missing?</summary><p>We confirmed path.is_symlink() and not path.exists() together identify a dangling symlink -- is_symlink() doesn&#x27;t follow the link, so it stays True even when the target is gone.</p></details>
+<details><summary>Does a dangling symlink raise an exception when checked?</summary><p>Not with .exists() or .is_symlink() -- both return plain booleans silently. We confirmed .stat() (which follows the link) is what raises FileNotFoundError.</p></details>
+<details><summary>Will a cleanup loop based on path.exists() find broken symlinks?</summary><p>We measured a dangling symlink being treated the same as a nonexistent path by a .exists() check, so a loop that only acts when .exists() is True will silently skip every broken symlink without removing or flagging it.</p></details>
+<details><summary>Is there a version of exists() that doesn&#x27;t follow symlinks?</summary><p>os.path.lexists() is the equivalent that checks the link itself rather than its target -- we confirmed it returns True for a dangling symlink where Path.exists() returns False.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in pathlib and os modules: created a symlink pointing at a nonexistent target, then checked Path.exists(), Path.is_symlink(), os.path.lexists(), Path.stat(), and whether os.listdir() reports the entry. PlainHeaders is our extension; Python&#x27;s pathlib and os modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

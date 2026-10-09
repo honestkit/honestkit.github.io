@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLite &#x27;Incomplete Input&#x27; / &#x27;Unrecognized Token&#x27; — Tested</title>
+<meta name="description" content="We reproduced SQLite&#x27;s three distinct syntax-error messages in Python: incomplete input, unrecognized token, and near X: syntax error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite-incomplete-input/">
+<meta property="og:title" content="SQLite &#x27;Incomplete Input&#x27; / &#x27;Unrecognized Token&#x27; — Tested">
+<meta property="og:description" content="We reproduced SQLite&#x27;s three distinct syntax-error messages in Python: incomplete input, unrecognized token, and near X: syntax error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite-incomplete-input/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What's the difference between \"incomplete input\" and \"near X: syntax error\"?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed incomplete input means the statement ends too early while every token so far was valid, whereas near X: syntax error means a specific token exists but is in a position the grammar rejects \u2014 the message names that exact token."}}, {"@type": "Question", "name": "Why does SQLite say \"unrecognized token\" instead of a syntax error for a stray #?", "acceptedAnswer": {"@type": "Answer", "text": "Because we measured it one level below a syntax error: the tokenizer itself can't classify the character as any valid SQL token type, which also happens for an unterminated string literal \u2014 the rest of the statement gets swallowed into one bad token."}}, {"@type": "Question", "name": "Why do I get \"You can only execute one statement at a time\" instead of a SQL error?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed this is Python's sqlite3 module rejecting multiple semicolon-separated statements in a single execute() call as a deliberate anti-injection safeguard, not something SQLite's parser itself complains about; use executescript() if you need multiple statements."}}, {"@type": "Question", "name": "What's the most common real cause of \"incomplete input\" in production code?", "acceptedAnswer": {"@type": "Answer", "text": "A truncated query string \u2014 we reproduced it from a dangling SELECT * FROM with nothing after, which matches what typically happens when string formatting or concatenation drops the rest of a query, for example on the last iteration of a loop that builds clauses."}}, {"@type": "Question", "name": "Does an unterminated string literal always produce \"unrecognized token\"?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we confirmed SELECT 'unterminated with no closing quote produces unrecognized token naming the whole swallowed fragment, which is the classic signature of a value containing an apostrophe that was concatenated into SQL instead of passed as a bound parameter."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLite: Incomplete Input / Unrecognized Token (tested)</h1>
+<p class="lead">SQLite's parser gives three different messages for a broken query, and which one you get tells you something specific about what's wrong. We fed it four kinds of broken SQL and recorded exactly which error each one produces.</p>
+<h2 id="repro1">1. "incomplete input" — the statement just stops</h2>
+<pre><code>con.execute("SELECT * FROM")
+sqlite3.OperationalError: incomplete input
+
+con.execute("SELECT * FROM t WHERE")
+sqlite3.OperationalError: incomplete input
+
+con.execute("CREATE TABLE")
+sqlite3.OperationalError: incomplete input</code></pre>
+<p><strong>Measured:</strong> this message appears when every token so far is valid SQL grammar, but the statement ends before it's grammatically complete &mdash; a dangling keyword with nothing after it. In practice this is almost always a string-building bug: an f-string or <code>.format()</code> call that got truncated, a loop that appends clauses but forgot one on the last iteration, or a copy-paste that dropped the rest of the query.</p>
+
+<h2 id="repro2">2. "near X: syntax error" — a real token in the wrong place</h2>
+<pre><code>con.execute("SELECT * FORM t")
+sqlite3.OperationalError: near "FORM": syntax error
+
+con.execute("SELEKT 1")
+sqlite3.OperationalError: near "SELEKT": syntax error
+
+con.execute("SELECT 1 FROM t WHERE id @1")
+sqlite3.OperationalError: near "@1": syntax error</code></pre>
+<p><strong>Measured:</strong> this fires when SQLite's tokenizer recognizes every character as a valid token, but the sequence doesn't parse &mdash; usually a typo'd keyword (<code>FORM</code> instead of <code>FROM</code>) or a token in a position the grammar doesn't allow there. The quoted text names the exact offending token, which makes this the easiest of the three to fix on sight.</p>
+
+<h2 id="repro3">3. "unrecognized token" — a character that isn't valid SQL at all</h2>
+<pre><code>con.execute("SELECT # FROM t")
+sqlite3.OperationalError: unrecognized token: "#"
+
+con.execute("SELECT 1 FROM t WHERE id = $")
+sqlite3.OperationalError: unrecognized token: "$"
+
+con.execute("SELECT 'unterminated")
+sqlite3.OperationalError: unrecognized token: "'unterminated"</code></pre>
+<p><strong>Measured:</strong> this is a step below "near X" &mdash; the tokenizer itself can't classify the character, because it isn't part of SQLite's grammar in any context (a bare <code>#</code> or <code>$</code> outside a named parameter) or because a string literal's closing quote is missing, which swallows the rest of the statement into one unterminated token. An unterminated string is the most common real-world trigger: a value containing an apostrophe concatenated directly into SQL instead of passed as a bound parameter.</p>
+
+<h2 id="repro4">4. A different error: running two statements through execute()</h2>
+<pre><code>con.execute("SELECT 1; SELECT 2")
+sqlite3.ProgrammingError: You can only execute one statement at a time.</code></pre>
+<p><strong>Measured:</strong> this one isn't a parser complaint at all &mdash; it's Python's sqlite3 module deliberately rejecting multiple <code>;</code>-separated statements in a single <code>execute()</code> call, as a safety measure against SQL injection via statement stacking. Use <code>executescript()</code> if you genuinely need to run several statements at once.</p>
+
+<h2 id="fix">5. How to tell them apart fast</h2>
+<p>"Incomplete input" means something is missing &mdash; check for a truncated query string. "Near X: syntax error" names the exact wrong token &mdash; check spelling and clause order right there. "Unrecognized token" means a character the tokenizer has never heard of, or an unterminated string &mdash; check for unescaped quotes in concatenated values, which is also a strong signal you should switch to parameterized queries (<code>?</code> placeholders) instead of building SQL strings by hand.</p>
+
+<aside class="cta"><strong>Debugging a half-built API request instead of a database query? Check the real headers it sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What&#x27;s the difference between &quot;incomplete input&quot; and &quot;near X: syntax error&quot;?</summary><p>We confirmed incomplete input means the statement ends too early while every token so far was valid, whereas near X: syntax error means a specific token exists but is in a position the grammar rejects — the message names that exact token.</p></details>
+<details><summary>Why does SQLite say &quot;unrecognized token&quot; instead of a syntax error for a stray #?</summary><p>Because we measured it one level below a syntax error: the tokenizer itself can&#x27;t classify the character as any valid SQL token type, which also happens for an unterminated string literal — the rest of the statement gets swallowed into one bad token.</p></details>
+<details><summary>Why do I get &quot;You can only execute one statement at a time&quot; instead of a SQL error?</summary><p>We confirmed this is Python&#x27;s sqlite3 module rejecting multiple semicolon-separated statements in a single execute() call as a deliberate anti-injection safeguard, not something SQLite&#x27;s parser itself complains about; use executescript() if you need multiple statements.</p></details>
+<details><summary>What&#x27;s the most common real cause of &quot;incomplete input&quot; in production code?</summary><p>A truncated query string — we reproduced it from a dangling SELECT * FROM with nothing after, which matches what typically happens when string formatting or concatenation drops the rest of a query, for example on the last iteration of a loop that builds clauses.</p></details>
+<details><summary>Does an unterminated string literal always produce &quot;unrecognized token&quot;?</summary><p>Yes — we confirmed SELECT &#x27;unterminated with no closing quote produces unrecognized token naming the whole swallowed fragment, which is the classic signature of a value containing an apostrophe that was concatenated into SQL instead of passed as a bound parameter.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in sqlite3 module, running each malformed SQL string directly through con.execute() and printing the exact exception text. Every message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s sqlite3 is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

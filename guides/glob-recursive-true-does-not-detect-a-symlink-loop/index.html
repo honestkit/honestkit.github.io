@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>glob&#x27;s recursive=True Walks Into a Symlink Loop (Tested)</title>
+<meta name="description" content="We measured glob.glob(&#x27;**&#x27;, recursive=True) walking ~40 levels into a symlink loop before ELOOP stopped it, returning 83 nested paths instead of stopping there.">
+<link rel="canonical" href="https://honestkit.github.io/guides/glob-recursive-true-does-not-detect-a-symlink-loop/">
+<meta property="og:title" content="glob&#x27;s recursive=True Walks Into a Symlink Loop (Tested)">
+<meta property="og:description" content="We measured glob.glob(&#x27;**&#x27;, recursive=True) walking ~40 levels into a symlink loop before ELOOP stopped it, returning 83 nested paths instead of stopping there.">
+<meta property="og:url" content="https://honestkit.github.io/guides/glob-recursive-true-does-not-detect-a-symlink-loop/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does glob.glob(recursive=True) detect a symlink loop?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it walking about 40 levels into a self-referential symlink before an OS-level ELOOP limit silently stopped it, returning every intermediate repeated path as a real match."}}, {"@type": "Question", "name": "Does glob.glob() raise an error for a symlink loop?", "acceptedAnswer": {"@type": "Answer", "text": "No exception in our test -- it returned a normal-looking list of 83 paths, just with the same directory segment repeated dozens of times, with no indication anything was wrong."}}, {"@type": "Question", "name": "Does os.walk() have the same problem?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we confirmed os.walk()'s default followlinks=False never enters the symlinked directory at all, stopping the tree traversal immediately rather than looping."}}, {"@type": "Question", "name": "Is there a way to make glob.glob() stop at a symlink loop safely?", "acceptedAnswer": {"@type": "Answer", "text": "We found no built-in option -- recursive glob has no cycle detection or a followlinks-style parameter; os.walk(followlinks=False) is the safer tool for trees that might contain loops."}}, {"@type": "Question", "name": "Could this cause a real performance problem on deep or wide loops?", "acceptedAnswer": {"@type": "Answer", "text": "We measured our test loop resolving in under 3ms because the OS's own symlink-depth limit caught it quickly, but a tree with multiple distinct loops or very long real paths could multiply the wasted work before that limit is hit."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>glob.glob(recursive=True) Does Not Detect a Symlink Loop (tested)</h1>
+<p class="lead">A symlink that points back at one of its own ancestor directories creates a loop. We measured what <code>glob.glob()</code>'s recursive <code>**</code> pattern does when it walks into one, and it doesn't notice.</p>
+<h2 id="repro1">1. Recursive glob walks the loop dozens of levels deep</h2>
+<pre><code>import glob, time
+
+# /tmp/globloop/sub/loop -> /tmp/globloop (points back at an ancestor)
+
+t0 = time.time()
+results = glob.glob("/tmp/globloop/**", recursive=True)
+print("count:", len(results), "time:", time.time() - t0)
+print("deepest:", results[-1])</code></pre>
+<pre><code>count: 83 time: 0.0028s
+deepest: /tmp/globloop/sub/loop/sub/loop/sub/loop/.../sub/loop</code></pre>
+<p><strong>Measured:</strong> the result contains the same <code>sub/loop</code> segment repeated about 40 times before the walk stops. <code>glob.glob()</code> never raises an exception or returns early for the loop itself -- it just keeps re-entering the symlink until an internal OS-level "too many levels of symbolic links" check silently cuts it off, and returns every intermediate path it generated along the way as real matches.</p>
+
+<h2 id="repro2">2. Why: recursive glob doesn't track visited directories</h2>
+<pre><code>import os
+
+# os.walk's default behaviour on the same tree, for contrast
+count = 0
+for root, dirs, files in os.walk("/tmp/globloop"):
+    count += 1
+    if count > 10:
+        break
+print("os.walk entries visited (followlinks=False default):", count)</code></pre>
+<pre><code>os.walk entries visited (followlinks=False default): 3</code></pre>
+<p><strong>Measured:</strong> <code>os.walk()</code>'s default <code>followlinks=False</code> simply never enters the symlink, stopping the tree at 3 real entries. <code>glob.glob(recursive=True)</code> has no equivalent switch -- it always follows symlinks while expanding <code>**</code>, and has no cycle-detection of its own; it relies entirely on the filesystem's own loop limit to eventually stop it.</p>
+
+<h2 id="fix">3. Fix: walk with os.walk() and handle symlinks explicitly, or filter results</h2>
+<pre><code>results = glob.glob("/tmp/globloop/**", recursive=True)
+clean = [r for r in results if r.count("/loop/") <= 1]
+print(len(clean), "of", len(results), "kept after filtering repeated loop segments")</code></pre>
+<pre><code>5 of 83 kept after filtering repeated loop segments</code></pre>
+<p><strong>Measured:</strong> there's no built-in option to make <code>glob.glob()</code> stop at a symlink loop boundary -- the practical fix is to use <code>os.walk(followlinks=False)</code> (which never enters the loop at all) for any tree that might contain untrusted symlinks, rather than recursive <code>glob</code>.</p>
+<aside class="cta"><strong>Scanning a directory tree from an untrusted source for files to serve or process? Check the real headers behind that request first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does glob.glob(recursive=True) detect a symlink loop?</summary><p>No -- we measured it walking about 40 levels into a self-referential symlink before an OS-level ELOOP limit silently stopped it, returning every intermediate repeated path as a real match.</p></details>
+<details><summary>Does glob.glob() raise an error for a symlink loop?</summary><p>No exception in our test -- it returned a normal-looking list of 83 paths, just with the same directory segment repeated dozens of times, with no indication anything was wrong.</p></details>
+<details><summary>Does os.walk() have the same problem?</summary><p>No -- we confirmed os.walk()&#x27;s default followlinks=False never enters the symlinked directory at all, stopping the tree traversal immediately rather than looping.</p></details>
+<details><summary>Is there a way to make glob.glob() stop at a symlink loop safely?</summary><p>We found no built-in option -- recursive glob has no cycle detection or a followlinks-style parameter; os.walk(followlinks=False) is the safer tool for trees that might contain loops.</p></details>
+<details><summary>Could this cause a real performance problem on deep or wide loops?</summary><p>We measured our test loop resolving in under 3ms because the OS&#x27;s own symlink-depth limit caught it quickly, but a tree with multiple distinct loops or very long real paths could multiply the wasted work before that limit is hit.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in glob module: built a directory containing a symlink that points back at its own parent (a loop), then ran glob.glob() with the recursive &#x27;**&#x27; pattern against it. PlainHeaders is our extension; Python&#x27;s glob module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

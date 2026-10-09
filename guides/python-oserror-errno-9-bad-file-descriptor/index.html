@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OSError: [Errno 9] Bad file descriptor in Python, Tested</title>
+<meta name="description" content="We measured Python&#x27;s Errno 9 Bad file descriptor: double close, fdopen sharing, buffered writes failing at close(), closed sockets, and silent fd reuse.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-oserror-errno-9-bad-file-descriptor/">
+<meta property="og:title" content="OSError: [Errno 9] Bad file descriptor in Python, Tested">
+<meta property="og:description" content="We measured Python&#x27;s Errno 9 Bad file descriptor: double close, fdopen sharing, buffered writes failing at close(), closed sockets, and silent fd reuse.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-oserror-errno-9-bad-file-descriptor/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does OSError: [Errno 9] Bad file descriptor mean in Python?", "acceptedAnswer": {"@type": "Answer", "text": "The OS got a file descriptor number that isn't open (or isn't open for that operation). We measured it from a double os.close, a descriptor closed under a file object, two fdopen objects sharing one fd, a read-only fd, and a closed socket."}}, {"@type": "Question", "name": "Why does the error happen on close() instead of write()?", "acceptedAnswer": {"@type": "Answer", "text": "File objects buffer writes, so the dead descriptor is only touched when the buffer is flushed. We measured write() succeeding and close() raising Errno 9, with the data lost."}}, {"@type": "Question", "name": "What is 'Exception ignored in TextIOWrapper ... Bad file descriptor'?", "acceptedAnswer": {"@type": "Answer", "text": "A file object whose descriptor was already closed was garbage-collected and failed to flush. We measured the message and the program continuing with the data lost."}}, {"@type": "Question", "name": "How do I share a file descriptor between two file objects?", "acceptedAnswer": {"@type": "Answer", "text": "Use os.fdopen(fd, closefd=False) for borrowers, or os.dup(fd) to give each its own copy. We measured both writing correctly."}}, {"@type": "Question", "name": "Can closing a file descriptor twice close another file?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We measured a freed fd number being reused by a new file, and the stale second close silently closing that file instead, which left it empty."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>OSError: [Errno 9] Bad file descriptor (tested)</h1>
+<p class="lead"><code>OSError: [Errno 9] Bad file descriptor</code> almost always means something closed a descriptor that something else still uses. We reproduced six causes. In one of them the second close doesn't fail at all: it closes a different file.</p>
+<p><code>Errno 9</code> (<code>EBADF</code>) means the operating system was handed a file descriptor number that isn't open, or isn't open for that operation. Python only passes the error on. Each cause below was run on Python 3.13.5 on Linux.</p>
+
+<h2 id="double">1. Closing the same descriptor twice</h2>
+<pre><code>import os
+fd = os.open(&quot;data.txt&quot;, os.O_WRONLY | os.O_CREAT)
+os.close(fd)
+try:
+    os.close(fd)
+except OSError as e:
+    print(repr(e))</code></pre>
+<p>Output:</p>
+<pre><code>OSError(9, &#x27;Bad file descriptor&#x27;)</code></pre>
+<p><strong>Measured:</strong> the second <code>os.close()</code> raises <code>OSError(9, 'Bad file descriptor')</code>. If you got this error, it's actually the lucky outcome; see section 5 for when the second close succeeds.</p>
+
+<h2 id="under">2. Closing a descriptor under a file object</h2>
+<pre><code>import os
+f = open(&quot;data.txt&quot;, &quot;w&quot;)
+os.close(f.fileno())          # someone closed the fd under the file object
+f.write(&quot;hello&quot;)              # buffered: no error yet
+try:
+    f.close()                 # flush hits the dead fd
+except OSError as e:
+    print(&quot;close():&quot;, repr(e))
+print(&quot;f.closed:&quot;, f.closed)</code></pre>
+<p>Output:</p>
+<pre><code>close(): OSError(9, &#x27;Bad file descriptor&#x27;)
+f.closed: True</code></pre>
+<p><strong>Measured:</strong> <code>f.write()</code> succeeds because it only fills Python's buffer. The error appears later, at <code>f.close()</code>, when the buffer is flushed to the dead descriptor, so the traceback points at the wrong line. The data is lost and <code>f.closed</code> is <code>True</code> anyway.</p>
+<pre><code>import os, gc
+f = open(&quot;data.txt&quot;, &quot;w&quot;)
+os.close(f.fileno())
+f.write(&quot;hello&quot;)
+del f; gc.collect()
+print(&quot;program continues&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>Exception ignored in: &lt;_io.TextIOWrapper name=&#x27;data.txt&#x27; mode=&#x27;w&#x27; encoding=&#x27;UTF-8&#x27;&gt;
+Traceback (most recent call last):
+  File &quot;/tmp/bf/b6.py&quot;, line 5, in &lt;module&gt;
+    del f; gc.collect()
+OSError: [Errno 9] Bad file descriptor
+program continues</code></pre>
+<p><strong>Measured:</strong> if nobody calls <code>close()</code>, the same error is printed as <code>Exception ignored in: &lt;_io.TextIOWrapper ...&gt;</code> when the object is garbage-collected, and the program continues with the data lost. That's the usual source of a stray "Exception ignored ... Bad file descriptor" at exit.</p>
+
+<h2 id="fdopen">3. Two file objects sharing one descriptor</h2>
+<pre><code>import os
+fd = os.open(&quot;data.txt&quot;, os.O_WRONLY | os.O_CREAT)
+f1 = os.fdopen(fd, &quot;w&quot;)
+f2 = os.fdopen(fd, &quot;w&quot;)       # two file objects, one fd
+f1.close()
+try:
+    f2.write(&quot;x&quot;); f2.close()
+except OSError as e:
+    print(&quot;f2:&quot;, repr(e))</code></pre>
+<p>Output:</p>
+<pre><code>f2: OSError(9, &#x27;Bad file descriptor&#x27;)</code></pre>
+<p><strong>Measured:</strong> <code>os.fdopen()</code> takes ownership: closing <code>f1</code> closes the descriptor that <code>f2</code> is still using. The same happens with <code>open(fd)</code>, <code>socket.socket(fileno=fd)</code>, or wrapping <code>sys.stdout.fileno()</code>.</p>
+<pre><code>import os
+fd = os.open(&quot;data.txt&quot;, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+f1 = os.fdopen(fd, &quot;w&quot;, closefd=False)   # borrow, don&#x27;t own
+f1.write(&quot;one\n&quot;); f1.close()
+f2 = os.fdopen(os.dup(fd), &quot;w&quot;)          # own a separate copy
+f2.write(&quot;two\n&quot;); f2.close()
+os.close(fd)                              # the real owner closes once
+print(open(&quot;data.txt&quot;).read(), end=&quot;&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>one
+two</code></pre>
+<p><strong>Fix (measured):</strong> pass <code>closefd=False</code> when you're only borrowing a descriptor, or give each object its own copy with <code>os.dup(fd)</code>. Exactly one owner should close each descriptor.</p>
+
+<h2 id="mode">4. Wrong mode: writing to a read-only descriptor</h2>
+<pre><code>import os
+fd = os.open(&quot;data.txt&quot;, os.O_RDONLY)
+try:
+    os.write(fd, b&quot;hi&quot;)
+except OSError as e:
+    print(&quot;write to read-only fd:&quot;, repr(e))
+f = open(&quot;data.txt&quot;, &quot;r&quot;)
+try:
+    f.write(&quot;hi&quot;)
+except Exception as e:
+    print(&quot;write to &#x27;r&#x27; file:&quot;, repr(e))</code></pre>
+<p>Output:</p>
+<pre><code>write to read-only fd: OSError(9, &#x27;Bad file descriptor&#x27;)
+write to &#x27;r&#x27; file: UnsupportedOperation(&#x27;not writable&#x27;)</code></pre>
+<p><strong>Measured:</strong> at the <code>os</code> level, writing to a descriptor opened <code>O_RDONLY</code> is also <code>Errno 9</code>, even though the descriptor is open. A normal file object catches it earlier with <code>io.UnsupportedOperation: not writable</code>. If you see Errno 9 from <code>os.write</code>/<code>os.read</code> on an open fd, check its flags.</p>
+
+<h2 id="socket">5. A closed socket</h2>
+<pre><code>import socket
+a, b = socket.socketpair()
+a.close()
+print(&quot;fileno after close:&quot;, a.fileno())
+try:
+    a.send(b&quot;x&quot;)
+except OSError as e:
+    print(&quot;send:&quot;, repr(e))</code></pre>
+<p>Output:</p>
+<pre><code>fileno after close: -1
+send: OSError(9, &#x27;Bad file descriptor&#x27;)</code></pre>
+<p><strong>Measured:</strong> after <code>close()</code>, <code>fileno()</code> returns <code>-1</code> and <code>send()</code> raises <code>Errno 9</code>. Typical cause: one thread or callback closes a socket another is still using. Check <code>sock.fileno() == -1</code> or use <code>with socket...</code> so the lifetime is obvious.</p>
+
+<h2 id="reuse">6. The dangerous case: the second close succeeds</h2>
+<pre><code>import os
+fd = os.open(&quot;data.txt&quot;, os.O_RDONLY)
+os.close(fd)
+log = open(&quot;log.txt&quot;, &quot;w&quot;)                # gets the freed number
+print(&quot;old fd:&quot;, fd, &quot;log fd:&quot;, log.fileno())
+os.close(fd)                              # second close: no error!
+try:
+    log.write(&quot;important\n&quot;); log.close()
+except OSError as e:
+    print(&quot;log:&quot;, repr(e))
+print(&quot;log.txt size:&quot;, os.path.getsize(&quot;log.txt&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>old fd: 3 log fd: 3
+log: OSError(9, &#x27;Bad file descriptor&#x27;)
+log.txt size: 0</code></pre>
+<p><strong>Measured:</strong> the OS reuses the lowest free descriptor number, so a new file got the number <code>3</code> that had just been freed. The stale second <code>os.close(3)</code> raised nothing and silently closed the <em>log file</em> instead. The error then surfaced in unrelated code, and <code>log.txt</code> ended up empty. In threaded code this is a race that only shows up sometimes. After closing a raw descriptor, set your variable to <code>None</code> (or <code>-1</code>) so it can't be closed twice.</p>
+
+<aside class="cta"><strong>Debugging sockets and HTTP? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does OSError: [Errno 9] Bad file descriptor mean in Python?</summary><p>The OS got a file descriptor number that isn&#x27;t open (or isn&#x27;t open for that operation). We measured it from a double os.close, a descriptor closed under a file object, two fdopen objects sharing one fd, a read-only fd, and a closed socket.</p></details>
+<details><summary>Why does the error happen on close() instead of write()?</summary><p>File objects buffer writes, so the dead descriptor is only touched when the buffer is flushed. We measured write() succeeding and close() raising Errno 9, with the data lost.</p></details>
+<details><summary>What is &#x27;Exception ignored in TextIOWrapper ... Bad file descriptor&#x27;?</summary><p>A file object whose descriptor was already closed was garbage-collected and failed to flush. We measured the message and the program continuing with the data lost.</p></details>
+<details><summary>How do I share a file descriptor between two file objects?</summary><p>Use os.fdopen(fd, closefd=False) for borrowers, or os.dup(fd) to give each its own copy. We measured both writing correctly.</p></details>
+<details><summary>Can closing a file descriptor twice close another file?</summary><p>Yes. We measured a freed fd number being reused by a new file, and the stale second close silently closing that file instead, which left it empty.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: double os.close, a descriptor closed under a file object (with and without close()), two os.fdopen objects on one fd, closefd=False and os.dup, writing to an O_RDONLY descriptor, a closed socketpair, and fd-number reuse. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

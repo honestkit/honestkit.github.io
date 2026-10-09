@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python shutil copy/move PermissionError [Errno 13], Tested</title>
+<meta name="description" content="We measured shutil copy/move Permission denied: read-only folders, copy vs move over read-only files, and why copy() fails on a rerun (it copies mode bits).">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-shutil-copy-move-permissionerror-errno-13/">
+<meta property="og:title" content="Python shutil copy/move PermissionError [Errno 13], Tested">
+<meta property="og:description" content="We measured shutil copy/move Permission denied: read-only folders, copy vs move over read-only files, and why copy() fails on a rerun (it copies mode bits).">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-shutil-copy-move-permissionerror-errno-13/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does shutil.copy give PermissionError: [Errno 13]?", "acceptedAnswer": {"@type": "Answer", "text": "Either the destination directory isn't writable or the destination file is read-only. We measured both on Linux with Python 3.13.5."}}, {"@type": "Question", "name": "Why does shutil.copy work once and then fail?", "acceptedAnswer": {"@type": "Answer", "text": "copy() and copy2() copy the source's permission bits, so a read-only source makes a read-only copy and the next copy onto it fails. We measured that; copyfile() copies contents only."}}, {"@type": "Question", "name": "Can shutil.move overwrite a read-only file?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, on Linux. We measured move() replacing a 0o444 file, because a rename only needs write permission on the directory."}}, {"@type": "Question", "name": "What is the difference between shutil.copy, copy2 and copyfile?", "acceptedAnswer": {"@type": "Answer", "text": "copyfile copies contents only; copy also copies permission bits; copy2 also copies timestamps. We measured copy and copy2 giving 0o400 copies of a 0o400 file and copyfile giving 0o664."}}, {"@type": "Question", "name": "Why does shutil.copyfile say Is a directory?", "acceptedAnswer": {"@type": "Answer", "text": "copyfile needs a destination file path, not a folder. We measured IsADirectoryError: [Errno 21] for a directory destination."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>shutil copy/move PermissionError: [Errno 13] (tested)</h1>
+<p class="lead"><code>PermissionError: [Errno 13] Permission denied</code> from <code>shutil.copy()</code> or <code>shutil.move()</code> has a few causes, and one of them only shows up on the <em>second</em> run of your script. We reproduced all of them on Python 3.13.5.</p>
+<h2 id="dir">1. The destination directory isn't writable</h2>
+<pre><code>import os, shutil
+os.makedirs(&quot;ro_dir&quot;, exist_ok=True); os.chmod(&quot;ro_dir&quot;, 0o555)
+open(&quot;src.txt&quot;, &quot;w&quot;).write(&quot;data&quot;)
+for label, call in [(&quot;copy into read-only dir&quot;, lambda: shutil.copy(&quot;src.txt&quot;, &quot;ro_dir&quot;)),
+                    (&quot;copy onto a directory path as file&quot;, lambda: shutil.copyfile(&quot;src.txt&quot;, &quot;ro_dir&quot;)),
+                    (&quot;move into read-only dir&quot;, lambda: shutil.move(&quot;src.txt&quot;, &quot;ro_dir/src.txt&quot;))]:
+    try:
+        call(); print(label, &quot;-&gt; ok&quot;)
+    except OSError as e:
+        print(f&quot;{label} -&gt; {type(e).__name__}: {e}&quot;)
+os.chmod(&quot;ro_dir&quot;, 0o755)</code></pre>
+<p>Output:</p>
+<pre><code>copy into read-only dir -&gt; PermissionError: [Errno 13] Permission denied: &#x27;ro_dir/src.txt&#x27;
+copy onto a directory path as file -&gt; IsADirectoryError: [Errno 21] Is a directory: &#x27;ro_dir&#x27;
+move into read-only dir -&gt; PermissionError: [Errno 13] Permission denied: &#x27;ro_dir/src.txt&#x27;</code></pre>
+<p><strong>Measured on Python 3.13.5, Linux:</strong> both <code>shutil.copy()</code> and <code>shutil.move()</code> need write permission on the <em>destination directory</em>, and the error names the full destination path (<code>ro_dir/src.txt</code>). <code>copyfile()</code> wants a file path, not a directory: give it a directory and you get <code>IsADirectoryError</code> (on Windows this case is reported as <code>PermissionError</code> instead, which is a common source of confusion; not measured here).</p>
+
+<h2 id="readonly">2. Copy over a read-only file fails, move over it works</h2>
+<pre><code>import os, shutil
+open(&quot;a.txt&quot;, &quot;w&quot;).write(&quot;new&quot;)
+open(&quot;b.txt&quot;, &quot;w&quot;).write(&quot;old&quot;); os.chmod(&quot;b.txt&quot;, 0o444)   # read-only destination
+try:
+    shutil.copy(&quot;a.txt&quot;, &quot;b.txt&quot;)
+except PermissionError as e:
+    print(&quot;copy over read-only file:&quot;, e)
+shutil.move(&quot;a.txt&quot;, &quot;b.txt&quot;)   # rename replaces it: directory permission is what counts
+print(&quot;move over read-only file: ok -&gt;&quot;, open(&quot;b.txt&quot;).read())</code></pre>
+<p>Output:</p>
+<pre><code>copy over read-only file: [Errno 13] Permission denied: &#x27;b.txt&#x27;
+move over read-only file: ok -&gt; new</code></pre>
+<p><strong>Measured:</strong> <code>copy()</code> opens the existing destination for writing, so a read-only <code>b.txt</code> gives <code>Errno 13</code>. <code>move()</code> renames instead, and replacing a file by rename only needs permission on the directory, so it silently replaced the read-only file.</p>
+
+<h2 id="mode">3. Why the second run fails: copy() copies the read-only bit</h2>
+<pre><code>import os, shutil
+open(&quot;s.txt&quot;, &quot;w&quot;).write(&quot;data&quot;); os.chmod(&quot;s.txt&quot;, 0o400)
+shutil.copy(&quot;s.txt&quot;, &quot;c1.txt&quot;); shutil.copy2(&quot;s.txt&quot;, &quot;c2.txt&quot;); shutil.copyfile(&quot;s.txt&quot;, &quot;c3.txt&quot;)
+for f in (&quot;c1.txt&quot;, &quot;c2.txt&quot;, &quot;c3.txt&quot;):
+    print(f, oct(os.stat(f).st_mode &amp; 0o777))
+try:
+    shutil.copy(&quot;s.txt&quot;, &quot;c1.txt&quot;)
+except PermissionError as e:
+    print(&quot;second copy:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>c1.txt 0o400
+c2.txt 0o400
+c3.txt 0o664
+second copy: [Errno 13] Permission denied: &#x27;c1.txt&#x27;</code></pre>
+<p><strong>Measured:</strong> <code>shutil.copy()</code> and <code>copy2()</code> copy the source's permission bits, so copying a read-only source (<code>0o400</code>) produces a read-only copy, and the <em>next</em> copy onto it fails. <code>copyfile()</code> copies only the contents and the new file gets normal permissions (<code>0o664</code> here, from the umask). This is the usual cause of a script that works once and then fails on every rerun.</p>
+
+<h2 id="fix">Fix: copy contents only, and make an existing destination writable first</h2>
+<pre><code>import os, shutil
+def copy_over(src, dst):
+    if os.path.exists(dst) and not os.access(dst, os.W_OK):
+        os.chmod(dst, os.stat(dst).st_mode | 0o200)   # make destination writable
+    shutil.copyfile(src, dst)                         # contents only, keeps dst&#x27;s mode
+copy_over(&quot;s.txt&quot;, &quot;c1.txt&quot;); copy_over(&quot;s.txt&quot;, &quot;c1.txt&quot;)
+print(&quot;c1.txt&quot;, oct(os.stat(&quot;c1.txt&quot;).st_mode &amp; 0o777), open(&quot;c1.txt&quot;).read())</code></pre>
+<p>Output:</p>
+<pre><code>c1.txt 0o600 data</code></pre>
+<p><strong>Measured:</strong> running it twice over the read-only <code>c1.txt</code> works. Only do the <code>chmod</code> on files you own and mean to overwrite. For the directory case (section 1), fix the permissions or copy somewhere you can write; on Windows also check that no other program has the file open. For deleting read-only trees see our <a href="/guides/python-shutil-rmtree-permissionerror-errno-13/">rmtree PermissionError guide</a>.</p>
+
+<aside class="cta"><strong>Automating file jobs that also hit web APIs? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does shutil.copy give PermissionError: [Errno 13]?</summary><p>Either the destination directory isn&#x27;t writable or the destination file is read-only. We measured both on Linux with Python 3.13.5.</p></details>
+<details><summary>Why does shutil.copy work once and then fail?</summary><p>copy() and copy2() copy the source&#x27;s permission bits, so a read-only source makes a read-only copy and the next copy onto it fails. We measured that; copyfile() copies contents only.</p></details>
+<details><summary>Can shutil.move overwrite a read-only file?</summary><p>Yes, on Linux. We measured move() replacing a 0o444 file, because a rename only needs write permission on the directory.</p></details>
+<details><summary>What is the difference between shutil.copy, copy2 and copyfile?</summary><p>copyfile copies contents only; copy also copies permission bits; copy2 also copies timestamps. We measured copy and copy2 giving 0o400 copies of a 0o400 file and copyfile giving 0o664.</p></details>
+<details><summary>Why does shutil.copyfile say Is a directory?</summary><p>copyfile needs a destination file path, not a folder. We measured IsADirectoryError: [Errno 21] for a directory destination.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: copy/copyfile/move into a read-only directory, copy vs move over a read-only file, permission bits after copy/copy2/copyfile from a 0o400 source, and a copy-over fix. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

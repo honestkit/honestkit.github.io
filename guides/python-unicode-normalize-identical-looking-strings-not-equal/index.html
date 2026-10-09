@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python Unicode: Identical-Looking Strings That Are Not Equal</title>
+<meta name="description" content="We measured two Python strings that print as the same word &#x27;cafe&#x27;: one has length 4, the other length 5, == returns False, and a set treats them as two items.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-unicode-normalize-identical-looking-strings-not-equal/">
+<meta property="og:title" content="Python Unicode: Identical-Looking Strings That Are Not Equal">
+<meta property="og:description" content="We measured two Python strings that print as the same word &#x27;cafe&#x27;: one has length 4, the other length 5, == returns False, and a set treats them as two items.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-unicode-normalize-identical-looking-strings-not-equal/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why do two Python strings that look identical fail an == check?", "acceptedAnswer": {"@type": "Answer", "text": "We measured this with accented text: one string used a single precomposed codepoint for the accented letter, the other used a base letter plus a separate combining accent codepoint. They render identically but == compares codepoints, so it correctly reports them as different."}}, {"@type": "Question", "name": "Can a Python set or dict silently treat two identical-looking strings as different keys?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we confirmed it: a set built from both Unicode forms of the same visible word kept two entries instead of one. The same applies to dict keys and database unique constraints on raw, unnormalized text."}}, {"@type": "Question", "name": "What does unicodedata.normalize() actually fix?", "acceptedAnswer": {"@type": "Answer", "text": "We measured normalizing both forms of the same word to NFC and to NFD: both conversions made the previously-unequal strings compare equal. The fix is to normalize every string the same way before storing or comparing it, not just the one that looks wrong."}}, {"@type": "Question", "name": "Should I use NFC or NFD normalization?", "acceptedAnswer": {"@type": "Answer", "text": "NFC (composed, single codepoints) is the usual default for storage and comparison, since it's more compact and what most text already looks like. NFD (decomposed) is mainly useful when you need to strip accents, since it separates the base letter from the combining marks."}}, {"@type": "Question", "name": "What's the difference between str.lower() and str.casefold() in Python?", "acceptedAnswer": {"@type": "Answer", "text": "We measured this on German eszett (\u00df): .lower() left it unchanged, but .casefold() expanded it to 'ss', matching how an uppercase 'STRASSE' casefolds too. Use casefold() for case-insensitive comparisons on non-ASCII text; lower() alone can miss matches like this."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python Unicode: Identical-Looking Strings That Are Not Equal (tested)</h1>
+<p class="lead">Two Python strings can print as exactly the same text on screen, in the same font, with no visible difference -- and still have different lengths, fail an <code>==</code> check, and silently duplicate in a set. We built this with ordinary accented text and measured every step.</p>
+<h2 id="repro1">1. The same visible word, built two ways, has two different lengths and fails ==</h2>
+<pre><code>precomposed = "caf\u00e9"       # single codepoint for accented e
+decomposed  = "cafe\u0301"       # plain e followed by a combining acute accent
+
+print(precomposed, "/", decomposed)
+print(len(precomposed), len(decomposed))
+print(precomposed == decomposed)</code></pre>
+<pre><code>café / café
+4 5
+False</code></pre>
+<p><strong>Measured:</strong> both strings display identically wherever they're rendered, but <code>precomposed</code> is 4 codepoints (the accented e is one codepoint) and <code>decomposed</code> is 5 (a plain <code>e</code> plus a separate combining-accent codepoint). Python's <code>==</code> compares codepoints, not rendered appearance, so it correctly says they're different strings -- which is exactly the problem if you expected it to say they're the same word.</p>
+
+<h2 id="repro2">2. A set silently keeps both as separate entries -- deduplication just fails</h2>
+<pre><code>precomposed = "caf\u00e9"
+decomposed  = "cafe\u0301"
+seen = {precomposed, decomposed}
+print(len(seen))</code></pre>
+<pre><code>2</code></pre>
+<p><strong>Measured:</strong> a set built from both forms of "the same" word keeps two entries, not one. The same applies to dict keys, <code>in</code> membership checks, and database unique constraints on raw text -- any of them can let in two "duplicate" values that look completely identical to a human. This is realistic any time text comes from different sources: a form field typed on one OS, a value copied from a PDF, or data normalized by a different library than the one that wrote it originally.</p>
+
+<h2 id="repro3">3. unicodedata.normalize() fixes it, but you must normalize both sides the same way</h2>
+<pre><code>import unicodedata
+
+precomposed = "caf\u00e9"
+decomposed  = "cafe\u0301"
+
+nfc_of_decomposed = unicodedata.normalize("NFC", decomposed)
+nfd_of_precomposed = unicodedata.normalize("NFD", precomposed)
+
+print(nfc_of_decomposed == precomposed)
+print(nfd_of_precomposed == decomposed)</code></pre>
+<pre><code>True
+True</code></pre>
+<p><strong>Measured:</strong> normalizing either string to the same form as the other makes them equal. <code>NFC</code> ("compose") prefers single combined codepoints and is the right default for storage and comparison; <code>NFD</code> ("decompose") splits them apart and is mainly useful for things like stripping accents. The fix isn't "normalize the incoming string" -- it's normalizing <strong>every</strong> string the same way before it's stored, compared, or deduplicated, since one unnormalized value anywhere breaks the whole comparison again.</p>
+
+<h2 id="repro4">4. Bonus: str.lower() and str.casefold() disagree on German sharp s</h2>
+<pre><code>german = "straße"  # "strasse" with an eszett
+
+print(german.lower())
+print(german.casefold())
+print(german.upper().lower() == german)</code></pre>
+<pre><code>straße
+strasse
+False</code></pre>
+<p><strong>Measured:</strong> <code>.lower()</code> leaves <code>ß</code> (eszett) alone, since it's already lowercase. <code>.casefold()</code> expands it to <code>"ss"</code>, which is what you actually want for case-insensitive comparison, because <code>"STRASSE".casefold()</code> also produces <code>"strasse"</code> while <code>"STRASSE".lower()</code> does not produce <code>"straße"</code> -- confirmed by the round-trip check above returning <code>False</code>. Use <code>.casefold()</code>, not <code>.lower()</code>, for case-insensitive matching on any text that might contain non-ASCII letters.</p>
+<aside class="cta"><strong>Comparing header values or form fields that contain accented characters? Check the raw bytes a server actually sends first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why do two Python strings that look identical fail an == check?</summary><p>We measured this with accented text: one string used a single precomposed codepoint for the accented letter, the other used a base letter plus a separate combining accent codepoint. They render identically but == compares codepoints, so it correctly reports them as different.</p></details>
+<details><summary>Can a Python set or dict silently treat two identical-looking strings as different keys?</summary><p>Yes -- we confirmed it: a set built from both Unicode forms of the same visible word kept two entries instead of one. The same applies to dict keys and database unique constraints on raw, unnormalized text.</p></details>
+<details><summary>What does unicodedata.normalize() actually fix?</summary><p>We measured normalizing both forms of the same word to NFC and to NFD: both conversions made the previously-unequal strings compare equal. The fix is to normalize every string the same way before storing or comparing it, not just the one that looks wrong.</p></details>
+<details><summary>Should I use NFC or NFD normalization?</summary><p>NFC (composed, single codepoints) is the usual default for storage and comparison, since it&#x27;s more compact and what most text already looks like. NFD (decomposed) is mainly useful when you need to strip accents, since it separates the base letter from the combining marks.</p></details>
+<details><summary>What&#x27;s the difference between str.lower() and str.casefold() in Python?</summary><p>We measured this on German eszett (ß): .lower() left it unchanged, but .casefold() expanded it to &#x27;ss&#x27;, matching how an uppercase &#x27;STRASSE&#x27; casefolds too. Use casefold() for case-insensitive comparisons on non-ASCII text; lower() alone can miss matches like this.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in unicodedata module: built the same visible word &#x27;cafe&#x27; with an accented e two different ways (a precomposed codepoint vs. a base letter plus a combining accent), then compared length, ==, set deduplication, and unicodedata.normalize() across both forms, plus str.lower() vs str.casefold() on a German sharp s. PlainHeaders is our extension; Python&#x27;s unicodedata module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

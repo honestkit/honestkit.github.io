@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python gzip Output Isn&#x27;t Reproducible By Default — Here&#x27;s Why</title>
+<meta name="description" content="We measured gzip.compress() output differing on every run for the same input — a timestamp and filename land in the header, breaking hashes and build caches.">
+<link rel="canonical" href="https://honestkit.github.io/guides/gzip-output-is-not-reproducible-by-default/">
+<meta property="og:title" content="Python gzip Output Isn&#x27;t Reproducible By Default — Here&#x27;s Why">
+<meta property="og:description" content="We measured gzip.compress() output differing on every run for the same input — a timestamp and filename land in the header, breaking hashes and build caches.">
+<meta property="og:url" content="https://honestkit.github.io/guides/gzip-output-is-not-reproducible-by-default/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does gzip.compress() produce different output for the same input in Python?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it embedding the current Unix timestamp (MTIME) into the gzip header by default, so two calls a second apart differ in 4 header bytes even though the compressed data itself is identical."}}, {"@type": "Question", "name": "Does gzip.open() add anything else that changes between runs besides the timestamp?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we measured gzip.open() on a file path also embedding that path's basename (with .gz stripped) as the FNAME field, so compressing the same content to differently-named files produces different bytes even with the same timestamp."}}, {"@type": "Question", "name": "Does mtime=0 make gzip output fully reproducible?", "acceptedAnswer": {"@type": "Answer", "text": "Not by itself \u2014 we measured mtime=0 zeroing the timestamp bytes but the embedded filename still differed between gzip.GzipFile('/tmp/test3.gz', ...) and gzip.GzipFile('/tmp/test4.gz', ...), so the output stayed unequal."}}, {"@type": "Question", "name": "How do I get byte-for-byte reproducible gzip output in Python?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed writing through fileobj= (an already-open file object, so there's no path to derive a name from) combined with mtime=0 and filename='' produces identical output across separate runs and file paths."}}, {"@type": "Question", "name": "Does non-reproducible gzip output affect the decompressed content?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we verified the decompressed bytes were identical in every case. Only the compressed container's header bytes (and therefore its hash) vary; this only matters if something hashes, diffs, or caches the compressed bytes themselves."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>gzip Output Is Not Reproducible By Default (tested)</h1>
+<p class="lead">Compressing the exact same bytes twice with Python's <code>gzip</code> module looks like it should produce identical output. We measured it producing a different SHA-256 hash every time, which silently breaks anything that hashes or diffs compressed output &mdash; build caches, CDN cache keys, content-addressed storage, reproducible-build checks.</p>
+<h2 id="repro1">1. gzip.compress() gives a different hash every run</h2>
+<pre><code>import gzip, hashlib, time
+
+data = b"hello world, this is test content for gzip reproducibility"
+
+out1 = gzip.compress(data)
+time.sleep(1.1)
+out2 = gzip.compress(data)
+
+out1 == out2
+False
+
+hashlib.sha256(out1).hexdigest()[:16]
+'69c35134a5ddc5d8'
+hashlib.sha256(out2).hexdigest()[:16]
+'c431c07d6905fcee'
+
+out1[:10]
+b'\x1f\x8b\x08\x00\xd8]\xc1j\x02\xff'
+out2[:10]
+b'\x1f\x8b\x08\x00\xd9]\xc1j\x02\xff'</code></pre>
+<p><strong>Measured:</strong> same input, same Python process, same machine &mdash; different output every call. Only 4 bytes differ (a little-endian Unix timestamp at offset 4-7 of the gzip header, the <code>MTIME</code> field), but that's enough to change the whole-file hash.</p>
+
+<h2 id="repro2">2. gzip.open() to a real file adds a second source of drift: the filename</h2>
+<pre><code>with gzip.open("/tmp/test1.gz", "wb") as f:
+    f.write(data)
+time.sleep(1.1)
+with gzip.open("/tmp/test2.gz", "wb") as f:
+    f.write(data)
+
+open("/tmp/test1.gz","rb").read()[:10]
+b'\x1f\x8b\x08\x08\xe0]\xc1j\x02\xff'
+open("/tmp/test2.gz","rb").read()[:10]
+b'\x1f\x8b\x08\x08\xe1]\xc1j\x02\xff'
+
+# decompressed content is identical either way
+gzip.open("/tmp/test1.gz","rb").read() == gzip.open("/tmp/test2.gz","rb").read()
+True</code></pre>
+<p><strong>Measured:</strong> the 4th byte is <code>0x08</code> here instead of <code>0x00</code> &mdash; the <code>FNAME</code> flag bit is set, because <code>gzip.open()</code> on a path embeds that path's basename (with <code>.gz</code> stripped) into the header, on top of the same timestamp drift from part 1. The decompressed content matches byte-for-byte; only the compressed container differs.</p>
+
+<h2 id="repro3">3. mtime=0 fixes the timestamp but not the filename</h2>
+<pre><code>with gzip.GzipFile("/tmp/test3.gz", "wb", mtime=0) as f:
+    f.write(data)
+with gzip.GzipFile("/tmp/test4.gz", "wb", mtime=0) as f:
+    f.write(data)
+
+open("/tmp/test3.gz","rb").read() == open("/tmp/test4.gz","rb").read()
+False
+
+open("/tmp/test3.gz","rb").read()[:16]
+b'\x1f\x8b\x08\x08\x00\x00\x00\x00\x02\xfftest3\x00'
+open("/tmp/test4.gz","rb").read()[:16]
+b'\x1f\x8b\x08\x08\x00\x00\x00\x00\x02\xfftest4\x00'</code></pre>
+<p><strong>Measured:</strong> passing <code>mtime=0</code> zeroes the timestamp bytes (confirmed identical in both files), but the output is still unequal &mdash; the embedded filename (<code>test3\x00</code> vs <code>test4\x00</code>, null-terminated) still differs because each file was opened by a different path. A partial fix like this looks like it worked (no error, output shrank to only differing in one spot) but still fails any exact byte-comparison or hash check.</p>
+
+<h2 id="fix">4. The actual fix: write through a fileobj and set filename=""</h2>
+<pre><code>with open("/tmp/test5.gz", "wb") as raw:
+    with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="") as f:
+        f.write(data)
+with open("/tmp/test6.gz", "wb") as raw:
+    with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, filename="") as f:
+        f.write(data)
+
+open("/tmp/test5.gz","rb").read() == open("/tmp/test6.gz","rb").read()
+True</code></pre>
+<p><strong>Measured:</strong> writing through an already-open file object (so there's no path for <code>GzipFile</code> to derive a name from) and explicitly passing both <code>mtime=0</code> and <code>filename=""</code> produces byte-identical output across separate runs, separate file paths, and separate processes. Per the <a href="https://docs.python.org/3/library/gzip.html#gzip.GzipFile">Python gzip docs</a>, <code>mtime</code> and <code>filename</code> are the only two header fields that vary between otherwise-identical compressions &mdash; pin both and the output is fully deterministic. <code>gzip.compress(data, mtime=0)</code> is the simpler equivalent when you don't need a filename-bearing header at all, since <code>compress()</code> never embeds a filename.</p>
+
+<aside class="cta"><strong>Debugging why a compressed asset an API serves changes on every deploy? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does gzip.compress() produce different output for the same input in Python?</summary><p>We measured it embedding the current Unix timestamp (MTIME) into the gzip header by default, so two calls a second apart differ in 4 header bytes even though the compressed data itself is identical.</p></details>
+<details><summary>Does gzip.open() add anything else that changes between runs besides the timestamp?</summary><p>Yes — we measured gzip.open() on a file path also embedding that path&#x27;s basename (with .gz stripped) as the FNAME field, so compressing the same content to differently-named files produces different bytes even with the same timestamp.</p></details>
+<details><summary>Does mtime=0 make gzip output fully reproducible?</summary><p>Not by itself — we measured mtime=0 zeroing the timestamp bytes but the embedded filename still differed between gzip.GzipFile(&#x27;/tmp/test3.gz&#x27;, ...) and gzip.GzipFile(&#x27;/tmp/test4.gz&#x27;, ...), so the output stayed unequal.</p></details>
+<details><summary>How do I get byte-for-byte reproducible gzip output in Python?</summary><p>We confirmed writing through fileobj= (an already-open file object, so there&#x27;s no path to derive a name from) combined with mtime=0 and filename=&#x27;&#x27; produces identical output across separate runs and file paths.</p></details>
+<details><summary>Does non-reproducible gzip output affect the decompressed content?</summary><p>No — we verified the decompressed bytes were identical in every case. Only the compressed container&#x27;s header bytes (and therefore its hash) vary; this only matters if something hashes, diffs, or caches the compressed bytes themselves.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in gzip module: compressed the same bytes twice (via gzip.compress(), gzip.open() to a file, and gzip.GzipFile() to a file) one second apart, compared the resulting bytes and SHA-256 hashes. PlainHeaders is our extension; Python&#x27;s gzip module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

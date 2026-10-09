@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python configparser Case Sensitive Keys (optionxform = str)</title>
+<meta name="description" content="We measured Python 3.13.5: ConfigParser lowercases keys, write() saves them that way, Port and port collide. optionxform = str fixes it if set before read().">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-configparser-case-sensitive-optionxform/">
+<meta property="og:title" content="Python configparser Case Sensitive Keys (optionxform = str)">
+<meta property="og:description" content="We measured Python 3.13.5: ConfigParser lowercases keys, write() saves them that way, Port and port collide. optionxform = str fixes it if set before read().">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-configparser-case-sensitive-optionxform/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I make configparser keys case-sensitive?", "acceptedAnswer": {"@type": "Answer", "text": "Set cfg.optionxform = str right after creating the parser and before any read(), read_string() or read_file() call. We measured that setting it after reading leaves the already-loaded keys lowercase."}}, {"@type": "Question", "name": "Are section names case-sensitive?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, by default. [Server] and [server] are different sections, and 'server' in cfg is False for [Server]. Only option names are lowercased."}}, {"@type": "Question", "name": "Why did my keys become lowercase in the saved file?", "acceptedAnswer": {"@type": "Answer", "text": "The default optionxform lowercases names on read, and write() saves the stored names. Any read-modify-write round trip with a default ConfigParser rewrites every key in lowercase."}}, {"@type": "Question", "name": "What happens with two keys that differ only by case?", "acceptedAnswer": {"@type": "Answer", "text": "With the default strict=True: DuplicateOptionError. With strict=False the last value wins and the other is silently dropped. With optionxform = str they are kept as two separate options."}}, {"@type": "Question", "name": "Is [default] the same as [DEFAULT]?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured that [default] is parsed as an ordinary section and its values are not inherited by other sections; only the exact name DEFAULT (configurable via default_section) is special."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python configparser Case Sensitive Keys: optionxform (tested)</h1>
+<p class="lead">Python's <code>ConfigParser</code> lowercases every option name it reads, writes them back lowercased, and treats <code>Port</code> and <code>port</code> as the same key -- while section names stay case-sensitive. We measured each behavior and the fix: <code>cfg.optionxform = str</code>, which only works if you set it <strong>before</strong> calling <code>read()</code>.</p>
+<h2 id="default">1. What ConfigParser does to case by default</h2>
+<pre><code>import configparser, io
+
+ini = """[Server]
+HostName = example.com
+Port = 8080
+port = 9090
+"""
+
+cfg = configparser.ConfigParser(strict=False)
+cfg.read_string(ini)
+print("sections:", cfg.sections())
+print("keys:", list(cfg["Server"]))
+print("cfg['Server']['HOSTNAME'] -&gt;", cfg["Server"]["HOSTNAME"])
+print("Port -&gt;", cfg["Server"]["Port"])
+print("'server' in cfg -&gt;", "server" in cfg)
+out = io.StringIO(); cfg.write(out); print(out.getvalue().strip())
+try:
+    configparser.ConfigParser().read_string(ini)
+except configparser.Error as e:
+    print(type(e).__name__ + ":", e)</code></pre>
+<pre><code>sections: ['Server']
+keys: ['hostname', 'port']
+cfg['Server']['HOSTNAME'] -&gt; example.com
+Port -&gt; 9090
+'server' in cfg -&gt; False
+[Server]
+hostname = example.com
+port = 9090
+DuplicateOptionError: While reading from '&lt;string&gt;' [line  4]: option 'port' in section 'Server' already exists</code></pre>
+<p><strong>Measured:</strong></p>
+<ul>
+<li><strong>Option names are lowercased</strong> on read: <code>HostName</code> is stored as <code>hostname</code>, and any spelling finds it (<code>['HOSTNAME']</code> works).</li>
+<li><strong><code>write()</code> saves them lowercased</strong>, so reading and re-saving a file silently rewrites every key. A tool that later reads the file case-sensitively (a .NET app, a game, a Java <code>Properties</code> consumer) then misses its keys.</li>
+<li><strong>Keys that differ only by case collide.</strong> <code>Port</code> and <code>port</code> are the same option: the default <code>strict=True</code> raises <code>DuplicateOptionError</code>; with <code>strict=False</code> the last one wins (<code>9090</code>) and the other is dropped without a warning.</li>
+<li><strong>Section names are case-sensitive</strong>: <code>'server' in cfg</code> is <code>False</code> for <code>[Server]</code>.</li>
+</ul>
+
+<h2 id="fix">2. The fix: optionxform = str, set before reading</h2>
+<pre><code>import configparser, io
+
+ini = """[Server]
+HostName = example.com
+Port = 8080
+"""
+
+# Too late: optionxform set after reading
+late = configparser.ConfigParser()
+late.read_string(ini)
+late.optionxform = str
+print("set after read:", list(late["Server"]))
+
+# Correct: set before reading
+cfg = configparser.ConfigParser()
+cfg.optionxform = str
+cfg.read_string(ini)
+print("set before read:", list(cfg["Server"]))
+out = io.StringIO(); cfg.write(out); print(out.getvalue().strip())
+try:
+    cfg["Server"]["hostname"]
+except KeyError as e:
+    print("lookup is now case-sensitive: KeyError", e)
+
+# Section names were always case-sensitive, and so is DEFAULT
+d = configparser.ConfigParser()
+d.read_string("[default]\ntimeout = 5\n[app]\n")
+print("[default] is a normal section:", d.sections(), "| app timeout:", d["app"].get("timeout"))</code></pre>
+<pre><code>set after read: ['hostname', 'port']
+set before read: ['HostName', 'Port']
+[Server]
+HostName = example.com
+Port = 8080
+lookup is now case-sensitive: KeyError 'hostname'
+[default] is a normal section: ['default', 'app'] | app timeout: None</code></pre>
+<p><strong>Measured:</strong> <code>optionxform</code> is applied while parsing, so setting it after <code>read()</code> changes nothing for keys already loaded -- they stay lowercase. Set it right after constructing the parser. Afterwards <code>write()</code> keeps the original spelling, and lookups become case-sensitive (<code>['hostname']</code> raises <code>KeyError</code>), so use the exact key name. The special <code>DEFAULT</code> section is matched case-sensitively too: <code>[default]</code> is just an ordinary section and its values are not inherited.</p>
+<p>The same applies to <code>RawConfigParser</code>: the lowercasing comes from the default <code>optionxform()</code>, which returns <code>optionstr.lower()</code>.</p>
+<p>Related: <a href="/guides/configparser-percent-sign-raises-interpolationsyntaxerror/">configparser % sign InterpolationSyntaxError</a> and <a href="/guides/configparser-read-missing-file-no-error/">configparser.read() ignoring a missing file</a>.</p>
+<aside class="cta"><strong>Debugging config that ends up in HTTP headers? See exactly what a server sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I make configparser keys case-sensitive?</summary><p>Set cfg.optionxform = str right after creating the parser and before any read(), read_string() or read_file() call. We measured that setting it after reading leaves the already-loaded keys lowercase.</p></details>
+<details><summary>Are section names case-sensitive?</summary><p>Yes, by default. [Server] and [server] are different sections, and &#x27;server&#x27; in cfg is False for [Server]. Only option names are lowercased.</p></details>
+<details><summary>Why did my keys become lowercase in the saved file?</summary><p>The default optionxform lowercases names on read, and write() saves the stored names. Any read-modify-write round trip with a default ConfigParser rewrites every key in lowercase.</p></details>
+<details><summary>What happens with two keys that differ only by case?</summary><p>With the default strict=True: DuplicateOptionError. With strict=False the last value wins and the other is silently dropped. With optionxform = str they are kept as two separate options.</p></details>
+<details><summary>Is [default] the same as [DEFAULT]?</summary><p>No. We measured that [default] is parsed as an ordinary section and its values are not inherited by other sections; only the exact name DEFAULT (configurable via default_section) is special.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in configparser.ConfigParser, reading INI text with mixed-case keys and sections via read_string() and writing it back with write(). PlainHeaders is our extension; Python&#x27;s configparser is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

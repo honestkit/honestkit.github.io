@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Next.js app/error.tsx Doesn&#x27;t Catch Root Layout Errors (Tested)</title>
+<meta name="description" content="We threw an error in Next.js app/layout.tsx and proved error.tsx never fires; only global-error.tsx catches it. Full HTTP responses and server logs included.">
+<link rel="canonical" href="https://honestkit.github.io/guides/nextjs-global-error-not-catching-layout/">
+<meta property="og:title" content="Next.js app/error.tsx Doesn&#x27;t Catch Root Layout Errors (Tested)">
+<meta property="og:description" content="We threw an error in Next.js app/layout.tsx and proved error.tsx never fires; only global-error.tsx catches it. Full HTTP responses and server logs included.">
+<meta property="og:url" content="https://honestkit.github.io/guides/nextjs-global-error-not-catching-layout/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why doesn't app/error.tsx catch my root layout error?", "acceptedAnswer": {"@type": "Answer", "text": "Because error.tsx's boundary is rendered inside the root layout component tree. We threw from app/layout.js and measured that error.js never mounted its fallback; only a global-error.js, which wraps the layout itself, caught it."}}, {"@type": "Question", "name": "Does app/global-error.tsx replace my normal error.tsx?", "acceptedAnswer": {"@type": "Answer", "text": "No, use both. We kept app/error.js in place and added app/global-error.js alongside it. error.tsx still catches errors from pages and nested layouts; global-error.tsx is only a safety net for errors in the root layout itself, which we confirmed by reproducing both cases."}}, {"@type": "Question", "name": "Why does global-error.tsx need its own html and body tags?", "acceptedAnswer": {"@type": "Answer", "text": "Because it replaces the entire root layout when it activates, not just a slice of the page. We defined <html> and <body> inside our global-error.js; Next.js rendered them directly since the real root layout had already thrown and couldn't be trusted."}}, {"@type": "Question", "name": "What happens if I have neither error.tsx nor global-error.tsx?", "acceptedAnswer": {"@type": "Answer", "text": "Next.js shows its own built-in minimal error screen. We saw it directly: 'This page couldn't load / A server error occurred. Reload to try again.' plus an ERROR line with the digest number, with no custom styling."}}, {"@type": "Question", "name": "Can I test this without deploying?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We reproduced it locally: add export const dynamic = \"force-dynamic\" to a root layout that throws, run next build && next start, and hit it with curl or a browser. Without force-dynamic, the throw fails next build itself instead, since Next tries to prerender the root layout at build time."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Next.js global-error vs error for layout (tested)</h1>
+<p class="lead"><code>app/error.tsx</code> catches errors thrown by pages and nested layouts, but not errors thrown by the root <code>app/layout.tsx</code> itself. That surprises people because the docs say error.tsx is for "unexpected errors" in a route segment &mdash; but the root layout wraps error.tsx's own boundary, so if the layout throws, there is no error.tsx rendered to catch it. We proved it by throwing from a real root layout and watching error.tsx get skipped, then added app/global-error.tsx and watched it catch the exact same throw.</p>
+<h2>1. The setup we tested</h2>
+<p>A one-route Next.js 16.3.8 app with three files:</p>
+<pre><code>// app/layout.js
+export const dynamic = "force-dynamic";
+
+export default function RootLayout({ children }) {
+  throw new Error("boom in root layout");
+  return (
+    &lt;html&gt;
+      &lt;body&gt;{children}&lt;/body&gt;
+    &lt;/html&gt;
+  );
+}
+</code></pre>
+<pre><code>// app/error.js
+"use client";
+export default function Error({ error, reset }) {
+  return &lt;div&gt;CUSTOM ERROR BOUNDARY FIRED: {error.message}&lt;/div&gt;;
+}
+</code></pre>
+<p><code>export const dynamic = "force-dynamic"</code> matters here too: without it, Next.js tries to prerender <code>/</code> at build time, and an unconditional throw in the root layout fails the build itself ("Error occurred prerendering page /") before the app ever runs. The error.tsx/global-error.tsx distinction only matters once the app is actually serving requests, so we forced the throw to happen per-request instead.</p>
+<p>We ran <code>next build</code> (it succeeded, now a dynamic route) then <code>next start -p 8977</code>, and hit the route with curl and with headless Chromium so we could see the fully hydrated page, not just the raw server markup.</p>
+
+<h2>2. With only app/error.js: the custom boundary never renders</h2>
+<p>Hitting the running server with both <code>app/layout.js</code> and <code>app/error.js</code> present, no <code>global-error.js</code>:</p>
+<pre><code>$ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8977/
+500</code></pre>
+<p>Loading the page in headless Chromium and reading the hydrated DOM text, byte for byte:</p>
+<pre><code>This page couldn&rsquo;t load
+
+A server error occurred. Reload to try again.
+
+Reload
+
+ERROR 1139808596</code></pre>
+<p>That is Next.js's own built-in default error screen, not our "CUSTOM ERROR BOUNDARY FIRED" text. <code>app/error.js</code> was in the project, correctly exported, and would have worked for a throw inside <code>app/page.js</code> &mdash; but it never ran for this throw, because the throw happened in the root layout that renders <em>above</em> error.js's own boundary in the component tree. The boundary itself never gets a chance to mount.</p>
+
+<h2>3. Adding app/global-error.js: now it's caught</h2>
+<p>We added a second file, keeping app/error.js exactly as it was:</p>
+<pre><code>// app/global-error.js
+"use client";
+export default function GlobalError({ error, reset }) {
+  return (
+    &lt;html&gt;
+      &lt;body&gt;
+        &lt;div&gt;GLOBAL ERROR BOUNDARY FIRED: {error.message}&lt;/div&gt;
+      &lt;/body&gt;
+    &lt;/html&gt;
+  );
+}
+</code></pre>
+<p>Notice it defines its own <code>&lt;html&gt;</code> and <code>&lt;body&gt;</code> tags. That's required, not stylistic: <code>global-error.js</code> replaces the entire root layout (including <code>&lt;html&gt;</code>/<code>&lt;body&gt;</code>) when it activates, because the root layout is exactly what failed and can no longer be trusted to render.</p>
+<p>Same throw, same <code>next build &amp;&amp; next start</code>, status still 500, but the hydrated DOM text this time:</p>
+<pre><code>GLOBAL ERROR BOUNDARY FIRED: Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.</code></pre>
+<p>This time our fallback fired. Both <code>app/error.js</code> and <code>app/global-error.js</code> were present simultaneously in this build; the root layout's throw skipped error.js entirely and was caught by global-error.js, confirming the nesting order rather than some file-naming precedence rule. (The <code>error.message</code> text itself is a minified production React error because we ran a production build; it doesn't affect the boundary-selection result we're testing here.)</p>
+
+<h2>4. Why the nesting works this way</h2>
+<p>Conceptually, the App Router wraps your tree roughly like this:</p>
+<pre><code>&lt;GlobalErrorBoundary&gt;        (from app/global-error.js, wraps EVERYTHING including html/body)
+  &lt;RootLayout&gt;                (app/layout.js — your html/body)
+    &lt;ErrorBoundary&gt;           (from app/error.js)
+      &lt;Page /&gt;
+    &lt;/ErrorBoundary&gt;
+  &lt;/RootLayout&gt;
+&lt;/GlobalErrorBoundary&gt;
+</code></pre>
+<p>An error boundary can only catch errors thrown by components <em>below</em> it in the tree. <code>app/error.js</code>'s boundary sits inside <code>RootLayout</code>, so when <code>RootLayout</code> itself throws, that boundary is torn down along with everything else below it and never gets to intercept the error &mdash; the error has to propagate to the next boundary up, which is <code>global-error.js</code>'s, outside the root layout. If you don't have a <code>global-error.js</code>, there is no boundary left to catch it, and Next.js falls back to its own built-in minimal error screen, exactly what we saw in section 2.</p>
+
+<h2>5. Quick reference</h2>
+<table>
+<tr><th>Where the throw happens</th><th>app/error.tsx catches it?</th><th>app/global-error.tsx catches it?</th></tr>
+<tr><td>app/page.tsx or a nested layout</td><td>Yes</td><td>Yes (if error.tsx absent)</td></tr>
+<tr><td>app/layout.tsx (the root layout)</td><td><strong>No</strong> &mdash; measured: default Next.js error screen instead</td><td><strong>Yes</strong> &mdash; measured: our fallback rendered</td></tr>
+</table>
+<p>Practical takeaway: if your root layout does anything that can throw &mdash; reading cookies/headers, calling a database or CMS for shared nav/header data, a provider that validates an env var &mdash; add an <code>app/global-error.tsx</code> alongside your <code>app/error.tsx</code>. Without it, a root layout failure shows users Next.js's unstyled default screen instead of your own branded fallback.</p>
+
+<aside class="cta"><strong>Check the status your own Next.js app actually returns when it errors:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why doesn&#x27;t app/error.tsx catch my root layout error?</summary><p>Because error.tsx&#x27;s boundary is rendered inside the root layout component tree. We threw from app/layout.js and measured that error.js never mounted its fallback; only a global-error.js, which wraps the layout itself, caught it.</p></details>
+<details><summary>Does app/global-error.tsx replace my normal error.tsx?</summary><p>No, use both. We kept app/error.js in place and added app/global-error.js alongside it. error.tsx still catches errors from pages and nested layouts; global-error.tsx is only a safety net for errors in the root layout itself, which we confirmed by reproducing both cases.</p></details>
+<details><summary>Why does global-error.tsx need its own html and body tags?</summary><p>Because it replaces the entire root layout when it activates, not just a slice of the page. We defined &lt;html&gt; and &lt;body&gt; inside our global-error.js; Next.js rendered them directly since the real root layout had already thrown and couldn&#x27;t be trusted.</p></details>
+<details><summary>What happens if I have neither error.tsx nor global-error.tsx?</summary><p>Next.js shows its own built-in minimal error screen. We saw it directly: &#x27;This page couldn&#x27;t load / A server error occurred. Reload to try again.&#x27; plus an ERROR line with the digest number, with no custom styling.</p></details>
+<details><summary>Can I test this without deploying?</summary><p>Yes. We reproduced it locally: add export const dynamic = &quot;force-dynamic&quot; to a root layout that throws, run next build &amp;&amp; next start, and hit it with curl or a browser. Without force-dynamic, the throw fails next build itself instead, since Next tries to prerender the root layout at build time.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Node.js 24.21.0 and Next.js 16.3.8 (App Router, Turbopack). Built a minimal app with a root app/layout.js that throws unconditionally, added export const dynamic = &quot;force-dynamic&quot; so the throw happens per-request instead of at build time, ran next build &amp;&amp; next start, and inspected the real response with curl plus headless Chromium (Playwright) to see the hydrated DOM, with and without an app/global-error.js present. PlainHeaders is our extension; curl, Chromium and Next.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

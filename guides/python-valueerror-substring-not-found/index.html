@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ValueError: substring not found in Python &amp;mdash; Tested Fixes</title>
+<meta name="description" content="We measured Python&#x27;s substring not found: index() vs find(), invisible \xa0 spaces and accents, and why switching to find() silently slices wrong data.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-valueerror-substring-not-found/">
+<meta property="og:title" content="ValueError: substring not found in Python &amp;mdash; Tested Fixes">
+<meta property="og:description" content="We measured Python&#x27;s substring not found: index() vs find(), invisible \xa0 spaces and accents, and why switching to find() silently slices wrong data.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-valueerror-substring-not-found/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does ValueError: substring not found mean?", "acceptedAnswer": {"@type": "Answer", "text": "str.index() or str.rindex() didn't find the text you passed. We measured that str.find() does the same search and returns -1 instead of raising."}}, {"@type": "Question", "name": "Why is my substring not found when I can see it?", "acceptedAnswer": {"@type": "Answer", "text": "Usually case, extra or non-breaking spaces (\\xa0), or a differently encoded accent. We measured all four failing; print both strings with repr() and normalize case and Unicode (NFC) before searching."}}, {"@type": "Question", "name": "Should I use find() instead of index()?", "acceptedAnswer": {"@type": "Answer", "text": "Only if you check for -1. We measured line[line.find('charset=') + 8:] returning '-Type: text/html' with no error when the text was missing; str.partition() is a safer alternative."}}, {"@type": "Question", "name": "What is the difference between 'substring not found' and 'is not in list'?", "acceptedAnswer": {"@type": "Answer", "text": "Same idea, different types: str.index() says 'substring not found', list.index() says \"'c' is not in list\". We measured both, including a list produced by split()."}}, {"@type": "Question", "name": "How do I check if a substring exists without an exception?", "acceptedAnswer": {"@type": "Answer", "text": "Use 'sub in text' or text.count(sub); neither raises."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ValueError: substring not found (tested)</h1>
+<p class="lead"><code>ValueError: substring not found</code> comes from <code>str.index()</code> or <code>str.rindex()</code>. We measured the four usual reasons text you can see isn't found, and a trap in the most common fix: <code>find()</code> returning <code>-1</code> that quietly turns into a wrong slice.</p>
+<h2 id="what">1. index() raises, find() doesn't</h2>
+<pre><code>line = &quot;Content-Type: text/html&quot;
+print(line.find(&quot;charset=&quot;))
+try:
+    line.index(&quot;charset=&quot;)
+except ValueError as e:
+    print(repr(e))
+try:
+    [1, 2, 3].index(4)
+except ValueError as e:
+    print(repr(e))
+try:
+    &quot;a,b&quot;.split(&quot;,&quot;).index(&quot;c&quot;)
+except ValueError as e:
+    print(repr(e))</code></pre>
+<pre><code>-1
+ValueError(&#x27;substring not found&#x27;)
+ValueError(&#x27;4 is not in list&#x27;)
+ValueError(&quot;&#x27;c&#x27; is not in list&quot;)</code></pre>
+<p><strong>Measured:</strong> <code>str.index()</code> raises <code>ValueError: substring not found</code> when the text isn't there; <code>str.find()</code> does the same search and returns <code>-1</code> instead. The message never says what was searched for or in what, so log both. The list version reads differently (<code>4 is not in list</code>), which is how you tell from the message alone whether the <code>.index()</code> was on a string or on a list, for example a list from <code>split()</code>.</p>
+
+<h2 id="why">2. Why text that's &ldquo;clearly there&rdquo; isn't found</h2>
+<pre><code>for s, sub in [(&quot;Hello World&quot;, &quot;hello&quot;), (&quot;price: 10&quot;, &quot;price:  &quot;),
+               (&quot;name =x&quot;, &quot;name =&quot;), (&quot;café&quot;, &quot;café&quot;)]:
+    print(repr(s), repr(sub), s.find(sub))
+print(&quot;Hello World&quot;.lower().find(&quot;hello&quot;))
+import unicodedata
+print(unicodedata.normalize(&quot;NFC&quot;, &quot;café&quot;).find(unicodedata.normalize(&quot;NFC&quot;, &quot;café&quot;)))</code></pre>
+<pre><code>&#x27;Hello World&#x27; &#x27;hello&#x27; -1
+&#x27;price: 10&#x27; &#x27;price:  &#x27; -1
+&#x27;name\xa0=x&#x27; &#x27;name =&#x27; -1
+&#x27;café&#x27; &#x27;café&#x27; -1
+0
+0</code></pre>
+<p><strong>Measured:</strong> all four searches failed: case (<code>Hello</code> vs <code>hello</code>), an extra space, a non-breaking space (<code>\xa0</code>, common in text copied from web pages and PDFs) that prints like a normal one, and the same accented letter stored two ways (precomposed <code>é</code> vs <code>e</code> plus a combining accent). Lowercasing both sides fixed the first; <code>unicodedata.normalize("NFC", ...)</code> on both sides fixed the last. Print with <code>repr()</code>, as above, to see these characters.</p>
+
+<h2 id="find-trap">3. Switching to find() can make it worse</h2>
+<pre><code>line = &quot;Content-Type: text/html&quot;
+
+# the bug: find() returns -1, and -1 is a valid slice index
+start = line.find(&quot;charset=&quot;) + len(&quot;charset=&quot;)
+print(repr(line[start:]))
+
+# fix 1: test the result
+i = line.find(&quot;charset=&quot;)
+print(line[i + 8:] if i != -1 else None)
+
+# fix 2: partition never raises
+before, sep, after = line.partition(&quot;charset=&quot;)
+print(repr(sep), repr(after))</code></pre>
+<pre><code>&#x27;-Type: text/html&#x27;
+None
+&#x27;&#x27; &#x27;&#x27;</code></pre>
+<p><strong>Measured:</strong> the common &ldquo;fix&rdquo; of replacing <code>index()</code> with <code>find()</code> and carrying on gave <code>'-Type: text/html'</code>: <code>-1 + len("charset=")</code> is 7, a perfectly valid slice start, so wrong data flows on with no error. Either check for <code>-1</code> explicitly, or use <code>str.partition()</code>, which never raises and returns an empty separator when the text isn't found. If the substring <em>must</em> be there, keep <code>index()</code>: the exception is the correct behavior and catching it with <code>try/except ValueError</code> lets you report which input was bad.</p>
+
+<h2 id="variants">4. rindex() and start positions</h2>
+<pre><code>text = &quot;a=1;b=2&quot;
+print(text.rfind(&quot;;&quot;), text.rindex(&quot;;&quot;))
+try:
+    text.rindex(&quot;|&quot;)
+except ValueError as e:
+    print(repr(e))
+print(text.index(&quot;=&quot;, 2))
+try:
+    text.index(&quot;a&quot;, 1)
+except ValueError as e:
+    print(repr(e))
+print(&quot;b&quot; in text, text.count(&quot;=&quot;))</code></pre>
+<pre><code>3 3
+ValueError(&#x27;substring not found&#x27;)
+5
+ValueError(&#x27;substring not found&#x27;)
+True 2</code></pre>
+<p><strong>Measured:</strong> <code>rindex()</code> searches from the right and raises the same message. Passing a start position (<code>text.index("a", 1)</code>) searches only from there, so text that exists earlier in the string still raises. If you only need to know whether it's present, <code>in</code> and <code>count()</code> never raise.</p>
+
+<aside class="cta"><strong>Searching header strings like Content-Type for charset=? See the exact headers a server sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does ValueError: substring not found mean?</summary><p>str.index() or str.rindex() didn&#x27;t find the text you passed. We measured that str.find() does the same search and returns -1 instead of raising.</p></details>
+<details><summary>Why is my substring not found when I can see it?</summary><p>Usually case, extra or non-breaking spaces (\xa0), or a differently encoded accent. We measured all four failing; print both strings with repr() and normalize case and Unicode (NFC) before searching.</p></details>
+<details><summary>Should I use find() instead of index()?</summary><p>Only if you check for -1. We measured line[line.find(&#x27;charset=&#x27;) + 8:] returning &#x27;-Type: text/html&#x27; with no error when the text was missing; str.partition() is a safer alternative.</p></details>
+<details><summary>What is the difference between &#x27;substring not found&#x27; and &#x27;is not in list&#x27;?</summary><p>Same idea, different types: str.index() says &#x27;substring not found&#x27;, list.index() says &quot;&#x27;c&#x27; is not in list&quot;. We measured both, including a list produced by split().</p></details>
+<details><summary>How do I check if a substring exists without an exception?</summary><p>Use &#x27;sub in text&#x27; or text.count(sub); neither raises.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5: str.index, str.rindex and str.find with missing text, case differences, extra and non-breaking spaces, NFC vs NFD accents, start positions, list.index, and the find() -1 slicing trap. Every code block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

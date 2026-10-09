@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sequence.__iter__ Loops Forever Without IndexError (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: Sequence&#x27;s mixin __iter__/__contains__ call __getitem__(0,1,...) until IndexError. Return None instead, both loop forever.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-collections-abc-sequence-iter-contains-infinite-loop/">
+<meta property="og:title" content="Sequence.__iter__ Loops Forever Without IndexError (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: Sequence&#x27;s mixin __iter__/__contains__ call __getitem__(0,1,...) until IndexError. Return None instead, both loop forever.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-collections-abc-sequence-iter-contains-infinite-loop/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does collections.abc.Sequence's __iter__ hang instead of using __len__?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that the default mixin __iter__ is implemented purely in terms of __getitem__: it calls index 0, 1, 2, ... and stops only when it catches an IndexError. It never calls len() to know where to stop, even though you're required to implement __len__ too."}}, {"@type": "Question", "name": "Is this specific to __iter__, or do other Sequence methods break too?", "acceptedAnswer": {"@type": "Answer", "text": "We measured __contains__ breaking the same way, since it's built on the same __getitem__-until-IndexError walk. __reversed__, index(), and count() rely on the same contract and would be expected to have the same failure mode for a __getitem__ that doesn't raise IndexError."}}, {"@type": "Question", "name": "What should __getitem__ return for an out-of-range index in a Sequence subclass?", "acceptedAnswer": {"@type": "Answer", "text": "It must raise IndexError, not return a sentinel like None or False. We measured that built-in types (list, tuple) follow this contract, and Sequence's mixin methods depend on it being followed exactly."}}, {"@type": "Question", "name": "Does this affect a Sequence that only implements positive-index access correctly?", "acceptedAnswer": {"@type": "Answer", "text": "Yes if __getitem__ silently returns a placeholder instead of raising for any out-of-range index, positive or negative, regardless of whether direct indexing inside the valid range works correctly."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>collections.abc.Sequence __iter__/in Loop Forever Without IndexError (tested)</h1>
+<p class="lead"><code>collections.abc.Sequence</code> only requires you to implement <code>__getitem__</code> and <code>__len__</code> yourself -- in exchange it gives you working <code>__iter__</code>, <code>__contains__</code>, <code>__reversed__</code>, <code>index()</code>, and <code>count()</code> for free. Those mixin methods are not built from <code>__len__</code>: the default <code>__iter__</code> calls <code>__getitem__(0)</code>, <code>__getitem__(1)</code>, <code>__getitem__(2)</code>, ... and treats catching an <code>IndexError</code> as the one and only signal that the sequence has ended. A <code>__getitem__</code> that instead returns a sentinel value like <code>None</code> for out-of-range indices -- a common instinct if you're used to <code>dict.get()</code>-style fallbacks -- never raises that signal, so the mixin methods never stop.</p>
+<h2 id="repro1">1. A __getitem__ that returns None instead of raising IndexError</h2>
+<pre><code>from collections.abc import Sequence
+
+class BadSeq(Sequence):
+    def __init__(self, data):
+        self._data = data
+    def __len__(self):
+        return len(self._data)
+    def __getitem__(self, i):
+        if i &lt; 0 or i &gt;= len(self._data):
+            return None   # looks safe, like dict.get()
+        return self._data[i]
+
+s = BadSeq([1, 2, 3])
+print("len:", len(s))
+print("s[0], s[1], s[2]:", s[0], s[1], s[2])
+print("s[5] (out of range):", s[5])</code></pre>
+<pre><code>len: 3
+s[0], s[1], s[2]: 1 2 3
+s[5] (out of range): None</code></pre>
+<p><strong>Measured:</strong> indexing directly looks completely fine -- out-of-range access just returns <code>None</code> instead of raising. <code>len()</code> is also correct. Nothing here hints that the mixin methods are broken.</p>
+
+<h2 id="repro2">2. The inherited __iter__ never stops</h2>
+<pre><code>it = iter(s)
+first_10 = [next(it) for _ in range(10)]
+print(first_10)</code></pre>
+<pre><code>[1, 2, 3, None, None, None, None, None, None, None]</code></pre>
+<p><strong>Measured:</strong> <code>Sequence</code>'s default <code>__iter__</code> is implemented as "call <code>self[0]</code>, <code>self[1]</code>, ... incrementing, until <code>__getitem__</code> raises <code>IndexError</code>, then stop." It does not call <code>len()</code> and does not treat <code>None</code> as a stop signal. Because <code>BadSeq.__getitem__</code> never raises, <code>list(s)</code> or <code>for x in s</code> will not terminate on its own -- it ran past index 3 straight through our 10-item cap and kept going, yielding <code>None</code> forever.</p>
+
+<h2 id="repro3">3. __contains__ hangs the same way when the value is absent</h2>
+<pre><code>print(2 in s)      # present -- found during the walk, returns fast
+print(99 in s)      # absent -- hangs; this call never returns</code></pre>
+<pre><code>True
+# (process timed out -- 99 in s never returns)</code></pre>
+<p><strong>Measured:</strong> <code>Sequence.__contains__</code> is also built on the same "iterate via <code>__getitem__</code> until <code>IndexError</code>" mixin logic. Checking membership of a value that <em>is</em> present still works, because the walk finds it and returns early. Checking a value that is <em>absent</em> has no other way to know the sequence ended, so it loops forever -- confirmed with a 3-second subprocess timeout that killed the call mid-hang.</p>
+
+<h2 id="repro4">4. The fix: raise IndexError, not a sentinel</h2>
+<pre><code>class GoodSeq(Sequence):
+    def __init__(self, data):
+        self._data = data
+    def __len__(self):
+        return len(self._data)
+    def __getitem__(self, i):
+        if i &lt; 0 or i &gt;= len(self._data):
+            raise IndexError(i)
+        return self._data[i]
+
+g = GoodSeq([1, 2, 3])
+print(list(g))
+print(2 in g, 99 in g)</code></pre>
+<pre><code>[1, 2, 3]
+True False</code></pre>
+<p><strong>Measured:</strong> once <code>__getitem__</code> raises <code>IndexError</code> for out-of-range access -- the same contract built-in sequences like <code>list</code> and <code>tuple</code> follow -- <code>__iter__</code>, <code>__contains__</code>, and every other inherited mixin method terminate correctly, including the absent-value membership check that previously hung.</p>
+<aside class="cta"><strong>Subclassing collections.abc.Sequence and writing your own __getitem__? Make sure it raises IndexError for out-of-range indices -- not a sentinel like None:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does collections.abc.Sequence&#x27;s __iter__ hang instead of using __len__?</summary><p>We measured that the default mixin __iter__ is implemented purely in terms of __getitem__: it calls index 0, 1, 2, ... and stops only when it catches an IndexError. It never calls len() to know where to stop, even though you&#x27;re required to implement __len__ too.</p></details>
+<details><summary>Is this specific to __iter__, or do other Sequence methods break too?</summary><p>We measured __contains__ breaking the same way, since it&#x27;s built on the same __getitem__-until-IndexError walk. __reversed__, index(), and count() rely on the same contract and would be expected to have the same failure mode for a __getitem__ that doesn&#x27;t raise IndexError.</p></details>
+<details><summary>What should __getitem__ return for an out-of-range index in a Sequence subclass?</summary><p>It must raise IndexError, not return a sentinel like None or False. We measured that built-in types (list, tuple) follow this contract, and Sequence&#x27;s mixin methods depend on it being followed exactly.</p></details>
+<details><summary>Does this affect a Sequence that only implements positive-index access correctly?</summary><p>Yes if __getitem__ silently returns a placeholder instead of raising for any out-of-range index, positive or negative, regardless of whether direct indexing inside the valid range works correctly.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in collections.abc.Sequence: subclassed it with a __getitem__ that returns None for out-of-range indices instead of raising IndexError, then called the inherited (mixin) __iter__ and __contains__ and observed them loop without end. PlainHeaders is our extension; Python&#x27;s collections.abc module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

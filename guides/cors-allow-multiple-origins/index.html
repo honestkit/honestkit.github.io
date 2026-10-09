@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access-Control-Allow-Origin Multiple Domains: Allow Several Origins (nginx Example)</title>
+<meta name="description" content="Access-Control-Allow-Origin takes one origin, not a list. Echo the request&#x27;s Origin from an allow-list instead: a tested nginx map config, preflight handling, Vary: Origin, and the mistakes browsers reject.">
+<link rel="canonical" href="https://honestkit.github.io/guides/cors-allow-multiple-origins/">
+<meta property="og:title" content="Access-Control-Allow-Origin Multiple Domains: Allow Several Origins (nginx Example)">
+<meta property="og:description" content="Access-Control-Allow-Origin takes one origin, not a list. Echo the request&#x27;s Origin from an allow-list instead: a tested nginx map config, preflight handling, Vary: Origin, and the mistakes browsers reject.">
+<meta property="og:url" content="https://honestkit.github.io/guides/cors-allow-multiple-origins/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can Access-Control-Allow-Origin have multiple values?", "acceptedAnswer": {"@type": "Answer", "text": "No. In our Chrome test, a comma-separated list was rejected for every origin. Send back one origin, chosen from an allow-list based on the request's Origin header."}}, {"@type": "Question", "name": "Why do I need Vary: Origin?", "acceptedAnswer": {"@type": "Answer", "text": "Because the response changes with the Origin header. Without Vary: Origin, a CDN or browser cache can serve one site's CORS header to another site, which then gets blocked."}}, {"@type": "Question", "name": "How do I allow localhost on any port?", "acceptedAnswer": {"@type": "Answer", "text": "Use an anchored regex such as ~^http://localhost(:[0-9]+)?$ in the nginx map. It matched localhost and localhost:3000 in our test, not localhost.evil.com."}}, {"@type": "Question", "name": "Is Access-Control-Allow-Origin: * safe?", "acceptedAnswer": {"@type": "Answer", "text": "For public data that needs no login, yes. It doesn't work with cookies or other credentials, and any site can read the response."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to allow multiple origins in Access-Control-Allow-Origin (CORS)</h1>
+<p class="lead">The header can hold only one origin (or *). To allow several sites, check the request's Origin against a list and send back that one origin.</p>
+<h2>1. Why a list doesn't work</h2>
+<p>We sent <code>Access-Control-Allow-Origin: http://localhost:8965, http://127.0.0.1:8966</code> and called the API from both pages in Chrome: <strong>both were blocked</strong>. The browser wants exactly one origin, or <code>*</code>.</p>
+<h2>2. nginx: echo the origin from an allow-list</h2>
+<pre><code>map $http_origin $cors_origin {
+    default &quot;&quot;;
+    &quot;https://app.example.com&quot;   $http_origin;
+    &quot;https://admin.example.com&quot; $http_origin;
+    &quot;~^http://localhost(:[0-9]+)?$&quot; $http_origin;
+}
+
+server {
+    listen 80;
+    location /api/ {
+        add_header Access-Control-Allow-Origin $cors_origin always;
+        add_header Vary Origin always;
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin $cors_origin always;
+            add_header Vary Origin always;
+            add_header Access-Control-Allow-Methods &quot;GET, POST, PUT, DELETE, OPTIONS&quot; always;
+            add_header Access-Control-Allow-Headers &quot;Authorization, Content-Type&quot; always;
+            add_header Access-Control-Max-Age 600 always;
+            return 204;
+        }
+        return 200 &#x27;{&quot;ok&quot;:true}\n&#x27;;
+    }
+}</code></pre>
+<p>How it works: <code>map</code> compares the request's <code>Origin</code> with the list and sets <code>$cors_origin</code> to that origin, or to an empty string. nginx doesn't send a header whose value is empty, so other sites get no CORS header and the browser blocks them. <code>Vary: Origin</code> stops caches from serving one site's answer to another. The <code>OPTIONS</code> branch answers preflight requests (sent before PUT/DELETE or requests with an Authorization or JSON Content-Type header). Inside <code>if</code>, the <code>add_header</code> lines are repeated on purpose: nginx doesn't inherit outer <code>add_header</code> lines into a block that has its own.</p>
+<h2>3. What we tested</h2>
+<table><thead><tr><th>Request</th><th>Result</th></tr></thead><tbody>
+<tr><td>GET from <code>http://localhost:8965</code> (matches the localhost rule)</td><td>Allowed</td></tr>
+<tr><td>PUT with Authorization + JSON from the same page (preflight)</td><td>Allowed</td></tr>
+<tr><td>GET and PUT from <code>http://127.0.0.1:8966</code> (not in the list)</td><td>Blocked</td></tr>
+<tr><td>Origin <code>https://app.example.com.evil.com</code> / <code>null</code> / none (curl)</td><td>No CORS header sent</td></tr>
+<tr><td><code>*</code> without credentials, from both pages</td><td>Allowed</td></tr>
+<tr><td><code>*</code> with <code>credentials: 'include'</code></td><td>Blocked</td></tr>
+</tbody></table>
+<h2>4. Mistakes to avoid</h2>
+<ul><li><strong>Unanchored patterns.</strong> A rule like <code>"~localhost"</code> also matched <code>http://localhost.evil.com</code> in our test. Anchor every regex with <code>^</code> and <code>$</code>, and escape dots (<code>\.</code>) if you match domains with a regex.</li>
+<li><strong>Echoing any origin.</strong> Sending back whatever Origin arrives is the same as <code>*</code>, but it also works with cookies. Never do that for an API that uses cookies or logins.</li>
+<li><strong>Allowing <code>null</code>.</strong> Sandboxed iframes and local files send <code>Origin: null</code>, so anyone can produce it. Keep it out of the list.</li>
+<li><strong>Cookies with <code>*</code>.</strong> Browsers reject <code>*</code> for credentialed requests. List the origins and add <code>Access-Control-Allow-Credentials: true</code>.</li></ul>
+<p>Check a response with <code>curl -sI -H 'Origin: https://app.example.com' https://api.your-site.com/</code>. To see the headers a page gets in the browser, use DevTools → Network → the request → Headers.</p>
+<aside class="cta"><strong>Try a CORS header in your browser before changing the server:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can Access-Control-Allow-Origin have multiple values?</summary><p>No. In our Chrome test, a comma-separated list was rejected for every origin. Send back one origin, chosen from an allow-list based on the request&#x27;s Origin header.</p></details>
+<details><summary>Why do I need Vary: Origin?</summary><p>Because the response changes with the Origin header. Without Vary: Origin, a CDN or browser cache can serve one site&#x27;s CORS header to another site, which then gets blocked.</p></details>
+<details><summary>How do I allow localhost on any port?</summary><p>Use an anchored regex such as ~^http://localhost(:[0-9]+)?$ in the nginx map. It matched localhost and localhost:3000 in our test, not localhost.evil.com.</p></details>
+<details><summary>Is Access-Control-Allow-Origin: * safe?</summary><p>For public data that needs no login, yes. It doesn&#x27;t work with cookies or other credentials, and any site can read the response.</p></details>
+</section>
+<p class="note">Written with AI assistance. The nginx config was run in nginx:alpine 1.31.6 on 2026-10-01; every &#x27;allowed&#x27; / &#x27;blocked&#x27; result is a real fetch() from Chromium 153 on two different origins. PlainHeaders is our extension; the other methods are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

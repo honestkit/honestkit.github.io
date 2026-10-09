@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AttributeError: can&#x27;t set attribute / Property Has No Setter</title>
+<meta name="description" content="We measured Python&#x27;s read-only attribute errors: @property with no setter, assignment in __init__, namedtuple, frozen dataclass, and two setter mistakes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-attributeerror-can-t-set-attribute-property-has-no-setter/">
+<meta property="og:title" content="AttributeError: can&#x27;t set attribute / Property Has No Setter">
+<meta property="og:description" content="We measured Python&#x27;s read-only attribute errors: @property with no setter, assignment in __init__, namedtuple, frozen dataclass, and two setter mistakes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-attributeerror-can-t-set-attribute-property-has-no-setter/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does AttributeError: can't set attribute mean?", "acceptedAnswer": {"@type": "Answer", "text": "You assigned to a read-only attribute: a property without a setter (Python 3.10 and earlier wording) or a namedtuple field (still this wording on 3.13.5, which we measured)."}}, {"@type": "Question", "name": "What does property object has no setter mean in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Since Python 3.11 that's the message for assigning to a @property that has no @x.setter. Add a setter with the same function name, or assign to the backing attribute instead."}}, {"@type": "Question", "name": "Why does my property fail in __init__?", "acceptedAnswer": {"@type": "Answer", "text": "self.name = value in __init__ goes through the property. We measured it raising the same no-setter error; set self._name directly or add a setter."}}, {"@type": "Question", "name": "How do I change a field of a namedtuple?", "acceptedAnswer": {"@type": "Answer", "text": "You can't in place; use p._replace(x=10), which returns a new tuple. We measured it returning Point(x=10, y=2)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>AttributeError: can&#x27;t set attribute / property has no setter (tested)</h1>
+<p class="lead"><code>AttributeError: can't set attribute</code> and, since Python 3.11, <code>property 'x' of 'C' object has no setter</code> both mean you assigned to something read-only. We ran every common cause on Python 3.13.5, including two setter mistakes that look right.</p>
+<h2 id="no-setter">1. The property has a getter and no setter</h2>
+<pre><code>class Temp:
+    def __init__(self, c):
+        self._c = c
+
+    @property
+    def celsius(self):
+        return self._c
+
+t = Temp(20)
+try:
+    t.celsius = 25
+except AttributeError as e:
+    print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>AttributeError: property &#x27;celsius&#x27; of &#x27;Temp&#x27; object has no setter</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> the message is <code>property 'celsius' of 'Temp' object has no setter</code>. Python 3.11 changed this text; older versions said <code>AttributeError: can't set attribute</code> for the same mistake (not re-tested here, we only ran 3.13). Same bug, same fix.</p>
+
+<h2 id="init">2. It fails inside __init__ too</h2>
+<p>A common surprise: you never assign to the property &ldquo;from outside&rdquo;, but <code>__init__</code> does <code>self.celsius = c</code>, which goes through the property:</p>
+<pre><code>class Temp:
+    def __init__(self, c):
+        self.celsius = c          # goes through the property
+
+    @property
+    def celsius(self):
+        return self._c
+
+try:
+    Temp(20)
+except AttributeError as e:
+    print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>AttributeError: property &#x27;celsius&#x27; of &#x27;Temp&#x27; object has no setter</code></pre>
+<p>Either store into the backing name (<code>self._c = c</code>) or add a setter, as in section 4.</p>
+
+<h2 id="namedtuple">3. namedtuple and frozen dataclasses</h2>
+<pre><code>from collections import namedtuple
+from dataclasses import dataclass
+
+Point = namedtuple(&quot;Point&quot;, &quot;x y&quot;)
+p = Point(1, 2)
+try:
+    p.x = 10
+except AttributeError as e:
+    print(&quot;namedtuple:&quot;, e)
+print(&quot;fix:&quot;, p._replace(x=10))
+
+@dataclass(frozen=True)
+class Cfg:
+    port: int
+
+c = Cfg(80)
+try:
+    c.port = 8080
+except AttributeError as e:
+    print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>namedtuple: can&#x27;t set attribute
+fix: Point(x=10, y=2)
+FrozenInstanceError: cannot assign to field &#x27;port&#x27;</code></pre>
+<p><strong>Measured:</strong> on 3.13.5 a <code>namedtuple</code> still raises the old wording, <code>can't set attribute</code>, so that's the likely source if you see that exact text on a current Python. Use <code>_replace()</code> to get a modified copy. A <code>@dataclass(frozen=True)</code> raises <code>FrozenInstanceError</code>, which is a subclass of <code>AttributeError</code> (checked: <code>issubclass(FrozenInstanceError, AttributeError)</code> is <code>True</code>); use <code>dataclasses.replace(c, port=8080)</code>.</p>
+
+<h2 id="fix">4. The fix: add a setter with the same name</h2>
+<pre><code>class Temp:
+    def __init__(self, c):
+        self.celsius = c
+
+    @property
+    def celsius(self):
+        return self._c
+
+    @celsius.setter
+    def celsius(self, value):
+        if value &lt; -273.15:
+            raise ValueError(&quot;below absolute zero&quot;)
+        self._c = value
+
+t = Temp(20)
+t.celsius = 25
+print(t.celsius)</code></pre>
+<p>Output:</p>
+<pre><code>25</code></pre>
+
+<h2 id="wrong-setter">5. Two setter mistakes that don't fix it</h2>
+<p>Forgetting the decorator: the second <code>def celsius</code> simply replaces the property with a plain function:</p>
+<pre><code>class Temp:
+    @property
+    def celsius(self):
+        return self._c
+
+    def celsius(self, value):      # meant as a setter, missing @celsius.setter
+        self._c = value
+
+t = Temp()
+t._c = 1
+print(type(Temp.__dict__[&quot;celsius&quot;]).__name__)
+try:
+    print(type(t.celsius).__name__, t.celsius == t._c)
+except Exception as e:
+    print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>function
+method False</code></pre>
+<p><strong>Measured:</strong> no error at all, but <code>Temp.celsius</code> is now a plain function, so <code>t.celsius</code> is a bound method, not the value. Naming the setter function differently:</p>
+<pre><code>class Temp:
+    @property
+    def celsius(self):
+        return self._c
+
+    @celsius.setter
+    def set_celsius(self, value):   # setter under a different name
+        self._c = value
+
+t = Temp()
+try:
+    t.celsius = 5
+except AttributeError as e:
+    print(type(e).__name__ + &quot;:&quot;, e)
+t.set_celsius = 5
+print(t.celsius)</code></pre>
+<p>Output:</p>
+<pre><code>AttributeError: property &#x27;celsius&#x27; of &#x27;Temp&#x27; object has no setter
+5</code></pre>
+<p><strong>Measured:</strong> <code>@celsius.setter</code> returns a new property bound to whatever name the function has. Under <code>set_celsius</code>, the original <code>celsius</code> is still read-only. The setter function must use the same name as the getter.</p>
+
+<aside class="cta"><strong>Debugging HTTP clients too? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does AttributeError: can&#x27;t set attribute mean?</summary><p>You assigned to a read-only attribute: a property without a setter (Python 3.10 and earlier wording) or a namedtuple field (still this wording on 3.13.5, which we measured).</p></details>
+<details><summary>What does property object has no setter mean in Python?</summary><p>Since Python 3.11 that&#x27;s the message for assigning to a @property that has no @x.setter. Add a setter with the same function name, or assign to the backing attribute instead.</p></details>
+<details><summary>Why does my property fail in __init__?</summary><p>self.name = value in __init__ goes through the property. We measured it raising the same no-setter error; set self._name directly or add a setter.</p></details>
+<details><summary>How do I change a field of a namedtuple?</summary><p>You can&#x27;t in place; use p._replace(x=10), which returns a new tuple. We measured it returning Point(x=10, y=2).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: a property without a setter (assigned outside and in __init__), namedtuple and frozen dataclass assignment, a correct setter, and two broken setter variants. Every block was run verbatim and its output pasted from that run. Pre-3.11 wording was not re-tested. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

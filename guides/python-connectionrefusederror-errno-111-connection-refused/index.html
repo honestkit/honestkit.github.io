@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python [Errno 111] Connection refused &amp;amp; 104 Reset, Tested</title>
+<meta name="description" content="We measured Python&#x27;s Errno 111 Connection refused (wrong address, ::1 vs 127.0.0.1, server not up) and Errno 104 reset by peer, with fixes that work.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-connectionrefusederror-errno-111-connection-refused/">
+<meta property="og:title" content="Python [Errno 111] Connection refused &amp;amp; 104 Reset, Tested">
+<meta property="og:description" content="We measured Python&#x27;s Errno 111 Connection refused (wrong address, ::1 vs 127.0.0.1, server not up) and Errno 104 reset by peer, with fixes that work.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-connectionrefusederror-errno-111-connection-refused/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does ConnectionRefusedError: [Errno 111] Connection refused mean?", "acceptedAnswer": {"@type": "Answer", "text": "Nothing accepted the connection at that address and port, and the other host said so immediately. We measured it returning instantly from socket, urllib and requests when no server was listening. Check the server is running, the port, and the address it's bound to."}}, {"@type": "Question", "name": "Why is localhost refused but 127.0.0.1 works (or the reverse)?", "acceptedAnswer": {"@type": "Answer", "text": "localhost can resolve to ::1 (IPv6) before 127.0.0.1. We measured a server bound to 127.0.0.1 refusing ::1; Python's create_connection then fell back to 127.0.0.1 and connected, but clients that only try the first address fail."}}, {"@type": "Question", "name": "How do I wait for a server to start before connecting?", "acceptedAnswer": {"@type": "Answer", "text": "Retry on ConnectionRefusedError with a growing delay and a maximum number of attempts. We measured a server that started after one second: three refused attempts, then a connection."}}, {"@type": "Question", "name": "What does ConnectionResetError: [Errno 104] Connection reset by peer mean?", "acceptedAnswer": {"@type": "Answer", "text": "The connection was open and the other side aborted it with a TCP reset. We reproduced it with a server closing with SO_LINGER 0; a normal close instead returns b'' from recv()."}}, {"@type": "Question", "name": "Is errno 111 the same as 10061 or 61?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, it's the same 'connection refused' condition: 111 is the Linux errno, 61 is macOS and 10061 is the Windows WSAECONNREFUSED code. Python raises ConnectionRefusedError for all of them."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ConnectionRefusedError: [Errno 111] Connection refused (tested)</h1>
+<p class="lead"><code>ConnectionRefusedError: [Errno 111] Connection refused</code> and <code>ConnectionResetError: [Errno 104] Connection reset by peer</code> look alike but mean different things. We reproduced both with local sockets on Python 3.13.5, including the IPv6 <code>localhost</code> trap, and tested a retry that only retries what it should.</p>
+<h2 id="refused">1. Errno 111: nothing is listening there</h2>
+<pre><code>import socket, urllib.request, requests
+
+# nothing is listening on port 8964
+try:
+    socket.create_connection((&quot;127.0.0.1&quot;, 8964), timeout=3)
+except OSError as e:
+    print(type(e).__name__, e.errno, e)
+
+try:
+    urllib.request.urlopen(&quot;http://127.0.0.1:8964/&quot;, timeout=3)
+except OSError as e:
+    print(type(e).__name__, e)
+
+try:
+    requests.get(&quot;http://127.0.0.1:8964/&quot;, timeout=3)
+except requests.ConnectionError as e:
+    print(type(e).__name__, str(e)[-60:])</code></pre>
+<pre><code>ConnectionRefusedError 111 [Errno 111] Connection refused
+URLError &lt;urlopen error [Errno 111] Connection refused&gt;
+ConnectionError stablish a new connection: [Errno 111] Connection refused&#x27;))</code></pre>
+<p><strong>Measured:</strong> the same refusal surfaces three ways: <code>ConnectionRefusedError</code> from <code>socket</code>, <code>URLError</code> wrapping it from <code>urllib</code>, and <code>requests.ConnectionError</code> (&ldquo;Failed to establish a new connection&rdquo;) from <code>requests</code>. It came back instantly, not after the timeout: the other machine answered &ldquo;no&rdquo; (a TCP RST). That rules out a firewall silently dropping packets (which looks like a timeout instead) and points at one of: the server isn't running, it's on a different port, or it isn't listening on the address you dialled. Errno 111 is the Linux number; macOS reports the same error as 61 and Windows as 10061.</p>
+
+<h2 id="addr">2. Listening on the wrong address</h2>
+<pre><code>import socket, threading, time
+
+def serve(host, family=socket.AF_INET):
+    s = socket.socket(family)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, 8965))
+    s.listen()
+    def loop():
+        while True:
+            s.accept()[0].close()
+    threading.Thread(target=loop, daemon=True).start()
+
+serve(&quot;127.0.0.1&quot;)      # server listens on IPv4 loopback only
+time.sleep(0.2)
+
+for host in [&quot;127.0.0.1&quot;, &quot;localhost&quot;, &quot;::1&quot;]:
+    try:
+        socket.create_connection((host, 8965), timeout=3).close()
+        print(host, &quot;-&gt; connected&quot;)
+    except OSError as e:
+        print(host, &quot;-&gt;&quot;, type(e).__name__, e)
+print(socket.getaddrinfo(&quot;localhost&quot;, 8965, type=socket.SOCK_STREAM)[0][4])</code></pre>
+<pre><code>127.0.0.1 -&gt; connected
+localhost -&gt; connected
+::1 -&gt; ConnectionRefusedError [Errno 111] Connection refused
+(&#x27;::1&#x27;, 8965, 0, 0)</code></pre>
+<p><strong>Measured:</strong> a server bound to <code>127.0.0.1</code> refuses connections to <code>::1</code>, the IPv6 loopback. <code>localhost</code> still connected, because on this machine it resolves to <code>::1</code> first and <code>socket.create_connection()</code> (which <code>urllib</code> and <code>requests</code> both use) tried the next address, <code>127.0.0.1</code>, when that was refused. Clients that only try the first address don't get that second chance. The same rule explains the classic Docker case: a server inside a container bound to <code>127.0.0.1</code> only accepts connections from inside that container, so bind to <code>0.0.0.0</code> there. Check what's really listening with <code>ss -ltn</code> (Linux) or <code>netstat -an</code>: <code>127.0.0.1:8000</code> means loopback only, <code>0.0.0.0:8000</code> or <code>*:8000</code> means all IPv4 interfaces.</p>
+
+<h2 id="startup">3. The server isn't up yet</h2>
+<p>In scripts that start a server, a container or a database and connect right away, the first attempt often lands before the port is open. Retry the refusal specifically, with a growing delay and a limit:</p>
+<pre><code>import socket, threading, time
+
+def start_late(delay):
+    time.sleep(delay)          # e.g. a database container still booting
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((&quot;127.0.0.1&quot;, 8964))
+    s.listen()
+    s.accept()[0].close()
+
+def connect_with_retry(addr, attempts=6, delay=0.25):
+    for i in range(attempts):
+        try:
+            return socket.create_connection(addr, timeout=3)
+        except ConnectionRefusedError:
+            print(f&quot;attempt {i + 1}: refused, retrying in {delay}s&quot;)
+            time.sleep(delay)
+            delay *= 2
+    raise ConnectionRefusedError(f&quot;{addr} still refusing after {attempts} attempts&quot;)
+
+threading.Thread(target=start_late, args=(1.0,), daemon=True).start()
+conn = connect_with_retry((&quot;127.0.0.1&quot;, 8964))
+print(&quot;connected to&quot;, conn.getpeername())</code></pre>
+<pre><code>attempt 1: refused, retrying in 0.25s
+attempt 2: refused, retrying in 0.5s
+attempt 3: refused, retrying in 1.0s
+connected to (&#x27;127.0.0.1&#x27;, 8964)</code></pre>
+<p><strong>Measured:</strong> the server came up after about a second; three refusals, then a connection. Catch <code>ConnectionRefusedError</code> only, not every <code>OSError</code>, so that a wrong hostname or a timeout still fails fast.</p>
+
+<h2 id="reset">4. Errno 104: the other side reset the connection</h2>
+<pre><code>import socket, struct, threading, time
+
+def rude_server():
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((&quot;127.0.0.1&quot;, 8966))
+    s.listen()
+    conn, _ = s.accept()
+    conn.recv(1024)
+    # SO_LINGER with timeout 0: close() sends RST instead of FIN
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack(&quot;ii&quot;, 1, 0))
+    conn.close()
+
+threading.Thread(target=rude_server, daemon=True).start()
+time.sleep(0.2)
+
+c = socket.create_connection((&quot;127.0.0.1&quot;, 8966), timeout=3)
+c.sendall(b&quot;GET / HTTP/1.1\r\nHost: x\r\n\r\n&quot;)
+time.sleep(0.2)
+try:
+    print(c.recv(1024))
+except OSError as e:
+    print(type(e).__name__, e.errno, e)</code></pre>
+<pre><code>ConnectionResetError 104 [Errno 104] Connection reset by peer</code></pre>
+<p><strong>Measured:</strong> <code>ConnectionResetError: [Errno 104] Connection reset by peer</code> is different: the connection <em>was</em> established and the other side then aborted it with a RST instead of closing it normally. We forced it with <code>SO_LINGER</code> set to 0, which is what a crashing process, a proxy/load balancer killing an idle connection, or a server rejecting what you sent effectively does. For comparison, a normal close is not an error at all:</p>
+<pre><code>import socket, threading, time
+
+def polite_server():
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((&quot;127.0.0.1&quot;, 8967))
+    s.listen()
+    conn, _ = s.accept()
+    conn.recv(1024)
+    conn.close()          # normal close: FIN, not RST
+
+threading.Thread(target=polite_server, daemon=True).start()
+time.sleep(0.2)
+
+c = socket.create_connection((&quot;127.0.0.1&quot;, 8967), timeout=3)
+c.sendall(b&quot;hello&quot;)
+time.sleep(0.2)
+print(repr(c.recv(1024)))</code></pre>
+<pre><code>b&#x27;&#x27;</code></pre>
+<p><strong>Measured:</strong> after a clean close, <code>recv()</code> returns <code>b''</code>. So an Errno 104 means something on the other end gave up abruptly. Common causes: the server crashed or hit a limit while handling your request (check its logs, not yours); an idle keep-alive connection was dropped by a proxy and then reused (retry once on a fresh connection); you spoke the wrong protocol, for example plain HTTP to a TLS port. In <code>requests</code> we measured it wrapped as <code>ConnectionError(ProtocolError(it shows up wrapped as <code>ConnectionError(&#x27;Connection aborted.&#x27;, ConnectionResetError(104, ...))</code>.#x27;Connection aborted.it shows up wrapped as <code>ConnectionError(&#x27;Connection aborted.&#x27;, ConnectionResetError(104, ...))</code>.#x27;, ConnectionResetError(104, it shows up wrapped as <code>ConnectionError(&#x27;Connection aborted.&#x27;, ConnectionResetError(104, ...))</code>.#x27;Connection reset by peerit shows up wrapped as <code>ConnectionError(&#x27;Connection aborted.&#x27;, ConnectionResetError(104, ...))</code>.#x27;)))</code>.</p>
+
+<aside class="cta"><strong>Connected but getting the wrong response? Check the status and headers the server actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does ConnectionRefusedError: [Errno 111] Connection refused mean?</summary><p>Nothing accepted the connection at that address and port, and the other host said so immediately. We measured it returning instantly from socket, urllib and requests when no server was listening. Check the server is running, the port, and the address it&#x27;s bound to.</p></details>
+<details><summary>Why is localhost refused but 127.0.0.1 works (or the reverse)?</summary><p>localhost can resolve to ::1 (IPv6) before 127.0.0.1. We measured a server bound to 127.0.0.1 refusing ::1; Python&#x27;s create_connection then fell back to 127.0.0.1 and connected, but clients that only try the first address fail.</p></details>
+<details><summary>How do I wait for a server to start before connecting?</summary><p>Retry on ConnectionRefusedError with a growing delay and a maximum number of attempts. We measured a server that started after one second: three refused attempts, then a connection.</p></details>
+<details><summary>What does ConnectionResetError: [Errno 104] Connection reset by peer mean?</summary><p>The connection was open and the other side aborted it with a TCP reset. We reproduced it with a server closing with SO_LINGER 0; a normal close instead returns b&#x27;&#x27; from recv().</p></details>
+<details><summary>Is errno 111 the same as 10061 or 61?</summary><p>Yes, it&#x27;s the same &#x27;connection refused&#x27; condition: 111 is the Linux errno, 61 is macOS and 10061 is the Windows WSAECONNREFUSED code. Python raises ConnectionRefusedError for all of them.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 and requests 2.32.3 on Linux, against local sockets only: a closed port via socket, urllib and requests; a server bound to 127.0.0.1 dialled as 127.0.0.1, localhost and ::1; a server that starts one second late with a retry loop; and a server that closes with SO_LINGER 0 (reset) versus a normal close. Every code block was run verbatim and its output pasted from that run. PlainHeaders is our extension; socket and urllib are built in, requests is a third-party library.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

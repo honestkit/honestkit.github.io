@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mixed Content Blocked on HTTPS: What Chrome Blocks (Tested)</title>
+<meta name="description" content="We loaded 9 kinds of http:// resource from an HTTPS page in Chromium 153. Which are blocked, which are auto-upgraded, the exact console text, and the fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/mixed-content-blocked-https/">
+<meta property="og:title" content="Mixed Content Blocked on HTTPS: What Chrome Blocks (Tested)">
+<meta property="og:description" content="We loaded 9 kinds of http:// resource from an HTTPS page in Chromium 153. Which are blocked, which are auto-upgraded, the exact console text, and the fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/mixed-content-blocked-https/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Chrome load my http image but block my http script?", "acceptedAnswer": {"@type": "Answer", "text": "In our Chromium 153 test, images, audio and video are auto-upgraded to https and loaded if the host serves HTTPS. Scripts, stylesheets, iframes, fetch, XHR and ws:// WebSockets are blocked with no upgrade."}}, {"@type": "Question", "name": "Does the auto-upgrade change the port?", "acceptedAnswer": {"@type": "Answer", "text": "No. http://assets.test:8991/i.png was requested as https://assets.test:8991/i.png. If that port only speaks HTTP, the image fails with net::ERR_SSL_PROTOCOL_ERROR and there is no fallback."}}, {"@type": "Question", "name": "Does upgrade-insecure-requests fix all mixed content?", "acceptedAnswer": {"@type": "Answer", "text": "It upgraded all ten request types in our test, including fetch, XHR, WebSocket and form posts, as a header or a meta tag. It only works if each host actually serves HTTPS on that port."}}, {"@type": "Question", "name": "Is http://localhost blocked from an HTTPS page?", "acceptedAnswer": {"@type": "Answer", "text": "No. In our test http://localhost and http://127.0.0.1 loaded scripts, fetch, XHR and ws:// without any block. Images were not upgraded, with a 'local network request' or 'host is an IP address' warning."}}, {"@type": "Question", "name": "Why does my fetch just say Failed to fetch?", "acceptedAnswer": {"@type": "Answer", "text": "A mixed-content block rejects fetch with a plain TypeError: Failed to fetch. The real reason is only in the console: 'requested an insecure resource ... This request has been blocked; the content must be served over HTTPS.'"}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Mixed Content blocked on HTTPS (tested)</h1>
+<p class="lead">A <code>Mixed Content</code> error means an HTTPS page asked for something over plain <code>http://</code>. Chrome blocks scripts, styles, frames, fetch, XHR and WebSocket outright. It silently upgrades images, audio and video to https. Forms get a warning page. We measured every case, the exact console messages, and the fixes.</p>
+<h2>1. Our test setup</h2>
+<p>A Node server on port 8990 served an HTTPS page at <code>https://site.test:8990/</code>. A second server on port 8991 answered both plain HTTP and HTTPS on the same port, and logged which one each request used. That shows whether Chrome blocked a request, sent it as http, or upgraded it to https.</p>
+<p>The page loaded <code>http://assets.test:8991/...</code> for a script, a stylesheet, an image, an <code>&lt;audio&gt;</code>, a <code>&lt;video&gt;</code>, an iframe, a <code>fetch()</code>, an <code>XMLHttpRequest</code>, a <code>WebSocket('ws://...')</code> and a POST form. Both host names pointed to 127.0.0.1 through a Chromium host-resolver rule, so Chrome treated them as normal remote hosts.</p>
+
+<h2>2. Results: what Chromium 153 does with each http:// resource</h2>
+<table>
+<tr><th>Resource</th><th>Result</th><th>Reached server as</th><th>Console level</th></tr>
+<tr><td><code>&lt;script src&gt;</code></td><td>Blocked</td><td>nothing</td><td>error</td></tr>
+<tr><td><code>&lt;link rel=stylesheet&gt;</code></td><td>Blocked</td><td>nothing</td><td>error</td></tr>
+<tr><td><code>&lt;iframe src&gt;</code></td><td>Blocked</td><td>nothing</td><td>error</td></tr>
+<tr><td><code>fetch()</code></td><td>Blocked, promise rejects with <code>TypeError: Failed to fetch</code></td><td>nothing</td><td>error</td></tr>
+<tr><td><code>XMLHttpRequest</code></td><td>Blocked, <code>onerror</code>, status 0</td><td>nothing</td><td>error</td></tr>
+<tr><td><code>new WebSocket('ws://...')</code></td><td>Constructor throws <code>SecurityError</code></td><td>nothing</td><td>error</td></tr>
+<tr><td><code>&lt;img src&gt;</code></td><td>Auto-upgraded, loaded</td><td>https, same port 8991</td><td>warning</td></tr>
+<tr><td><code>&lt;audio src&gt;</code></td><td>Auto-upgraded, loaded</td><td>https, same port 8991</td><td>2 warnings</td></tr>
+<tr><td><code>&lt;video src&gt;</code></td><td>Auto-upgraded, loaded</td><td>https, same port 8991</td><td>2 warnings</td></tr>
+<tr><td><code>&lt;form action=http://&gt;</code> submit</td><td>Interstitial "Form is not secure"</td><td>nothing (until the user clicks "Send anyway")</td><td>warning</td></tr>
+</table>
+<p>The upgrade only changes the scheme. Chrome kept the explicit port: <code>http://assets.test:8991/i.png</code> became <code>https://assets.test:8991/i.png</code>. If the host does not speak HTTPS there, the upgraded image just breaks. When we made port 8991 HTTP-only, the image, audio and video all failed with <code>net::ERR_SSL_PROTOCOL_ERROR</code>. There is no fallback to http.</p>
+
+<h2>3. The exact console messages</h2>
+<p>Blocked script (same wording for <code>stylesheet</code> and <code>frame</code>):</p>
+<pre><code>Mixed Content: The page at 'https://site.test:8990/' was loaded over HTTPS, but requested an insecure script 'http://assets.test:8991/t1/s.js'. This request has been blocked; the content must be served over HTTPS.</code></pre>
+<p>Blocked fetch and XHR:</p>
+<pre><code>... but requested an insecure resource 'http://assets.test:8991/t1/fetch'. This request has been blocked; the content must be served over HTTPS.
+... but requested an insecure XMLHttpRequest endpoint 'http://assets.test:8991/t1/xhr'. This request has been blocked; the content must be served over HTTPS.</code></pre>
+<p>WebSocket (console, plus the thrown exception):</p>
+<pre><code>... but attempted to connect to the insecure WebSocket endpoint 'ws://assets.test:8991/t1/ws'. This request has been blocked; this endpoint must be available over WSS.
+SecurityError: Failed to construct 'WebSocket': An insecure WebSocket connection may not be initiated from a page loaded over HTTPS.</code></pre>
+<p>Auto-upgraded image, audio or video (a warning, not an error):</p>
+<pre><code>... but requested an insecure element 'http://assets.test:8991/t1/i.png'. This request was automatically upgraded to HTTPS, For more information see https://blog.chromium.org/2019/10/no-more-mixed-messages-about-https.html</code></pre>
+<p>Audio and video also log a second warning: <code>... requested an insecure audio file '...a.wav'. This content should also be served over HTTPS.</code></p>
+<p>Form:</p>
+<pre><code>... was loaded over a secure connection, but contains a form that targets an insecure endpoint 'http://assets.test:8991/t1/form'. This endpoint should be made available over a secure connection.</code></pre>
+<p>In Playwright and DevTools Protocol, blocked requests fail with the error text <code>mixed-content</code>. A blocked fetch only gives your code <code>TypeError: Failed to fetch</code>, which looks like every other network failure. See <a href="/guides/typeerror-failed-to-fetch/">TypeError: Failed to fetch</a> for the other causes.</p>
+
+<h2>4. Fix 1: use https:// URLs (best)</h2>
+<p>Change every <code>http://</code> to <code>https://</code>. With <code>https://assets.test:8991</code> everything loaded, all requests arrived over https, and the console was empty. This is the only fix that also works in older browsers and in non-browser clients.</p>
+<p>Protocol-relative URLs (<code>//assets.test:8991/s.js</code>) gave the same clean result on an HTTPS page: every request, including the WebSocket built from <code>//assets.test:8991/ws</code>, went over https or wss. They still break when the page itself is opened over http, so prefer plain <code>https://</code>.</p>
+
+<h2>5. Fix 2: Content-Security-Policy: upgrade-insecure-requests</h2>
+<p>If you cannot edit every URL (old CMS content, user posts), send this header on the HTML page:</p>
+<pre><code>Content-Security-Policy: upgrade-insecure-requests</code></pre>
+<p>With the header, Chromium rewrote all ten requests to https or wss before sending them. The script ran, the CSS applied, the iframe loaded, fetch and XHR returned 200, the WebSocket opened as <code>wss://assets.test:8991/...</code> and the form posted to <code>https://assets.test:8991/form</code> without the warning page. The <code>&lt;meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests"&gt;</code> tag gave exactly the same result.</p>
+<p>Three details we saw:</p>
+<ul>
+<li>The port was kept (8991 stayed 8991). Per the CSP spec, only port 80 is changed to 443; we did not measure that.</li>
+<li>The host must really serve HTTPS. With an HTTP-only port 8991, every resource failed with <code>net::ERR_SSL_PROTOCOL_ERROR</code>, and the console showed <code>WebSocket connection to 'wss://...' failed: Error in connection establishment: net::ERR_SSL_PROTOCOL_ERROR</code>.</li>
+<li>For <code>fetch</code>, <code>response.url</code> still reported the original <code>http://</code> URL, although the server log shows the request came over https. XHR's <code>responseURL</code> showed <code>https://</code>.</li>
+</ul>
+<p>Audio and video still logged the "should also be served over HTTPS" warning under the header, even though they were upgraded. The header is a safety net, not a replacement for fixing the URLs. More detail in <a href="/guides/upgrade-insecure-requests/">upgrade-insecure-requests</a> and <a href="/guides/content-security-policy-header-example/">Content-Security-Policy header examples</a>.</p>
+
+<h2>6. localhost and 127.0.0.1 are allowed</h2>
+<p>Loopback addresses count as "potentially trustworthy". From the same HTTPS page, <code>http://localhost:8991</code> and <code>http://127.0.0.1:8991</code> were not blocked at all. Script, CSS, iframe, fetch, XHR, <code>ws://</code> and the form POST all went out as plain http with no interstitial. Images, audio and video were not upgraded either, and Chrome logged:</p>
+<pre><code>... requested an insecure element 'http://localhost:8991/t6/i.png'. This request was not upgraded to HTTPS because it is a local network request.
+... requested an insecure element 'http://127.0.0.1:8991/t7/i.png'. This request was not upgraded to HTTPS because its URL's host is an IP address.</code></pre>
+<p>So code that works against a local dev API can fail once the API moves to a real host name. That is when the mixed content errors appear.</p>
+
+<h2>7. Find the mixed content on your site</h2>
+<ul>
+<li>Open DevTools &gt; Console and filter for <code>Mixed Content</code>. Each line names the exact URL.</li>
+<li>Search your templates and database for <code>http://</code> in <code>src=</code>, <code>href=</code>, <code>action=</code>, <code>url(</code>, <code>fetch(</code> and <code>ws://</code>.</li>
+<li>Behind a TLS-terminating proxy, the app may think it is on http and build http:// links. See <a href="/guides/x-forwarded-proto-nginx/">X-Forwarded-Proto in nginx</a>.</li>
+<li>Once clean, add <a href="/guides/strict-transport-security-header-nginx/">Strict-Transport-Security</a> so the page itself is never loaded over http.</li>
+</ul>
+<aside class="cta"><strong>Check whether your page sends Content-Security-Policy: upgrade-insecure-requests:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Chrome load my http image but block my http script?</summary><p>In our Chromium 153 test, images, audio and video are auto-upgraded to https and loaded if the host serves HTTPS. Scripts, stylesheets, iframes, fetch, XHR and ws:// WebSockets are blocked with no upgrade.</p></details>
+<details><summary>Does the auto-upgrade change the port?</summary><p>No. http://assets.test:8991/i.png was requested as https://assets.test:8991/i.png. If that port only speaks HTTP, the image fails with net::ERR_SSL_PROTOCOL_ERROR and there is no fallback.</p></details>
+<details><summary>Does upgrade-insecure-requests fix all mixed content?</summary><p>It upgraded all ten request types in our test, including fetch, XHR, WebSocket and form posts, as a header or a meta tag. It only works if each host actually serves HTTPS on that port.</p></details>
+<details><summary>Is http://localhost blocked from an HTTPS page?</summary><p>No. In our test http://localhost and http://127.0.0.1 loaded scripts, fetch, XHR and ws:// without any block. Images were not upgraded, with a &#x27;local network request&#x27; or &#x27;host is an IP address&#x27; warning.</p></details>
+<details><summary>Why does my fetch just say Failed to fetch?</summary><p>A mixed-content block rejects fetch with a plain TypeError: Failed to fetch. The real reason is only in the console: &#x27;requested an insecure resource ... This request has been blocked; the content must be served over HTTPS.&#x27;</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright) and Node.js 24.21.0. An HTTPS page on one port loaded http:// resources from a second port that spoke both HTTP and HTTPS, so we could log which scheme each request really arrived on. Self-signed cert from openssl, ignoreHTTPSErrors on. PlainHeaders is our extension; Chromium, Node.js and openssl are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

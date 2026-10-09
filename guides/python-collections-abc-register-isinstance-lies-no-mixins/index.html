@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>collections.abc .register() Skips the Mixin Methods (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: Mapping.register(Cls) makes isinstance(obj, Mapping) True, but obj.get()/.keys() still don&#x27;t exist -- no code is granted.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-collections-abc-register-isinstance-lies-no-mixins/">
+<meta property="og:title" content="collections.abc .register() Skips the Mixin Methods (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: Mapping.register(Cls) makes isinstance(obj, Mapping) True, but obj.get()/.keys() still don&#x27;t exist -- no code is granted.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-collections-abc-register-isinstance-lies-no-mixins/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does collections.abc.Mapping.register() give my class the .get()/.keys() methods?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured that register() only affects isinstance()/issubclass() checks -- it never touches the registered class's attributes or bases, so none of Mapping's mixin methods (get, keys, items, values, __contains__) become available, even if the class separately implements all three required abstract methods."}}, {"@type": "Question", "name": "How do I get the free mixin methods from an ABC like Mapping?", "acceptedAnswer": {"@type": "Answer", "text": "Subclass it directly (class Foo(Mapping): ...) and implement the required abstract methods (__getitem__, __len__, __iter__ for Mapping) -- we measured this giving working get()/keys()/items()/values() automatically, inherited from Mapping's own code."}}, {"@type": "Question", "name": "Why does register() exist if it doesn't grant any methods?", "acceptedAnswer": {"@type": "Answer", "text": "It's meant for making an already-complete, independently-implemented class (often one you don't control, like a C extension type) satisfy isinstance checks for duck-typing purposes, without altering its class hierarchy. It assumes the class already behaves like a Mapping on its own; it doesn't grant any behavior."}}, {"@type": "Question", "name": "Does this affect other collections.abc classes besides Mapping?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- the same register()-vs-subclass distinction applies to every ABC in collections.abc (Sequence, Set, Iterable, Callable, etc.): register() only ever affects isinstance/issubclass, never grants mixin methods or enforces the abstract methods actually being implemented."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>collections.abc .register() Makes isinstance Pass But Grants No Methods (tested)</h1>
+<p class="lead">Properly subclassing <code>collections.abc.Mapping</code> gets you two things at once: <code>isinstance()</code>/<code>issubclass()</code> recognize your class as a <code>Mapping</code>, and you inherit real, working mixin methods like <code>get()</code>, <code>keys()</code>, <code>items()</code>, <code>values()</code>, and <code>__contains__()</code> for free, built on top of the three abstract methods (<code>__getitem__</code>, <code>__len__</code>, <code>__iter__</code>) you're required to implement. Calling <code>Mapping.register(YourClass)</code> instead -- the documented way to make an unrelated class satisfy <code>isinstance</code> checks without inheriting from the ABC -- only does the first half. It never touches your class's code at all, so none of the mixin methods exist, even if you also happen to implement the three abstract methods yourself.</p>
+<h2 id="repro1">1. register() makes isinstance pass with zero implementation</h2>
+<pre><code>from collections.abc import Mapping
+
+class FakeMapping:
+    pass
+
+Mapping.register(FakeMapping)
+
+f = FakeMapping()
+print("isinstance:", isinstance(f, Mapping))
+try:
+    f.get("x")
+except AttributeError as e:
+    print("f.get() ->", e)
+try:
+    len(f)
+except TypeError as e:
+    print("len(f) ->", e)</code></pre>
+<pre><code>isinstance: True
+f.get() -> 'FakeMapping' object has no attribute 'get'
+len(f) -> object of type 'FakeMapping' has no len()</code></pre>
+<p><strong>Measured:</strong> <code>isinstance(f, Mapping)</code> is <code>True</code> -- any code that branches on <code>isinstance(x, Mapping)</code> will treat <code>f</code> as a mapping. But <code>f</code> has none of <code>Mapping</code>'s abstract methods, let alone its mixins; calling anything on it fails immediately. <code>register()</code> is purely a registration for <code>isinstance</code>/<code>issubclass</code> -- it does not touch the class's attributes, bases, or MRO at all.</p>
+
+<h2 id="repro2">2. Real subclassing gives you the mixin methods for free</h2>
+<pre><code>from collections.abc import Mapping
+
+class RealMapping(Mapping):
+    def __init__(self, d):
+        self._d = d
+    def __getitem__(self, k):
+        return self._d[k]
+    def __len__(self):
+        return len(self._d)
+    def __iter__(self):
+        return iter(self._d)
+
+r = RealMapping({"a": 1})
+print(r.get("a"), r.get("z", "default"))
+print(list(r.keys()))
+print(isinstance(r, Mapping))</code></pre>
+<pre><code>1 default
+['a']
+True</code></pre>
+<p><strong>Measured:</strong> implementing just the three required abstract methods via real subclassing gives working <code>get()</code>, <code>keys()</code>, and every other <code>Mapping</code> mixin method automatically -- <code>Mapping</code>'s source defines them in terms of the three abstract methods, and they're inherited normally through the class hierarchy that <code>register()</code> never creates.</p>
+
+<h2 id="repro3">3. Even implementing the abstract methods yourself doesn't help after register()</h2>
+<pre><code>from collections.abc import Mapping
+
+class ManualMapping:
+    def __init__(self, d):
+        self._d = d
+    def __getitem__(self, k):
+        return self._d[k]
+    def __len__(self):
+        return len(self._d)
+    def __iter__(self):
+        return iter(self._d)
+
+Mapping.register(ManualMapping)
+
+m = ManualMapping({"a": 1})
+print(isinstance(m, Mapping))
+try:
+    m.get("a")
+except AttributeError as e:
+    print("m.get() ->", e)</code></pre>
+<pre><code>True
+m.get() -> 'ManualMapping' object has no attribute 'get'
+</code></pre>
+<p><strong>Measured:</strong> implementing the three abstract methods by hand and then registering instead of subclassing still leaves <code>get()</code> missing. The mixin methods only exist as code defined on the <code>Mapping</code> class itself; without inheriting from it, nothing provides them, no matter how faithfully the abstract methods are reimplemented.</p>
+<aside class="cta"><strong>Using Mapping.register(YourClass) to make isinstance checks pass without subclassing? Check what you actually get first -- it&#x27;s not the free .get()/.keys()/.items() methods you&#x27;d get from real subclassing:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does collections.abc.Mapping.register() give my class the .get()/.keys() methods?</summary><p>No. We measured that register() only affects isinstance()/issubclass() checks -- it never touches the registered class&#x27;s attributes or bases, so none of Mapping&#x27;s mixin methods (get, keys, items, values, __contains__) become available, even if the class separately implements all three required abstract methods.</p></details>
+<details><summary>How do I get the free mixin methods from an ABC like Mapping?</summary><p>Subclass it directly (class Foo(Mapping): ...) and implement the required abstract methods (__getitem__, __len__, __iter__ for Mapping) -- we measured this giving working get()/keys()/items()/values() automatically, inherited from Mapping&#x27;s own code.</p></details>
+<details><summary>Why does register() exist if it doesn&#x27;t grant any methods?</summary><p>It&#x27;s meant for making an already-complete, independently-implemented class (often one you don&#x27;t control, like a C extension type) satisfy isinstance checks for duck-typing purposes, without altering its class hierarchy. It assumes the class already behaves like a Mapping on its own; it doesn&#x27;t grant any behavior.</p></details>
+<details><summary>Does this affect other collections.abc classes besides Mapping?</summary><p>Yes -- the same register()-vs-subclass distinction applies to every ABC in collections.abc (Sequence, Set, Iterable, Callable, etc.): register() only ever affects isinstance/issubclass, never grants mixin methods or enforces the abstract methods actually being implemented.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in collections.abc.Mapping: registered a plain class with Mapping.register() (implementing none of Mapping&#x27;s abstract methods), then compared isinstance() results and available methods against a second class that properly subclasses Mapping and implements its three required abstract methods. PlainHeaders is our extension; Python&#x27;s collections.abc module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

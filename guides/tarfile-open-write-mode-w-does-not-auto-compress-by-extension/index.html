@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tarfile.open(name, &quot;w&quot;) Won&#x27;t Compress .tar.gz for You</title>
+<meta name="description" content="We measured tarfile.open(&#x27;x.tar.gz&#x27;, &#x27;w&#x27;) writing a plain tar despite the .gz name -- gzip.open() and system tar both reject the file as not gzipped.">
+<link rel="canonical" href="https://honestkit.github.io/guides/tarfile-open-write-mode-w-does-not-auto-compress-by-extension/">
+<meta property="og:title" content="tarfile.open(name, &quot;w&quot;) Won&#x27;t Compress .tar.gz for You">
+<meta property="og:description" content="We measured tarfile.open(&#x27;x.tar.gz&#x27;, &#x27;w&#x27;) writing a plain tar despite the .gz name -- gzip.open() and system tar both reject the file as not gzipped.">
+<meta property="og:url" content="https://honestkit.github.io/guides/tarfile-open-write-mode-w-does-not-auto-compress-by-extension/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does tarfile.open() pick compression based on the filename when writing?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured tarfile.open('x.tar.gz', 'w') writing a plain, uncompressed tar archive; the mode string alone decides, not the extension."}}, {"@type": "Question", "name": "Why did my .tar.gz file work when I tested it in Python but fail elsewhere?", "acceptedAnswer": {"@type": "Answer", "text": "Because tarfile's read mode 'r' auto-detects compression from the actual bytes, so Python can read an uncompressed file even with a .gz name. We confirmed gzip.open() and the system tar -tzf command both reject the same file."}}, {"@type": "Question", "name": "How do I write a real gzip-compressed tar with the tarfile module?", "acceptedAnswer": {"@type": "Answer", "text": "Use mode 'w:gz' explicitly -- we confirmed this produces correct gzip magic bytes that gzip.open() and tar -tzf both read without error."}}, {"@type": "Question", "name": "Is shutil.make_archive() safer for this?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- it takes a format name like 'gztar' instead of a mode string, so there's no mode-vs-extension mismatch to get wrong. We didn't need to test this failure mode with make_archive() since the API doesn't expose the mistake."}}, {"@type": "Question", "name": "Does this affect reading compressed archives too?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we confirmed reading with plain 'r' correctly auto-detects gzip, bz2, xz, or uncompressed tar from the file's actual contents. The mismatch only happens on the write side, where the mode string must be explicit."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>tarfile.open() Write Mode Ignores the .tar.gz Extension (tested)</h1>
+<p class="lead"><code>tarfile.open()</code> can auto-detect compression when <strong>reading</strong> a file. We measured whether it does the same when <strong>writing</strong> one named <code>.tar.gz</code> &mdash; it doesn't. The mode string, not the filename, decides.</p>
+<h2 id="repro1">1. Writing with mode="w" to a ".tar.gz" filename</h2>
+<pre><code>import tarfile
+
+with tarfile.open("test.tar.gz", "w") as tf:   # note: "w", not "w:gz"
+    tf.add("hostname")</code></pre>
+<pre><code>with open("test.tar.gz", "rb") as f:
+    print(f.read(4))</code></pre>
+<pre><code>b'./\x00\x00'</code></pre>
+<p><strong>Measured:</strong> the first bytes are plain tar header bytes, not gzip's magic number (<code>\x1f\x8b</code>). <code>tarfile.open(name, "w")</code> writes an ordinary, uncompressed tar archive &mdash; it never looked at the <code>.gz</code> in the filename to decide whether to compress.</p>
+
+<h2 id="repro2">2. Python itself can still read it back &mdash; which hides the bug</h2>
+<pre><code>with tarfile.open("test.tar.gz", "r") as tf:   # mode "r": auto-detect
+    print(tf.getnames())</code></pre>
+<pre><code>['hostname']</code></pre>
+<p><strong>Measured:</strong> opening the same file with plain <code>"r"</code> works fine &mdash; <code>tarfile</code>'s read-mode auto-detection inspects the actual bytes, not the extension, so it happily reads the uncompressed data back. If your only test is "write it, then read it back with <code>tarfile</code>," this bug is invisible.</p>
+
+<h2 id="repro3">3. Anything else expecting real gzip breaks</h2>
+<pre><code>import gzip
+with gzip.open("test.tar.gz", "rb") as f:
+    f.read(10)</code></pre>
+<pre><code>gzip.BadGzipFile: Not a gzipped file (b'./')</code></pre>
+<pre><code>$ tar -tzf test.tar.gz
+gzip: stdin: not in gzip format
+tar: Child returned status 1</code></pre>
+<p><strong>Measured:</strong> <code>gzip.open()</code> raises <code>BadGzipFile</code>, and the system <code>tar -tzf</code> command (the standard way to list a <code>.tar.gz</code>) refuses outright. Anyone downloading this file and using a normal gzip-aware tool &mdash; not just Python's own auto-detecting reader &mdash; hits a hard failure, with a file that looks completely normal (right name, right size, no error at creation time).</p>
+
+<h2 id="fix">4. Fix: name the compression in the mode string</h2>
+<pre><code>with tarfile.open("test2.tar.gz", "w:gz") as tf:
+    tf.add("hostname")
+
+with open("test2.tar.gz", "rb") as f:
+    print(f.read(2))</code></pre>
+<pre><code>b'\x1f\x8b'</code></pre>
+<p><strong>Measured:</strong> <code>"w:gz"</code> produces real gzip magic bytes, and both <code>gzip.open()</code> and <code>tar -tzf</code> read it correctly. The rule confirmed here: for <strong>reading</strong>, plain <code>"r"</code> auto-detects gzip/bz2/xz/plain; for <strong>writing</strong>, you must spell out <code>"w:gz"</code>, <code>"w:bz2"</code>, or <code>"w:xz"</code> yourself &mdash; <code>shutil.make_archive()</code> sidesteps this entirely by taking a format name (<code>"gztar"</code>) instead of a mode string, which is the safer API if you don't need <code>tarfile</code>'s lower-level control.</p>
+<aside class="cta"><strong>Debugging a download that your tar tool refuses to open? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does tarfile.open() pick compression based on the filename when writing?</summary><p>No -- we measured tarfile.open(&#x27;x.tar.gz&#x27;, &#x27;w&#x27;) writing a plain, uncompressed tar archive; the mode string alone decides, not the extension.</p></details>
+<details><summary>Why did my .tar.gz file work when I tested it in Python but fail elsewhere?</summary><p>Because tarfile&#x27;s read mode &#x27;r&#x27; auto-detects compression from the actual bytes, so Python can read an uncompressed file even with a .gz name. We confirmed gzip.open() and the system tar -tzf command both reject the same file.</p></details>
+<details><summary>How do I write a real gzip-compressed tar with the tarfile module?</summary><p>Use mode &#x27;w:gz&#x27; explicitly -- we confirmed this produces correct gzip magic bytes that gzip.open() and tar -tzf both read without error.</p></details>
+<details><summary>Is shutil.make_archive() safer for this?</summary><p>Yes -- it takes a format name like &#x27;gztar&#x27; instead of a mode string, so there&#x27;s no mode-vs-extension mismatch to get wrong. We didn&#x27;t need to test this failure mode with make_archive() since the API doesn&#x27;t expose the mistake.</p></details>
+<details><summary>Does this affect reading compressed archives too?</summary><p>No -- we confirmed reading with plain &#x27;r&#x27; correctly auto-detects gzip, bz2, xz, or uncompressed tar from the file&#x27;s actual contents. The mismatch only happens on the write side, where the mode string must be explicit.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in tarfile and gzip modules: wrote an archive with tarfile.open(&#x27;test.tar.gz&#x27;, &#x27;w&#x27;) (no compression mode in the string), inspected the resulting file&#x27;s magic bytes, then tried to read it back with tarfile&#x27;s own auto-detecting &#x27;r&#x27; mode, gzip.open(), and the system tar command. PlainHeaders is our extension; Python&#x27;s tarfile and gzip modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

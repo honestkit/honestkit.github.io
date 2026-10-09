@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>400 Bad Request &#x27;Request Header Or Cookie Too Large&#x27;: Fix for Users and nginx (Tested)</title>
+<meta name="description" content="Why nginx answers 400 Request Header Or Cookie Too Large, measured: an 8 KB limit per header line (the whole Cookie line counts), 32 KB in total. How to fix it in Chrome by clearing one site&#x27;s cookies, and on the server with large_client_header_buffers.">
+<link rel="canonical" href="https://honestkit.github.io/guides/request-header-or-cookie-too-large/">
+<meta property="og:title" content="400 Bad Request &#x27;Request Header Or Cookie Too Large&#x27;: Fix for Users and nginx (Tested)">
+<meta property="og:description" content="Why nginx answers 400 Request Header Or Cookie Too Large, measured: an 8 KB limit per header line (the whole Cookie line counts), 32 KB in total. How to fix it in Chrome by clearing one site&#x27;s cookies, and on the server with large_client_header_buffers.">
+<meta property="og:url" content="https://honestkit.github.io/guides/request-header-or-cookie-too-large/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I fix 400 Bad Request Request Header Or Cookie Too Large?", "acceptedAnswer": {"@type": "Answer", "text": "As a visitor, delete that one site's cookies (site info icon \u2192 Cookies and site data) and reload. As the site owner, raise large_client_header_buffers in nginx, e.g. 4 16k, and cut down the cookies the site sets."}}, {"@type": "Question", "name": "What is the default large_client_header_buffers in nginx?", "acceptedAnswer": {"@type": "Answer", "text": "4 8k: each header line may be up to 8 KB and all of them together about 32 KB. In our test a Cookie line of 8,192 bytes passed and 8,193 bytes failed."}}, {"@type": "Question", "name": "Why do I get this error in Chrome but not in another browser?", "acceptedAnswer": {"@type": "Answer", "text": "Cookies are stored per browser. The browser with the error has collected more cookies for that site; clearing them fixes it."}}, {"@type": "Question", "name": "How big can a cookie be in Chrome?", "acceptedAnswer": {"@type": "Answer", "text": "4,096 bytes for name plus value. In our test a 4,097-byte cookie was silently dropped, from both Set-Cookie and document.cookie. Three 4,000-byte cookies were enough to trigger the nginx error."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>400 Bad Request: Request Header Or Cookie Too Large (nginx), fixed and tested</h1>
+<p class="lead">nginx shows this page when one request header line, almost always the Cookie line, is bigger than its buffer. We reproduced it with curl and with Chrome, then raised the limit.</p>
+<h2>1. What the error looks like</h2>
+<pre><code>HTTP/1.1 400 Bad Request
+Server: nginx/1.31.6
+Content-Type: text/html
+Content-Length: 233
+Connection: close
+
+&lt;title&gt;400 Request Header Or Cookie Too Large&lt;/title&gt;
+...&lt;h1&gt;400 Bad Request&lt;/h1&gt;
+Request Header Or Cookie Too Large</code></pre>
+<p>It comes from nginx itself, before your application runs, so your app logs show nothing.</p>
+<h2>2. What triggers it (default nginx, measured)</h2>
+<table><thead><tr><th>Request</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>Cookie: a=</code> + 8,180 bytes (line = 8,192 bytes with CRLF)</td><td>200</td></tr>
+<tr><td><code>Cookie: a=</code> + 8,181 bytes</td><td><strong>400</strong></td></tr>
+<tr><td>7 cookies × 1,000 bytes on one Cookie line (7 KB)</td><td>200</td></tr>
+<tr><td>9 cookies × 1,000 bytes on one Cookie line (9 KB)</td><td><strong>400</strong></td></tr>
+<tr><td>4 separate header lines × 8,100 bytes (32.4 KB)</td><td>200</td></tr>
+<tr><td>32 separate header lines × 1,000 bytes</td><td>200</td></tr>
+<tr><td>33 separate header lines × 1,000 bytes</td><td><strong>400</strong></td></tr>
+</tbody></table>
+<p>The default is <code>large_client_header_buffers 4 8k</code>, which sets two limits: <strong>each header line</strong> (name, value and line ending) must fit in one 8 KB buffer, and <strong>all headers together</strong> in four of them, about 32 KB. A browser sends all cookies on one <code>Cookie</code> line, so it is the cookies' <em>combined</em> size that hits the 8 KB per-line limit, long before the 32 KB total. Many small cookies fail just like one big one.</p>
+<h2>3. Same thing in Chrome</h2>
+<p>Chrome refuses to store any single cookie whose name plus value exceeds 4,096 bytes: a 4,096-byte cookie was kept, a 4,097-byte one was silently dropped, whether it came from <code>Set-Cookie</code> or <code>document.cookie</code>. So one cookie can't cause this error; several can. With 4,000-byte cookies on the same host:</p>
+<table><thead><tr><th>Cookies stored</th><th>Cookie header Chrome sent</th><th>nginx (default)</th></tr></thead><tbody>
+<tr><td>1</td><td>4,003 bytes</td><td>200</td></tr>
+<tr><td>2</td><td>8,008 bytes</td><td>200</td></tr>
+<tr><td>3</td><td>12,013 bytes</td><td><strong>400 Request Header Or Cookie Too Large</strong></td></tr>
+<tr><td>after clearing the cookies</td><td>none</td><td>200</td></tr>
+</tbody></table>
+<p>The page stays broken on every visit, because the browser keeps sending the same cookies until they expire or are deleted.</p>
+<h2>4. Fix it as a visitor</h2>
+<p>Delete the cookies for that one site; you don't need to clear everything. In Chrome: click the icon left of the address bar → <strong>Cookies and site data</strong> → <strong>Manage on-device site data</strong> → delete the site's entries, then reload. Or open DevTools → Application → Storage → <strong>Clear site data</strong>. A private window works too, because it starts with no cookies. If the error returns soon after, the site itself keeps setting too many cookies and only its owner can fix that.</p>
+<h2>5. Fix it as the server owner</h2>
+<p>Raise the buffers in the <code>http</code> or <code>server</code> block and reload:</p>
+<pre><code>large_client_header_buffers 4 16k;   # each line up to 16 KB, about 64 KB in total
+nginx -t &amp;&amp; nginx -s reload</code></pre>
+<p>Measured with <code>4 16k</code>: a Cookie line with 16,372 bytes of value (16,384-byte line) passed and 16,373 failed; a 15 KB Cookie line that failed before now passed; 64 header lines of 1,000 bytes passed and 65 failed; a 40 KB Cookie line still failed. The per-line limit is the second number, so raise that one for cookie problems; raising only the count doesn't help: with <code>8 8k</code>, 64 lines of 1,000 bytes passed but an 8,193-byte Cookie line still failed.</p>
+<p>Then find the cause, or the next deploy will hit the new limit. Typical culprits are analytics and A/B-testing cookies piling up on a shared parent domain, sessions stored entirely in a cookie, and big JWTs (check one with the <a href="/tools/jwt-decoder/">JWT decoder</a>). If a CDN or load balancer sits in front, it has its own limit too. Node.js answers <code>431</code> instead of 400; limits for both servers are in <a href="/guides/http-header-size-limit/">HTTP header size limits, measured</a>.</p>
+<h2>6. Reproduce it</h2>
+<pre><code>curl -i -H "Cookie: a=$(head -c 9000 /dev/zero | tr '\0' a)" https://your-site/</code></pre>
+<p>A <code>400</code> with the text above means nginx refuses lines of that size. Over HTTP/2 nginx applies the same directive to header fields, per its documentation.</p>
+<aside class="cta"><strong>See the request and response headers a site exchanges:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I fix 400 Bad Request Request Header Or Cookie Too Large?</summary><p>As a visitor, delete that one site&#x27;s cookies (site info icon → Cookies and site data) and reload. As the site owner, raise large_client_header_buffers in nginx, e.g. 4 16k, and cut down the cookies the site sets.</p></details>
+<details><summary>What is the default large_client_header_buffers in nginx?</summary><p>4 8k: each header line may be up to 8 KB and all of them together about 32 KB. In our test a Cookie line of 8,192 bytes passed and 8,193 bytes failed.</p></details>
+<details><summary>Why do I get this error in Chrome but not in another browser?</summary><p>Cookies are stored per browser. The browser with the error has collected more cookies for that site; clearing them fixes it.</p></details>
+<details><summary>How big can a cookie be in Chrome?</summary><p>4,096 bytes for name plus value. In our test a 4,097-byte cookie was silently dropped, from both Set-Cookie and document.cookie. Three 4,000-byte cookies were enough to trigger the nginx error.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 against nginx:alpine 1.31.6 (default config, then large_client_header_buffers 4 16k and 8 8k) with curl 8.14, and in Chromium 153: a Node server set 4,000-byte cookies on 127.0.0.1, then Chromium loaded the nginx page on the same host. Chrome&#x27;s per-cookie limit was tested with both Set-Cookie and document.cookie. Deleting cookies was tested by clearing the browser&#x27;s cookies; the Chrome menu names are from Chrome&#x27;s settings UI, not automated. The &#x27;http or server block&#x27; placement and the HTTP/2 note are from the nginx documentation, not this test. PlainHeaders is our extension; DevTools and curl show the same, free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

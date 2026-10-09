@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL Duplicate Key Error: Causes and Fixes, Tested</title>
+<meta name="description" content="We reproduced PostgreSQL&#x27;s duplicate key error from INSERT and UPDATE, then tested ON CONFLICT DO NOTHING and DO UPDATE (upsert) as real fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sql-duplicate-key-error/">
+<meta property="og:title" content="SQL Duplicate Key Error: Causes and Fixes, Tested">
+<meta property="og:description" content="We reproduced PostgreSQL&#x27;s duplicate key error from INSERT and UPDATE, then tested ON CONFLICT DO NOTHING and DO UPDATE (upsert) as real fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sql-duplicate-key-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does the DETAIL line actually tell me?", "acceptedAnswer": {"@type": "Answer", "text": "In PostgreSQL, DETAIL: Key (col)=(value) already exists names the exact column and value that collided. In our test, inserting a second row with email 'a@x.com' showed DETAIL: Key (email)=(a@x.com) already exists. \u2014 that's the duplicate value itself, not a placeholder."}}, {"@type": "Question", "name": "Can an UPDATE cause this error, or only INSERT?", "acceptedAnswer": {"@type": "Answer", "text": "Both. We reproduced it with a plain UPDATE that changed an existing row's email to a value another row already had: UPDATE users SET email = 'a@x.com' WHERE name = 'Bob' raised the identical duplicate key error."}}, {"@type": "Question", "name": "What's the difference between ON CONFLICT DO NOTHING and DO UPDATE?", "acceptedAnswer": {"@type": "Answer", "text": "DO NOTHING silently keeps the existing row and inserts zero rows (we measured INSERT 0 0). DO UPDATE performs an upsert: it updates the existing row with the new values via the special EXCLUDED pseudo-table, and reports INSERT 0 1 even though no new row was created."}}, {"@type": "Question", "name": "Does ON CONFLICT need to name the column?", "acceptedAnswer": {"@type": "Answer", "text": "ON CONFLICT DO NOTHING works with no column list and catches any unique violation on the table. ON CONFLICT (email) DO UPDATE must name the specific unique column or constraint being targeted, so Postgres knows which row to update."}}, {"@type": "Question", "name": "Why would a primary key duplicate even happen if it's auto-generated?", "acceptedAnswer": {"@type": "Answer", "text": "If something inserts a row with an explicit id value (bypassing the auto-increment sequence), a later auto-generated id can collide with it once the sequence catches up to that number. We reproduced this with INSERT INTO users (id, email, name) VALUES (1, ...) \u2014 fix is to resync the sequence with setval()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQL &quot;duplicate key value violates unique constraint&quot; (tested)</h1>
+<p class="lead">A duplicate key error means a write tried to put two rows with the same value into a column that has a <code>UNIQUE</code> or <code>PRIMARY KEY</code> constraint. PostgreSQL's wording is <code>duplicate key value violates unique constraint</code>; other databases use different text for the same rule. The fix depends on whether the duplicate was a mistake or expected, which section&nbsp;3 below covers.</p>
+<h2>1. Reading the error</h2>
+<p>PostgreSQL gives two lines. The first names the constraint, the second shows the exact value that collided:</p>
+<pre><code>ERROR:  duplicate key value violates unique constraint "users_email_key"
+DETAIL:  Key (email)=(a@x.com) already exists.</code></pre>
+<p>The constraint name tells you which column (or columns) is unique. Postgres auto-names constraints as <code>&lt;table&gt;_&lt;column&gt;_key</code> for a plain <code>UNIQUE</code> column, or <code>&lt;table&gt;_pkey</code> for the primary key, unless you named it yourself when creating the table.</p>
+
+<h2>2. Two reproduced triggers</h2>
+<table>
+<tr><th>Statement</th><th>Exact error</th></tr>
+<tr><td><code>INSERT INTO users (email, name) VALUES ('a@x.com', 'Alice2');</code> (email already exists)</td><td><code>ERROR: duplicate key value violates unique constraint "users_email_key"</code><br><code>DETAIL: Key (email)=(a@x.com) already exists.</code></td></tr>
+<tr><td><code>INSERT INTO users (id, email, name) VALUES (1, 'c@x.com', 'Carl');</code> (explicit id reuses an existing primary key)</td><td><code>ERROR: duplicate key value violates unique constraint "users_pkey"</code><br><code>DETAIL: Key (id)=(1) already exists.</code></td></tr>
+<tr><td><code>UPDATE users SET email = 'a@x.com' WHERE name = 'Bob';</code> (an UPDATE, not just INSERT, can collide too)</td><td><code>ERROR: duplicate key value violates unique constraint "users_email_key"</code><br><code>DETAIL: Key (email)=(a@x.com) already exists.</code></td></tr>
+</table>
+<p>The third row matters: this is not only an INSERT problem. Any statement that changes a unique column's value &mdash; INSERT, UPDATE, or a MERGE/upsert &mdash; can hit it.</p>
+
+<h2>3. Decide: is the duplicate a bug, or expected?</h2>
+<p>Two different fixes, depending on which:</p>
+<ul>
+<li><strong>It's a bug</strong> (e.g. you generated an ID wrong, or re-ran an import without clearing old rows first): fix the logic that produces the duplicate. The error is doing its job.</li>
+<li><strong>It's expected</strong> (e.g. an import that re-runs and should skip or update rows that already exist): use <code>ON CONFLICT</code>, tested below.</li>
+</ul>
+
+<h2>4. Fix for expected duplicates: <code>ON CONFLICT</code></h2>
+<p><strong>Ignore the duplicate</strong> &mdash; keep the existing row, don't error:</p>
+<pre><code>psql&gt; INSERT INTO users (email, name) VALUES ('a@x.com','Dup') ON CONFLICT DO NOTHING;
+INSERT 0 0
+psql&gt; SELECT * FROM users;
+ id |  email  | name
+----+---------+-------
+  1 | a@x.com | Alice
+(1 row)</code></pre>
+<p><code>INSERT 0 0</code> means zero rows were inserted &mdash; no error, and the original row ("Alice") is untouched.</p>
+<p><strong>Upsert</strong> &mdash; update the existing row with the new values instead of erroring:</p>
+<pre><code>psql&gt; INSERT INTO users (email, name) VALUES ('a@x.com','AliceUpdated')
+      ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name;
+INSERT 0 1
+psql&gt; SELECT * FROM users;
+ id |  email  |     name
+----+---------+--------------
+  1 | a@x.com | AliceUpdated
+(1 row)</code></pre>
+<p><code>EXCLUDED</code> refers to the row that was proposed for insertion but conflicted &mdash; so <code>EXCLUDED.name</code> is the new value ("AliceUpdated"), not the old one. <code>ON CONFLICT (email)</code> must name the exact unique column (or constraint) that might collide; <code>ON CONFLICT DO NOTHING</code> without a column list catches any unique violation on the table.</p>
+
+<h2>5. Fix for a genuine bug: find where the duplicate comes from</h2>
+<ul>
+<li>If it's an auto-increment/serial primary key, check whether something inserted a row with an explicit ID (as in row 2 of the table above) that collides with a future auto-generated value. Postgres's sequence doesn't know about manually-inserted IDs; reset it with <code>SELECT setval('users_id_seq', (SELECT max(id) FROM users));</code> if this happens.</li>
+<li>If it's a business key (email, SKU, username), the duplicate is usually real data: a retry that didn't check first, or two code paths racing to insert the same thing. Check first with a <code>SELECT</code>, or use <code>ON CONFLICT DO NOTHING</code> as a safety net even when you believe you already checked &mdash; the check and the insert are not atomic otherwise.</li>
+</ul>
+
+<h2>6. Other databases (per their docs, not measured on this box)</h2>
+<table>
+<tr><th>Database</th><th>Error text</th><th>Upsert syntax</th></tr>
+<tr><td>MySQL / MariaDB</td><td><code>ERROR 1062 (23000): Duplicate entry 'a@x.com' for key 'users.email'</code></td><td><code>INSERT ... ON DUPLICATE KEY UPDATE col = value</code></td></tr>
+<tr><td>SQLite</td><td><code>UNIQUE constraint failed: users.email</code></td><td><code>INSERT ... ON CONFLICT(email) DO UPDATE SET ...</code> (same syntax as Postgres, SQLite 3.24+)</td></tr>
+<tr><td>SQL Server</td><td><code>Violation of UNIQUE KEY constraint 'UQ_users_email'. Cannot insert duplicate key.</code></td><td><code>MERGE</code> statement, or check-then-insert inside a transaction</td></tr>
+</table>
+<p>The underlying rule (a unique constraint rejects a second row with the same value) is identical across all of them; only the wording and upsert syntax differ.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does the DETAIL line actually tell me?</summary><p>In PostgreSQL, DETAIL: Key (col)=(value) already exists names the exact column and value that collided. In our test, inserting a second row with email &#x27;a@x.com&#x27; showed DETAIL: Key (email)=(a@x.com) already exists. — that&#x27;s the duplicate value itself, not a placeholder.</p></details>
+<details><summary>Can an UPDATE cause this error, or only INSERT?</summary><p>Both. We reproduced it with a plain UPDATE that changed an existing row&#x27;s email to a value another row already had: UPDATE users SET email = &#x27;a@x.com&#x27; WHERE name = &#x27;Bob&#x27; raised the identical duplicate key error.</p></details>
+<details><summary>What&#x27;s the difference between ON CONFLICT DO NOTHING and DO UPDATE?</summary><p>DO NOTHING silently keeps the existing row and inserts zero rows (we measured INSERT 0 0). DO UPDATE performs an upsert: it updates the existing row with the new values via the special EXCLUDED pseudo-table, and reports INSERT 0 1 even though no new row was created.</p></details>
+<details><summary>Does ON CONFLICT need to name the column?</summary><p>ON CONFLICT DO NOTHING works with no column list and catches any unique violation on the table. ON CONFLICT (email) DO UPDATE must name the specific unique column or constraint being targeted, so Postgres knows which row to update.</p></details>
+<details><summary>Why would a primary key duplicate even happen if it&#x27;s auto-generated?</summary><p>If something inserts a row with an explicit id value (bypassing the auto-increment sequence), a later auto-generated id can collide with it once the sequence catches up to that number. We reproduced this with INSERT INTO users (id, email, name) VALUES (1, ...) — fix is to resync the sequence with setval().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with PostgreSQL 16.15 (official Docker image), using psql. Every error message below is copy-pasted output, not paraphrased. MySQL, SQLite and SQL Server enforce the same rule but phrase the error differently (per their docs, not measured here). PlainHeaders is our extension; PostgreSQL and Docker are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TypeError: unhashable type: &#x27;list&#x27; &amp;mdash; Every Cause, Tested</title>
+<meta name="description" content="We measured where Python raises unhashable type &#x27;list&#x27; / &#x27;dict&#x27; / &#x27;set&#x27; (keys, sets, lookups, lru_cache, Counter) and the tuple fixes that work.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-typeerror-unhashable-type-list/">
+<meta property="og:title" content="TypeError: unhashable type: &#x27;list&#x27; &amp;mdash; Every Cause, Tested">
+<meta property="og:description" content="We measured where Python raises unhashable type &#x27;list&#x27; / &#x27;dict&#x27; / &#x27;set&#x27; (keys, sets, lookups, lru_cache, Counter) and the tuple fixes that work.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-typeerror-unhashable-type-list/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does TypeError: unhashable type: 'list' mean?", "acceptedAnswer": {"@type": "Answer", "text": "A list was used where Python needs a hash: as a dict key, a set element, or the value you look up with 'in' on a set or dict. We measured all of these raising the same message on Python 3.13.5."}}, {"@type": "Question", "name": "How do I fix unhashable type: 'list'?", "acceptedAnswer": {"@type": "Answer", "text": "Convert the list to a tuple: tuple(x), or map(tuple, rows) for a list of lists. If the tuple itself contains lists, convert those too; we measured that (1, [2, 3]) still raises."}}, {"@type": "Question", "name": "How do I remove duplicate lists from a list?", "acceptedAnswer": {"@type": "Answer", "text": "list(dict.fromkeys(map(tuple, rows))). We measured that it removes duplicates and keeps the original order."}}, {"@type": "Question", "name": "What does unhashable type: 'dict' mean?", "acceptedAnswer": {"@type": "Answer", "text": "A dict was used as a set element or dict key. Build a tuple of the fields that identify the record and use that as the key instead, keeping the dicts themselves in a list."}}, {"@type": "Question", "name": "Why does lru_cache raise unhashable type: 'list'?", "acceptedAnswer": {"@type": "Answer", "text": "lru_cache stores results in a dict keyed by the arguments. We measured that a tuple argument works and a list argument raises at call time; pass tuples to cached functions."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TypeError: unhashable type: &#x27;list&#x27; (tested fixes)</h1>
+<p class="lead"><code>TypeError: unhashable type: 'list'</code> means a list ended up somewhere Python needs to hash it. We ran every common trigger on Python 3.13.5, including two that don't look like they store anything, and tested the fix for each.</p>
+<h2 id="where">1. Every place it comes from</h2>
+<pre><code>tests = {
+    &quot;dict key&quot;:      lambda: {[&quot;a&quot;, &quot;b&quot;]: 1},
+    &quot;set item&quot;:      lambda: {[1, 2]},
+    &quot;set() of rows&quot;: lambda: set([[1, 2], [3, 4]]),
+    &quot;in a set&quot;:      lambda: [1] in {(1,)},
+    &quot;dict lookup&quot;:   lambda: {&quot;a&quot;: 1}[[&quot;a&quot;]],
+    &quot;dict in set&quot;:   lambda: {{&quot;id&quot;: 1}},
+    &quot;set in set&quot;:    lambda: {{1, 2}},
+}
+for name, f in tests.items():
+    try:
+        f()
+        print(f&quot;{name}: ok&quot;)
+    except TypeError as e:
+        print(f&quot;{name}: {e}&quot;)</code></pre>
+<pre><code>dict key: unhashable type: &#x27;list&#x27;
+set item: unhashable type: &#x27;list&#x27;
+set() of rows: unhashable type: &#x27;list&#x27;
+in a set: unhashable type: &#x27;list&#x27;
+dict lookup: unhashable type: &#x27;list&#x27;
+dict in set: unhashable type: &#x27;dict&#x27;
+set in set: unhashable type: &#x27;set&#x27;</code></pre>
+<p><strong>Measured:</strong> anything that puts a value into a hash table raises it: a dict key, a set element, <code>set(list_of_lists)</code>, and also <em>looking up</em> a list (<code>[1] in some_set</code>, <code>d[["a"]]</code>), which surprises people because nothing is being stored. Lists, dicts and sets are mutable, so Python refuses to hash them: if the value changed after insertion, the table could never find it again. The type in quotes tells you which one reached the hash table: <code>'list'</code>, <code>'dict'</code> or <code>'set'</code>.</p>
+
+<h2 id="tuple">2. A tuple doesn't help if it contains a list</h2>
+<pre><code>nested = (1, [2, 3])
+try:
+    {nested: &quot;x&quot;}
+except TypeError as e:
+    print(e)
+print(hash((1, (2, 3))) == hash((1, (2, 3))))</code></pre>
+<pre><code>unhashable type: &#x27;list&#x27;
+True</code></pre>
+<p><strong>Measured:</strong> <code>(1, [2, 3])</code> is a tuple but hashing it hashes each item, so the inner list raises the same error. Convert all the way down: <code>(1, (2, 3))</code> works.</p>
+
+<h2 id="dedupe">3. Fix: de-duplicate rows and records</h2>
+<pre><code>rows = [[1, &quot;a&quot;], [2, &quot;b&quot;], [1, &quot;a&quot;]]
+print(list(dict.fromkeys(map(tuple, rows))))
+
+records = [{&quot;id&quot;: 1, &quot;tags&quot;: [&quot;x&quot;]}, {&quot;id&quot;: 1, &quot;tags&quot;: [&quot;x&quot;]}]
+seen = set()
+unique = []
+for r in records:
+    key = (r[&quot;id&quot;], tuple(r[&quot;tags&quot;]))
+    if key not in seen:
+        seen.add(key)
+        unique.append(r)
+print(unique)
+print(frozenset({1, 2}) in {frozenset({2, 1})})</code></pre>
+<pre><code>[(1, &#x27;a&#x27;), (2, &#x27;b&#x27;)]
+[{&#x27;id&#x27;: 1, &#x27;tags&#x27;: [&#x27;x&#x27;]}]
+True</code></pre>
+<p><strong>Measured:</strong> <code>dict.fromkeys(map(tuple, rows))</code> removes duplicate list rows and keeps their original order (a plain <code>set</code> would lose the order). For dicts, build a hashable key from the fields that define &ldquo;the same record&rdquo; and keep the original objects in a list. <code>frozenset</code> is the hashable version of <code>set</code>, and two frozensets with the same items compare and hash equal regardless of order.</p>
+
+<h2 id="cache">4. Fix: <code>@lru_cache</code> / <code>@cache</code> with list arguments</h2>
+<pre><code>from functools import lru_cache
+
+@lru_cache
+def total(items):
+    return sum(items)
+
+print(total((1, 2, 3)))
+try:
+    total([1, 2, 3])
+except TypeError as e:
+    print(e)</code></pre>
+<pre><code>6
+unhashable type: &#x27;list&#x27;</code></pre>
+<p><strong>Measured:</strong> <code>functools.lru_cache</code> builds a dict key from the arguments, so a list argument raises <code>unhashable type: 'list'</code> at call time, even though the function body would happily sum a list. Pass a tuple, or convert inside a small wrapper before calling the cached function.</p>
+
+<h2 id="counter">5. Counter, and a list used as a key path</h2>
+<pre><code>from collections import Counter
+
+words = [[&quot;the&quot;, &quot;cat&quot;], [&quot;the&quot;, &quot;cat&quot;], [&quot;a&quot;, &quot;dog&quot;]]
+try:
+    Counter(words)
+except TypeError as e:
+    print(e)
+print(Counter(map(tuple, words)).most_common(1))
+
+data = {&quot;user&quot;: {&quot;name&quot;: &quot;ann&quot;}}
+key = [&quot;user&quot;, &quot;name&quot;]
+try:
+    data[key]
+except TypeError as e:
+    print(e)
+d = data
+for k in key:
+    d = d[k]
+print(d)</code></pre>
+<pre><code>unhashable type: &#x27;list&#x27;
+[((&#x27;the&#x27;, &#x27;cat&#x27;), 2)]
+unhashable type: &#x27;list&#x27;
+ann</code></pre>
+<p><strong>Measured:</strong> <code>Counter</code> is a dict, so counting lists fails the same way; map to tuples first. The second case is a common slip: a list of keys meant as a path (<code>["user", "name"]</code>) passed as one key. The fix is to walk the path, not to hash it.</p>
+
+<h2 id="avoid">What not to do</h2>
+<p>Using <code>str(my_list)</code> as the key also stops the error, but keys then stop following equality: <code>[1] == [1.0]</code> is true, yet <code>str([1])</code> is <code>'[1]'</code> and <code>str([1.0])</code> is <code>'[1.0]'</code>, while the tuple keys <code>(1,)</code> and <code>(1.0,)</code> find each other. You also can't get the list back out of the string. Convert to a tuple (or a frozenset when order doesn't matter) instead. And don't add a <code>__hash__</code> to a mutable class just to silence the error: if the object changes after insertion, set and dict lookups silently stop finding it.</p>
+
+<aside class="cta"><strong>Turning JSON from an API into sets and dict keys? Check the real response headers and status first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does TypeError: unhashable type: &#x27;list&#x27; mean?</summary><p>A list was used where Python needs a hash: as a dict key, a set element, or the value you look up with &#x27;in&#x27; on a set or dict. We measured all of these raising the same message on Python 3.13.5.</p></details>
+<details><summary>How do I fix unhashable type: &#x27;list&#x27;?</summary><p>Convert the list to a tuple: tuple(x), or map(tuple, rows) for a list of lists. If the tuple itself contains lists, convert those too; we measured that (1, [2, 3]) still raises.</p></details>
+<details><summary>How do I remove duplicate lists from a list?</summary><p>list(dict.fromkeys(map(tuple, rows))). We measured that it removes duplicates and keeps the original order.</p></details>
+<details><summary>What does unhashable type: &#x27;dict&#x27; mean?</summary><p>A dict was used as a set element or dict key. Build a tuple of the fields that identify the record and use that as the key instead, keeping the dicts themselves in a list.</p></details>
+<details><summary>Why does lru_cache raise unhashable type: &#x27;list&#x27;?</summary><p>lru_cache stores results in a dict keyed by the arguments. We measured that a tuple argument works and a list argument raises at call time; pass tuples to cached functions.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5: lists, dicts and sets used as dict keys, set elements, set() input and in-lookups; a tuple containing a list; functools.lru_cache with list arguments; collections.Counter over lists; and the de-duplication fixes. Every code block on this page was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>statistics: variance()&#x27;s xbar Param Isn&#x27;t Validated</title>
+<meta name="description" content="We measured Python 3.13.5: variance(data, xbar=100) accepts a precomputed mean with no validation, silently returning 11763.75 instead of the correct 2.5.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-statistics-variance-xbar-param-accepts-wrong-mean-with-no-validation/">
+<meta property="og:title" content="statistics: variance()&#x27;s xbar Param Isn&#x27;t Validated">
+<meta property="og:description" content="We measured Python 3.13.5: variance(data, xbar=100) accepts a precomputed mean with no validation, silently returning 11763.75 instead of the correct 2.5.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-statistics-variance-xbar-param-accepts-wrong-mean-with-no-validation/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does statistics.variance() check that a passed xbar value is correct?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured variance([1,2,3,4,5], xbar=100) returning 11763.75 with no error or warning, instead of the correct 2.5. The xbar parameter is a performance shortcut with no validation against the actual data."}}, {"@type": "Question", "name": "What happens if you pass the wrong precomputed mean to stdev()?", "acceptedAnswer": {"@type": "Answer", "text": "It silently returns a wrong result -- we measured stdev([1,2,3,4,5], xbar=100) returning 108.46, about 70 times larger than the correct 1.58, with no exception raised."}}, {"@type": "Question", "name": "Is the precomputed-mean parameter named xbar or mu in Python's statistics module?", "acceptedAnswer": {"@type": "Answer", "text": "Both, depending on the function -- we measured variance() and stdev() using xbar, while pvariance() and pstdev() (the population variants) use mu. Passing xbar to pvariance() raises a TypeError for the unexpected keyword."}}, {"@type": "Question", "name": "How do I safely use the xbar shortcut in statistics.variance()?", "acceptedAnswer": {"@type": "Answer", "text": "Only pass it when you're certain it's the current, correct mean of the exact data being passed -- we measured no runtime check at all, so a stale or wrong value produces a plausible-looking but incorrect float instead of an error you could catch."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>statistics: A Wrong xbar Silently Corrupts variance() (tested)</h1>
+<p class="lead"><code>statistics.variance()</code> and <code>stdev()</code> accept an optional precomputed mean as a performance shortcut, so callers who already know the mean don't pay to recompute it. We measured what happens when that precomputed value is wrong.</p>
+<h2 id="repro1">1. A wrong xbar produces a wrong result with no error, warning, or validation</h2>
+<pre><code>import statistics as st
+
+data = [1, 2, 3, 4, 5]
+
+print(st.mean(data))
+print(st.variance(data))
+print(st.variance(data, xbar=100))</code></pre>
+<pre><code>3
+2.5
+11763.75</code></pre>
+<p><strong>Measured:</strong> the real mean of <code>data</code> is <code>3</code>, and <code>variance()</code> correctly computed without <code>xbar</code> returns <code>2.5</code>. Passing a deliberately wrong <code>xbar=100</code> doesn't raise <code>StatisticsError</code>, doesn't warn, and doesn't check the value against the data at all -- it just computes the sum of squared deviations from the wrong center and returns <code>11763.75</code> as if it were correct.</p>
+
+<h2 id="repro2">2. stdev() has the same gap, and it compounds through the square root</h2>
+<pre><code>import statistics as st
+
+data = [1, 2, 3, 4, 5]
+
+print(st.stdev(data))
+print(st.stdev(data, xbar=100))</code></pre>
+<pre><code>1.5811388300841898
+108.46082241989501
+</code></pre>
+<p><strong>Measured:</strong> <code>stdev()</code> takes the same unchecked <code>xbar</code> shortcut and returns <code>108.46</code> instead of the correct <code>1.58</code> -- nearly 70x too large, with no indication anything is wrong. A caching bug that stores a stale mean (for example, recomputing a running mean after new data arrives but forgetting to refresh a cached value passed into <code>variance()</code>) produces silently wrong variance/stdev numbers that look like plausible floats, not an exception to catch.</p>
+
+<h2 id="repro3">3. The population variants use a different keyword name, mu, not xbar</h2>
+<pre><code>import statistics as st
+
+data = [1, 2, 3, 4, 5]
+
+print(st.pvariance(data, mu=100))
+
+try:
+    st.pvariance(data, xbar=100)
+except TypeError as e:
+    print("pvariance(xbar=...) raised:", e)</code></pre>
+<pre><code>9411
+pvariance(xbar=...) raised: pvariance() got an unexpected keyword argument 'xbar'</code></pre>
+<p><strong>Measured:</strong> <code>pvariance()</code>/<code>pstdev()</code> (the population variants) accept the same kind of precomputed-center shortcut, but under the keyword <code>mu</code> instead of <code>xbar</code> -- reusing <code>xbar</code> from a <code>variance()</code> call raises a plain <code>TypeError</code> for the wrong keyword name, which is at least loud, but the <code>mu</code> value itself gets exactly the same lack of validation as <code>xbar</code> once you use the right name.</p>
+<aside class="cta"><strong>Passing a precomputed mean to variance() or stdev() for speed? Check it&#x27;s actually correct first -- there&#x27;s no validation:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does statistics.variance() check that a passed xbar value is correct?</summary><p>No -- we measured variance([1,2,3,4,5], xbar=100) returning 11763.75 with no error or warning, instead of the correct 2.5. The xbar parameter is a performance shortcut with no validation against the actual data.</p></details>
+<details><summary>What happens if you pass the wrong precomputed mean to stdev()?</summary><p>It silently returns a wrong result -- we measured stdev([1,2,3,4,5], xbar=100) returning 108.46, about 70 times larger than the correct 1.58, with no exception raised.</p></details>
+<details><summary>Is the precomputed-mean parameter named xbar or mu in Python&#x27;s statistics module?</summary><p>Both, depending on the function -- we measured variance() and stdev() using xbar, while pvariance() and pstdev() (the population variants) use mu. Passing xbar to pvariance() raises a TypeError for the unexpected keyword.</p></details>
+<details><summary>How do I safely use the xbar shortcut in statistics.variance()?</summary><p>Only pass it when you&#x27;re certain it&#x27;s the current, correct mean of the exact data being passed -- we measured no runtime check at all, so a stale or wrong value produces a plausible-looking but incorrect float instead of an error you could catch.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in statistics module: called variance(), stdev(), and pvariance() with a deliberately wrong precomputed mean passed via their xbar/mu keyword argument. PlainHeaders is our extension; Python&#x27;s statistics module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

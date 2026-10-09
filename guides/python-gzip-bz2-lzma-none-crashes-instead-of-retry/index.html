@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gzip, bz2, lzma Crash Instead of Retrying on None (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: gzip, bz2 and lzma all crash on a single transient None read -- even with valid compressed data waiting on the very next call.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-gzip-bz2-lzma-none-crashes-instead-of-retry/">
+<meta property="og:title" content="gzip, bz2, lzma Crash Instead of Retrying on None (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: gzip, bz2 and lzma all crash on a single transient None read -- even with valid compressed data waiting on the very next call.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-gzip-bz2-lzma-none-crashes-instead-of-retry/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "None of the gzip, bz2 or lzma module documentation mentions non-blocking streams or None returns at all; they are written assuming a blocking file object whose read() returns either data or b'' for EOF. We measured that a None-returning source is mishandled rather than rejected or documented as unsupported."}}, {"@type": "Question", "name": "Why do gzip and bz2/lzma fail differently?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that gzip's internal _PaddedFile.read() concatenates buffers directly without a None check, producing a TypeError, while bz2 and lzma's decompressor loops check for falsy/empty input and treat None the same as real EOF, producing an EOFError instead. Different internal implementations, same root cause: no code path distinguishes a transient None from end-of-stream."}}, {"@type": "Question", "name": "Does this only matter for non-blocking sockets?", "acceptedAnswer": {"@type": "Answer", "text": "We used a custom RawIOBase for a controlled, reproducible test, but the same gap applies to any file-like object whose read() can legitimately return None -- primarily non-blocking sockets, pipes, or other I/O wrapped as io.RawIOBase. Ordinary files and BytesIO never return None, so typical disk-based gzip.open() usage is unaffected."}}, {"@type": "Question", "name": "Is this related to the BufferedReader.read1() or BufferedWriter write() == 0 findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- same family of bugs (a correct None/EOF-or-not-ready signal gets collapsed or mishandled one layer up), but a different manifestation: those were about io.BufferedReader/Writer's own methods; this is about three separate higher-level stdlib modules that sit on top of a correctly-behaving io layer and still get it wrong, each in its own way."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>gzip/bz2/lzma Crash on a Non-Blocking None (Tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> from <code>readinto()</code> -- distinct from the empty read that means real end-of-stream. Plain <code>io.BufferedReader.read()</code> handles this correctly, returning <code>None</code> itself so a caller can retry. We measured that Python's three built-in compression file wrappers do not: <code>gzip.GzipFile</code>, <code>bz2.BZ2File</code> and <code>lzma.LZMAFile</code> each crash outright on that same transient <code>None</code>, even when the underlying stream has real, complete, valid compressed data waiting on the very next read call. None of them retry; each fails with a different, misleading exception.</p>
+<h2 id="repro1">1. The source: real compressed data, one call away, behind a single transient None</h2>
+<pre><code>import io
+
+def make_flaky_raw(payload):
+    class FlakyRaw(io.RawIOBase):
+        def __init__(self):
+            self.calls = 0
+            self.sent = False
+        def readable(self):
+            return True
+        def readinto(self, b):
+            self.calls += 1
+            if self.calls == 1:
+                return None            # transient: no data ready yet
+            if not self.sent:
+                self.sent = True
+                n = len(payload)
+                b[:n] = payload
+                return n               # the real data, one call later
+            return 0                   # real EOF after that
+    return FlakyRaw()</code></pre>
+<p>The payload is genuinely valid, complete compressed data for each format -- nothing is actually truncated or corrupt. The only flaw is a single <code>None</code> on the very first read call.</p>
+
+<h2 id="repro2">2. gzip.GzipFile: crashes with an opaque TypeError</h2>
+<pre><code>import gzip
+
+compressed = gzip.compress(b"hello world, this is real data")
+raw = make_flaky_raw(compressed)
+gz = gzip.GzipFile(fileobj=io.BufferedReader(raw))
+try:
+    print(gz.read())
+except Exception as e:
+    print("CRASHED:", type(e).__name__, e)</code></pre>
+<pre><code>CRASHED: TypeError can't concat NoneType to bytes</code></pre>
+<p><strong>Measured:</strong> the crash happens deep inside <code>gzip.py</code>'s internal header reader, which concatenates <code>self._buffer[read:] + self.file.read(...)</code> without checking for <code>None</code>. The traceback points entirely at standard library internals, with no hint that the real cause was a transient, retryable signal from the caller's own stream.</p>
+
+<h2 id="repro3">3. bz2.BZ2File and lzma.LZMAFile: crash with a misleading EOFError instead</h2>
+<pre><code>import bz2, lzma
+
+for mod_name, compress, cls in [("bz2", bz2.compress, bz2.BZ2File), ("lzma", lzma.compress, lzma.LZMAFile)]:
+    compressed = compress(b"hello world, this is real data")
+    raw = make_flaky_raw(compressed)
+    try:
+        f = cls(io.BufferedReader(raw))
+        print(mod_name, "result:", f.read())
+    except Exception as e:
+        print(mod_name, "CRASHED:", type(e).__name__, e)</code></pre>
+<pre><code>bz2 CRASHED: EOFError Compressed file ended before the end-of-stream marker was reached
+lzma CRASHED: EOFError Compressed file ended before the end-of-stream marker was reached</code></pre>
+<p><strong>Measured:</strong> both treat the single <code>None</code> as if the stream had truly ended, raising <code>EOFError</code> claiming the file was truncated -- actively misleading, since the file is not truncated at all and the real data is sitting one read call away. A developer debugging this would reasonably suspect a corrupt file or a broken producer, not a transient non-blocking hiccup.</p>
+
+<h2 id="repro4">4. Contrast: plain BufferedReader.read() on the identical raw stream</h2>
+<pre><code>raw2 = make_flaky_raw(b"irrelevant for this check")
+br = io.BufferedReader(raw2)
+print("plain read():", repr(br.read(5)))</code></pre>
+<pre><code>plain read(): None</code></pre>
+<p><strong>Measured:</strong> at the raw <code>io</code> layer, the exact same signal is preserved correctly as <code>None</code>, letting a caller retry. All three compression wrappers sit directly on top of this correctly-behaving layer, yet none of them propagate or handle the <code>None</code> themselves -- each lets it corrupt a different piece of internal bookkeeping instead.</p>
+
+<h2 id="repro5">5. The fix: don't hand a None-capable stream straight to these wrappers</h2>
+<p>None of <code>gzip.GzipFile</code>, <code>bz2.BZ2File</code> or <code>lzma.LZMAFile</code> expose a way to retry past a transient <code>None</code> -- the only robust fix is to read the compressed bytes yourself with a loop that retries on <code>None</code>, buffer them into a plain <code>io.BytesIO</code>, and only then hand the complete, in-memory buffer to the compression wrapper:</p>
+<pre><code>def drain_retrying_on_none(raw_stream, chunk_size=65536):
+    buf = io.BytesIO()
+    br = io.BufferedReader(raw_stream)
+    while True:
+        chunk = br.read(chunk_size)
+        if chunk is None:
+            continue              # retry: not ready yet, not EOF
+        if not chunk:
+            break                  # real EOF
+        buf.write(chunk)
+    buf.seek(0)
+    return buf
+
+raw3 = make_flaky_raw(gzip.compress(b"hello world, this is real data"))
+safe_buf = drain_retrying_on_none(raw3)
+gz2 = gzip.GzipFile(fileobj=safe_buf)
+print("safe result:", gz2.read())</code></pre>
+<pre><code>safe result: b'hello world, this is real data'</code></pre>
+<p><strong>Measured:</strong> once the <code>None</code>/EOF distinction is handled before the data ever reaches the compression wrapper, decompression succeeds correctly.</p>
+<aside class="cta"><strong>Decompressing from a non-blocking stream with gzip, bz2 or lzma? A single transient None read crashes the whole decompression, even with valid data waiting right behind it:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>None of the gzip, bz2 or lzma module documentation mentions non-blocking streams or None returns at all; they are written assuming a blocking file object whose read() returns either data or b&#x27;&#x27; for EOF. We measured that a None-returning source is mishandled rather than rejected or documented as unsupported.</p></details>
+<details><summary>Why do gzip and bz2/lzma fail differently?</summary><p>We measured that gzip&#x27;s internal _PaddedFile.read() concatenates buffers directly without a None check, producing a TypeError, while bz2 and lzma&#x27;s decompressor loops check for falsy/empty input and treat None the same as real EOF, producing an EOFError instead. Different internal implementations, same root cause: no code path distinguishes a transient None from end-of-stream.</p></details>
+<details><summary>Does this only matter for non-blocking sockets?</summary><p>We used a custom RawIOBase for a controlled, reproducible test, but the same gap applies to any file-like object whose read() can legitimately return None -- primarily non-blocking sockets, pipes, or other I/O wrapped as io.RawIOBase. Ordinary files and BytesIO never return None, so typical disk-based gzip.open() usage is unaffected.</p></details>
+<details><summary>Is this related to the BufferedReader.read1() or BufferedWriter write() == 0 findings?</summary><p>Yes -- same family of bugs (a correct None/EOF-or-not-ready signal gets collapsed or mishandled one layer up), but a different manifestation: those were about io.BufferedReader/Writer&#x27;s own methods; this is about three separate higher-level stdlib modules that sit on top of a correctly-behaving io layer and still get it wrong, each in its own way.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in gzip.GzipFile, bz2.BZ2File and lzma.LZMAFile, each wrapping an io.BufferedReader over a custom non-blocking RawIOBase whose readinto() returns None once (no data ready yet) before returning real, valid compressed data. PlainHeaders is our extension; Python&#x27;s gzip, bz2 and lzma modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

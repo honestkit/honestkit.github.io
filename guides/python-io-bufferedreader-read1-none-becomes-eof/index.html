@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BufferedReader.read1() Mistakes &#x27;Not Ready&#x27; for EOF (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: read() correctly returns None for a non-blocking stream with no data ready, but read1() returns b&#x27;&#x27; instead -- identical to real EOF.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-io-bufferedreader-read1-none-becomes-eof/">
+<meta property="og:title" content="BufferedReader.read1() Mistakes &#x27;Not Ready&#x27; for EOF (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: read() correctly returns None for a non-blocking stream with no data ready, but read1() returns b&#x27;&#x27; instead -- identical to real EOF.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-io-bufferedreader-read1-none-becomes-eof/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is read1() documented to behave this way?", "acceptedAnswer": {"@type": "Answer", "text": "The documentation describes read1() as making at most one call to the underlying raw stream and says little about its behavior under non-blocking None specifically; we measured that it collapses None into b'', while read() on the same BufferedReader, wrapping the same raw stream, keeps None distinguishable from b''."}}, {"@type": "Question", "name": "Why would read1() be more affected than read()?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that read1()'s one-call-only contract means it has no fallback path to distinguish 'this one call returned nothing because of None' from 'this one call returned nothing because of EOF' -- both just become an empty result as far as read1()'s return value is concerned."}}, {"@type": "Question", "name": "Does this affect TextIOWrapper too?", "acceptedAnswer": {"@type": "Answer", "text": "We only measured BufferedReader.read1() directly against BufferedReader.read(); a related but different bug already exists one layer up -- TextIOWrapper.read() crashes with TypeError on the same None signal instead of handling it at all, which is a separate, already-documented finding."}}, {"@type": "Question", "name": "What's the safe general rule here?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that only read() reliably preserves the None/EOF distinction on a non-blocking BufferedReader. If you need read1()'s one-call behavior for latency reasons, you cannot safely use its return value alone to detect EOF on a stream that can also return None."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>io.BufferedReader.read1() Turns a Non-Blocking None Into b&#x27;&#x27; (tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data available right now" by having <code>readinto()</code> return <code>None</code> -- distinct from the empty read that means real end-of-stream. <code>io.BufferedReader.read()</code> handles this correctly: called on a stream with nothing ready, it returns <code>None</code> itself, so a caller can tell "try again later" apart from "the stream is done." <code>read1()</code>, meant for exactly this kind of lower-level non-blocking use, does not: the same transient <code>None</code> comes back from <code>read1()</code> as <code>b''</code> -- the identical empty-bytes value Python's read conventions use for real EOF. A caller using the standard <code>while chunk := f.read1(n): process(chunk)</code> idiom stops permanently on the first moment the stream isn't instantly ready, even though more data is still coming.</p>
+<h2 id="repro1">1. read() correctly distinguishes 'not ready yet' from EOF</h2>
+<pre><code>import io
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self):
+        self.calls = 0
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None          # transient: no data ready yet
+        data = b"hello world"
+        n = min(len(data), len(b))
+        b[:n] = data[:n]
+        return n
+
+raw = FlakyRaw()
+br = io.BufferedReader(raw, buffer_size=64)
+print("read(5) while not ready:", repr(br.read(5)))</code></pre>
+<pre><code>read(5) while not ready: None</code></pre>
+<p><strong>Measured:</strong> <code>read()</code> propagates the raw stream's <code>None</code> signal as-is. A caller can check <code>if chunk is None: retry_later()</code> and correctly keep the connection open.</p>
+
+<h2 id="repro2">2. read1() turns the exact same signal into b'', identical to real EOF</h2>
+<pre><code>raw2 = FlakyRaw()
+br2 = io.BufferedReader(raw2, buffer_size=64)
+r1 = br2.read1(5)
+print("first read1() call (raw said None):", repr(r1))
+r2 = br2.read1(5)
+print("second read1() call (raw has real data now):", repr(r2))</code></pre>
+<pre><code>first read1() call (raw said None): b''
+second read1() call (raw has real data now): b'hello'</code></pre>
+<p><strong>Measured:</strong> the first <code>read1()</code> call returns <code>b''</code> -- exactly what a real end-of-stream would return -- even though the very next call proves the stream was never at EOF at all. Standard Python code that checks <code>if not chunk: break</code> cannot tell these two situations apart through <code>read1()</code>.</p>
+
+<h2 id="repro3">3. The fix: use read(), not read1(), on streams that can return None</h2>
+<pre><code>raw3 = FlakyRaw()
+br3 = io.BufferedReader(raw3, buffer_size=64)
+chunk = br3.read(5)
+while chunk is None:
+    chunk = br3.read(5)   # retry on None, distinct from stopping on b''
+print("correct result after retrying on None:", repr(chunk))</code></pre>
+<pre><code>correct result after retrying on None: b'hello'</code></pre>
+<p><strong>Measured:</strong> checking specifically for <code>None</code> (not just falsy/empty) and retrying only in that case, using <code>read()</code> rather than <code>read1()</code>, reads the real data correctly instead of stopping early.</p>
+<aside class="cta"><strong>Using read1() on a non-blocking raw stream? read() correctly returns None when no data is ready, but read1() turns that same signal into b&#x27;&#x27; -- indistinguishable from real end-of-stream:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is read1() documented to behave this way?</summary><p>The documentation describes read1() as making at most one call to the underlying raw stream and says little about its behavior under non-blocking None specifically; we measured that it collapses None into b&#x27;&#x27;, while read() on the same BufferedReader, wrapping the same raw stream, keeps None distinguishable from b&#x27;&#x27;.</p></details>
+<details><summary>Why would read1() be more affected than read()?</summary><p>We measured that read1()&#x27;s one-call-only contract means it has no fallback path to distinguish &#x27;this one call returned nothing because of None&#x27; from &#x27;this one call returned nothing because of EOF&#x27; -- both just become an empty result as far as read1()&#x27;s return value is concerned.</p></details>
+<details><summary>Does this affect TextIOWrapper too?</summary><p>We only measured BufferedReader.read1() directly against BufferedReader.read(); a related but different bug already exists one layer up -- TextIOWrapper.read() crashes with TypeError on the same None signal instead of handling it at all, which is a separate, already-documented finding.</p></details>
+<details><summary>What&#x27;s the safe general rule here?</summary><p>We measured that only read() reliably preserves the None/EOF distinction on a non-blocking BufferedReader. If you need read1()&#x27;s one-call behavior for latency reasons, you cannot safely use its return value alone to detect EOF on a stream that can also return None.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in io.BufferedReader wrapping a custom non-blocking RawIOBase whose readinto() returns None on its first call (no data ready yet) and real data on the next, comparing read() against read1(). PlainHeaders is our extension; Python&#x27;s io module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

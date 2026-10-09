@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>functools.lru_cache Misses on Keyword-Argument Order (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: f(a=1,b=2) and f(b=2,a=1) are the same call, but lru_cache caches them as two separate entries -- kwarg order changes the cache key.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-functools-lru-cache-kwarg-order-cache-miss/">
+<meta property="og:title" content="functools.lru_cache Misses on Keyword-Argument Order (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: f(a=1,b=2) and f(b=2,a=1) are the same call, but lru_cache caches them as two separate entries -- kwarg order changes the cache key.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-functools-lru-cache-kwarg-order-cache-miss/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does functools.lru_cache care about the order of keyword arguments?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We measured f(a=1, b=2) and f(b=2, a=1), identical in every way that matters to the function itself, producing two separate cache entries -- two misses, not one miss and one hit -- because the cache key is built by walking kwargs.items() in call order, without sorting."}}, {"@type": "Question", "name": "Why would keyword argument order ever differ between calls to the same function?", "acceptedAnswer": {"@type": "Answer", "text": "Most commonly when keyword arguments come from unpacking a dict (f(**some_dict)) that was built or merged along different code paths -- dict insertion order varies by how the dict was constructed, and that order flows straight into the cache key."}}, {"@type": "Question", "name": "Does this affect positional arguments too?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured g(1, 2) called twice producing one miss and one hit as expected -- positional arguments have no order ambiguity, since g(1, 2) only has one possible spelling. The issue is specific to keyword arguments."}}, {"@type": "Question", "name": "How do I avoid lru_cache missing on reordered keyword arguments?", "acceptedAnswer": {"@type": "Answer", "text": "Normalize how the function is called -- pass arguments positionally where possible, or sort a kwargs dict's items before unpacking it into the call -- so the same logical call always arrives in the same keyword order and hits the existing cache entry."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>functools.lru_cache Treats Keyword Argument Order as Part of the Cache Key (tested)</h1>
+<p class="lead">Calling a function with the same keyword arguments in a different order produces an identical result -- <code>f(a=1, b=2)</code> and <code>f(b=2, a=1)</code> do exactly the same thing. We measured that <code>functools.lru_cache</code> does not treat them as the same call: it builds its cache key by walking <code>kwargs.items()</code> in whatever order the arguments arrived in, so the two calls land in two different cache entries, silently doubling the work instead of reusing the first result.</p>
+<h2 id="repro1">1. Same keyword arguments, different order, two cache misses</h2>
+<pre><code>import functools
+
+@functools.lru_cache()
+def f(**kwargs):
+    print("MISS, computing for", kwargs)
+    return sum(kwargs.values())
+
+print(f(a=1, b=2))
+print(f(b=2, a=1))
+print(f.cache_info())</code></pre>
+<pre><code>MISS, computing for {'a': 1, 'b': 2}
+3
+MISS, computing for {'b': 2, 'a': 1}
+3
+CacheInfo(hits=0, misses=2, maxsize=128, currsize=2)</code></pre>
+<p><strong>Measured:</strong> both calls print "MISS" -- the function body ran twice for what is, by every normal definition, the same call. <code>cache_info()</code> confirms it: two misses, zero hits, two entries sitting in the cache for one logical set of arguments. Calling <code>f(a=1, b=2)</code> a second time, in that same order, is a clean hit; only the <em>order</em> the keywords arrived in matters.</p>
+
+<h2 id="repro2">2. Why: the cache key is built by walking kwargs.items() in call order</h2>
+<pre><code>import functools
+
+@functools.lru_cache()
+def f(**kwargs):
+    return sum(kwargs.values())
+
+f(a=1, b=2)
+f(b=2, a=1)
+
+# the cache's internal key order mirrors each call's kwargs order --
+# inspect it indirectly via cache_parameters() / cache_info(), or just
+# trust the measured miss count above: two different key tuples were built.
+print(f.cache_info())</code></pre>
+<pre><code>CacheInfo(hits=0, misses=2, maxsize=128, currsize=2)</code></pre>
+<p><strong>Measured:</strong> <code>functools.lru_cache</code>'s internal key-building step appends each keyword and its value to the key tuple in the order <code>kwargs.items()</code> yields them, which is the order Python's <code>**kwargs</code> collected them at the call site -- it never sorts them. Two tuples built from the same pairs in a different order are different tuples with (generally) different hashes, so the dict-based cache treats them as unrelated keys. This matters most when the keyword arguments come from unpacking a dict (<code>f(**some_dict)</code>) built or merged in different code paths, since dict insertion order is exactly what ends up driving the mismatch.</p>
+
+<h2 id="repro3">3. Positional arguments don't have this problem</h2>
+<pre><code>import functools
+
+@functools.lru_cache()
+def g(a, b):
+    print("MISS, computing for", a, b)
+    return a + b
+
+print(g(1, 2))
+print(g(1, 2))
+print(g.cache_info())</code></pre>
+<pre><code>MISS, computing for 1 2
+3
+3
+CacheInfo(hits=1, misses=1, maxsize=128, currsize=1)</code></pre>
+<p><strong>Measured:</strong> positional arguments have no "order" ambiguity to begin with -- <code>g(1, 2)</code> only ever means one thing, so repeating it is a clean hit. The miss-doubling only shows up once keyword arguments enter the picture and the same logical call can be spelled with its keywords in more than one order. If a function's call sites might pass keywords in varying order (including via <code>**dict</code> unpacking), switching those arguments to positional-only, or normalizing them (e.g. sorting a kwargs dict before unpacking) before calling the cached function avoids the duplicate entries.</p>
+<aside class="cta"><strong>Calling the same lru_cache-wrapped function with the same keyword arguments but built in a different order (from a dict, or from different call sites)? Check cache_info() first -- it&#x27;s probably missing more than you think:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does functools.lru_cache care about the order of keyword arguments?</summary><p>Yes. We measured f(a=1, b=2) and f(b=2, a=1), identical in every way that matters to the function itself, producing two separate cache entries -- two misses, not one miss and one hit -- because the cache key is built by walking kwargs.items() in call order, without sorting.</p></details>
+<details><summary>Why would keyword argument order ever differ between calls to the same function?</summary><p>Most commonly when keyword arguments come from unpacking a dict (f(**some_dict)) that was built or merged along different code paths -- dict insertion order varies by how the dict was constructed, and that order flows straight into the cache key.</p></details>
+<details><summary>Does this affect positional arguments too?</summary><p>No. We measured g(1, 2) called twice producing one miss and one hit as expected -- positional arguments have no order ambiguity, since g(1, 2) only has one possible spelling. The issue is specific to keyword arguments.</p></details>
+<details><summary>How do I avoid lru_cache missing on reordered keyword arguments?</summary><p>Normalize how the function is called -- pass arguments positionally where possible, or sort a kwargs dict&#x27;s items before unpacking it into the call -- so the same logical call always arrives in the same keyword order and hits the existing cache entry.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in functools.lru_cache: called a function decorated with @lru_cache() using identical keyword arguments in two different orders (a=1, b=2 then b=2, a=1), and checked whether the second call was a cache hit or a fresh miss via print statements inside the function and cache_info(). PlainHeaders is our extension; Python&#x27;s functools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

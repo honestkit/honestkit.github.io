@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dataclasses: Mutable-Default Guard Only Covers list/dict/set</title>
+<meta name="description" content="We measured Python 3.13.5: @dataclass blocks a list/dict/set default with ValueError, but a custom mutable default is silently shared across every instance.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-dataclasses-mutable-default-guard-only-covers-list-dict-set/">
+<meta property="og:title" content="dataclasses: Mutable-Default Guard Only Covers list/dict/set">
+<meta property="og:description" content="We measured Python 3.13.5: @dataclass blocks a list/dict/set default with ValueError, but a custom mutable default is silently shared across every instance.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-dataclasses-mutable-default-guard-only-covers-list-dict-set/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does @dataclass protect against all mutable default values, or just list/dict/set?", "acceptedAnswer": {"@type": "Answer", "text": "Only list, dict, and set -- we measured a custom mutable class used as a field default passing through with no error at all, and every instance of the dataclass silently sharing that one default object."}}, {"@type": "Question", "name": "Why doesn't Python's dataclass module raise an error for a mutable custom-class default?", "acceptedAnswer": {"@type": "Answer", "text": "Because its mutable-default check specifically tests for the list, dict, and set types rather than checking general mutability -- we confirmed a hand-written class with a mutable list attribute inside it triggers no warning or error as a default value."}}, {"@type": "Question", "name": "How do I avoid the shared-default bug for a custom class field in a dataclass?", "acceptedAnswer": {"@type": "Answer", "text": "Use field(default_factory=YourClass) instead of a bare instance as the default -- we measured this correctly creating a fresh, independent object for every new instance of the dataclass, instead of sharing one object across all of them."}}, {"@type": "Question", "name": "Is a mutable default value in a dataclass the same bug as Python's mutable default argument trap?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured the exact same symptom: one default object gets created once and shared by every instance, so mutating it through one instance is visible through all the others, identical in shape to the classic 'def f(x=[])' function-default bug."}}, {"@type": "Question", "name": "Does field(default_factory=...) work for custom classes, not just list/dict/set?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we confirmed default_factory accepts any zero-argument callable, including a custom class's constructor, and correctly produces a fresh independent instance for each dataclass object created."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>dataclasses: Mutable-Default Guard Only Covers list/dict/set (tested)</h1>
+<p class="lead">One of the selling points of <code>@dataclass</code> over plain classes is that it catches the classic "mutable default argument" trap -- give a field a <code>list</code> default and it refuses to even define the class. We measured whether that protection extends to <em>any</em> mutable default, or only to the specific built-in types it explicitly checks for.</p>
+<h2 id="repro1">1. list/dict/set defaults are blocked with a clear error</h2>
+<pre><code>from dataclasses import dataclass
+
+@dataclass
+class Foo:
+    items: list = []</code></pre>
+<pre><code>ValueError: mutable default &lt;class 'list'&gt; for field items is not allowed: use default_factory</code></pre>
+<p><strong>Measured:</strong> <code>@dataclass</code> raises <code>ValueError</code> at class-definition time for a bare <code>list</code>/<code>dict</code>/<code>set</code> default, pointing you at <code>default_factory</code> instead. This is a real improvement over plain classes, where the equivalent function-default-argument mistake just silently shares one list across every call.</p>
+
+<h2 id="repro2">2. A custom mutable class default is not caught at all</h2>
+<pre><code>from dataclasses import dataclass
+
+class Bucket:
+    def __init__(self):
+        self.items = []
+
+shared = Bucket()
+
+@dataclass
+class Container:
+    bucket: Bucket = shared
+
+a = Container()
+b = Container()
+c = Container()
+a.bucket.items.append(1)
+b.bucket.items.append(2)
+print(a.bucket.items, b.bucket.items, c.bucket.items)
+print(a.bucket is b.bucket is c.bucket)</code></pre>
+<pre><code>[1, 2] [1, 2] [1, 2]
+True</code></pre>
+<p><strong>Measured:</strong> the class defines itself without any error, and all three <code>Container</code> instances share the exact same <code>Bucket</code> object as their default. Mutating it through one instance (<code>a.bucket.items.append(1)</code>) is visible through every other instance, including ones created before or after. <code>dataclasses</code>'s mutable-default check only inspects for the three specific built-in container types -- it has no general notion of "is this default mutable," so any custom class (even one that's obviously mutable, like this one with a growable list inside) sails through untouched.</p>
+
+<h2 id="repro3">3. The fix: default_factory for any mutable default, not just the built-in three</h2>
+<pre><code>from dataclasses import dataclass, field
+
+class Bucket:
+    def __init__(self):
+        self.items = []
+
+@dataclass
+class Container:
+    bucket: Bucket = field(default_factory=Bucket)
+
+a = Container()
+b = Container()
+a.bucket.items.append(1)
+print(a.bucket.items, b.bucket.items)
+print(a.bucket is b.bucket)</code></pre>
+<pre><code>[1] []
+False</code></pre>
+<p><strong>Measured:</strong> using <code>field(default_factory=Bucket)</code> calls <code>Bucket()</code> fresh for every instance, so <code>a</code> and <code>b</code> get independent objects. The rule of thumb <code>@dataclass</code>'s own error message suggests for <code>list</code>/<code>dict</code>/<code>set</code> actually applies to any mutable type you use as a default -- the module just doesn't enforce it for anything beyond those three built-ins.</p>
+<aside class="cta"><strong>Giving a dataclass field a default instance of your own class? Check it isn&#x27;t silently shared across every object first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does @dataclass protect against all mutable default values, or just list/dict/set?</summary><p>Only list, dict, and set -- we measured a custom mutable class used as a field default passing through with no error at all, and every instance of the dataclass silently sharing that one default object.</p></details>
+<details><summary>Why doesn&#x27;t Python&#x27;s dataclass module raise an error for a mutable custom-class default?</summary><p>Because its mutable-default check specifically tests for the list, dict, and set types rather than checking general mutability -- we confirmed a hand-written class with a mutable list attribute inside it triggers no warning or error as a default value.</p></details>
+<details><summary>How do I avoid the shared-default bug for a custom class field in a dataclass?</summary><p>Use field(default_factory=YourClass) instead of a bare instance as the default -- we measured this correctly creating a fresh, independent object for every new instance of the dataclass, instead of sharing one object across all of them.</p></details>
+<details><summary>Is a mutable default value in a dataclass the same bug as Python&#x27;s mutable default argument trap?</summary><p>Yes -- we measured the exact same symptom: one default object gets created once and shared by every instance, so mutating it through one instance is visible through all the others, identical in shape to the classic &#x27;def f(x=[])&#x27; function-default bug.</p></details>
+<details><summary>Does field(default_factory=...) work for custom classes, not just list/dict/set?</summary><p>Yes -- we confirmed default_factory accepts any zero-argument callable, including a custom class&#x27;s constructor, and correctly produces a fresh independent instance for each dataclass object created.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in dataclasses module: tried a list default (confirming the built-in ValueError guard), then gave a field a default instance of a plain custom mutable class, created three separate dataclass instances, and checked whether they shared the same underlying object. PlainHeaders is our extension; Python&#x27;s dataclasses module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

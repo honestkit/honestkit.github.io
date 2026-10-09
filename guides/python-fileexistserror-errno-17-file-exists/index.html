@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FileExistsError: [Errno 17] File exists in Python (Tested Fix)</title>
+<meta name="description" content="We measured Python FileExistsError [Errno 17]: mkdir twice, exist_ok over a file, open mode &#x27;x&#x27;, symlink and copytree, with the fix for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-fileexistserror-errno-17-file-exists/">
+<meta property="og:title" content="FileExistsError: [Errno 17] File exists in Python (Tested Fix)">
+<meta property="og:description" content="We measured Python FileExistsError [Errno 17]: mkdir twice, exist_ok over a file, open mode &#x27;x&#x27;, symlink and copytree, with the fix for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-fileexistserror-errno-17-file-exists/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does FileExistsError: [Errno 17] File exists mean?", "acceptedAnswer": {"@type": "Answer", "text": "You asked Python to create something at a path that is already taken: os.mkdir on an existing directory, open(path, 'x'), os.symlink or shutil.copytree onto an existing target. We measured each on Python 3.13.5."}}, {"@type": "Question", "name": "How do I create a directory only if it doesn't exist in Python?", "acceptedAnswer": {"@type": "Answer", "text": "os.makedirs(path, exist_ok=True) or Path(path).mkdir(parents=True, exist_ok=True). We measured both succeeding when run twice."}}, {"@type": "Question", "name": "Why do I get FileExistsError even with exist_ok=True?", "acceptedAnswer": {"@type": "Answer", "text": "A regular file, not a directory, exists at that path. We measured makedirs('logs', exist_ok=True) failing because a file named logs existed."}}, {"@type": "Question", "name": "How do I fix FileExistsError in shutil.copytree?", "acceptedAnswer": {"@type": "Answer", "text": "Pass dirs_exist_ok=True (Python 3.8+) to copy into an existing directory. We measured it succeed where the plain call raised Errno 17."}}, {"@type": "Question", "name": "How do I rename a file and overwrite the destination?", "acceptedAnswer": {"@type": "Answer", "text": "Use os.replace, which overwrites on every OS. We measured it replacing an existing file; os.rename raises FileExistsError on Windows when the target exists."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>FileExistsError: [Errno 17] File exists (tested)</h1>
+<p class="lead"><code>FileExistsError: [Errno 17] File exists</code> means Python was asked to create a directory, file or link at a path that is already taken. We measured the usual sources on Python 3.13.5, including the case where <code>exist_ok=True</code> doesn't help.</p>
+<h2 id="mkdir">1. os.mkdir on a directory that exists</h2>
+<pre><code>import os
+os.mkdir(&quot;out&quot;)
+try:
+    os.mkdir(&quot;out&quot;)
+except FileExistsError as e:
+    print(type(e).__name__, e)
+os.makedirs(&quot;out/a/b&quot;, exist_ok=True)
+os.makedirs(&quot;out/a/b&quot;, exist_ok=True)          # no error the second time
+print(&quot;makedirs exist_ok: fine&quot;)
+from pathlib import Path
+Path(&quot;out/c&quot;).mkdir(parents=True, exist_ok=True)
+Path(&quot;out/c&quot;).mkdir(parents=True, exist_ok=True)
+print(&quot;Path.mkdir exist_ok: fine&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>FileExistsError [Errno 17] File exists: &#x27;out&#x27;
+makedirs exist_ok: fine
+Path.mkdir exist_ok: fine</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> <code>os.mkdir</code> raises <code>FileExistsError: [Errno 17] File exists</code> the second time. <code>os.makedirs(path, exist_ok=True)</code> and <code>Path(path).mkdir(parents=True, exist_ok=True)</code> create any missing parents and do nothing if the directory is already there.</p>
+
+<h2 id="file">2. exist_ok=True still fails if a file has that name</h2>
+<pre><code>import os
+open(&quot;logs&quot;, &quot;w&quot;).close()                     # a FILE named logs already exists
+try:
+    os.makedirs(&quot;logs&quot;, exist_ok=True)
+except FileExistsError as e:
+    print(&quot;exist_ok but it&#x27;s a file:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>exist_ok but it&#x27;s a file: [Errno 17] File exists: &#x27;logs&#x27;</code></pre>
+<p><strong>Measured:</strong> <code>exist_ok</code> only forgives an existing <em>directory</em>. If a regular file sits at that path (a log file called <code>logs</code>, a download that saved as <code>output</code> with no extension), you still get Errno 17. Rename or remove the file, or pick a different directory name.</p>
+
+<h2 id="race">3. Don't check first: use exist_ok, or mode "x" to claim a file</h2>
+<pre><code>import os
+# check-then-create is a race: another process can create it in between
+if not os.path.exists(&quot;data&quot;):
+    os.mkdir(&quot;data&quot;)
+# open(..., &quot;x&quot;) fails if the file exists: use it to claim a file atomically
+with open(&quot;data/lock&quot;, &quot;x&quot;) as f:
+    f.write(&quot;mine&quot;)
+try:
+    open(&quot;data/lock&quot;, &quot;x&quot;)
+except FileExistsError as e:
+    print(&quot;mode &#x27;x&#x27;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>mode &#x27;x&#x27;: [Errno 17] File exists: &#x27;data/lock&#x27;</code></pre>
+<p>"<code>if not exists: mkdir</code>" is a race: with parallel workers, two can pass the check and the second <code>mkdir</code> fails. <code>exist_ok=True</code> has no gap. For files, <code>open(path, "x")</code> creates the file only if it doesn't exist and raises <code>FileExistsError</code> otherwise, which makes it a simple lock or "write once" guard.</p>
+
+<h2 id="others">4. symlink, copytree, rename</h2>
+<pre><code>import os, shutil
+open(&quot;a.txt&quot;, &quot;w&quot;).write(&quot;new&quot;)
+open(&quot;b.txt&quot;, &quot;w&quot;).write(&quot;old&quot;)
+os.replace(&quot;a.txt&quot;, &quot;b.txt&quot;)                  # overwrites on every OS
+print(&quot;os.replace:&quot;, open(&quot;b.txt&quot;).read())
+os.symlink(&quot;b.txt&quot;, &quot;link&quot;)
+try:
+    os.symlink(&quot;b.txt&quot;, &quot;link&quot;)
+except FileExistsError as e:
+    print(&quot;symlink:&quot;, e)
+shutil.copytree(&quot;out&quot;, &quot;copy&quot;)
+try:
+    shutil.copytree(&quot;out&quot;, &quot;copy&quot;)
+except FileExistsError as e:
+    print(&quot;copytree:&quot;, e)
+shutil.copytree(&quot;out&quot;, &quot;copy&quot;, dirs_exist_ok=True)
+print(&quot;copytree dirs_exist_ok: fine&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>os.replace: new
+symlink: [Errno 17] File exists: &#x27;b.txt&#x27; -&gt; &#x27;link&#x27;
+copytree: [Errno 17] File exists: &#x27;copy&#x27;
+copytree dirs_exist_ok: fine</code></pre>
+<p><strong>Measured on Linux:</strong> <code>os.replace</code> overwrites the destination; <code>os.symlink</code> and <code>shutil.copytree</code> refuse an existing target. <code>copytree(..., dirs_exist_ok=True)</code> (3.8+) merges into the existing directory. On Windows (not tested here), <code>os.rename</code> also raises <code>FileExistsError</code> if the destination exists ([WinError 183]), per the docs; use <code>os.replace</code> when you mean "overwrite".</p>
+
+<aside class="cta"><strong>Debugging a Python HTTP script? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does FileExistsError: [Errno 17] File exists mean?</summary><p>You asked Python to create something at a path that is already taken: os.mkdir on an existing directory, open(path, &#x27;x&#x27;), os.symlink or shutil.copytree onto an existing target. We measured each on Python 3.13.5.</p></details>
+<details><summary>How do I create a directory only if it doesn&#x27;t exist in Python?</summary><p>os.makedirs(path, exist_ok=True) or Path(path).mkdir(parents=True, exist_ok=True). We measured both succeeding when run twice.</p></details>
+<details><summary>Why do I get FileExistsError even with exist_ok=True?</summary><p>A regular file, not a directory, exists at that path. We measured makedirs(&#x27;logs&#x27;, exist_ok=True) failing because a file named logs existed.</p></details>
+<details><summary>How do I fix FileExistsError in shutil.copytree?</summary><p>Pass dirs_exist_ok=True (Python 3.8+) to copy into an existing directory. We measured it succeed where the plain call raised Errno 17.</p></details>
+<details><summary>How do I rename a file and overwrite the destination?</summary><p>Use os.replace, which overwrites on every OS. We measured it replacing an existing file; os.rename raises FileExistsError on Windows when the target exists.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: os.mkdir twice, makedirs and Path.mkdir with exist_ok, exist_ok over a regular file, open mode &#x27;x&#x27;, os.replace, os.symlink and shutil.copytree with and without dirs_exist_ok. Every block was run verbatim and its output pasted from that run. Windows was not tested; the os.rename note is from the Python docs. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shelve Silently Drops In-Place Mutations -- Even Same-Session</title>
+<meta name="description" content="We measured Python 3.13.5: shelve without writeback=True returns a fresh object every read, so in-place mutations vanish instantly, same session.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-shelve-writeback-false-mutation-lost-same-session/">
+<meta property="og:title" content="shelve Silently Drops In-Place Mutations -- Even Same-Session">
+<meta property="og:description" content="We measured Python 3.13.5: shelve without writeback=True returns a fresh object every read, so in-place mutations vanish instantly, same session.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-shelve-writeback-false-mutation-lost-same-session/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does shelve raise an error if you mutate a stored list without writeback=True?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured calling .append() on a value read from a shelf with the default writeback=False: it raised nothing, and the mutation was already gone by the next line, even in the same process before any close() or reopen()."}}, {"@type": "Question", "name": "Why does shelve lose in-place mutations by default?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that shelf[key] returns a newly-unpickled object on every single read when writeback is off -- two back-to-back reads of the same key are provably different objects (a is b is False) -- so mutating one of them has nothing to persist."}}, {"@type": "Question", "name": "Does writeback=True fix the mutation problem?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured that with writeback=True, the same append() call is visible immediately in the same session and still present after closing and reopening the shelf, because shelve caches every touched key in memory and writes it all back on close()."}}, {"@type": "Question", "name": "What's the safe way to mutate a value in a shelve database without writeback=True?", "acceptedAnswer": {"@type": "Answer", "text": "Read it into a local variable, mutate the local variable, then explicitly assign it back to the key -- we measured that tmp = s[\"x\"]; tmp.append(4); s[\"x\"] = tmp correctly persists the change in the same session."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>shelve: Without writeback=True, a Mutation Vanishes in the Same Session (tested)</h1>
+<p class="lead"><code>shelve</code> looks like a dict that happens to persist to disk, so <code>shelf["x"].append(4)</code> looks like it should behave exactly like <code>d["x"].append(4)</code> on a plain dict. It doesn't, by default: every <code>shelf[key]</code> read unpickles a brand-new object from disk. We measured what that does to an in-place mutation, including whether it's even visible before you close or reopen anything.</p>
+<h2 id="repro1">1. The mutation looks like it worked -- and then it's just gone</h2>
+<pre><code>import shelve, tempfile, os
+
+path = os.path.join(tempfile.mkdtemp(), "db")
+s = shelve.open(path)   # writeback=False is the default
+s["x"] = [1, 2, 3]
+s["x"].append(4)        # no error -- looks exactly like it worked
+print(s["x"])</code></pre>
+<pre><code>[1, 2, 3]</code></pre>
+<p><strong>Measured:</strong> <code>s["x"].append(4)</code> raised nothing and returned nothing unusual -- a list's <code>.append()</code> always "succeeds" syntactically. But reading <code>s["x"]</code> back on the very next line, in the same process, before calling <code>.close()</code> or touching the file again, shows <code>[1, 2, 3]</code>. The <code>4</code> never existed anywhere except on a temporary object that was discarded the instant the statement finished.</p>
+
+<h2 id="repro2">2. Why: every read returns a different object, not a cached one</h2>
+<pre><code>import shelve, tempfile, os
+
+path = os.path.join(tempfile.mkdtemp(), "db")
+s = shelve.open(path)
+s["x"] = [1, 2, 3]
+
+a = s["x"]
+b = s["x"]
+print("same object?", a is b)</code></pre>
+<pre><code>same object? False</code></pre>
+<p><strong>Measured:</strong> two reads of the same key, back to back, are not the same object -- each <code>shelf[key]</code> unpickles a fresh copy from the underlying dbm file. <code>s["x"].append(4)</code> mutates one of those disposable copies, which is never stored anywhere and is garbage the moment the line finishes. This is unlike a plain <code>dict</code>, where <code>d["x"]</code> always returns the one object actually being stored.</p>
+
+<h2 id="repro3">3. writeback=True fixes it -- by caching every object you've touched, in memory</h2>
+<pre><code>import shelve, tempfile, os
+
+path = os.path.join(tempfile.mkdtemp(), "db")
+s = shelve.open(path, writeback=True)
+s["x"] = [1, 2, 3]
+s["x"].append(4)
+print("writeback=True, same session:", s["x"])
+s.close()
+
+s2 = shelve.open(path)
+print("reopened:", s2["x"])
+s2.close()</code></pre>
+<pre><code>writeback=True, same session: [1, 2, 3, 4]
+reopened: [1, 2, 3, 4]</code></pre>
+<p><strong>Measured:</strong> with <code>writeback=True</code>, the shelf keeps an in-memory cache of every entry you've accessed and writes it all back on <code>close()</code> -- so the mutation is visible immediately, and persists. The documented tradeoff is memory: that cache holds every object you've touched, uncollected, for the life of the shelf, and nothing is written to disk until <code>close()</code> (or an explicit <code>sync()</code>) runs. Without it, the only safe pattern is read-modify-store: <code>tmp = s["x"]; tmp.append(4); s["x"] = tmp</code>, which we also measured to work correctly in the same session.</p>
+<aside class="cta"><strong>Storing lists or dicts in a shelve database and mutating them with .append() or similar? Check whether you passed writeback=True -- otherwise that mutation goes nowhere, even before you close it:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does shelve raise an error if you mutate a stored list without writeback=True?</summary><p>No -- we measured calling .append() on a value read from a shelf with the default writeback=False: it raised nothing, and the mutation was already gone by the next line, even in the same process before any close() or reopen().</p></details>
+<details><summary>Why does shelve lose in-place mutations by default?</summary><p>We measured that shelf[key] returns a newly-unpickled object on every single read when writeback is off -- two back-to-back reads of the same key are provably different objects (a is b is False) -- so mutating one of them has nothing to persist.</p></details>
+<details><summary>Does writeback=True fix the mutation problem?</summary><p>Yes -- we measured that with writeback=True, the same append() call is visible immediately in the same session and still present after closing and reopening the shelf, because shelve caches every touched key in memory and writes it all back on close().</p></details>
+<details><summary>What&#x27;s the safe way to mutate a value in a shelve database without writeback=True?</summary><p>Read it into a local variable, mutate the local variable, then explicitly assign it back to the key -- we measured that tmp = s[&quot;x&quot;]; tmp.append(4); s[&quot;x&quot;] = tmp correctly persists the change in the same session.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in shelve module (default dbm backend): opened a shelf without writeback, mutated a stored list in place, and read the key back in the exact same session before closing anything. PlainHeaders is our extension; Python&#x27;s shelve module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

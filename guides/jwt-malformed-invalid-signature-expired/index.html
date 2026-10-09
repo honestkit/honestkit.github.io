@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JWT Verify Errors: malformed, invalid signature, expired</title>
+<meta name="description" content="Tested jsonwebtoken 9.0.3 verify() against bad, tampered and expired tokens: exact error names/messages, expiredAt, clockTolerance, and decode() vs verify().">
+<link rel="canonical" href="https://honestkit.github.io/guides/jwt-malformed-invalid-signature-expired/">
+<meta property="og:title" content="JWT Verify Errors: malformed, invalid signature, expired">
+<meta property="og:description" content="Tested jsonwebtoken 9.0.3 verify() against bad, tampered and expired tokens: exact error names/messages, expiredAt, clockTolerance, and decode() vs verify().">
+<meta property="og:url" content="https://honestkit.github.io/guides/jwt-malformed-invalid-signature-expired/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does jwt.verify() say \"jwt malformed\" for a token with only one dot?", "acceptedAnswer": {"@type": "Answer", "text": "jsonwebtoken splits the token on '.' before doing anything else. If the result isn't exactly 3 parts (header, payload, signature), it throws JsonWebTokenError: jwt malformed immediately, without trying to decode anything."}}, {"@type": "Question", "name": "Is \"invalid signature\" caused by a wrong secret or a tampered token?", "acceptedAnswer": {"@type": "Answer", "text": "Either. We measured both: verifying with the wrong secret, and verifying a token whose payload was edited after signing without re-signing, produced the identical JsonWebTokenError: invalid signature. The error can't tell you which happened."}}, {"@type": "Question", "name": "What type is error.expiredAt on a TokenExpiredError?", "acceptedAnswer": {"@type": "Answer", "text": "A real JavaScript Date instance, not a number. We confirmed expiredAt instanceof Date is true on jsonwebtoken 9.0.3. Use it directly, e.g. in a log message, without converting from a timestamp."}}, {"@type": "Question", "name": "Does jsonwebtoken still say \"not enough segments\"?", "acceptedAnswer": {"@type": "Answer", "text": "No, not in the installed 9.0.3. We grepped the package source and that phrase doesn't appear; a token with the wrong number of parts gets jwt malformed instead. If you see \"not enough segments\", it's from a different JWT library."}}, {"@type": "Question", "name": "Can I catch TokenExpiredError and JsonWebTokenError separately?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, but check TokenExpiredError (and NotBeforeError) first. Both extend JsonWebTokenError, so err instanceof jwt.JsonWebTokenError is true for all of them; checking the base class first will catch expired tokens too and you'll never reach the more specific branch."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>jwt malformed, invalid signature, jwt expired (tested)</h1>
+<p class="lead">Node's <code>jsonwebtoken</code> package throws three different errors from <code>jwt.verify()</code>: <code>JsonWebTokenError: jwt malformed</code>, <code>JsonWebTokenError: invalid signature</code>, and <code>TokenExpiredError: jwt expired</code>. We signed and verified real tokens with jsonwebtoken 9.0.3 to pin down exactly which input produces which error, what the <code>.expiredAt</code> property looks like, and how <code>clockTolerance</code> changes the outcome. The token itself is usually sent in an <a href="/guides/bearer-token-authorization-header/">Authorization: Bearer header</a>.</p>
+<h2>1. The three errors at a glance</h2>
+<table>
+<tr><th>Error you see</th><th>error.name</th><th>Typical cause</th></tr>
+<tr><td>JsonWebTokenError: jwt malformed</td><td>JsonWebTokenError</td><td>The string isn't 3 dot-separated parts (0, 1, or more than 2 dots)</td></tr>
+<tr><td>JsonWebTokenError: invalid signature</td><td>JsonWebTokenError</td><td>3 parts, but the signature doesn't match the header+payload for the given secret</td></tr>
+<tr><td>TokenExpiredError: jwt expired</td><td>TokenExpiredError</td><td>Signature is valid, but the <code>exp</code> claim is in the past</td></tr>
+</table>
+<p>All three, plus a fourth <code>NotBeforeError</code> (for a future <code>nbf</code> claim), extend the same base <code>JsonWebTokenError</code>, which extends <code>Error</code>. Section 6 covers why that matters for your <code>catch</code> block.</p>
+
+<h2>2. "jwt malformed" &mdash; exactly which inputs trigger it</h2>
+<p>We called <code>jwt.verify(token, 'secret')</code> with seven different bad inputs and logged <code>error.name</code> and <code>error.message</code> for each:</p>
+<table>
+<tr><th>Input</th><th>error.name</th><th>error.message</th></tr>
+<tr><td><code>'abc'</code> (no dots)</td><td>JsonWebTokenError</td><td>jwt malformed</td></tr>
+<tr><td><code>'abc.def'</code> (1 dot)</td><td>JsonWebTokenError</td><td>jwt malformed</td></tr>
+<tr><td><code>'   '</code> (whitespace, no dots)</td><td>JsonWebTokenError</td><td>jwt malformed</td></tr>
+<tr><td><code>'!!!.###.$$$'</code> (2 dots, 3 parts, but not valid base64url/JSON)</td><td>JsonWebTokenError</td><td>invalid token</td></tr>
+<tr><td><code>''</code> (empty string)</td><td>JsonWebTokenError</td><td>jwt must be provided</td></tr>
+<tr><td><code>undefined</code></td><td>JsonWebTokenError</td><td>jwt must be provided</td></tr>
+<tr><td><code>null</code></td><td>JsonWebTokenError</td><td>jwt must be provided</td></tr>
+</table>
+<p>No input produced a plain <code>TypeError</code>; <code>jsonwebtoken</code> wraps every case in <code>JsonWebTokenError</code>. But "jwt malformed" is not the only message you can get back from a bad token: it is specifically what you get when <code>token.split('.')</code> does not yield exactly 3 parts. If the string has exactly 3 parts but they don't decode to valid base64url JSON, the message is the different <code>invalid token</code>, from this check in <code>verify.js</code>:</p>
+<pre><code>const parts = jwtString.split('.');
+if (parts.length !== 3){
+  return done(new JsonWebTokenError('jwt malformed'));
+}
+// ...
+decodedToken = decode(jwtString, { complete: true });
+if (!decodedToken) {
+  return done(new JsonWebTokenError('invalid token'));
+}</code></pre>
+<p>And a falsy token (<code>''</code>, <code>undefined</code>, <code>null</code>) is caught even earlier, before the split, giving <code>jwt must be provided</code> instead of either of those. If your error-handling code matches on the string <code>"malformed"</code> alone, it will miss <code>invalid token</code> and <code>jwt must be provided</code> &mdash; match on the error class instead (section 6).</p>
+
+<h2>3. "invalid signature" &mdash; wrong secret and tampered payloads look the same</h2>
+<p>We signed a token with <code>correct-secret</code>, then verified it two different ways:</p>
+<pre><code>const token = jwt.sign({ foo: 'bar' }, 'correct-secret');
+
+jwt.verify(token, 'wrong-secret');
+// JsonWebTokenError: invalid signature</code></pre>
+<p>Then we left the secret alone and tampered with the payload instead: base64url-decoded the middle segment, changed a field, re-encoded it, and swapped it back in &mdash; <strong>without</strong> re-signing:</p>
+<pre><code>const parts = token.split('.');
+const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+payload.foo = 'TAMPERED';
+const tampered = parts[0] + '.' +
+  Buffer.from(JSON.stringify(payload)).toString('base64url') + '.' + parts[2];
+
+jwt.verify(tampered, 'correct-secret');
+// JsonWebTokenError: invalid signature</code></pre>
+<p>Same error, same message, in both cases: <code>JsonWebTokenError: invalid signature</code>. That's the point of an HMAC signature &mdash; the library recomputes it over whatever header+payload bytes are actually present and compares it to the third segment. Change either the secret used to verify or the bytes being signed, and the comparison fails the same way. You cannot tell from the error alone whether the client used the wrong secret or someone edited the payload in transit.</p>
+
+<h2>4. "jwt expired" (TokenExpiredError) &mdash; the .expiredAt property and clockTolerance</h2>
+<p>We signed a token that expires almost immediately, waited past that point, then verified:</p>
+<pre><code>const token = jwt.sign({ foo: 'bar' }, 'correct-secret', { expiresIn: '1ms' });
+// ... wait 50ms ...
+jwt.verify(token, 'correct-secret');</code></pre>
+<p>Result: <code>TokenExpiredError</code>, message <code>jwt expired</code>, and an <code>expiredAt</code> property that is a real <code>Date</code> instance (not a timestamp number):</p>
+<pre><code>error.name       // 'TokenExpiredError'
+error.message    // 'jwt expired'
+error.expiredAt  // 2026-10-02T12:34:24.000Z  (instanceof Date === true)</code></pre>
+<p>Signing with an explicit past <code>exp</code> claim (<code>jwt.sign({ foo: 'bar', exp: nowSeconds - 100 }, secret)</code>) gives the identical error shape. <code>exp</code> is read in whole seconds, so sub-second precision isn't meaningful either way.</p>
+<p>The <code>clockTolerance</code> option (seconds) forgives small clock drift between signer and verifier. We signed a token with <code>exp</code> set 2 seconds in the past, then verified it twice:</p>
+<pre><code>jwt.verify(token, secret);
+// throws TokenExpiredError: jwt expired
+
+jwt.verify(token, secret, { clockTolerance: 5 });
+// succeeds: returns { foo: 'bar', exp: ..., iat: ... }</code></pre>
+<p>With no tolerance it throws; with <code>clockTolerance: 5</code> the same 2-seconds-expired token verifies successfully and returns the decoded payload. Use this for clock skew between servers, not as a way to extend real session lifetimes.</p>
+
+<h2>5. "not enough segments" &mdash; not in this version</h2>
+<p>Some JWT error messages you'll find in search results (and in other languages' JWT libraries) say "not enough segments" for a token that isn't split into 3 parts. We grepped the installed <code>jsonwebtoken@9.0.3</code> source for that exact phrase and it does not appear anywhere in the package. The only messages the library's own <code>verify.js</code> throws for a bad token shape are the ones measured in section 2: <code>jwt malformed</code>, <code>invalid token</code>, and <code>jwt must be provided</code>. If you're seeing "not enough segments" in your logs, it's coming from a different library (older PyJWT and some other-language JWT ports use that wording) &mdash; not from Node's <code>jsonwebtoken</code>.</p>
+
+<h2>6. Catching these safely: the error class hierarchy</h2>
+<p>Reading the installed package's source confirms the inheritance chain:</p>
+<pre><code>JsonWebTokenError  extends  Error
+TokenExpiredError  extends  JsonWebTokenError
+NotBeforeError     extends  JsonWebTokenError</code></pre>
+<p>That means <code>err instanceof jwt.JsonWebTokenError</code> is <code>true</code> for a <code>TokenExpiredError</code> too &mdash; we confirmed this directly (<code>instanceof</code> returned <code>true</code> in our test run). If you want to treat expiry differently from a bad signature, check the more specific class first:</p>
+<pre><code>try {
+  jwt.verify(token, secret);
+} catch (err) {
+  if (err instanceof jwt.TokenExpiredError) {
+    // respond 401 "token expired", maybe prompt a refresh
+  } else if (err instanceof jwt.JsonWebTokenError) {
+    // malformed / invalid signature / invalid token &mdash; respond 401 "invalid token"
+  } else {
+    throw err; // something else entirely
+  }
+}</code></pre>
+<p>Checking <code>instanceof jwt.JsonWebTokenError</code> first would swallow the expired-token case into the generic branch, since the check also matches <code>TokenExpiredError</code> instances.</p>
+
+<h2>7. decode() has none of these checks</h2>
+<p><code>jwt.decode(token)</code> just base64url-decodes the header and payload segments and returns them as an object. It does not check the signature and does not check <code>exp</code>. We called it on both tokens from earlier sections:</p>
+<pre><code>jwt.decode(tamperedToken);
+// { foo: 'TAMPERED', iat: 1790944464 }  -- no error, no signature check
+
+jwt.decode(expiredToken);
+// { foo: 'bar', iat: 1790944464, exp: 1790944464 }  -- no error, no expiry check</code></pre>
+<p>Both returned the claims with no error at all &mdash; the tampered field and the expired timestamp decode just fine, because <code>decode()</code> never touches the signature. That's fine when you only need to read claims you already trust (showing a username in a UI, say) but it is not verification. Our <a href="/tools/jwt-decoder/">jwt-decoder tool</a> does the same client-side decode-only inspection &mdash; paste a token to see its header and payload, with <code>iat</code>/<code>nbf</code>/<code>exp</code> converted to UTC dates, without needing the signing secret. For anything that gates access, use <code>jwt.verify()</code> with the real secret or key, server-side.</p>
+<aside class="cta"><strong>Paste a token and inspect its claims without writing any code:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does jwt.verify() say &quot;jwt malformed&quot; for a token with only one dot?</summary><p>jsonwebtoken splits the token on &#x27;.&#x27; before doing anything else. If the result isn&#x27;t exactly 3 parts (header, payload, signature), it throws JsonWebTokenError: jwt malformed immediately, without trying to decode anything.</p></details>
+<details><summary>Is &quot;invalid signature&quot; caused by a wrong secret or a tampered token?</summary><p>Either. We measured both: verifying with the wrong secret, and verifying a token whose payload was edited after signing without re-signing, produced the identical JsonWebTokenError: invalid signature. The error can&#x27;t tell you which happened.</p></details>
+<details><summary>What type is error.expiredAt on a TokenExpiredError?</summary><p>A real JavaScript Date instance, not a number. We confirmed expiredAt instanceof Date is true on jsonwebtoken 9.0.3. Use it directly, e.g. in a log message, without converting from a timestamp.</p></details>
+<details><summary>Does jsonwebtoken still say &quot;not enough segments&quot;?</summary><p>No, not in the installed 9.0.3. We grepped the package source and that phrase doesn&#x27;t appear; a token with the wrong number of parts gets jwt malformed instead. If you see &quot;not enough segments&quot;, it&#x27;s from a different JWT library.</p></details>
+<details><summary>Can I catch TokenExpiredError and JsonWebTokenError separately?</summary><p>Yes, but check TokenExpiredError (and NotBeforeError) first. Both extend JsonWebTokenError, so err instanceof jwt.JsonWebTokenError is true for all of them; checking the base class first will catch expired tokens too and you&#x27;ll never reach the more specific branch.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 and jsonwebtoken 9.0.3 (the most downloaded JWT library on npm), calling jwt.sign() and jwt.verify() directly and reading the installed package&#x27;s source for the error classes and exact message strings. The jwt-decoder tool is ours and free; Node.js and jsonwebtoken are open source.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

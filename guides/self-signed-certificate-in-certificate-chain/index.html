@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Self-Signed Certificate in Certificate Chain: Fixes (Tested)</title>
+<meta name="description" content="We served four broken TLS chains and logged the exact errors from Node, npm, curl, Python and git, then verified each safe fix (NODE_EXTRA_CA_CERTS, cafile).">
+<link rel="canonical" href="https://honestkit.github.io/guides/self-signed-certificate-in-certificate-chain/">
+<meta property="og:title" content="Self-Signed Certificate in Certificate Chain: Fixes (Tested)">
+<meta property="og:description" content="We served four broken TLS chains and logged the exact errors from Node, npm, curl, Python and git, then verified each safe fix (NODE_EXTRA_CA_CERTS, cafile).">
+<meta property="og:url" content="https://honestkit.github.io/guides/self-signed-certificate-in-certificate-chain/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does 'self signed certificate in certificate chain' mean?", "acceptedAnswer": {"@type": "Answer", "text": "The server sent a chain that ends in a root CA your client does not trust. In our test, sending leaf + intermediate + private root gave SELF_SIGNED_CERT_IN_CHAIN in Node and npm, and curl error 60 with the same text."}}, {"@type": "Question", "name": "How do I fix it for npm behind a corporate proxy?", "acceptedAnswer": {"@type": "Answer", "text": "Get the proxy's root CA as a PEM file and set cafile=/path/root.pem in your .npmrc (npm config set cafile /path/root.pem). In our test npm ping went from SELF_SIGNED_CERT_IN_CHAIN to PONG. Do not use strict-ssl=false."}}, {"@type": "Question", "name": "What causes 'unable to verify the first certificate'?", "acceptedAnswer": {"@type": "Answer", "text": "Usually the server sends its leaf certificate without the intermediate. Node reports UNABLE_TO_VERIFY_LEAF_SIGNATURE. Trusting the root alone did not fix it in any client we tried; the server must send the intermediate, or you trust root + intermediate."}}, {"@type": "Question", "name": "Does NODE_EXTRA_CA_CERTS replace the default CAs?", "acceptedAnswer": {"@type": "Answer", "text": "No. It adds to them; https://example.com still worked with it set. It is read only at process start, so setting it in process.env inside your script has no effect."}}, {"@type": "Question", "name": "Why does Python requests ignore SSL_CERT_FILE?", "acceptedAnswer": {"@type": "Answer", "text": "requests uses its own CA bundle setting. In our test SSL_CERT_FILE fixed urllib but not requests. Use REQUESTS_CA_BUNDLE or verify=, and include the default CAs too, since it replaces the bundle."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Self-signed certificate in certificate chain (tested)</h1>
+<p class="lead"><code>self-signed certificate in certificate chain</code> and <code>unable to verify the first certificate</code> mean your client cannot build a path from the server's certificate to a root it trusts. Usually a corporate proxy or a private CA is in the way, or the server forgot to send its intermediate. We reproduced both errors and tested the fixes for Node.js, npm, curl, Python and git.</p>
+<h2>1. Which error means what</h2>
+<p>A server certificate (the leaf) is signed by an intermediate CA, which is signed by a root CA. The client must find that root in its own trust store. The error tells you which link broke.</p>
+<table>
+<tr><th>Node / npm code</th><th>Message</th><th>Typical cause</th></tr>
+<tr><td><code>SELF_SIGNED_CERT_IN_CHAIN</code></td><td>self-signed certificate in certificate chain</td><td>The server sent a root your client does not trust. Classic corporate TLS-inspecting proxy or private company CA.</td></tr>
+<tr><td><code>UNABLE_TO_GET_ISSUER_CERT_LOCALLY</code></td><td>unable to get local issuer certificate</td><td>Same private CA, but the server did not send the root. Your client lacks it.</td></tr>
+<tr><td><code>UNABLE_TO_VERIFY_LEAF_SIGNATURE</code></td><td>unable to verify the first certificate</td><td>The server sent only its leaf, without the intermediate. Or your client lacks the CA.</td></tr>
+<tr><td><code>DEPTH_ZERO_SELF_SIGNED_CERT</code></td><td>self-signed certificate</td><td>The server certificate signs itself. Common in dev and on appliances.</td></tr>
+</table>
+
+<h2>2. Our test setup</h2>
+<p>We made a root CA "Test Corp Root CA", an intermediate "Test Corp Intermediate CA" and a leaf for <code>localhost</code> and <code>127.0.0.1</code>. A Node https server sent one of four chains:</p>
+<ul>
+<li><strong>(a) full</strong>: leaf + intermediate + root</li>
+<li><strong>(b) chain</strong>: leaf + intermediate (the normal, correct setup)</li>
+<li><strong>(c) leaf only</strong>: intermediate missing</li>
+<li><strong>(d) self-signed</strong>: one certificate that signs itself</li>
+</ul>
+<p>None of the clients trusted our root at first. That is exactly the position of a laptop behind a company proxy.</p>
+<pre><code>openssl req -x509 -newkey rsa:2048 -nodes -keyout root.key -out root.pem \
+  -days 30 -subj "/CN=Test Corp Root CA" \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
+# intermediate and leaf signed with: openssl x509 -req -CA ... -extfile ext.cnf</code></pre>
+
+<h2>3. The exact errors, per client</h2>
+<table>
+<tr><th>Client</th><th>(a) full chain</th><th>(b) leaf + intermediate</th><th>(c) leaf only</th><th>(d) self-signed</th></tr>
+<tr><td>Node https.get / fetch (<code>err.cause.code</code>)</td><td>SELF_SIGNED_CERT_IN_CHAIN</td><td>UNABLE_TO_GET_ISSUER_CERT_LOCALLY</td><td>UNABLE_TO_VERIFY_LEAF_SIGNATURE</td><td>DEPTH_ZERO_SELF_SIGNED_CERT</td></tr>
+<tr><td>npm ping</td><td>same code as Node</td><td>same code as Node</td><td>same code as Node</td><td>same code as Node</td></tr>
+<tr><td>curl</td><td>(60) self-signed certificate in certificate chain</td><td>(60) unable to get local issuer certificate</td><td>(60) unable to get local issuer certificate</td><td>(60) self-signed certificate</td></tr>
+<tr><td>Python urllib / requests</td><td>CERTIFICATE_VERIFY_FAILED ... self-signed certificate in certificate chain</td><td>... unable to get local issuer certificate</td><td>... unable to get local issuer certificate</td><td>... self-signed certificate</td></tr>
+<tr><td>git (Debian, GnuTLS)</td><td colspan="4">server verification failed: certificate signer not trusted. (CAfile: /etc/ssl/certs/ca-certificates.crt CRLfile: none), for all four</td></tr>
+<tr><td>openssl s_client</td><td>Verify return code: 19</td><td>20</td><td>21 (unable to verify the first certificate)</td><td>18</td></tr>
+</table>
+<p>Node 24 adds a hint to some messages. For (c) and (d) the full text was:</p>
+<pre><code>unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca</code></pre>
+<p>With <code>fetch</code>, the top-level error is only <code>TypeError: fetch failed</code>. The real reason is in <code>err.cause.code</code>. See <a href="/guides/typeerror-failed-to-fetch/">TypeError: Failed to fetch</a>.</p>
+<p>npm was slow to fail. Each <code>npm ping</code> took about 70 s (we timed 1m10s) because npm retries before giving up. With <code>--fetch-retries=0</code> it fails at once.</p>
+<p>curl reports the same text for (b) and (c). Only Node and openssl tell them apart. Python requests wraps the error in <code>SSLError(... Max retries exceeded ...)</code>, which is misleading: nothing was retried that could succeed.</p>
+
+<h2>4. Find out which case you have</h2>
+<pre><code>openssl s_client -connect host:443 -servername host -showcerts &lt;/dev/null</code></pre>
+<p>Look at the <code>s:</code> (subject) and <code>i:</code> (issuer) lines. On our leaf-only server we saw a single certificate, <code>0 s:CN=localhost</code> issued by <code>CN=Test Corp Intermediate CA</code>, and return code 21. If the last issuer is a name like your company or your antivirus, a proxy is intercepting TLS. Ask IT for that root CA as a PEM file.</p>
+
+<h2>5. Fix: trust the CA, per tool (each verified)</h2>
+<p>Every fix below turned the error into a 200 against server (a), using only <code>root.pem</code>. None touches the system trust store or a global config.</p>
+<table>
+<tr><th>Tool</th><th>Fix</th><th>Notes from our test</th></tr>
+<tr><td>Node.js</td><td><code>NODE_EXTRA_CA_CERTS=/path/root.pem node app.js</code></td><td>Adds to the built-in roots. https://example.com still returned 200. Setting <code>process.env.NODE_EXTRA_CA_CERTS</code> inside the script did nothing (still UNABLE_TO_GET_ISSUER_CERT_LOCALLY); it is read at startup. A wrong path only prints "Warning: Ignoring extra certs from `/tmp/nope.pem`, load failed".</td></tr>
+<tr><td>npm</td><td><code>cafile=/path/root.pem</code> in an .npmrc</td><td>We used a throwaway <code>--userconfig</code> file. Result: <code>npm notice PONG 34ms</code>. Or run <code>npm config set cafile /path/root.pem</code> to save it in your own .npmrc.</td></tr>
+<tr><td>curl</td><td><code>curl --cacert root.pem URL</code> or <code>CURL_CA_BUNDLE=root.pem</code></td><td>Both worked.</td></tr>
+<tr><td>git</td><td><code>git -c http.sslCAInfo=/path/root.pem ...</code> or <code>GIT_SSL_CAINFO=</code></td><td>The TLS error went away (our test server is not a git repo, so git then said "not valid: is this a git repository?"). For one host only: <code>git config http.https://host/.sslCAInfo /path/root.pem</code>.</td></tr>
+<tr><td>Python requests</td><td><code>REQUESTS_CA_BUNDLE=/path/root.pem</code> or <code>verify="/path/root.pem"</code></td><td><code>SSL_CERT_FILE</code> did <strong>not</strong> help requests. And REQUESTS_CA_BUNDLE <strong>replaces</strong> the default list: with only root.pem, https://example.com failed. Use a bundle of the default CAs plus your root (<code>cat $(python3 -m certifi) root.pem &gt; combined.pem</code>); that passed both.</td></tr>
+<tr><td>Python urllib</td><td><code>SSL_CERT_FILE=/path/root.pem</code> or <code>ssl.create_default_context(cafile=...)</code></td><td>Both worked. On this Debian box example.com still loaded, because the default certs directory is still searched.</td></tr>
+</table>
+
+<h2>6. The missing intermediate is a server bug</h2>
+<p>For server (c), trusting <code>root.pem</code> was <strong>not</strong> enough. Node, npm, curl, Python and git all still failed, because nothing could link the leaf to the root. Browsers often hide this by fetching or caching the intermediate, so "it works in Chrome" proves little.</p>
+<p>Two fixes, both verified:</p>
+<ul>
+<li><strong>Right fix (server):</strong> serve leaf + intermediate. Server (b) with <code>root.pem</code> trusted gave 200 in curl and Node. In Node https use <code>cert: fs.readFileSync('fullchain.pem')</code> (leaf first, then intermediate). In nginx use the fullchain file in <code>ssl_certificate</code>.</li>
+<li><strong>Client workaround:</strong> trust a bundle of root + intermediate. With <code>bundle.pem</code>, all six clients reached server (c).</li>
+</ul>
+<p>Server (a) shows that sending the root is harmless when the client trusts it, but it is pointless. Clients ignore a root that the server sends.</p>
+
+<h2>7. Why not just turn verification off</h2>
+<p>All of these "work", which is the problem. They accept any certificate, including an attacker's.</p>
+<pre><code>$ NODE_TLS_REJECT_UNAUTHORIZED=0 node -e "fetch('https://localhost:8983/')..."
+(node:1579287) Warning: Setting the NODE_TLS_REJECT_UNAUTHORIZED environment variable to '0' makes TLS connections and HTTPS requests insecure by disabling certificate verification.</code></pre>
+<ul>
+<li><code>NODE_TLS_REJECT_UNAUTHORIZED=0</code> turns off checks for every connection in the process, not just the one host.</li>
+<li><code>strict-ssl=false</code> in npm: ping returned PONG with no warning at all. Packages can then be swapped in transit.</li>
+<li><code>requests.get(..., verify=False)</code> printed <code>InsecureRequestWarning: Unverified HTTPS request is being made to host 'localhost'</code>.</li>
+<li><code>curl -k</code> and <code>git -c http.sslVerify=false</code> worked silently.</li>
+</ul>
+<p>The proper fix takes one line too: point the tool at the CA file.</p>
+
+<h2>8. Related errors</h2>
+<p>In Chrome the same problem shows as <a href="/guides/err-cert-authority-invalid/">NET::ERR_CERT_AUTHORITY_INVALID</a>. If the handshake fails before any certificate check, see <a href="/guides/err-ssl-protocol-error/">ERR_SSL_PROTOCOL_ERROR</a>. To check when a certificate expires, see <a href="/guides/check-ssl-certificate-expiry/">check SSL certificate expiry</a>.</p>
+<aside class="cta"><strong>Check what a server actually sends back, headers and status included:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &#x27;self signed certificate in certificate chain&#x27; mean?</summary><p>The server sent a chain that ends in a root CA your client does not trust. In our test, sending leaf + intermediate + private root gave SELF_SIGNED_CERT_IN_CHAIN in Node and npm, and curl error 60 with the same text.</p></details>
+<details><summary>How do I fix it for npm behind a corporate proxy?</summary><p>Get the proxy&#x27;s root CA as a PEM file and set cafile=/path/root.pem in your .npmrc (npm config set cafile /path/root.pem). In our test npm ping went from SELF_SIGNED_CERT_IN_CHAIN to PONG. Do not use strict-ssl=false.</p></details>
+<details><summary>What causes &#x27;unable to verify the first certificate&#x27;?</summary><p>Usually the server sends its leaf certificate without the intermediate. Node reports UNABLE_TO_VERIFY_LEAF_SIGNATURE. Trusting the root alone did not fix it in any client we tried; the server must send the intermediate, or you trust root + intermediate.</p></details>
+<details><summary>Does NODE_EXTRA_CA_CERTS replace the default CAs?</summary><p>No. It adds to them; https://example.com still worked with it set. It is read only at process start, so setting it in process.env inside your script has no effect.</p></details>
+<details><summary>Why does Python requests ignore SSL_CERT_FILE?</summary><p>requests uses its own CA bundle setting. In our test SSL_CERT_FILE fixed urllib but not requests. Use REQUESTS_CA_BUNDLE or verify=, and include the default CAs too, since it replaces the bundle.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 (https.get and fetch), npm 11.19.0, curl 8.14.1 (OpenSSL 3.5.7), Python 3.13.5 urllib and requests 2.32.3, git 2.47.3 (Debian, GnuTLS) and openssl 3.5.7. We built a private root CA, an intermediate and a leaf with openssl, and served four chain variants from a Node https server on 127.0.0.1. PlainHeaders is our extension; Node.js, npm, curl, Python, git and openssl are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

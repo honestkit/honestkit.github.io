@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>base64.encode()/decode() Silently Empty on None (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: both base64.encode() and base64.decode() silently write zero bytes of output on a transient non-blocking None read.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-base64-encode-decode-none-silently-empty-output/">
+<meta property="og:title" content="base64.encode()/decode() Silently Empty on None (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: both base64.encode() and base64.decode() silently write zero bytes of output on a transient non-blocking None read.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-base64-encode-decode-none-silently-empty-output/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "The base64 module's documentation for encode() and decode() says they operate on binary files; it says nothing about non-blocking streams or a None read result. We measured that a None-returning source produces silently empty results on both, with no error of any kind."}}, {"@type": "Question", "name": "Doesn't io.BufferedReader.read() correctly return None, unlike readline()?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured that elsewhere separately. The surprise here is that encode() uses the standard while chunk := f.read(n): idiom, and that idiom treats None exactly like b'' because both are falsy. Having read() return the 'correct' signal doesn't help if the calling code's loop condition can't tell None apart from real EOF."}}, {"@type": "Question", "name": "So is there any safe way to loop on read() results?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- check explicitly: while True: chunk = f.read(n); if chunk is None: continue (retry); if not chunk: break (real EOF); process(chunk). The walrus-while shorthand is concise but silently conflates the two cases."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- decode()'s failure is the same io.BufferedReader.readline() collapse already confirmed in http.client, smtplib, and poplib. encode()'s failure is new: it's the first case in the family where read()'s correct None return still causes a silent failure, because of how the calling code's loop is written -- a reminder that the None convention only helps if every caller checks for it explicitly."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>base64.encode()/decode() Silently Return Empty Output on None (tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> from <code>readinto()</code> -- distinct from the empty read that means real end-of-stream. Both <code>base64.decode()</code> and <code>base64.encode()</code> loop with a truthy <code>while</code> check (<code>while line := input.readline():</code> and <code>while s := input.read(MAXBINSIZE):</code>), and <code>None</code> is just as falsy as <code>b''</code> to that check -- so a single transient <code>None</code> stops either loop immediately. Even though <code>io.BufferedReader.read()</code> correctly returns <code>None</code> (unlike <code>readline()</code>, which collapses it to <code>b''</code>), the common <code>while chunk := f.read(n):</code> idiom used by <code>encode()</code> mishandles the <em>correctly</em>-returned <code>None</code> just as badly -- both functions write zero bytes with no exception, even with a complete, valid payload one read call away.</p>
+<h2 id="repro1">1. decode(): readline()'s None-to-b'' collapse silently empties the output</h2>
+<pre><code>import io, base64
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self, payload):
+        self.calls = 0
+        self.sent = False
+        self.payload = payload
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None            # transient: no data ready yet
+        if not self.sent:
+            self.sent = True
+            n = len(self.payload)
+            b[:n] = self.payload
+            return n               # the real, complete data
+        return 0                   # real EOF after that
+
+payload = base64.b64encode(b"hello world, this is a real payload") + b"\n"
+raw = FlakyRaw(payload)
+br = io.BufferedReader(raw)
+out = io.BytesIO()
+base64.decode(br, out)
+print("decoded:", repr(out.getvalue()))
+print("raw calls made:", raw.calls)</code></pre>
+<pre><code>decoded: b''
+raw calls made: 1</code></pre>
+<p><strong>Measured:</strong> no exception anywhere. <code>decode()</code>'s <code>while line := input.readline():</code> loop made one call, got back <code>b''</code> (readline()'s collapse of the transient <code>None</code>), and silently concluded the file was empty.</p>
+
+<h2 id="repro2">2. encode(): even read()'s correct None return breaks the same truthy-while idiom</h2>
+<pre><code>payload2 = b"hello world, this is a real payload for encoding"
+raw2 = FlakyRaw(payload2)
+br2 = io.BufferedReader(raw2)
+out2 = io.BytesIO()
+base64.encode(br2, out2)
+print("encoded:", repr(out2.getvalue()))
+print("raw calls made:", raw2.calls)</code></pre>
+<pre><code>encoded: b''
+raw calls made: 1</code></pre>
+<p><strong>Measured:</strong> <code>encode()</code> uses <code>while s := input.read(MAXBINSIZE):</code>, and <code>read()</code> correctly returns <code>None</code> for the transient signal here -- but <code>None</code> is exactly as falsy as <code>b''</code> to a <code>while</code> check. The one documented, correct way <code>io</code> has to signal "not ready yet" is silently swallowed by the single most common idiom for draining a file-like object in Python.</p>
+
+<h2 id="repro3">3. The fix: drain into a real buffer first, retrying on None explicitly</h2>
+<pre><code>def drain_retrying_on_none(raw_stream, chunk_size=65536):
+    out = io.BytesIO()
+    br = io.BufferedReader(raw_stream)
+    while True:
+        chunk = br.read(chunk_size)
+        if chunk is None:
+            continue              # retry: not ready yet, not EOF
+        if not chunk:
+            break                  # real EOF
+        out.write(chunk)
+    out.seek(0)
+    return out
+
+raw3 = FlakyRaw(payload)
+safe_buf = drain_retrying_on_none(raw3)
+out3 = io.BytesIO()
+base64.decode(safe_buf, out3)
+print("decoded:", repr(out3.getvalue()))
+
+raw4 = FlakyRaw(payload2)
+safe_buf2 = drain_retrying_on_none(raw4)
+out4 = io.BytesIO()
+base64.encode(safe_buf2, out4)
+print("encoded:", repr(out4.getvalue()))</code></pre>
+<pre><code>decoded: b'hello world, this is a real payload'
+encoded: b'aGVsbG8gd29ybGQsIHRoaXMgaXMgYSByZWFsIHBheWxvYWQgZm9yIGVuY29kaW5n\n'</code></pre>
+<p><strong>Measured:</strong> resolving the <code>None</code>/EOF distinction explicitly before the bytes reach either function produces correct output for both.</p>
+<aside class="cta"><strong>Encoding or decoding a file with base64.encode()/decode() on a non-blocking stream? A transient None read silently produces empty output on both -- no error, no partial data, nothing:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>The base64 module&#x27;s documentation for encode() and decode() says they operate on binary files; it says nothing about non-blocking streams or a None read result. We measured that a None-returning source produces silently empty results on both, with no error of any kind.</p></details>
+<details><summary>Doesn&#x27;t io.BufferedReader.read() correctly return None, unlike readline()?</summary><p>Yes -- we measured that elsewhere separately. The surprise here is that encode() uses the standard while chunk := f.read(n): idiom, and that idiom treats None exactly like b&#x27;&#x27; because both are falsy. Having read() return the &#x27;correct&#x27; signal doesn&#x27;t help if the calling code&#x27;s loop condition can&#x27;t tell None apart from real EOF.</p></details>
+<details><summary>So is there any safe way to loop on read() results?</summary><p>Yes -- check explicitly: while True: chunk = f.read(n); if chunk is None: continue (retry); if not chunk: break (real EOF); process(chunk). The walrus-while shorthand is concise but silently conflates the two cases.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>Yes -- decode()&#x27;s failure is the same io.BufferedReader.readline() collapse already confirmed in http.client, smtplib, and poplib. encode()&#x27;s failure is new: it&#x27;s the first case in the family where read()&#x27;s correct None return still causes a silent failure, because of how the calling code&#x27;s loop is written -- a reminder that the None convention only helps if every caller checks for it explicitly.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in base64.encode() and base64.decode(), reading genuinely valid, complete payloads through an io.BufferedReader over a custom non-blocking RawIOBase whose readinto() returns None once before returning the real bytes. PlainHeaders is our extension; Python&#x27;s base64 and io modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

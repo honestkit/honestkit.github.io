@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python __getattr__ RecursionError on copy/pickle (Tested Fix)</title>
+<meta name="description" content="We measured why a dict-backed __getattr__ hits RecursionError on copy and pickle, why hasattr breaks, and the fix. Plus the __getattribute__ version.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-getattr-recursionerror-maximum-recursion-depth/">
+<meta property="og:title" content="Python __getattr__ RecursionError on copy/pickle (Tested Fix)">
+<meta property="og:description" content="We measured why a dict-backed __getattr__ hits RecursionError on copy and pickle, why hasattr breaks, and the fix. Plus the __getattribute__ version.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-getattr-recursionerror-maximum-recursion-depth/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does my __getattr__ cause RecursionError?", "acceptedAnswer": {"@type": "Answer", "text": "It reads an attribute (like self.data) that doesn't exist yet, so that read calls __getattr__ again. We measured this happening on copy.copy and pickle, which create the object without running __init__."}}, {"@type": "Question", "name": "How do I avoid recursion in __getattr__?", "acceptedAnswer": {"@type": "Answer", "text": "Read backing state via self.__dict__['data'], raise AttributeError for missing names, and refuse dunder names. We measured copy, pickle, getattr and hasattr all working with that version."}}, {"@type": "Question", "name": "Should __getattr__ raise KeyError or AttributeError?", "acceptedAnswer": {"@type": "Answer", "text": "AttributeError. We measured a KeyError-raising __getattr__ making hasattr() raise KeyError instead of returning False."}}, {"@type": "Question", "name": "Why does __getattribute__ recurse with self.__dict__?", "acceptedAnswer": {"@type": "Answer", "text": "__getattribute__ handles every attribute access, including self.__dict__ inside it. Use object.__getattribute__(self, name); we measured the naive version recursing 999 times."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>__getattr__ RecursionError: maximum recursion depth exceeded (tested)</h1>
+<p class="lead">A <code>__getattr__</code> that forwards to <code>self.data</code> works until something builds the object without <code>__init__</code>: then it hits <code>RecursionError: maximum recursion depth exceeded</code>. We measured this with <code>copy</code> and <code>pickle</code> on Python 3.13.5, and the fix that handles both.</p>
+<h2 id="works">1. A __getattr__ that looks fine</h2>
+<pre><code>class Config:
+    def __init__(self, data):
+        self.data = data
+
+    def __getattr__(self, name):
+        return self.data[name]
+
+c = Config({&quot;port&quot;: 80})
+print(c.port)
+for label, fn in [(&quot;c.missing&quot;, lambda: c.missing), (&quot;hasattr(c, &#x27;missing&#x27;)&quot;, lambda: hasattr(c, &quot;missing&quot;))]:
+    try:
+        print(label, &quot;-&gt;&quot;, fn())
+    except Exception as e:
+        print(label, &quot;-&gt;&quot;, type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>80
+c.missing -&gt; KeyError: &#x27;missing&#x27;
+hasattr(c, &#x27;missing&#x27;) -&gt; KeyError: &#x27;missing&#x27;</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> normal use works, but it already has a bug: a missing key raises <code>KeyError</code>, so <code>hasattr()</code> raises instead of returning <code>False</code>. <code>__getattr__</code> must raise <code>AttributeError</code>.</p>
+
+<h2 id="copy">2. copy and pickle make it recurse forever</h2>
+<pre><code>import copy, pickle
+
+class Config:
+    def __init__(self, data):
+        self.data = data
+
+    def __getattr__(self, name):
+        return self.data[name]
+
+c = Config({&quot;port&quot;: 80})
+for label, fn in [(&quot;copy.copy&quot;, copy.copy), (&quot;pickle round-trip&quot;, lambda o: pickle.loads(pickle.dumps(o)))]:
+    try:
+        fn(c)
+        print(label, &quot;ok&quot;)
+    except RecursionError as e:
+        print(label, &quot;-&gt; RecursionError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>copy.copy -&gt; RecursionError: maximum recursion depth exceeded
+pickle round-trip -&gt; RecursionError: maximum recursion depth exceeded</code></pre>
+<p><strong>Measured:</strong> both hit <code>RecursionError: maximum recursion depth exceeded</code>. <code>copy</code> and <code>pickle</code> create the new object <em>without</em> calling <code>__init__</code>, so <code>self.data</code> doesn't exist yet. Looking up a missing attribute calls <code>__getattr__('data')</code>, which reads <code>self.data</code>, which calls <code>__getattr__('data')</code>&hellip; We confirmed it directly: <code>Config.__new__(Config).port</code> raises the same RecursionError. Any code path that touches an attribute before <code>__init__</code> sets it (an exception in <code>__init__</code>, a <code>__new__</code> override, a mock) does the same.</p>
+
+<h2 id="fix">3. Fix: read the backing dict directly, raise AttributeError, skip dunders</h2>
+<pre><code>import copy, pickle
+
+class Config:
+    def __init__(self, data):
+        self.data = data
+
+    def __getattr__(self, name):
+        if name.startswith(&quot;__&quot;):
+            raise AttributeError(name)
+        try:
+            return self.__dict__[&quot;data&quot;][name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+c = Config({&quot;port&quot;: 80})
+print(c.port, getattr(c, &quot;missing&quot;, &quot;default&quot;), hasattr(c, &quot;missing&quot;))
+print(copy.copy(c).port, pickle.loads(pickle.dumps(c)).port)</code></pre>
+<p>Output:</p>
+<pre><code>80 default False
+80 80</code></pre>
+<p><code>self.__dict__</code> is found by normal lookup and never goes through <code>__getattr__</code>, so a missing <code>data</code> becomes a <code>KeyError</code> converted to <code>AttributeError</code>, not recursion. Refusing <code>__dunder__</code> names keeps <code>copy</code>, <code>pickle</code> and other protocol probes on their default paths. Measured: <code>getattr</code> with a default, <code>hasattr</code>, <code>copy</code> and <code>pickle</code> all work.</p>
+
+<h2 id="getattribute">4. __getattribute__ recurses on every access</h2>
+<pre><code>calls = 0
+
+class Wrapper:
+    def __init__(self):
+        object.__setattr__(self, &quot;x&quot;, 1)
+
+    def __getattribute__(self, name):
+        global calls
+        calls += 1
+        return self.__dict__[name]          # self.__dict__ calls __getattribute__ again
+
+class Fixed(Wrapper):
+    def __getattribute__(self, name):
+        return object.__getattribute__(self, name)
+
+try:
+    Wrapper().x
+except RecursionError as e:
+    print(&quot;RecursionError:&quot;, e, &quot;| calls:&quot;, calls)
+print(&quot;Fixed:&quot;, Fixed().x)</code></pre>
+<p>Output:</p>
+<pre><code>RecursionError: maximum recursion depth exceeded | calls: 999
+Fixed: 1</code></pre>
+<p><strong>Measured:</strong> unlike <code>__getattr__</code> (called only when normal lookup fails), <code>__getattribute__</code> runs for <em>every</em> attribute access, including <code>self.__dict__</code> inside itself, so it recursed 999 times before failing. Inside <code>__getattribute__</code>, always go through <code>object.__getattribute__(self, name)</code>.</p>
+
+<aside class="cta"><strong>Wrapping an HTTP API in Python objects? Check the real status and headers it returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does my __getattr__ cause RecursionError?</summary><p>It reads an attribute (like self.data) that doesn&#x27;t exist yet, so that read calls __getattr__ again. We measured this happening on copy.copy and pickle, which create the object without running __init__.</p></details>
+<details><summary>How do I avoid recursion in __getattr__?</summary><p>Read backing state via self.__dict__[&#x27;data&#x27;], raise AttributeError for missing names, and refuse dunder names. We measured copy, pickle, getattr and hasattr all working with that version.</p></details>
+<details><summary>Should __getattr__ raise KeyError or AttributeError?</summary><p>AttributeError. We measured a KeyError-raising __getattr__ making hasattr() raise KeyError instead of returning False.</p></details>
+<details><summary>Why does __getattribute__ recurse with self.__dict__?</summary><p>__getattribute__ handles every attribute access, including self.__dict__ inside it. Use object.__getattribute__(self, name); we measured the naive version recursing 999 times.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: a dict-backed __getattr__ under normal use, hasattr, copy.copy and a pickle round-trip, the fixed version, and a naive vs object.__getattribute__-based __getattribute__. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

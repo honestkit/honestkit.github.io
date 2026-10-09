@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>http.cookiejar MozillaCookieJar None Crashes as Bad Format</title>
+<meta name="description" content="We measured Python 3.13.5: MozillaCookieJar.load() blames a transient None read on the cookie file&#x27;s format, not the real non-blocking-stream cause.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-http-cookiejar-mozillacookiejar-load-none-bad-format/">
+<meta property="og:title" content="http.cookiejar MozillaCookieJar None Crashes as Bad Format">
+<meta property="og:description" content="We measured Python 3.13.5: MozillaCookieJar.load() blames a transient None read on the cookie file&#x27;s format, not the real non-blocking-stream cause.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-http-cookiejar-mozillacookiejar-load-none-bad-format/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "http.cookiejar's documentation describes load() as reading cookies from a file in the jar's native format; it says nothing about None or non-blocking streams. We measured that a None-collapsed-to-empty first line fails the magic-header regex check the same way a genuinely corrupt file would, with no way to tell the two apart from the exception alone."}}, {"@type": "Question", "name": "Does LWPCookieJar have the same problem?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured the identical mechanism: LWPCookieJar._really_load() also calls f.readline() first to check a magic header (a Set-Cookie3 (LWP) marker instead of the Netscape one), and an empty collapsed line fails that check the same way, raising LoadError: '...' does not look like a Set-Cookie3 (LWP) format file."}}, {"@type": "Question", "name": "Why does this only affect the first line?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that both classes check the magic header with a single readline() call before any loop begins. Every later line is read inside a while (line := f.readline()) != '': loop, where a None-collapsed-to-empty line would just look like normal end-of-file and stop the loop early -- silently dropping the rest of the cookies instead of raising, which is arguably worse since it gives no error at all."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- it's a direct real-world consequence of the already-confirmed TextIOWrapper.readline() None-to-empty-string collapse, applied to a specific, widely used consumer: persisted cookie jars loaded by requests and urllib.request.HTTPCookieProcessor. Same root mechanism as the misleading-content-blaming crashes already confirmed in gzip/bz2/lzma/tarfile/zipfile/ElementTree.parse(), just with its own file-format-specific wording."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>http.cookiejar&#x27;s MozillaCookieJar Blames None on File Format (tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> from <code>readinto()</code> -- distinct from the empty read that means real end-of-stream. We measured that loading a saved cookie jar runs straight into the already-confirmed <code>TextIOWrapper.readline()</code> collapse: a transient <code>None</code> becomes <code>''</code> instead of raising, and <code>MozillaCookieJar._really_load()</code> reads exactly one line first to check a magic header -- <code>if not NETSCAPE_MAGIC_RGX.match(f.readline()): raise LoadError(...)</code>. An empty first line fails that regex match every time, so the real, valid cookie file gets rejected with <code>LoadError: '...' does not look like a Netscape format cookies file</code> -- an error that blames the file's contents, when the file was never actually read.</p>
+<h2 id="repro1">1. A real, valid cookies.txt behind one transient None</h2>
+<pre><code>import http.cookiejar, io
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self, payload):
+        self.calls = 0
+        self.sent = False
+        self.payload = payload
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None            # transient: no data ready yet
+        if not self.sent:
+            self.sent = True
+            n = len(self.payload)
+            b[:n] = self.payload
+            return n               # the real, complete cookie file
+        return 0                   # real EOF after that
+
+payload = (b"# Netscape HTTP Cookie File\n"
+           b"example.com\tFALSE\t/\tFALSE\t2000000000\tname\tvalue\n")
+raw = FlakyRaw(payload)
+br = io.BufferedReader(raw)
+tr = io.TextIOWrapper(br)
+
+cj = http.cookiejar.MozillaCookieJar()
+try:
+    cj._really_load(tr, "cookies.txt", False, False)
+    print("LOADED OK:", [(c.name, c.value) for c in cj])
+except Exception as e:
+    print("CRASHED:", type(e).__name__, "--", e)</code></pre>
+<pre><code>CRASHED: LoadError -- 'cookies.txt' does not look like a Netscape format cookies file</code></pre>
+<p><strong>Measured:</strong> the cookie file is valid and complete, with the correct <code># Netscape HTTP Cookie File</code> header one read call away. <code>TextIOWrapper.readline()</code> silently collapsed the transient <code>None</code> into <code>''</code>, and that empty first line failed <code>MozillaCookieJar</code>'s magic-header check -- producing an error that names the file's format as the problem, when no header line was actually read at all.</p>
+
+<h2 id="repro2">2. The fix: drain into a real buffer first, retrying on None</h2>
+<pre><code>def read_retrying_on_none(buffered_reader, chunk_size=65536):
+    out = io.BytesIO()
+    while True:
+        chunk = buffered_reader.read(chunk_size)
+        if chunk is None:
+            continue   # retry: not ready yet, not real EOF
+        if not chunk:
+            break      # real EOF
+        out.write(chunk)
+    out.seek(0)
+    return out
+
+raw2 = FlakyRaw(payload)
+br2 = io.BufferedReader(raw2)
+safe_buf = read_retrying_on_none(br2)
+tr2 = io.TextIOWrapper(safe_buf)
+
+cj2 = http.cookiejar.MozillaCookieJar()
+cj2._really_load(tr2, "cookies.txt", False, False)
+print("LOADED OK:", [(c.name, c.value) for c in cj2])</code></pre>
+<pre><code>LOADED OK: [('name', 'value')]</code></pre>
+<p><strong>Measured:</strong> resolving the <code>None</code>/EOF distinction at the binary layer before <code>TextIOWrapper</code> ever sees it loads the same file correctly. If <code>MozillaCookieJar</code> (or <code>LWPCookieJar</code>) rejects a cookie file you're confident is well-formed, the real cause is almost certainly a non-blocking stream behind it, not a corrupt or mistyped file.</p>
+<aside class="cta"><strong>Loading a saved cookies.txt file with http.cookiejar.MozillaCookieJar on a non-blocking stream? A transient None on the very first line gets blamed on the file&#x27;s format, not the real cause:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>http.cookiejar&#x27;s documentation describes load() as reading cookies from a file in the jar&#x27;s native format; it says nothing about None or non-blocking streams. We measured that a None-collapsed-to-empty first line fails the magic-header regex check the same way a genuinely corrupt file would, with no way to tell the two apart from the exception alone.</p></details>
+<details><summary>Does LWPCookieJar have the same problem?</summary><p>Yes -- we measured the identical mechanism: LWPCookieJar._really_load() also calls f.readline() first to check a magic header (a Set-Cookie3 (LWP) marker instead of the Netscape one), and an empty collapsed line fails that check the same way, raising LoadError: &#x27;...&#x27; does not look like a Set-Cookie3 (LWP) format file.</p></details>
+<details><summary>Why does this only affect the first line?</summary><p>We measured that both classes check the magic header with a single readline() call before any loop begins. Every later line is read inside a while (line := f.readline()) != &#x27;&#x27;: loop, where a None-collapsed-to-empty line would just look like normal end-of-file and stop the loop early -- silently dropping the rest of the cookies instead of raising, which is arguably worse since it gives no error at all.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>Yes -- it&#x27;s a direct real-world consequence of the already-confirmed TextIOWrapper.readline() None-to-empty-string collapse, applied to a specific, widely used consumer: persisted cookie jars loaded by requests and urllib.request.HTTPCookieProcessor. Same root mechanism as the misleading-content-blaming crashes already confirmed in gzip/bz2/lzma/tarfile/zipfile/ElementTree.parse(), just with its own file-format-specific wording.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in http.cookiejar.MozillaCookieJar (and confirmed the same mechanism on LWPCookieJar), loading a genuinely valid, complete Netscape-format cookie file through an io.TextIOWrapper over an io.BufferedReader over a custom non-blocking RawIOBase whose readinto() returns None once before returning the real bytes. PlainHeaders is our extension; Python&#x27;s http.cookiejar and io modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>weakref.finalize(obj, obj.method) Keeps obj Alive Forever</title>
+<meta name="description" content="We measured Python 3.13.5: passing a bound method as the finalize callback keeps a strong ref, so the object is never collected and cleanup never runs early.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-weakref-finalize-bound-method-keeps-object-alive/">
+<meta property="og:title" content="weakref.finalize(obj, obj.method) Keeps obj Alive Forever">
+<meta property="og:description" content="We measured Python 3.13.5: passing a bound method as the finalize callback keeps a strong ref, so the object is never collected and cleanup never runs early.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-weakref-finalize-bound-method-keeps-object-alive/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does weakref.finalize(obj, obj.method) raise an error if the callback keeps obj alive?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it: no exception, no warning, no ResourceWarning. The object is simply never collected while the process runs, and the cleanup callback doesn't fire until interpreter shutdown."}}, {"@type": "Question", "name": "Why does passing a bound method to weakref.finalize keep the object alive?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that a bound method (self.cleanup) holds a strong reference to self internally (self.cleanup.__self__ is self), and weakref.finalize keeps a strong reference to whatever callback it's given -- so the finalizer ends up strongly referencing the very object it's supposed to let get collected."}}, {"@type": "Question", "name": "When does the finalizer callback eventually run if the object is leaking this way?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it running exactly once, at process/interpreter shutdown via weakref.finalize's own exit handling -- not at any point tied to del or gc.collect() in the running program, which in a long-lived process means the resource effectively never gets cleaned up while it's running."}}, {"@type": "Question", "name": "How do you fix weakref.finalize so it doesn't keep the object alive?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that replacing the bound method with a plain function (or any callable that doesn't hold a reference back to the target object) and passing plain data as the arguments collects the object immediately on the next del + gc.collect(), with the callback firing right away."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>weakref.finalize(obj, obj.method) Silently Keeps obj Alive Forever (tested)</h1>
+<p class="lead"><code>weakref.finalize(obj, callback, *args)</code> is meant to run <code>callback</code> once <code>obj</code> becomes unreachable -- a safer alternative to <code>__del__</code>. It works by holding a weak reference to <code>obj</code>, but a strong reference to <code>callback</code> and every argument in <code>*args</code>. Passing <code>obj.some_method</code> as that callback -- a natural-looking way to register "call this object's own cleanup method" -- passes a bound method, and a bound method holds a strong reference to <code>obj</code> internally. We measured exactly what that does.</p>
+<h2 id="repro1">1. A bound-method callback keeps the object alive -- the finalizer never fires early</h2>
+<pre><code>import weakref, gc
+
+class Resource:
+    def __init__(self, name):
+        self.name = name
+        self._finalizer = weakref.finalize(self, self.cleanup, self.name)
+
+    def cleanup(self, name):
+        print(f"cleaning up {name}")
+
+r = Resource("r1")
+ref = weakref.ref(r)
+del r
+gc.collect()
+print("still alive?", ref() is not None)</code></pre>
+<pre><code>still alive? True</code></pre>
+<p><strong>Measured:</strong> after deleting the only other reference to <code>r</code> and forcing a collection, the object is still alive -- <code>ref()</code> is not <code>None</code>. No exception, no warning. <code>self.cleanup</code> is a bound method, and a bound method keeps a strong reference to the instance it's bound to (<code>self.cleanup.__self__ is self</code>). <code>weakref.finalize</code> keeps a strong reference to the callback it was given, so it ends up holding the object alive through its own cleanup hook -- defeating the entire point of registering it.</p>
+
+<h2 id="repro2">2. The "cleanup" does eventually run -- just not when you think, and not because of anything you did</h2>
+<pre><code># continuing straight from the same process, no further code --
+# the only output that ever appears is at interpreter shutdown:
+#   cleaning up r1</code></pre>
+<p><strong>Measured:</strong> the <code>print(f"cleaning up {name}")</code> line from the first repro only ever printed once, at process exit, as part of <code>weakref.finalize</code>'s own atexit-style shutdown pass -- not at <code>del r</code>, not at <code>gc.collect()</code>, and not at any point where the program could know it had happened. In a long-running process (a server, a worker loop), that means the resource leaks for the entire lifetime of the process, invisibly.</p>
+
+<h2 id="repro3">3. The fix: pass a plain function and plain data, not a bound method</h2>
+<pre><code>import weakref, gc
+
+def cleanup(name):
+    print(f"cleaning up {name}")
+
+class Resource:
+    def __init__(self, name):
+        self.name = name
+        self._finalizer = weakref.finalize(self, cleanup, self.name)
+
+r = Resource("r2")
+ref = weakref.ref(r)
+del r
+gc.collect()
+print("still alive?", ref() is not None)</code></pre>
+<pre><code>cleaning up r2
+still alive? False</code></pre>
+<p><strong>Measured:</strong> with a module-level function and a plain string instead of a bound method, the same sequence (<code>del</code> then <code>gc.collect()</code>) collects the object immediately and the cleanup callback runs right away. The only change is removing every strong reference back to <code>self</code> from the arguments passed to <code>finalize()</code> -- the fix is data, not logic.</p>
+<aside class="cta"><strong>Registering a weakref.finalize() cleanup callback on an object by passing one of its own bound methods? Check what that callback is actually holding onto -- it&#x27;s the object itself:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does weakref.finalize(obj, obj.method) raise an error if the callback keeps obj alive?</summary><p>No -- we measured it: no exception, no warning, no ResourceWarning. The object is simply never collected while the process runs, and the cleanup callback doesn&#x27;t fire until interpreter shutdown.</p></details>
+<details><summary>Why does passing a bound method to weakref.finalize keep the object alive?</summary><p>We measured that a bound method (self.cleanup) holds a strong reference to self internally (self.cleanup.__self__ is self), and weakref.finalize keeps a strong reference to whatever callback it&#x27;s given -- so the finalizer ends up strongly referencing the very object it&#x27;s supposed to let get collected.</p></details>
+<details><summary>When does the finalizer callback eventually run if the object is leaking this way?</summary><p>We measured it running exactly once, at process/interpreter shutdown via weakref.finalize&#x27;s own exit handling -- not at any point tied to del or gc.collect() in the running program, which in a long-lived process means the resource effectively never gets cleaned up while it&#x27;s running.</p></details>
+<details><summary>How do you fix weakref.finalize so it doesn&#x27;t keep the object alive?</summary><p>We measured that replacing the bound method with a plain function (or any callable that doesn&#x27;t hold a reference back to the target object) and passing plain data as the arguments collects the object immediately on the next del + gc.collect(), with the callback firing right away.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in weakref module: registered weakref.finalize(obj, obj.method, ...) using a bound method of the target object as the callback, deleted the only other reference, ran gc.collect(), and checked whether the object was actually collected -- then repeated with a plain function instead of a bound method. PlainHeaders is our extension; Python&#x27;s weakref module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>urllib.error.URLError: urlopen error in Python, Tested</title>
+<meta name="description" content="We measured Python&#x27;s urllib URLError: what e.reason tells you, why HTTPError must be caught first, read timeouts that escape it, unknown url type.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-urllib-error-urlerror-urlopen-error/">
+<meta property="og:title" content="urllib.error.URLError: urlopen error in Python, Tested">
+<meta property="og:description" content="We measured Python&#x27;s urllib URLError: what e.reason tells you, why HTTPError must be caught first, read timeouts that escape it, unknown url type.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-urllib-error-urlerror-urlopen-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does urllib.error.URLError: urlopen error mean?", "acceptedAnswer": {"@type": "Answer", "text": "urlopen got no HTTP response at all. The cause is in e.reason; we measured a gaierror for an unresolvable host and ConnectionRefusedError for a closed port on Python 3.13.5."}}, {"@type": "Question", "name": "What is the difference between URLError and HTTPError?", "acceptedAnswer": {"@type": "Answer", "text": "HTTPError means the server answered with an error status; URLError means no answer. HTTPError subclasses URLError, so we measured that an except URLError written first also catches 404s."}}, {"@type": "Question", "name": "Why doesn't except URLError catch my urllib timeout?", "acceptedAnswer": {"@type": "Answer", "text": "A timeout while reading the response raises a bare TimeoutError. We measured that with a server that answered after 3 s and timeout=1; connect timeouts are wrapped in URLError."}}, {"@type": "Question", "name": "What does urlopen error unknown url type mean?", "acceptedAnswer": {"@type": "Answer", "text": "The URL has a wrong scheme. We measured 'htps://' raising URLError and a URL with no scheme at all raising ValueError."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>urllib.error.URLError: urlopen error (tested)</h1>
+<p class="lead"><code>urllib.error.URLError: &lt;urlopen error ...&gt;</code> means <code>urlopen</code> never got an HTTP response. We reproduced the common causes on Python 3.13.5 and found two that don't behave the way the exception hierarchy suggests.</p>
+<h2 id="reason">1. Read e.reason: it says what actually failed</h2>
+<pre><code>import urllib.request, urllib.error
+for url in [&quot;http://nonexistent.invalid/&quot;, &quot;http://127.0.0.1:1/&quot;]:
+    try:
+        urllib.request.urlopen(url, timeout=3)
+    except urllib.error.URLError as e:
+        print(url)
+        print(&quot;  &quot;, type(e).__name__, &quot;|&quot;, e)
+        print(&quot;   reason:&quot;, type(e.reason).__name__, repr(e.reason))</code></pre>
+<p>Output:</p>
+<pre><code>http://nonexistent.invalid/
+   URLError | &lt;urlopen error [Errno -2] Name or service not known&gt;
+   reason: gaierror gaierror(-2, &#x27;Name or service not known&#x27;)
+http://127.0.0.1:1/
+   URLError | &lt;urlopen error [Errno 111] Connection refused&gt;
+   reason: ConnectionRefusedError ConnectionRefusedError(111, &#x27;Connection refused&#x27;)</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> <code>URLError</code> is a wrapper. The real error is in <code>e.reason</code>: a <code>socket.gaierror</code> for a hostname that doesn't resolve (typo, no DNS, no network), a <code>ConnectionRefusedError</code> when nothing listens on that port. See our <a href="/guides/python-connectionrefusederror-errno-111-connection-refused/">Errno 111 guide</a> for the refused case.</p>
+
+<h2 id="order">2. HTTPError is a URLError: catch it first</h2>
+<p>Blocks 2, 3 and 5 import this small local test server (port 8964): <code>/missing</code> returns 404 with a body, <code>/slow</code> waits 3 seconds before answering.</p>
+<pre><code>import http.server, threading, time
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path == &quot;/slow&quot;:
+            time.sleep(3)
+        code = 404 if self.path == &quot;/missing&quot; else 200
+        body = b&quot;no such page&quot; if code == 404 else b&quot;ok&quot;
+        self.send_response(code); self.send_header(&quot;Content-Length&quot;, str(len(body))); self.end_headers()
+        self.wfile.write(body)
+def start():
+    s = http.server.ThreadingHTTPServer((&quot;127.0.0.1&quot;, 8964), H)
+    threading.Thread(target=s.serve_forever, daemon=True).start()</code></pre>
+<pre><code>import urllib.request, urllib.error
+from server import start; start()
+url = &quot;http://127.0.0.1:8964/missing&quot;
+# Wrong order: the URLError branch also catches HTTPError
+try:
+    urllib.request.urlopen(url)
+except urllib.error.URLError as e:
+    print(&quot;caught as URLError:&quot;, type(e).__name__, e)
+# Right order: HTTPError first
+try:
+    urllib.request.urlopen(url)
+except urllib.error.HTTPError as e:
+    print(&quot;HTTPError&quot;, e.code, e.read())
+except urllib.error.URLError as e:
+    print(&quot;network problem:&quot;, e.reason)</code></pre>
+<p>Output:</p>
+<pre><code>caught as URLError: HTTPError HTTP Error 404: Not Found
+HTTPError 404 b&#x27;no such page&#x27;</code></pre>
+<p><strong>Measured:</strong> <code>HTTPError</code> subclasses <code>URLError</code>, so an <code>except URLError</code> placed first also swallows every 404 and 500, and code that reports "network problem" is really looking at a server reply. Put <code>except HTTPError</code> above it; <code>e.code</code> and <code>e.read()</code> give the status and body. For 403s from sites that block Python's default User-Agent, see our <a href="/guides/python-urllib-http-error-403-forbidden-user-agent/">urllib 403 guide</a>.</p>
+
+<h2 id="timeout">3. A read timeout is not a URLError</h2>
+<pre><code>import urllib.request, urllib.error
+from server import start; start()
+try:
+    urllib.request.urlopen(&quot;http://127.0.0.1:8964/slow&quot;, timeout=1)
+except urllib.error.URLError as e:
+    print(&quot;URLError:&quot;, e)
+except TimeoutError as e:
+    print(&quot;not a URLError:&quot;, type(e).__name__, e)
+    print(&quot;is OSError:&quot;, isinstance(e, OSError))</code></pre>
+<p>Output:</p>
+<pre><code>not a URLError: TimeoutError timed out
+is OSError: True</code></pre>
+<p><strong>Measured:</strong> the server accepted the connection, then took 3 seconds to answer. With <code>timeout=1</code> that raised a bare <code>TimeoutError</code>, which an <code>except URLError</code> does not catch. A timeout while <em>connecting</em> is different: we pointed it at an unroutable address and got <code>URLError: &lt;urlopen error timed out&gt;</code> with <code>reason</code> a <code>TimeoutError</code>. Handle both.</p>
+
+<h2 id="scheme">4. "unknown url type": a missing scheme is a ValueError</h2>
+<pre><code>import urllib.request
+for url in [&quot;example.com&quot;, &quot;htps://example.com&quot;]:
+    try:
+        urllib.request.urlopen(url, timeout=3)
+    except Exception as e:
+        print(repr(url), &quot;-&gt;&quot;, type(e).__name__, e)</code></pre>
+<p>Output:</p>
+<pre><code>&#x27;example.com&#x27; -&gt; ValueError unknown url type: &#x27;example.com&#x27;
+&#x27;htps://example.com&#x27; -&gt; URLError &lt;urlopen error unknown url type: htps&gt;</code></pre>
+<p><strong>Measured:</strong> a URL without <code>http://</code> raises <code>ValueError</code>, not <code>URLError</code>. A misspelled scheme raises <code>URLError</code>. Both mean the URL string is wrong, not the network.</p>
+
+<h2 id="fetch">5. One fetch() that handles every case</h2>
+<pre><code>import urllib.request, urllib.error
+from server import start; start()
+
+def fetch(url, timeout=1):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return f&quot;{r.status} {r.read()!r}&quot;
+    except urllib.error.HTTPError as e:      # server answered with 4xx/5xx
+        return f&quot;HTTP {e.code}: {e.read()!r}&quot;
+    except urllib.error.URLError as e:       # DNS, refused, SSL, bad scheme
+        return f&quot;no response: {e.reason}&quot;
+    except TimeoutError:                     # timed out while reading
+        return &quot;timed out&quot;
+
+for path in [&quot;/&quot;, &quot;/missing&quot;, &quot;/slow&quot;]:
+    print(path, &quot;-&gt;&quot;, fetch(&quot;http://127.0.0.1:8964&quot; + path))
+print(fetch(&quot;http://127.0.0.1:1/&quot;))
+print(fetch(&quot;http://nonexistent.invalid/&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>/ -&gt; 200 b&#x27;ok&#x27;
+/missing -&gt; HTTP 404: b&#x27;no such page&#x27;
+/slow -&gt; timed out
+no response: [Errno 111] Connection refused
+no response: [Errno -2] Name or service not known</code></pre>
+<p><strong>Measured:</strong> <code>HTTPError</code> first, then <code>URLError</code>, then <code>TimeoutError</code> for slow reads. SSL failures also arrive as a <code>URLError</code> whose reason is an <code>SSLCertVerificationError</code>; see our <a href="/guides/python-ssl-certificate-verify-failed/">CERTIFICATE_VERIFY_FAILED guide</a>.</p>
+
+<aside class="cta"><strong>Got a response but not the one you expected? Check the real status and headers the server sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does urllib.error.URLError: urlopen error mean?</summary><p>urlopen got no HTTP response at all. The cause is in e.reason; we measured a gaierror for an unresolvable host and ConnectionRefusedError for a closed port on Python 3.13.5.</p></details>
+<details><summary>What is the difference between URLError and HTTPError?</summary><p>HTTPError means the server answered with an error status; URLError means no answer. HTTPError subclasses URLError, so we measured that an except URLError written first also catches 404s.</p></details>
+<details><summary>Why doesn&#x27;t except URLError catch my urllib timeout?</summary><p>A timeout while reading the response raises a bare TimeoutError. We measured that with a server that answered after 3 s and timeout=1; connect timeouts are wrapped in URLError.</p></details>
+<details><summary>What does urlopen error unknown url type mean?</summary><p>The URL has a wrong scheme. We measured &#x27;htps://&#x27; raising URLError and a URL with no scheme at all raising ValueError.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5: urlopen against an unresolvable host, a closed port, a local server returning 404 and a slow response, an unroutable address, and bad URL schemes. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

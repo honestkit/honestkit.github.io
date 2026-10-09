@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python queue.Empty Exception: When It&#x27;s Raised, Tested</title>
+<meta name="description" content="We measured Python&#x27;s queue.Empty: which get() calls raise it, why except IndexError misses it, asyncio.QueueEmpty, and a worker pattern without it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-queue-empty-exception/">
+<meta property="og:title" content="Python queue.Empty Exception: When It&#x27;s Raised, Tested">
+<meta property="og:description" content="We measured Python&#x27;s queue.Empty: which get() calls raise it, why except IndexError misses it, asyncio.QueueEmpty, and a worker pattern without it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-queue-empty-exception/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "When does Python raise queue.Empty?", "acceptedAnswer": {"@type": "Answer", "text": "When get_nowait(), get(block=False) or get(timeout=...) finds the queue empty. We measured all three on Python 3.13.5; a plain get() waits instead of raising."}}, {"@type": "Question", "name": "Why is the traceback just _queue.Empty with no message?", "acceptedAnswer": {"@type": "Answer", "text": "queue.Empty is raised without a message, and _queue is the C module that defines it. We measured an empty str() for all three calls."}}, {"@type": "Question", "name": "Does except IndexError catch queue.Empty?", "acceptedAnswer": {"@type": "Answer", "text": "No. We checked queue.Empty's bases: it subclasses Exception directly, not IndexError."}}, {"@type": "Question", "name": "Is asyncio.QueueEmpty the same as queue.Empty?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured asyncio.Queue.get_nowait() raising asyncio.QueueEmpty, which is not a subclass of queue.Empty, while multiprocessing.Queue raises queue.Empty."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python queue.Empty exception (tested)</h1>
+<p class="lead"><code>queue.Empty</code> (shown as <code>_queue.Empty</code> in tracebacks) means a non-blocking or timed <code>get()</code> found nothing. We measured which calls raise it on Python 3.13.5 and which similar queues raise something else.</p>
+<h2 id="when">1. When queue.Empty is raised</h2>
+<pre><code>import queue
+q = queue.Queue()
+for call in (&quot;q.get_nowait()&quot;, &quot;q.get(block=False)&quot;, &quot;q.get(timeout=0.5)&quot;):
+    try:
+        eval(call)
+    except Exception as e:
+        print(f&quot;{call:20} -&gt; {type(e).__module__}.{type(e).__name__} {str(e)!r}&quot;)
+print(&quot;queue.Empty is IndexError?&quot;, issubclass(queue.Empty, IndexError))
+print(&quot;bases:&quot;, queue.Empty.__mro__[1:])</code></pre>
+<p>Output:</p>
+<pre><code>q.get_nowait()       -&gt; _queue.Empty &#x27;&#x27;
+q.get(block=False)   -&gt; _queue.Empty &#x27;&#x27;
+q.get(timeout=0.5)   -&gt; _queue.Empty &#x27;&#x27;
+queue.Empty is IndexError? False
+bases: (&lt;class &#x27;Exception&#x27;&gt;, &lt;class &#x27;BaseException&#x27;&gt;, &lt;class &#x27;object&#x27;&gt;)</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> <code>get_nowait()</code>, <code>get(block=False)</code> and <code>get(timeout=...)</code> on an empty queue all raise <code>queue.Empty</code> with an empty message, so a traceback ends in a bare <code>_queue.Empty</code> (the C module's name for the same class). A plain <code>q.get()</code> never raises it: it waits forever. <code>queue.Empty</code> is not an <code>IndexError</code>, so code that catches <code>IndexError</code> as you would for <code>list.pop()</code> misses it. Catch <code>queue.Empty</code>.</p>
+
+<h2 id="asyncio">2. multiprocessing uses queue.Empty, asyncio doesn't</h2>
+<pre><code>import asyncio, queue, multiprocessing
+mq = multiprocessing.Queue()
+try:
+    mq.get(timeout=0.2)
+except queue.Empty:
+    print(&quot;multiprocessing.Queue raises queue.Empty&quot;)
+
+async def main():
+    aq = asyncio.Queue()
+    try:
+        aq.get_nowait()
+    except queue.Empty:
+        print(&quot;caught as queue.Empty&quot;)
+    except asyncio.QueueEmpty as e:
+        print(&quot;asyncio.Queue raises asyncio.QueueEmpty, not queue.Empty:&quot;,
+              issubclass(asyncio.QueueEmpty, queue.Empty))
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>multiprocessing.Queue raises queue.Empty
+asyncio.Queue raises asyncio.QueueEmpty, not queue.Empty: False</code></pre>
+<p><strong>Measured:</strong> <code>multiprocessing.Queue</code> raises the same <code>queue.Empty</code>, but <code>asyncio.Queue.get_nowait()</code> raises <code>asyncio.QueueEmpty</code>, which is a separate class. An <code>except queue.Empty</code> in async code doesn't catch it. For the list version of this error, see our <a href="/guides/python-indexerror-pop-from-empty-list/">pop from empty list guide</a>.</p>
+
+<h2 id="workers">3. Worker threads: block on get() and send a stop marker</h2>
+<pre><code>import queue, threading, time
+q = queue.Queue()
+STOP = object()
+handled = {}
+def worker(n):
+    done = 0
+    while (item := q.get()) is not STOP:   # blocks; no Empty, no busy loop
+        time.sleep(0.001)                  # simulate work
+        done += 1
+    handled[n] = done
+threads = [threading.Thread(target=worker, args=(n,)) for n in range(3)]
+for t in threads: t.start()
+for i in range(30):
+    q.put(i)
+for _ in threads:
+    q.put(STOP)                            # one stop marker per worker
+for t in threads: t.join()
+print(&quot;items handled per worker:&quot;, dict(sorted(handled.items())), &quot;total:&quot;, sum(handled.values()))</code></pre>
+<p>Output:</p>
+<pre><code>items handled per worker: {0: 10, 1: 10, 2: 10} total: 30</code></pre>
+<p><strong>Measured:</strong> instead of polling with <code>get_nowait()</code> and catching <code>Empty</code>, let each worker block on <code>get()</code> and put one stop marker per worker on the queue when the work is done. All 30 items were handled and every thread exited. A <code>while not q.empty()</code> loop is not a safe alternative with several consumers: the Python docs note that <code>empty()</code> gives no guarantee the next <code>get()</code> won't block. (Our test with 8 threads didn't hit that race, but it's timing-dependent.)</p>
+
+<aside class="cta"><strong>Workers fetching URLs from a queue? Check the status and headers each server really returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>When does Python raise queue.Empty?</summary><p>When get_nowait(), get(block=False) or get(timeout=...) finds the queue empty. We measured all three on Python 3.13.5; a plain get() waits instead of raising.</p></details>
+<details><summary>Why is the traceback just _queue.Empty with no message?</summary><p>queue.Empty is raised without a message, and _queue is the C module that defines it. We measured an empty str() for all three calls.</p></details>
+<details><summary>Does except IndexError catch queue.Empty?</summary><p>No. We checked queue.Empty&#x27;s bases: it subclasses Exception directly, not IndexError.</p></details>
+<details><summary>Is asyncio.QueueEmpty the same as queue.Empty?</summary><p>No. We measured asyncio.Queue.get_nowait() raising asyncio.QueueEmpty, which is not a subclass of queue.Empty, while multiprocessing.Queue raises queue.Empty.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5: get_nowait/get(block=False)/get(timeout) on an empty queue.Queue, multiprocessing.Queue and asyncio.Queue, and three worker threads with stop markers. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

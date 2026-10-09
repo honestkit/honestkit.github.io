@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python OverflowError: math range error (Tested Causes &amp; Fixes)</title>
+<meta name="description" content="We measured Python&#x27;s float overflow: where math.exp breaks, three different OverflowError messages, cases that silently return inf, and stable fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-overflowerror-math-range-error/">
+<meta property="og:title" content="Python OverflowError: math range error (Tested Causes &amp; Fixes)">
+<meta property="og:description" content="We measured Python&#x27;s float overflow: where math.exp breaks, three different OverflowError messages, cases that silently return inf, and stable fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-overflowerror-math-range-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes OverflowError: math range error in Python?", "acceptedAnswer": {"@type": "Answer", "text": "A math function's result is too big for a float (max about 1.8e308). We measured math.exp(709) working and math.exp(710) raising."}}, {"@type": "Question", "name": "Why does 1 / (1 + math.exp(-x)) raise OverflowError?", "acceptedAnswer": {"@type": "Answer", "text": "For large negative x, math.exp(-x) overflows. We measured it failing at x = -745; a sign-branched stable sigmoid returned 5e-324 instead."}}, {"@type": "Question", "name": "Why does OverflowError say (34, 'Numerical result out of range')?", "acceptedAnswer": {"@type": "Answer", "text": "That's the message from float ** (errno 34 is ERANGE). We measured 10.0 ** 309 raising it, while math.pow(10, 309) says math range error."}}, {"@type": "Question", "name": "Does Python float multiplication raise OverflowError?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured 1e308 * 10 returning inf silently; check math.isinf() if that matters."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>OverflowError: math range error (tested)</h1>
+<p class="lead"><code>OverflowError: math range error</code> means a <code>math</code> function produced a number too large for a float. We measured where the limit is on Python 3.13.5, why the same overflow has three different messages, and the stable rewrites (sigmoid, log-sum-exp) that avoid it.</p>
+<h2 id="where">1. Where the limit is, and which operations raise</h2>
+<pre><code>import math
+
+tests = {
+    &quot;math.exp(709)&quot;: lambda: math.exp(709),
+    &quot;math.exp(710)&quot;: lambda: math.exp(710),
+    &quot;math.pow(10, 309)&quot;: lambda: math.pow(10, 309),
+    &quot;10.0 ** 309&quot;: lambda: 10.0 ** 309,
+    &quot;10 ** 309 (int)&quot;: lambda: len(str(10 ** 309)),
+    &quot;float(10 ** 309)&quot;: lambda: float(10 ** 309),
+    &quot;1e308 * 10&quot;: lambda: 1e308 * 10,
+    &quot;math.exp(-1000)&quot;: lambda: math.exp(-1000),
+}
+for label, fn in tests.items():
+    try:
+        print(f&quot;{label:20} -&gt; {fn()}&quot;)
+    except OverflowError as e:
+        print(f&quot;{label:20} -&gt; OverflowError: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>math.exp(709)        -&gt; 8.218407461554972e+307
+math.exp(710)        -&gt; OverflowError: math range error
+math.pow(10, 309)    -&gt; OverflowError: math range error
+10.0 ** 309          -&gt; OverflowError: (34, &#x27;Numerical result out of range&#x27;)
+10 ** 309 (int)      -&gt; 310
+float(10 ** 309)     -&gt; OverflowError: int too large to convert to float
+1e308 * 10           -&gt; inf
+math.exp(-1000)      -&gt; 0.0</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> a float tops out near <code>1.8e308</code>, so <code>math.exp()</code> works up to 709 and raises <code>math range error</code> at 710. The same overflow gives three different messages depending on the operation: <code>math range error</code> from the <code>math</code> module, <code>(34, 'Numerical result out of range')</code> from float <code>**</code>, and <code>int too large to convert to float</code> when a big int becomes a float. Two cases don't raise at all: plain float multiplication silently returns <code>inf</code>, and <code>math.exp(-1000)</code> silently underflows to <code>0.0</code>. Python ints never overflow; <code>10 ** 309</code> is fine until you convert it.</p>
+
+<h2 id="sigmoid">2. The classic: sigmoid / logistic with large negative input</h2>
+<pre><code>import math
+
+def sigmoid(x):
+    return 1 / (1 + math.exp(-x))
+
+def sigmoid_stable(x):
+    if x &gt;= 0:
+        return 1 / (1 + math.exp(-x))
+    z = math.exp(x)
+    return z / (1 + z)
+
+for x in [5, -745, -800]:
+    try:
+        a = sigmoid(x)
+    except OverflowError as e:
+        a = f&quot;OverflowError: {e}&quot;
+    print(x, &quot;|&quot;, a, &quot;|&quot;, sigmoid_stable(x))</code></pre>
+<p>Output:</p>
+<pre><code>5 | 0.9933071490757153 | 0.9933071490757153
+-745 | OverflowError: math range error | 5e-324
+-800 | OverflowError: math range error | 0.0</code></pre>
+<p><strong>Measured:</strong> the textbook <code>1 / (1 + exp(-x))</code> raises for <code>x = -745</code>, because <code>exp(745)</code> overflows even though the true answer is just tiny. Branching on the sign so <code>exp()</code> only ever sees a non-positive argument never overflows.</p>
+
+<h2 id="logsumexp">3. Sums of exponentials: subtract the max first</h2>
+<pre><code>import math
+
+xs = [1000, 1001, 1002]
+try:
+    print(math.log(sum(math.exp(x) for x in xs)))
+except OverflowError as e:
+    print(&quot;naive:&quot;, &quot;OverflowError:&quot;, e)
+
+m = max(xs)
+print(&quot;log-sum-exp:&quot;, m + math.log(sum(math.exp(x - m) for x in xs)))
+
+from decimal import Decimal
+print(&quot;Decimal:&quot;, Decimal(1000).exp())</code></pre>
+<p>Output:</p>
+<pre><code>naive: OverflowError: math range error
+log-sum-exp: 1002.4076059644444
+Decimal: 1.970071114017046993888879352E+434</code></pre>
+<p><strong>Measured:</strong> <code>log(sum(exp(x)))</code> overflows for values around 1000; the log-sum-exp trick (factor out <code>exp(max)</code>) gives <code>1002.4076...</code> with no overflow. Softmax needs the same trick. If you need the huge number itself, <code>Decimal</code> has a far larger exponent range: <code>Decimal(1000).exp()</code> returned about <code>1.97E+434</code>.</p>
+
+<h2 id="checklist">4. Checklist</h2>
+<ul>
+<li>Print the argument that failed. <code>exp()</code> overflows above ~709.78; <code>x ** y</code> when the result passes ~1.8e308.</li>
+<li>Rewrite so <code>exp()</code> gets non-positive arguments (stable sigmoid, log-sum-exp).</li>
+<li>Work in logs: <code>y * math.log(x)</code> instead of <code>x ** y</code> when only comparisons or logs are needed.</li>
+<li>Don't rely on <code>try/except OverflowError</code> alone: multiplication returned <code>inf</code> with no exception, so check <code>math.isinf()</code> too.</li>
+</ul>
+
+<aside class="cta"><strong>Working with numeric data from APIs? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes OverflowError: math range error in Python?</summary><p>A math function&#x27;s result is too big for a float (max about 1.8e308). We measured math.exp(709) working and math.exp(710) raising.</p></details>
+<details><summary>Why does 1 / (1 + math.exp(-x)) raise OverflowError?</summary><p>For large negative x, math.exp(-x) overflows. We measured it failing at x = -745; a sign-branched stable sigmoid returned 5e-324 instead.</p></details>
+<details><summary>Why does OverflowError say (34, &#x27;Numerical result out of range&#x27;)?</summary><p>That&#x27;s the message from float ** (errno 34 is ERANGE). We measured 10.0 ** 309 raising it, while math.pow(10, 309) says math range error.</p></details>
+<details><summary>Does Python float multiplication raise OverflowError?</summary><p>No. We measured 1e308 * 10 returning inf silently; check math.isinf() if that matters.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on x86-64 Linux: math.exp, math.pow, float and int powers, int-to-float conversion, float multiplication and underflow, a naive and a stable sigmoid, and naive vs log-sum-exp with a Decimal comparison. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

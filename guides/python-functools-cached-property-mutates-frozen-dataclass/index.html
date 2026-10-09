@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cached_property Mutates a Frozen Dataclass Anyway (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: Point(3,4) is frozen -- p.x=10 raises FrozenInstanceError -- but p.magnitude (a cached_property) writes to p.__dict__ with no error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-functools-cached-property-mutates-frozen-dataclass/">
+<meta property="og:title" content="cached_property Mutates a Frozen Dataclass Anyway (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: Point(3,4) is frozen -- p.x=10 raises FrozenInstanceError -- but p.magnitude (a cached_property) writes to p.__dict__ with no error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-functools-cached-property-mutates-frozen-dataclass/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does functools.cached_property work on a frozen dataclass?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, and that's the surprise -- we measured it writing a new key into the frozen instance's __dict__ on first access with no error, even though assigning to any declared field on the same instance raises dataclasses.FrozenInstanceError immediately."}}, {"@type": "Question", "name": "Why doesn't frozen=True stop cached_property from writing to the instance?", "acceptedAnswer": {"@type": "Answer", "text": "frozen=True works by overriding __setattr__ to raise on every call. functools.cached_property.__get__ stores its result by writing directly into the instance's __dict__, which is documented as an optimization, and that bypasses __setattr__ entirely -- the guard a frozen dataclass relies on is simply never invoked."}}, {"@type": "Question", "name": "Does this break hashing or equality for a frozen dataclass with a cached_property?", "acceptedAnswer": {"@type": "Answer", "text": "No, we measured hash() and == staying consistent before and after the cached_property was accessed, because the generated __eq__/__hash__ only consider the dataclass's declared fields, not arbitrary __dict__ entries. What breaks is the assumption that the object's memory never changes after construction."}}, {"@type": "Question", "name": "Is there a way to get a cached, lazy attribute on a frozen dataclass without this gap?", "acceptedAnswer": {"@type": "Answer", "text": "Use object.__setattr__(self, name, value) explicitly inside a plain @property's getter if you want the bypass to be visible and intentional in your own code, or accept that functools.cached_property already does this silently and document it where the class is used."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>functools.cached_property Writes to a Frozen Dataclass&#x27;s __dict__ Anyway (tested)</h1>
+<p class="lead"><code>@dataclass(frozen=True)</code> is the standard way to make a Python object's state immutable: assigning to any declared field raises <code>FrozenInstanceError</code>. We measured that a <code>functools.cached_property</code> method on that same frozen instance writes a brand-new entry into the instance's <code>__dict__</code> on first access, with no error at all -- because it bypasses the overridden <code>__setattr__</code> that frozen dataclasses rely on to block mutation.</p>
+<h2 id="repro1">1. Frozen blocks a normal field assignment, not a cached_property access</h2>
+<pre><code>import dataclasses, functools
+
+@dataclasses.dataclass(frozen=True)
+class Point:
+    x: float
+    y: float
+
+    @functools.cached_property
+    def magnitude(self):
+        print("computing magnitude")
+        return (self.x**2 + self.y**2) ** 0.5
+
+p = Point(3, 4)
+try:
+    p.x = 10
+except Exception as e:
+    print("setting x RAISED", type(e).__name__, e)
+
+print("magnitude:", p.magnitude)
+print("magnitude again:", p.magnitude)
+print(p.__dict__)</code></pre>
+<pre><code>setting x RAISED FrozenInstanceError cannot assign to field 'x'
+computing magnitude
+magnitude: 5.0
+magnitude again: 5.0
+{'x': 3, 'y': 4, 'magnitude': 5.0}</code></pre>
+<p><strong>Measured:</strong> <code>p.x = 10</code> raises immediately, exactly as <code>frozen=True</code> promises. But the very next line, <code>p.magnitude</code>, silently adds a <code>'magnitude'</code> key to <code>p.__dict__</code> -- a dict that, going by the <code>FrozenInstanceError</code> above, looked completely locked down one line earlier. The second access is a cache hit (no second "computing" print), confirming the write actually happened and stuck.</p>
+
+<h2 id="repro2">2. Why: cached_property writes to the dict directly, not through setattr</h2>
+<pre><code>import dataclasses, functools
+
+@dataclasses.dataclass(frozen=True)
+class Point:
+    x: float
+    y: float
+
+    @functools.cached_property
+    def magnitude(self):
+        return (self.x**2 + self.y**2) ** 0.5
+
+p = Point(3, 4)
+print("before:", p.__dict__)
+p.magnitude
+print("after:", p.__dict__)</code></pre>
+<pre><code>before: {'x': 3, 'y': 4}
+after: {'x': 3, 'y': 4, 'magnitude': 5.0}</code></pre>
+<p><strong>Measured:</strong> a frozen dataclass's immutability comes entirely from a generated <code>__setattr__</code> that raises on every call. <code>functools.cached_property.__get__</code> does not call <code>setattr(instance, name, value)</code> -- the cached_property docs themselves note it stores the result straight into the instance's <code>__dict__</code> for performance, skipping the attribute-assignment machinery entirely. That implementation choice is exactly what lets it slip past a guard that every ordinary assignment respects.</p>
+
+<h2 id="repro3">3. The hash and equality stay safe -- it's specifically the "immutable" guarantee that doesn't</h2>
+<pre><code>import dataclasses, functools
+
+@dataclasses.dataclass(frozen=True)
+class Point:
+    x: float
+    y: float
+
+    @functools.cached_property
+    def magnitude(self):
+        return (self.x**2 + self.y**2) ** 0.5
+
+p1 = Point(3, 4)
+p2 = Point(3, 4)
+s = {p1}
+print("p1 == p2:", p1 == p2)
+print("hash(p1) == hash(p2):", hash(p1) == hash(p2))
+p1.magnitude            # triggers the hidden __dict__ write
+print("p1 in s after accessing magnitude:", p1 in s)
+print("hash(p1) == hash(p2) still:", hash(p1) == hash(p2))</code></pre>
+<pre><code>p1 == p2: True
+hash(p1) == hash(p2): True
+p1 in s after accessing magnitude: True
+hash(p1) == hash(p2) still: True</code></pre>
+<p><strong>Measured:</strong> a frozen dataclass's generated <code>__eq__</code>/<code>__hash__</code> only look at the declared fields (<code>x</code>, <code>y</code>), so the cached_property's extra <code>__dict__</code> entry doesn't break hashing or set membership here. What it does break is the broader assumption that "frozen means nothing about this object's memory ever changes again" -- code that relies on that for thread-safety, deep-copy snapshotting, or memory-identity comparisons across time is measurably wrong the first time a cached_property is touched.</p>
+<aside class="cta"><strong>Putting a functools.cached_property method on a frozen dataclass or NamedTuple-like class to get free immutability? Check what accessing it actually does to the instance first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does functools.cached_property work on a frozen dataclass?</summary><p>Yes, and that&#x27;s the surprise -- we measured it writing a new key into the frozen instance&#x27;s __dict__ on first access with no error, even though assigning to any declared field on the same instance raises dataclasses.FrozenInstanceError immediately.</p></details>
+<details><summary>Why doesn&#x27;t frozen=True stop cached_property from writing to the instance?</summary><p>frozen=True works by overriding __setattr__ to raise on every call. functools.cached_property.__get__ stores its result by writing directly into the instance&#x27;s __dict__, which is documented as an optimization, and that bypasses __setattr__ entirely -- the guard a frozen dataclass relies on is simply never invoked.</p></details>
+<details><summary>Does this break hashing or equality for a frozen dataclass with a cached_property?</summary><p>No, we measured hash() and == staying consistent before and after the cached_property was accessed, because the generated __eq__/__hash__ only consider the dataclass&#x27;s declared fields, not arbitrary __dict__ entries. What breaks is the assumption that the object&#x27;s memory never changes after construction.</p></details>
+<details><summary>Is there a way to get a cached, lazy attribute on a frozen dataclass without this gap?</summary><p>Use object.__setattr__(self, name, value) explicitly inside a plain @property&#x27;s getter if you want the bypass to be visible and intentional in your own code, or accept that functools.cached_property already does this silently and document it where the class is used.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in functools and dataclasses modules: created a @dataclass(frozen=True) class with a functools.cached_property method, confirmed assigning to a declared field raises FrozenInstanceError, then accessed the cached_property and inspected the instance&#x27;s __dict__ before and after. PlainHeaders is our extension; Python&#x27;s functools and dataclasses modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>itertools.tee Silently Drops Items If You Reuse the Source</title>
+<meta name="description" content="We measured itertools.tee in Python 3.13.5: calling next() on the original iterator after tee() silently removes that item from every tee copy too, no error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/itertools-tee-silently-drops-items-if-you-reuse-the-source/">
+<meta property="og:title" content="itertools.tee Silently Drops Items If You Reuse the Source">
+<meta property="og:description" content="We measured itertools.tee in Python 3.13.5: calling next() on the original iterator after tee() silently removes that item from every tee copy too, no error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/itertools-tee-silently-drops-items-if-you-reuse-the-source/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is my itertools.tee copy missing an item?", "acceptedAnswer": {"@type": "Answer", "text": "We measured this: it happens when the original iterator passed to tee() is read directly after tee() runs. Every tee'd copy silently loses that item too, with no exception."}}, {"@type": "Question", "name": "Does itertools.tee raise an error if I reuse the original iterator?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we confirmed it fails silently. The item is simply missing from every tee'd copy's output, which is easy to miss if you're not comparing lengths."}}, {"@type": "Question", "name": "How do I avoid the itertools.tee data-loss bug?", "acceptedAnswer": {"@type": "Answer", "text": "Stop referencing the original iterator entirely once you've passed it to tee() -- read only from the returned copies, even if one copy is read far ahead of the other."}}, {"@type": "Question", "name": "Does it matter if the two tee'd iterators are read at different speeds?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured one copy being fully consumed while the other hadn't started, and it still returned every item correctly. The bug is specifically about reusing the original source, not about uneven consumption speed between the copies."}}, {"@type": "Question", "name": "Does this affect itertools.groupby the same way?", "acceptedAnswer": {"@type": "Answer", "text": "They're different bugs -- groupby's gotcha is about deferring list(group) until later, not about reusing a source iterator. See our separate groupby guide for that one; both stem from itertools functions sharing iterator state in ways that aren't obvious from the output."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>itertools.tee Silently Drops Items If You Reuse the Source (tested)</h1>
+<p class="lead"><code>itertools.tee()</code> looks like it makes two independent snapshots of an iterator. We measured what happens when you keep using the original iterator after splitting it, and it quietly removes items from both copies with no error at all.</p>
+<h2 id="repro1">1. Using the original iterator after tee() drops an item from both copies</h2>
+<pre><code>import itertools
+
+src = iter([1, 2, 3, 4, 5])
+a, b = itertools.tee(src, 2)
+print(next(src))       # pull one item from the ORIGINAL iterator
+print(list(a))
+print(list(b))</code></pre>
+<pre><code>1
+[2, 3, 4, 5]
+[2, 3, 4, 5]</code></pre>
+<p><strong>Measured:</strong> the <code>1</code> never shows up in either <code>a</code> or <code>b</code> -- both copies are missing the exact item that was pulled from <code>src</code>. There's no exception and no warning; the data is just gone from both tee'd iterators, not only the one you read from directly.</p>
+
+<h2 id="repro2">2. Never touching the original avoids the problem entirely</h2>
+<pre><code>import itertools
+
+src = iter(range(5))
+a, b = itertools.tee(src, 2)
+print(list(a))  # consume a fully first
+print(list(b))  # b still has everything</code></pre>
+<pre><code>[0, 1, 2, 3, 4]
+[0, 1, 2, 3, 4]</code></pre>
+<p><strong>Measured:</strong> as long as only the tee'd copies are read -- never the original <code>src</code> -- both <code>a</code> and <code>b</code> see every item, even when one is fully drained well before the other starts. <code>tee()</code> internally buffers items the faster consumer has already seen but the slower one hasn't, which is exactly why reaching around it to read <code>src</code> directly breaks that bookkeeping: the buffer never finds out an item was consumed.</p>
+
+<h2 id="fix">3. Fix: treat the original iterator as unusable once tee() runs</h2>
+<pre><code>import itertools
+
+src = iter([1, 2, 3, 4, 5])
+a, b = itertools.tee(src, 2)
+del src  # make it impossible to accidentally reuse
+
+print(list(a))
+print(list(b))</code></pre>
+<pre><code>[1, 2, 3, 4, 5]
+[1, 2, 3, 4, 5]</code></pre>
+<p><strong>Measured:</strong> deleting the name (or simply never referencing it again) and reading only <code>a</code> and <code>b</code> gives both copies the full, correct sequence. The Python docs do note this requirement, but they don't describe it as silently dropping data -- in practice it reads as a hard-to-notice off-by-one, not a documented error case.</p>
+<aside class="cta"><strong>Debugging a data pipeline? Check the real request/response headers behind it first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is my itertools.tee copy missing an item?</summary><p>We measured this: it happens when the original iterator passed to tee() is read directly after tee() runs. Every tee&#x27;d copy silently loses that item too, with no exception.</p></details>
+<details><summary>Does itertools.tee raise an error if I reuse the original iterator?</summary><p>No -- we confirmed it fails silently. The item is simply missing from every tee&#x27;d copy&#x27;s output, which is easy to miss if you&#x27;re not comparing lengths.</p></details>
+<details><summary>How do I avoid the itertools.tee data-loss bug?</summary><p>Stop referencing the original iterator entirely once you&#x27;ve passed it to tee() -- read only from the returned copies, even if one copy is read far ahead of the other.</p></details>
+<details><summary>Does it matter if the two tee&#x27;d iterators are read at different speeds?</summary><p>No -- we measured one copy being fully consumed while the other hadn&#x27;t started, and it still returned every item correctly. The bug is specifically about reusing the original source, not about uneven consumption speed between the copies.</p></details>
+<details><summary>Does this affect itertools.groupby the same way?</summary><p>They&#x27;re different bugs -- groupby&#x27;s gotcha is about deferring list(group) until later, not about reusing a source iterator. See our separate groupby guide for that one; both stem from itertools functions sharing iterator state in ways that aren&#x27;t obvious from the output.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in itertools module: created an iterator, split it with itertools.tee() into two copies, then called next() on the original iterator afterward, and compared that against never touching the original once tee() ran. PlainHeaders is our extension; Python&#x27;s itertools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

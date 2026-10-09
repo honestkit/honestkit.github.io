@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>decimal: Context.copy() Is Independent, Never ==</title>
+<meta name="description" content="We measured Python 3.13.5: Context.copy() makes an independent copy, but two identical-setting Contexts still compare unequal and hash differently (no __eq__).">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-decimal-context-copy-is-independent-but-never-equal/">
+<meta property="og:title" content="decimal: Context.copy() Is Independent, Never ==">
+<meta property="og:description" content="We measured Python 3.13.5: Context.copy() makes an independent copy, but two identical-setting Contexts still compare unequal and hash differently (no __eq__).">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-decimal-context-copy-is-independent-but-never-equal/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does decimal.Context.copy() create an independent object?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured mutating the copy's prec leaving the original Context's prec unchanged. copy() is a safe, real copy, not a reference to the same object."}}, {"@type": "Question", "name": "Why does ctx == ctx.copy() return False even though nothing was changed?", "acceptedAnswer": {"@type": "Answer", "text": "Because decimal.Context doesn't define __eq__, so == falls back to identity comparison. We confirmed every individual setting (prec, rounding, traps, flags) matched between the original and the fresh copy, yet == still returned False since they're two different objects."}}, {"@type": "Question", "name": "Can I use a set or dict to deduplicate decimal.Context objects by their settings?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured two separately-constructed Context(prec=10) objects with identical settings hashing differently and both landing in a 2-element set. Context has no custom __hash__ or __eq__, so dedup falls back to object identity, not settings equality."}}, {"@type": "Question", "name": "How do I compare two decimal.Context objects for equivalent settings?", "acceptedAnswer": {"@type": "Answer", "text": "Compare the attributes you care about directly, e.g. a.prec == b.prec and a.rounding == b.rounding and a.traps == b.traps, rather than a == b -- we confirmed == on the Context objects themselves uses identity, not settings, even when every attribute matches."}}, {"@type": "Question", "name": "Is decimal.Context hashable based on its settings?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured hash(a) != hash(b) for two Context objects with identical prec and other settings. Context's hash (like its equality) is the default identity-based one inherited from object, not derived from its field values."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>decimal: Context.copy() Is Independent but Never Equal (tested)</h1>
+<p class="lead"><code>decimal.Context</code> objects hold a precision, rounding mode, and trap settings. We measured whether <code>.copy()</code> gives a truly independent object (it does) and, separately, whether two <code>Context</code> objects with identical settings compare as equal (they don't) -- a combination that trips up caching or test code that assumes equal settings means <code>==</code>.</p>
+<h2 id="repro1">1. copy() does produce an independent object -- mutating the copy doesn't touch the original</h2>
+<pre><code>from decimal import getcontext
+
+ctx = getcontext()
+ctx2 = ctx.copy()
+ctx2.prec = 2
+print("original prec:", ctx.prec, "| copy prec:", ctx2.prec)</code></pre>
+<pre><code>original prec: 28 | copy prec: 2</code></pre>
+<p><strong>Measured:</strong> <code>Context.copy()</code> behaves correctly here -- it's a real, independent copy, not a reference to the same object. Mutating <code>ctx2</code> leaves <code>ctx</code> untouched. This part matches what most code assumes.</p>
+
+<h2 id="repro2">2. But before any mutation, the original and its copy are NOT equal</h2>
+<pre><code>from decimal import getcontext
+
+ctx = getcontext()
+ctx2 = ctx.copy()
+print("prec matches:", ctx.prec == ctx2.prec)
+print("rounding matches:", ctx.rounding == ctx2.rounding)
+print("traps match:", ctx.traps == ctx2.traps)
+print("flags match:", ctx.flags == ctx2.flags)
+print("ctx == ctx2:", ctx == ctx2)</code></pre>
+<pre><code>prec matches: True
+rounding matches: True
+traps match: True
+flags match: True
+ctx == ctx2: False</code></pre>
+<p><strong>Measured:</strong> every individual setting is identical, yet <code>ctx == ctx2</code> is <code>False</code>. <code>decimal.Context</code> doesn't define <code>__eq__</code>, so <code>==</code> falls back to identity comparison (the same as <code>is</code>) -- a copy is, by definition, never the same object as its source, so it can never equal it even immediately after copying with nothing changed.</p>
+
+<h2 id="repro3">3. The risk: deduplication and equality-based caching silently fail</h2>
+<pre><code>from decimal import Context
+
+a = Context(prec=10)
+b = Context(prec=10)
+print("separately built, identical settings, ==:", a == b)
+
+seen = {a, b}
+print("set size for two identical-settings Contexts:", len(seen))
+print("hash(a) == hash(b):", hash(a) == hash(b))</code></pre>
+<pre><code>separately built, identical settings, ==: False
+set size for two identical-settings Contexts: 2
+hash(a) == hash(b): False</code></pre>
+<p><strong>Measured:</strong> two <code>Context</code> objects built from scratch with the exact same <code>prec</code> (and every other default setting matching) are still unequal and hash differently. Code that deduplicates contexts in a <code>set</code>/<code>dict</code>, caches a context "for prec=10" and compares against a stored baseline with <code>==</code>, or asserts <code>context_from_pool == expected_context</code> in a test, will silently treat every pair as distinct no matter how identical their settings are. Compare the individual attributes you care about (<code>prec</code>, <code>rounding</code>, <code>traps</code>) explicitly instead of relying on <code>==</code> or set/dict membership on the <code>Context</code> object itself.</p>
+<aside class="cta"><strong>Comparing or deduplicating decimal.Context objects? Check whether == actually sees them as equal first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does decimal.Context.copy() create an independent object?</summary><p>Yes -- we measured mutating the copy&#x27;s prec leaving the original Context&#x27;s prec unchanged. copy() is a safe, real copy, not a reference to the same object.</p></details>
+<details><summary>Why does ctx == ctx.copy() return False even though nothing was changed?</summary><p>Because decimal.Context doesn&#x27;t define __eq__, so == falls back to identity comparison. We confirmed every individual setting (prec, rounding, traps, flags) matched between the original and the fresh copy, yet == still returned False since they&#x27;re two different objects.</p></details>
+<details><summary>Can I use a set or dict to deduplicate decimal.Context objects by their settings?</summary><p>No -- we measured two separately-constructed Context(prec=10) objects with identical settings hashing differently and both landing in a 2-element set. Context has no custom __hash__ or __eq__, so dedup falls back to object identity, not settings equality.</p></details>
+<details><summary>How do I compare two decimal.Context objects for equivalent settings?</summary><p>Compare the attributes you care about directly, e.g. a.prec == b.prec and a.rounding == b.rounding and a.traps == b.traps, rather than a == b -- we confirmed == on the Context objects themselves uses identity, not settings, even when every attribute matches.</p></details>
+<details><summary>Is decimal.Context hashable based on its settings?</summary><p>No -- we measured hash(a) != hash(b) for two Context objects with identical prec and other settings. Context&#x27;s hash (like its equality) is the default identity-based one inherited from object, not derived from its field values.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in decimal module: created a Context, copied it with .copy(), confirmed the copy mutates independently, then compared the original and the unmutated copy (and two separately-constructed Contexts with identical settings) with ==, in a set, and via hash(). PlainHeaders is our extension; Python&#x27;s decimal module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pip install Failed: Fixing Every Common Error (Tested)</title>
+<meta name="description" content="We reproduced pip&#x27;s externally-managed-environment, build-wheel, and connection errors on Debian 13 (plus the real causes of SSL errors) with the fix for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pip-install-failed/">
+<meta property="og:title" content="pip install Failed: Fixing Every Common Error (Tested)">
+<meta property="og:description" content="We reproduced pip&#x27;s externally-managed-environment, build-wheel, and connection errors on Debian 13 (plus the real causes of SSL errors) with the fix for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pip-install-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does \"externally-managed-environment\" mean?", "acceptedAnswer": {"@type": "Answer", "text": "Your system's Python (Debian, Ubuntu, Fedora and others) is marked as managed by the OS package manager, per PEP 668. pip refuses to install into it directly to avoid breaking OS tools. We reproduced the exact error on Debian 13; the fix is to use a virtual environment, pipx, or pass --break-system-packages if you accept the risk."}}, {"@type": "Question", "name": "Is --break-system-packages safe to use?", "acceptedAnswer": {"@type": "Answer", "text": "It works, but it can overwrite files that apt manages, including packages some OS tools depend on. We did not need it in our tests because a venv installed the same package cleanly. Use a venv first; reach for --break-system-packages only as a last resort, and reinstall the OS package with apt if something breaks afterward."}}, {"@type": "Question", "name": "Why does the same pip install work in a venv but not outside one?", "acceptedAnswer": {"@type": "Answer", "text": "A virtual environment has its own site-packages directory that is never marked externally managed, so PEP 668's guard does not apply. We installed the identical package (six) both ways: it failed system-wide with the externally-managed error and succeeded immediately in a venv."}}, {"@type": "Question", "name": "Why does pip say \"Failed to build wheel\" for some packages but not others?", "acceptedAnswer": {"@type": "Answer", "text": "Packages that ship a prebuilt wheel for your OS/Python/CPU combination never need to build. Packages without a matching wheel are compiled from source, which needs a compiler and often a system library (like libpq for psycopg2, which we used to reproduce the error). Installing the missing system dependency or switching to a binary-only package name usually fixes it."}}, {"@type": "Question", "name": "pip install hangs then fails with a connection error \u2014 is that a pip bug?", "acceptedAnswer": {"@type": "Answer", "text": "No, it's pip retrying a genuinely unreachable host 5 times with backoff before giving up, which is why it feels slow. We saw this by pointing pip at a port with nothing listening (Errno 111, Connection refused). Test the network path directly with curl against the same index URL to confirm it's a connectivity or proxy-configuration problem, not pip itself."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pip install Failed (tested)</h1>
+<p class="lead"><code>pip install</code> fails for a handful of distinct reasons that get lumped together under "pip install failed": a blocked system Python (PEP 668), a missing compiler or header for a package built from source, a bad TLS certificate, or a package index that isn't reachable. Each needs a different fix. We reproduced four of them on a real Debian 13 box and recorded the exact text pip prints.</p>
+<h2>1. "externally-managed-environment" (the most common one today)</h2>
+<p>On Debian, Ubuntu and other distros that follow <a href="https://peps.python.org/pep-0668/">PEP 668</a>, the system Python ships a marker file (<code>/usr/lib/python3.13/EXTERNALLY-MANAGED</code> on our box) that blocks <code>pip install</code> outside a virtual environment. This is new compared to older tutorials, which is why it confuses people. Running <code>pip install six</code> with the system Python, no venv active, gave us exactly this:</p>
+<pre><code>error: externally-managed-environment
+
+&#215; This environment is externally managed
+&#9561;&#9472;&#62; To install Python packages system-wide, try apt install
+    python3-xyz, where xyz is the package you are trying to
+    install.
+
+    If you wish to install a non-Debian-packaged Python package,
+    create a virtual environment using python3 -m venv path/to/venv.
+    Then use path/to/venv/bin/python and path/to/venv/bin/pip. Make
+    sure you have python3-full installed.
+
+    If you wish to install a non-Debian packaged Python application,
+    it may be easiest to use pipx install xyz, which will manage a
+    virtual environment for you. Make sure you have pipx installed.
+
+    See /usr/share/doc/python3.13/README.venv for more information.
+
+note: If you believe this is a mistake, please contact your Python installation or OS distribution provider. You can override this, at the risk of breaking your Python installation or OS, by passing --break-system-packages.
+hint: See PEP 668 for the detailed specification.</code></pre>
+<p>Nothing was installed and the system Python was left untouched &mdash; pip aborts before touching any files. pip itself suggests three fixes, in order of how safe they are:</p>
+<ul>
+<li><strong>Use a virtual environment</strong> (recommended): <code>python3 -m venv .venv &amp;&amp; .venv/bin/pip install six</code>. This is the fix that matches how the rest of the Python ecosystem expects you to work.</li>
+<li><strong>Use pipx</strong> for installing command-line tools system-wide without touching the interpreter's own site-packages.</li>
+<li><strong>Pass <code>--break-system-packages</code></strong> only if you understand the risk: it can overwrite files apt manages and break system tools that depend on them (apt itself, on Debian, is written in Python). Treat it as a last resort, and reinstall with <code>apt install --reinstall python3-xyz</code> if it breaks something.</li>
+</ul>
+
+<h2>2. The fix, proven: same package, in a venv, works</h2>
+<p>To make the contrast concrete we installed the exact same package in a virtual environment right after the failure above:</p>
+<pre><code>$ python3 -m venv /tmp/demo-venv
+$ /tmp/demo-venv/bin/pip install six
+Collecting six
+  Using cached six-1.17.0-py2.py3-none-any.whl.metadata (1.7 kB)
+Using cached six-1.17.0-py2.py3-none-any.whl (11 kB)
+Installing collected packages: six
+Successfully installed six-1.17.0</code></pre>
+<p>No flags, no errors. A venv has its own site-packages directory, so it is never "externally managed" and pip will install into it freely. If you only ever see this error in system contexts (a bare <code>pip install</code> with no venv active, or inside a minimal Docker image using the distro's Python), creating a venv &mdash; or using a python base image that doesn't apply PEP 668, see below &mdash; fixes it for good.</p>
+
+<h2>3. "Failed to build wheel for X" / "Failed building wheel for X"</h2>
+<p>This means pip had to compile a package from source (no prebuilt wheel matched your OS/Python/CPU) and the build failed, usually because a system library or compiler header is missing. We reproduced it with <code>psycopg2</code> (the PostgreSQL driver, whose source build needs <code>pg_config</code> from libpq, forced with <code>pip install psycopg2==2.9.9 --no-binary :all:</code>):</p>
+<pre><code>running egg_info
+writing psycopg2.egg-info/PKG-INFO
+writing dependency_links to psycopg2.egg-info/dependency_links.txt
+writing top-level names to psycopg2.egg-info/top_level.txt
+
+Error: pg_config executable not found.
+
+pg_config is required to build psycopg2 from source.  Please add the directory
+containing pg_config to the $PATH or specify the full executable path with the
+option:
+
+    python setup.py build_ext --pg-config /path/to/pg_config build ...
+
+or with the pg_config option in 'setup.cfg'.
+
+If you prefer to avoid building psycopg2 from source, please install the PyPI
+'psycopg2-binary' package instead.
+
+ERROR: Failed to build 'psycopg2' when getting requirements to build wheel</code></pre>
+<p>The fix depends on which library is missing, but the pattern is always the same:</p>
+<ul>
+<li>Read the last 10&ndash;15 lines above the "Failed to build" line &mdash; the real cause (missing header, missing binary like <code>pg_config</code>, wrong compiler) is always printed just above it.</li>
+<li>Prefer a prebuilt wheel if one exists: here, <code>pip install psycopg2-binary</code> instead of <code>psycopg2</code> sidesteps the compile entirely.</li>
+<li>Otherwise install the missing system dependency (e.g. <code>apt install libpq-dev</code> for psycopg2, <code>build-essential</code> for a missing compiler) and retry.</li>
+<li>If the package is simply too old for your Python version (no sdist or wheel supports it), the fix is to bump the pinned version instead of fighting the build.</li>
+</ul>
+
+<h2>4. SSL certificate errors (per pip/CPython docs, not measured)</h2>
+<p>We did not stand up a self-signed HTTPS index for this guide, but the three real-world causes are well documented and worth naming directly, since the generic <code>pip._vendor.urllib3...SSLError: [SSL: CERTIFICATE_VERIFY_FAILED]</code> message doesn't tell you which one you have:</p>
+<ul>
+<li><strong>Corporate proxy / firewall TLS inspection (MITM).</strong> By far the most common cause on company laptops: the proxy re-signs HTTPS traffic with its own CA, which isn't in Python's trust store. Fix: point pip at the corporate CA bundle with <code>pip config set global.cert /path/to/corp-ca.pem</code>, or set <code>PIP_CERT</code>/<code>REQUESTS_CA_BUNDLE</code>.</li>
+<li><strong>Outdated <code>certifi</code> bundle.</strong> pip vendors its own CA list via <code>certifi</code>; an old pip can be missing a newer root cert. Fix: upgrade pip (<code>python -m pip install --upgrade pip</code>) in a venv, or upgrade <code>certifi</code>.</li>
+<li><strong>Clock skew.</strong> If the machine's clock is far enough off, certificate validity windows fail even with a correct chain. Check <code>date</code> against real time.</li>
+</ul>
+<p>If the exact wording is "self-signed certificate in certificate chain," see our dedicated page: <a href="/guides/self-signed-certificate-in-certificate-chain/">self-signed certificate in certificate chain</a>. For the browser/TLS-handshake version of a broken certificate, see <a href="/guides/err-ssl-protocol-error/">ERR_SSL_PROTOCOL_ERROR</a>.</p>
+
+<h2>5. "Failed to establish a new connection" / index unreachable</h2>
+<p>This is pip saying it can't open a TCP connection to the package index at all &mdash; no proxy, no DNS, no listener, or a firewall drop. We pointed pip at a port nothing listens on (<code>--index-url http://127.0.0.1:1/</code>) to get the exact text:</p>
+<pre><code>Looking in indexes: http://127.0.0.1:1/
+WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError("HTTPConnection(host='127.0.0.1', port=1): Failed to establish a new connection: [Errno 111] Connection refused")': /somepkg-doesnotmatter/
+WARNING: Retrying (Retry(total=3, ...)) after connection broken by '...Connection refused...'
+WARNING: Retrying (Retry(total=2, ...)) after connection broken by '...Connection refused...'
+WARNING: Retrying (Retry(total=1, ...)) after connection broken by '...Connection refused...'
+WARNING: Retrying (Retry(total=0, ...)) after connection broken by '...Connection refused...'
+ERROR: Could not find a version that satisfies the requirement somepkg-doesnotmatter (from versions: none)
+ERROR: No matching distribution found for somepkg-doesnotmatter</code></pre>
+<p>pip retries 5 times with backoff before giving up, which is why this error is slow to appear. Common real causes and fixes:</p>
+<ul>
+<li><strong>No internet / DNS failure in CI or Docker.</strong> Test with <code>curl -v https://pypi.org</code> from the same shell pip runs in; if that also fails it's a network/DNS problem, not a pip problem.</li>
+<li><strong>A proxy env var is wrong or missing.</strong> Check <code>HTTPS_PROXY</code>/<code>HTTP_PROXY</code> are set (or correctly unset) for the shell/container pip runs in.</li>
+<li><strong>A private/internal index URL is misconfigured</strong> in <code>pip.conf</code>, <code>PIP_INDEX_URL</code>, or <code>--index-url</code> &mdash; a typo'd host or port reproduces exactly the error above.</li>
+</ul>
+<p>If you see "Connection refused" from a specific service rather than pip's index, see <a href="/guides/err-connection-refused-econnrefused/">ERR_CONNECTION_REFUSED / ECONNREFUSED</a>, or the requests-library version in <a href="/guides/python-requests-connectionerror-max-retries/">Python requests ConnectionError: Max retries exceeded</a>.</p>
+
+<h2>6. "pip install fails in Docker build"</h2>
+<p>Inside a Docker build, every error above can show up, but two causes are specific to containers:</p>
+<ul>
+<li><strong>Base image has PEP 668 enabled</strong> (e.g. <code>debian:trixie</code>, recent <code>python:3.x-slim</code> variants built on Debian). The fix in a Dockerfile is usually to install into a venv baked into the image, or use an official <code>python:3.x</code> image (upstream builds don't apply PEP 668 the way Debian's own python3 package does), rather than reaching for <code>--break-system-packages</code> in a disposable image.</li>
+<li><strong>No network during build</strong> (air-gapped CI, missing <code>--network</code> flag, or a build-time secret/proxy not forwarded into the build stage) &mdash; this looks exactly like section 5 above.</li>
+</ul>
+<p>If the daemon itself is the problem rather than pip, that's a different error: see <a href="/guides/docker-cannot-connect-to-the-docker-daemon/">Docker: Cannot connect to the Docker daemon</a>.</p>
+
+<h2>7. Quick diagnosis table</h2>
+<table>
+<tr><th>What you see</th><th>Likely cause</th><th>Fix</th></tr>
+<tr><td><code>error: externally-managed-environment</code></td><td>PEP 668 system Python guard</td><td>Use a venv, or pipx, or <code>--break-system-packages</code> as a last resort</td></tr>
+<tr><td><code>Failed to build wheel for X</code> / <code>Failed building wheel for X</code></td><td>Missing compiler or system library for a source build</td><td>Read the lines just above the error; install the missing dependency or switch to a binary wheel package</td></tr>
+<tr><td><code>SSLError: CERTIFICATE_VERIFY_FAILED</code></td><td>MITM proxy, stale certifi, or clock skew</td><td>Point pip at the right CA bundle, upgrade pip/certifi, or fix the clock</td></tr>
+<tr><td><code>Failed to establish a new connection</code></td><td>Index unreachable: no network, wrong proxy, bad index URL</td><td>Test with curl first; fix proxy/index-url/network</td></tr>
+</table>
+<p>If the failure is actually about the package not existing once it does download, that's a different bug class &mdash; see <a href="/guides/python-modulenotfounderror-vs-importerror/">ModuleNotFoundError vs ImportError</a> for what happens after a successful install when the import still fails.</p>
+<aside class="cta"><strong>Check the status and headers your package index or proxy actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &quot;externally-managed-environment&quot; mean?</summary><p>Your system&#x27;s Python (Debian, Ubuntu, Fedora and others) is marked as managed by the OS package manager, per PEP 668. pip refuses to install into it directly to avoid breaking OS tools. We reproduced the exact error on Debian 13; the fix is to use a virtual environment, pipx, or pass --break-system-packages if you accept the risk.</p></details>
+<details><summary>Is --break-system-packages safe to use?</summary><p>It works, but it can overwrite files that apt manages, including packages some OS tools depend on. We did not need it in our tests because a venv installed the same package cleanly. Use a venv first; reach for --break-system-packages only as a last resort, and reinstall the OS package with apt if something breaks afterward.</p></details>
+<details><summary>Why does the same pip install work in a venv but not outside one?</summary><p>A virtual environment has its own site-packages directory that is never marked externally managed, so PEP 668&#x27;s guard does not apply. We installed the identical package (six) both ways: it failed system-wide with the externally-managed error and succeeded immediately in a venv.</p></details>
+<details><summary>Why does pip say &quot;Failed to build wheel&quot; for some packages but not others?</summary><p>Packages that ship a prebuilt wheel for your OS/Python/CPU combination never need to build. Packages without a matching wheel are compiled from source, which needs a compiler and often a system library (like libpq for psycopg2, which we used to reproduce the error). Installing the missing system dependency or switching to a binary-only package name usually fixes it.</p></details>
+<details><summary>pip install hangs then fails with a connection error — is that a pip bug?</summary><p>No, it&#x27;s pip retrying a genuinely unreachable host 5 times with backoff before giving up, which is why it feels slow. We saw this by pointing pip at a port with nothing listening (Errno 111, Connection refused). Test the network path directly with curl against the same index URL to confirm it&#x27;s a connectivity or proxy-configuration problem, not pip itself.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 on Debian GNU/Linux 13 (trixie) with system Python 3.13.5 and pip 26.2.1 (run from a separate venv at /tmp/py415venv, since this Debian install ships no system-wide pip module). The SSL certificate section is from pip/CPython docs, not measured. PlainHeaders is our extension; curl, Python and pip are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

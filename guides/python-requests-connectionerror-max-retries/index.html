@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python requests Max retries exceeded: ConnectionError Fixed</title>
+<meta name="description" content="We triggered every common requests ConnectionError: refused, DNS, self-signed SSL, ReadTimeout, RemoteDisconnected. Exact messages, causes and a tested Retry setup.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-requests-connectionerror-max-retries/">
+<meta property="og:title" content="Python requests Max retries exceeded: ConnectionError Fixed">
+<meta property="og:description" content="We triggered every common requests ConnectionError: refused, DNS, self-signed SSL, ReadTimeout, RemoteDisconnected. Exact messages, causes and a tested Retry setup.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-requests-connectionerror-max-retries/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does requests say Max retries exceeded when I never set retries?", "acceptedAnswer": {"@type": "Answer", "text": "Because the message comes from urllib3, which wraps every connect error in MaxRetryError. With the default 0 retries we still got \"Max retries exceeded with url\" for refused, DNS and SSL errors after one attempt."}}, {"@type": "Question", "name": "How do I see the real cause?", "acceptedAnswer": {"@type": "Answer", "text": "Read the text after \"Caused by\". NewConnectionError with Connection refused means nothing listens on the port. NameResolutionError means DNS. SSLError means the certificate failed. ReadTimeoutError means the server was too slow."}}, {"@type": "Question", "name": "What timeout should I use with requests?", "acceptedAnswer": {"@type": "Answer", "text": "Always pass one, because there is no default. Our call without a timeout was still waiting at 3 s and would wait forever. A tuple like timeout=(3, 10) sets 3 s to connect and 10 s to read."}}, {"@type": "Question", "name": "Does except requests.ConnectionError catch timeouts?", "acceptedAnswer": {"@type": "Answer", "text": "Not a plain ReadTimeout: it inherits from Timeout. But SSLError is a ConnectionError, and after Retry runs out a read timeout comes back as ConnectionError. Catch requests.RequestException to cover all of them."}}, {"@type": "Question", "name": "How many times does Retry(total=3) hit the server?", "acceptedAnswer": {"@type": "Answer", "text": "4 times: the first try plus 3 retries. With backoff_factor=0.5 we measured gaps of 0, 1 and 2 s, so about 3 s in total before the final error."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python requests: Max retries exceeded (tested)</h1>
+<p class="lead"><code>ConnectionError: HTTPSConnectionPool(...): Max retries exceeded with url</code> is a wrapper. The real cause is in the <code>Caused by</code> part at the end. We reproduced six causes with requests 2.34.2 and show the exact message for each, plus timeouts and retries that we measured.</p>
+<h2>1. Read the "Caused by" part, not "Max retries"</h2>
+<p>requests prints the same prefix for many different failures. The useful part is the class inside <code>Caused by (...)</code>. "Max retries exceeded" shows up even with no retries at all. By default requests uses 0 retries, and every message in the table below came from a plain <code>requests.get()</code> with the default setting.</p>
+
+<h2>2. The exact errors we got</h2>
+<table>
+<tr><th>Situation</th><th>Exception class</th><th>Caused by (exact text)</th><th>Time to fail</th></tr>
+<tr><td>Nothing listening on the port</td><td><code>ConnectionError</code></td><td><code>NewConnectionError(... Failed to establish a new connection: [Errno 111] Connection refused)</code></td><td>0.00 s</td></tr>
+<tr><td>Host name does not exist</td><td><code>ConnectionError</code></td><td><code>NameResolutionError(... Failed to resolve 'no-such-host.invalid' ([Errno -2] Name or service not known))</code></td><td>0.01 s</td></tr>
+<tr><td>Self-signed HTTPS certificate</td><td><code>SSLError</code></td><td><code>SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1029)')</code></td><td>0.03 s</td></tr>
+<tr><td>Cert trusted, but wrong host name</td><td><code>SSLError</code></td><td><code>... Hostname mismatch, certificate is not valid for 'localhost'.</code></td><td>0.00 s</td></tr>
+<tr><td>Server accepts but never answers, <code>timeout=(3, 1)</code></td><td><code>ReadTimeout</code></td><td>No "Max retries" text: <code>HTTPConnectionPool(host='127.0.0.1', port=8983): Read timed out. (read timeout=1)</code></td><td>1.00 s</td></tr>
+<tr><td>Server closes the socket without a reply</td><td><code>ConnectionError</code></td><td>No "Max retries" text: <code>('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))</code></td><td>0.00 s</td></tr>
+<tr><td>Server never answers, no <code>timeout</code></td><td>none</td><td>Still waiting when we killed it at 3 s</td><td>forever</td></tr>
+</table>
+<p>Full message for the refused case:</p>
+<pre><code>requests.exceptions.ConnectionError: HTTPConnectionPool(host='127.0.0.1', port=8985):
+Max retries exceeded with url: / (Caused by NewConnectionError("HTTPConnection(host='127.0.0.1',
+port=8985): Failed to establish a new connection: [Errno 111] Connection refused"))</code></pre>
+<p><code>SSLError</code> is a subclass of <code>ConnectionError</code>, so <code>except ConnectionError</code> also catches it. <code>ReadTimeout</code> is not. It inherits from <code>Timeout</code> and <code>RequestException</code>. Catch <code>requests.RequestException</code> if you want all of them.</p>
+
+<h2>3. Fix by cause</h2>
+<ul>
+<li><strong>Connection refused</strong>: the host is up but nothing listens on that port. Check the port, that the service is running and that it binds the right address. See <a href="/guides/err-connection-refused-econnrefused/">ERR_CONNECTION_REFUSED / ECONNREFUSED</a>.</li>
+<li><strong>NameResolutionError</strong>: DNS. Check the spelling, a missing scheme or stray path in the host, and DNS inside containers. See <a href="/guides/err-name-not-resolved/">ERR_NAME_NOT_RESOLVED</a>.</li>
+<li><strong>SSLError CERTIFICATE_VERIFY_FAILED</strong>: pass the CA file with <code>verify="/path/ca.pem"</code> instead of <code>verify=False</code>. The certificate must also match the host name you call. Our cert had <code>CN=localhost</code> and no SAN, and Python rejected it for <code>localhost</code> with "Hostname mismatch". Python checks the SAN only. See <a href="/guides/self-signed-certificate-in-certificate-chain/">self-signed certificate in certificate chain</a>.</li>
+<li><strong>RemoteDisconnected</strong>: the server or a proxy dropped the connection. Look at its logs. Often it crashed, or a keep-alive connection was closed while idle. See <a href="/guides/err-empty-response/">ERR_EMPTY_RESPONSE</a>.</li>
+<li><strong>ReadTimeout</strong>: the server is slow. Raise the read timeout or fix the slow endpoint.</li>
+</ul>
+
+<h2>4. Always set a timeout</h2>
+<p>requests has no default timeout. Our test call to a server that accepted the connection but never replied was still hanging when <code>timeout 3</code> killed it. Use a tuple: the first number is the connect timeout, the second is the read timeout.</p>
+<pre><code>r = requests.get(url, timeout=(3, 10))  # 3 s to connect, 10 s between bytes</code></pre>
+<p>With <code>timeout=(3, 1)</code> the slow server raised <code>ReadTimeout</code> after exactly 1.00 s.</p>
+
+<h2>5. Add real retries with HTTPAdapter and Retry</h2>
+<pre><code>import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+
+s = requests.Session()
+retry = Retry(total=3, backoff_factor=0.5,
+              status_forcelist=[502, 503, 504],
+              allowed_methods=None)  # None = retry all methods, incl. POST
+s.mount("http://", HTTPAdapter(max_retries=retry))
+s.mount("https://", HTTPAdapter(max_retries=retry))
+r = s.get(url, timeout=(3, 10))</code></pre>
+<p>What we measured with <code>total=3, backoff_factor=0.5</code> (connect timeout 3 s, read timeout 1 s where noted):</p>
+<table>
+<tr><th>Server behaviour</th><th>Server hits</th><th>Gaps between hits</th><th>Total time</th><th>Final exception</th></tr>
+<tr><td>Closes without reply</td><td>4</td><td>0.0, 1.0, 2.0 s</td><td>3.01 s</td><td><code>ConnectionError ... Caused by ProtocolError('Connection aborted.', RemoteDisconnected(...))</code></td></tr>
+<tr><td>Always 503</td><td>4</td><td>0.0, 1.0, 2.0 s</td><td>3.01 s</td><td><code>RetryError ... Caused by ResponseError('too many 503 error responses')</code></td></tr>
+<tr><td>Never answers, read timeout 1 s</td><td>4</td><td>1.0, 2.0, 3.0 s (1 s timeout + backoff)</td><td>7.01 s</td><td><code>ConnectionError ... Caused by ReadTimeoutError(... Read timed out. (read timeout=1))</code></td></tr>
+<tr><td>Port closed (refused)</td><td>0</td><td>-</td><td>3.00 s</td><td><code>ConnectionError ... Caused by NewConnectionError(... Connection refused)</code></td></tr>
+</table>
+<p>Things to notice:</p>
+<ul>
+<li><code>total=3</code> means 1 try plus 3 retries, so 4 hits.</li>
+<li>With <code>backoff_factor=0.5</code> the waits were 0, 1 and 2 s in our run.</li>
+<li>After retries run out, a read timeout comes back as <code>ConnectionError</code>, not <code>ReadTimeout</code>. Code that only catches <code>Timeout</code> will miss it.</li>
+<li>Exhausted status retries raise <code>RetryError</code>, which is not a <code>ConnectionError</code>.</li>
+<li>Without the adapter (default, 0 retries) a dropped connection fails at once with <code>('Connection aborted.', RemoteDisconnected(...))</code> and 1 server hit.</li>
+</ul>
+<p>Only retry requests that are safe to repeat. Per the urllib3 docs (not measured), the default <code>allowed_methods</code> excludes POST and PATCH. We set it to <code>None</code> only for the test.</p>
+
+<aside class="cta"><strong>Check what a URL actually answers before you blame your code:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does requests say Max retries exceeded when I never set retries?</summary><p>Because the message comes from urllib3, which wraps every connect error in MaxRetryError. With the default 0 retries we still got &quot;Max retries exceeded with url&quot; for refused, DNS and SSL errors after one attempt.</p></details>
+<details><summary>How do I see the real cause?</summary><p>Read the text after &quot;Caused by&quot;. NewConnectionError with Connection refused means nothing listens on the port. NameResolutionError means DNS. SSLError means the certificate failed. ReadTimeoutError means the server was too slow.</p></details>
+<details><summary>What timeout should I use with requests?</summary><p>Always pass one, because there is no default. Our call without a timeout was still waiting at 3 s and would wait forever. A tuple like timeout=(3, 10) sets 3 s to connect and 10 s to read.</p></details>
+<details><summary>Does except requests.ConnectionError catch timeouts?</summary><p>Not a plain ReadTimeout: it inherits from Timeout. But SSLError is a ConnectionError, and after Retry runs out a read timeout comes back as ConnectionError. Catch requests.RequestException to cover all of them.</p></details>
+<details><summary>How many times does Retry(total=3) hit the server?</summary><p>4 times: the first try plus 3 retries. With backoff_factor=0.5 we measured gaps of 0, 1 and 2 s, so about 3 s in total before the final error.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with requests 2.34.2, urllib3 2.8.0 and Python 3.13.5 against local Python socket servers (plain HTTP and a self-signed TLS server made with openssl). Error strings below are copied from the output. PlainHeaders is our extension; requests, urllib3 and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>strptime ValueError: time data does not match format (Tested)</title>
+<meta name="description" content="We measured Python strptime errors: trailing newlines, Z timestamps, %H with PM silently giving AM, %Z dropping the zone. Fixes that work, tested.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-strptime-valueerror-time-data-does-not-match-format/">
+<meta property="og:title" content="strptime ValueError: time data does not match format (Tested)">
+<meta property="og:description" content="We measured Python strptime errors: trailing newlines, Z timestamps, %H with PM silently giving AM, %Z dropping the zone. Fixes that work, tested.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-strptime-valueerror-time-data-does-not-match-format/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does 'time data does not match format' mean?", "acceptedAnswer": {"@type": "Answer", "text": "strptime() hit a character in the string that the format didn't expect, for example '-' where the format has '/', or a 2-digit year where %Y needs 4. We measured that the message shows the whole string and format but not the position where they diverged."}}, {"@type": "Question", "name": "What does 'unconverted data remains' mean?", "acceptedAnswer": {"@type": "Answer", "text": "The format matched the start of the string but there was text left over. We measured it on a trailing newline from readline() (the message then looks empty) and on a time part the format didn't include. Strip the input or extend the format."}}, {"@type": "Question", "name": "How do I parse an ISO 8601 string ending in Z?", "acceptedAnswer": {"@type": "Answer", "text": "Use datetime.fromisoformat(s) on Python 3.11+, or the %z directive in strptime. We measured that both return tzinfo=timezone.utc, while a literal 'Z' in the format returns a naive datetime that has lost the UTC information."}}, {"@type": "Question", "name": "Why is my PM time parsed as AM?", "acceptedAnswer": {"@type": "Answer", "text": "%p only works with %I. With %H we measured that 'Jan 5 2024 2:30 PM' parses to 02:30 with no error; with %I it parses to 14:30."}}, {"@type": "Question", "name": "Why does %Z fail on EST?", "acceptedAnswer": {"@type": "Answer", "text": "strptime's %Z only accepts UTC, GMT and the local machine's time zone names. We measured 'UTC' parsing (but returning a naive datetime) and 'EST' raising does not match format."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ValueError: time data does not match format (strptime, tested)</h1>
+<p class="lead"><code>ValueError: time data '...' does not match format '...'</code> and its sibling <code>unconverted data remains</code> come from <code>datetime.strptime()</code>. We ran 30 real-world string/format pairs on Python 3.13.5 and found that the errors are the easy part: two common formats parse <em>without</em> error and give the wrong answer.</p>
+<h2 id="two">1. Two different messages, two different problems</h2>
+<pre><code>from datetime import datetime
+
+for s, fmt in [(&quot;2024-01-05&quot;, &quot;%d/%m/%Y&quot;),
+               (&quot;2024-01-05\n&quot;, &quot;%Y-%m-%d&quot;),
+               (&quot;2024-01-05 14:30:00&quot;, &quot;%Y-%m-%d&quot;)]:
+    try:
+        datetime.strptime(s, fmt)
+    except ValueError as e:
+        print(repr(e))</code></pre>
+<pre><code>ValueError(&quot;time data &#x27;2024-01-05&#x27; does not match format &#x27;%d/%m/%Y&#x27;&quot;)
+ValueError(&#x27;unconverted data remains: \n&#x27;)
+ValueError(&#x27;unconverted data remains:  14:30:00&#x27;)</code></pre>
+<p><strong>Measured:</strong> <code>time data ... does not match format</code> means parsing failed somewhere in the middle: here the string uses <code>-</code> and starts with the year, the format expects <code>/</code> and the day first. <code>unconverted data remains: ...</code> means the format matched fine but the string kept going. The text after the colon is the leftover, and it is easy to miss when it is a <code>\n</code> from <code>readline()</code> or a trailing space: the message looks like it ends in nothing. Call <code>.strip()</code> on the input, or add the time part (<code>" %H:%M:%S"</code>) to the format.</p>
+
+<h2 id="z">2. ISO timestamps ending in Z</h2>
+<pre><code>from datetime import datetime
+
+s = &quot;2024-01-05T14:30:00Z&quot;
+print(repr(datetime.strptime(s, &quot;%Y-%m-%dT%H:%M:%SZ&quot;)))
+print(repr(datetime.strptime(s, &quot;%Y-%m-%dT%H:%M:%S%z&quot;)))
+print(repr(datetime.fromisoformat(s)))</code></pre>
+<pre><code>datetime.datetime(2024, 1, 5, 14, 30)
+datetime.datetime(2024, 1, 5, 14, 30, tzinfo=datetime.timezone.utc)
+datetime.datetime(2024, 1, 5, 14, 30, tzinfo=datetime.timezone.utc)</code></pre>
+<p><strong>Measured:</strong> putting a literal <code>Z</code> in the format parses without error but returns a <em>naive</em> datetime: the &ldquo;this is UTC&rdquo; information is thrown away, and later comparisons with aware datetimes raise <code>TypeError: can't compare offset-naive and offset-aware datetimes</code>. Use <code>%z</code>, which accepts <code>Z</code> and <code>+05:30</code> and returns <code>timezone.utc</code>, or skip the format entirely: <code>datetime.fromisoformat()</code> accepts the trailing <code>Z</code> on Python 3.11 and newer (we tested 3.13.5). If the string has fractional seconds (<code>.123Z</code>), the <code>strptime</code> format needs <code>.%f</code> as well or you get the &ldquo;does not match&rdquo; error; <code>fromisoformat</code> handles both.</p>
+
+<h2 id="pm">3. 12-hour times: the silent wrong answer</h2>
+<pre><code>from datetime import datetime
+
+s = &quot;Jan 5 2024 2:30 PM&quot;
+print(datetime.strptime(s, &quot;%b %d %Y %H:%M %p&quot;))
+print(datetime.strptime(s, &quot;%b %d %Y %I:%M %p&quot;))</code></pre>
+<pre><code>2024-01-05 02:30:00
+2024-01-05 14:30:00</code></pre>
+<p><strong>Measured:</strong> with <code>%H</code> (24-hour), the <code>PM</code> is matched by <code>%p</code> and then ignored. 2:30 PM becomes 02:30 with no error at all. <code>%p</code> only has an effect together with <code>%I</code> (12-hour clock). This one never raises, so grep your formats for <code>%H</code> next to <code>%p</code>.</p>
+
+<h2 id="tz">4. %Z only knows a few names</h2>
+<pre><code>from datetime import datetime
+
+for s in [&quot;2024-01-05 14:30:00 UTC&quot;, &quot;2024-01-05 14:30:00 EST&quot;]:
+    try:
+        print(repr(datetime.strptime(s, &quot;%Y-%m-%d %H:%M:%S %Z&quot;)))
+    except ValueError as e:
+        print(repr(e))</code></pre>
+<pre><code>datetime.datetime(2024, 1, 5, 14, 30)
+ValueError(&quot;time data &#x27;2024-01-05 14:30:00 EST&#x27; does not match format &#x27;%Y-%m-%d %H:%M:%S %Z&#x27;&quot;)</code></pre>
+<p><strong>Measured:</strong> <code>%Z</code> accepted <code>UTC</code> (and <code>GMT</code>, which we also tested) but the result is naive: the zone is checked, then discarded. <code>EST</code> was rejected outright. Per the docs, <code>%Z</code> only accepts UTC, GMT and the machine's local <code>time.tzname</code> names, so the same code can pass on one server and fail on another. Prefer numeric offsets with <code>%z</code>; if your input really has names like EST, map them to offsets yourself or use <code>zoneinfo</code>.</p>
+
+<h2 id="other">5. Errors that look like the same problem but aren't</h2>
+<pre><code>from datetime import datetime
+
+for s, fmt in [(&quot;2/30/2024&quot;, &quot;%m/%d/%Y&quot;),
+               (&quot;January 5 2024&quot;, &quot;%b %d %Y&quot;),
+               (&quot;1704465000&quot;, &quot;%s&quot;)]:
+    try:
+        datetime.strptime(s, fmt)
+    except ValueError as e:
+        print(repr(e))</code></pre>
+<pre><code>ValueError(&#x27;day is out of range for month&#x27;)
+ValueError(&quot;time data &#x27;January 5 2024&#x27; does not match format &#x27;%b %d %Y&#x27;&quot;)
+ValueError(&quot;&#x27;s&#x27; is a bad directive in format &#x27;%s&#x27;&quot;)</code></pre>
+<p><strong>Measured:</strong> February 30 matches the format and then fails validation with <code>day is out of range for month</code> &mdash; the format is right, the data is wrong. <code>%b</code> is the abbreviated month (<code>Jan</code>) and won't accept <code>January</code>; use <code>%B</code> for full names (both are locale-dependent). <code>%s</code> (Unix timestamp) is not a <code>strptime</code> directive; use <code>datetime.fromtimestamp(int(s), tz=timezone.utc)</code>. Also note that <code>%d</code> and <code>%m</code> accept unpadded values (<code>5/1/2024</code> parsed fine), and <code>%Y</code> requires four digits (<code>24-01-05</code> failed; use <code>%y</code> for two).</p>
+
+<h2 id="fix">6. A parser for messy input</h2>
+<pre><code>from datetime import datetime
+
+FORMATS = [&quot;%Y-%m-%d&quot;, &quot;%d/%m/%Y&quot;, &quot;%b %d %Y&quot;, &quot;%B %d %Y&quot;]
+
+def parse_date(s):
+    s = s.strip()
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        pass
+    for fmt in FORMATS:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f&quot;unrecognised date {s!r}; tried ISO 8601 and {FORMATS}&quot;)
+
+for s in [&quot;2024-01-05\n&quot;, &quot;05/01/2024&quot;, &quot;January 5 2024&quot;, &quot;2024-01-05T14:30:00Z&quot;]:
+    print(repr(parse_date(s)))
+try:
+    parse_date(&quot;5th Jan&quot;)
+except ValueError as e:
+    print(e)</code></pre>
+<pre><code>datetime.datetime(2024, 1, 5, 0, 0)
+datetime.datetime(2024, 1, 5, 0, 0)
+datetime.datetime(2024, 1, 5, 0, 0)
+datetime.datetime(2024, 1, 5, 14, 30, tzinfo=datetime.timezone.utc)
+unrecognised date &#x27;5th Jan&#x27;; tried ISO 8601 and [&#x27;%Y-%m-%d&#x27;, &#x27;%d/%m/%Y&#x27;, &#x27;%b %d %Y&#x27;, &#x27;%B %d %Y&#x27;]</code></pre>
+<p>Strip first, try <code>fromisoformat()</code> (which covers most machine-written timestamps), then a short list of known formats, and raise an error that shows the actual value. Keep the list short and ordered on purpose: <code>05/01/2024</code> is 5 January with <code>%d/%m/%Y</code> first and 1 May if <code>%m/%d/%Y</code> comes first, and both &ldquo;succeed&rdquo;. Don't put both in the same list; decide per data source.</p>
+
+<aside class="cta"><strong>Parsing dates out of HTTP responses (Date, Last-Modified, Expires)? See the exact header strings a server sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &#x27;time data does not match format&#x27; mean?</summary><p>strptime() hit a character in the string that the format didn&#x27;t expect, for example &#x27;-&#x27; where the format has &#x27;/&#x27;, or a 2-digit year where %Y needs 4. We measured that the message shows the whole string and format but not the position where they diverged.</p></details>
+<details><summary>What does &#x27;unconverted data remains&#x27; mean?</summary><p>The format matched the start of the string but there was text left over. We measured it on a trailing newline from readline() (the message then looks empty) and on a time part the format didn&#x27;t include. Strip the input or extend the format.</p></details>
+<details><summary>How do I parse an ISO 8601 string ending in Z?</summary><p>Use datetime.fromisoformat(s) on Python 3.11+, or the %z directive in strptime. We measured that both return tzinfo=timezone.utc, while a literal &#x27;Z&#x27; in the format returns a naive datetime that has lost the UTC information.</p></details>
+<details><summary>Why is my PM time parsed as AM?</summary><p>%p only works with %I. With %H we measured that &#x27;Jan 5 2024 2:30 PM&#x27; parses to 02:30 with no error; with %I it parses to 14:30.</p></details>
+<details><summary>Why does %Z fail on EST?</summary><p>strptime&#x27;s %Z only accepts UTC, GMT and the local machine&#x27;s time zone names. We measured &#x27;UTC&#x27; parsing (but returning a naive datetime) and &#x27;EST&#x27; raising does not match format.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s datetime.strptime() and datetime.fromisoformat() on 30 input/format pairs: separator and year mismatches, trailing newline, ISO 8601 with Z and fractional seconds, %H vs %I with %p, %Z with UTC/GMT/EST, out-of-range days, %b vs %B and %s. Every code block on this page was run verbatim and its output pasted from that run. PlainHeaders is our extension; Python&#x27;s datetime module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python zlib.error: Error -3 incorrect header check (Tested)</title>
+<meta name="description" content="Measured in Python 3.13.5: which wbits decodes zlib, gzip and raw deflate, why 47 misses raw deflate, and the truncated stream that decompressobj hides.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-zlib-error-3-incorrect-header-check-decompress/">
+<meta property="og:title" content="Python zlib.error: Error -3 incorrect header check (Tested)">
+<meta property="og:description" content="Measured in Python 3.13.5: which wbits decodes zlib, gzip and raw deflate, why 47 misses raw deflate, and the truncated stream that decompressobj hides.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-zlib-error-3-incorrect-header-check-decompress/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does zlib.error: Error -3 while decompressing data: incorrect header check mean?", "acceptedAnswer": {"@type": "Answer", "text": "The data isn't in the format the wbits value expects. We measured gzip, raw deflate, base64 text and uncompressed bytes all giving it with the default wbits; use wbits=47 for zlib or gzip, -15 for raw deflate."}}, {"@type": "Question", "name": "How do I decompress gzip data with zlib?", "acceptedAnswer": {"@type": "Answer", "text": "zlib.decompress(data, 31) for gzip only, or 47 to auto-detect zlib and gzip. We measured both working on gzip.compress() output."}}, {"@type": "Question", "name": "What does Error -5 incomplete or truncated stream mean?", "acceptedAnswer": {"@type": "Answer", "text": "The compressed data was cut off. We measured it with half of a valid stream; decompressobj() returned partial data with no error, so check d.eof."}}, {"@type": "Question", "name": "Does wbits=47 handle raw deflate?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured auto mode (47) failing on raw deflate with incorrect header check; raw deflate needs wbits=-15."}}, {"@type": "Question", "name": "Why does zlib.decompress fail on base64 data?", "acceptedAnswer": {"@type": "Answer", "text": "Base64 text isn't compressed bytes. Decode it with base64.b64decode() first; we measured the direct call giving incorrect header check."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>zlib.error Error -3 incorrect header check (tested)</h1>
+<p class="lead"><code>zlib.error: Error -3 while decompressing data: incorrect header check</code> means you handed <code>zlib.decompress()</code> a format it wasn't told to expect. We ran zlib, gzip, raw deflate and plain bytes against every common <code>wbits</code> value, plus truncated and base64 input.</p>
+<h2 id="header">1. incorrect header check = wrong format for the wbits you used</h2>
+<pre><code>import gzip, zlib
+
+text = b&quot;hello world &quot; * 200
+formats = {
+    &quot;zlib (zlib.compress)&quot;:  zlib.compress(text),
+    &quot;gzip (gzip.compress)&quot;:  gzip.compress(text),
+    &quot;raw deflate&quot;:           (lambda c: c.compress(text) + c.flush())(
+                                 zlib.compressobj(wbits=-15)),
+    &quot;not compressed&quot;:        text,
+}
+for label, data in formats.items():
+    print(f&quot;{label:22} first bytes {data[:2].hex()}&quot;)
+    for wbits, name in [(15, &quot;default&quot;), (31, &quot;gzip only&quot;), (-15, &quot;raw only&quot;), (47, &quot;auto&quot;)]:
+        try:
+            out = zlib.decompress(data, wbits)
+            print(f&quot;    wbits={wbits:3} ({name:9}) OK {len(out)} bytes&quot;)
+        except zlib.error as e:
+            print(f&quot;    wbits={wbits:3} ({name:9}) zlib.error: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>zlib (zlib.compress)   first bytes 789c
+    wbits= 15 (default  ) OK 2400 bytes
+    wbits= 31 (gzip only) zlib.error: Error -3 while decompressing data: incorrect header check
+    wbits=-15 (raw only ) zlib.error: Error -3 while decompressing data: invalid stored block lengths
+    wbits= 47 (auto     ) OK 2400 bytes
+gzip (gzip.compress)   first bytes 1f8b
+    wbits= 15 (default  ) zlib.error: Error -3 while decompressing data: incorrect header check
+    wbits= 31 (gzip only) OK 2400 bytes
+    wbits=-15 (raw only ) zlib.error: Error -3 while decompressing data: invalid block type
+    wbits= 47 (auto     ) OK 2400 bytes
+raw deflate            first bytes cb48
+    wbits= 15 (default  ) zlib.error: Error -3 while decompressing data: incorrect header check
+    wbits= 31 (gzip only) zlib.error: Error -3 while decompressing data: incorrect header check
+    wbits=-15 (raw only ) OK 2400 bytes
+    wbits= 47 (auto     ) zlib.error: Error -3 while decompressing data: incorrect header check
+not compressed         first bytes 6865
+    wbits= 15 (default  ) zlib.error: Error -3 while decompressing data: incorrect header check
+    wbits= 31 (gzip only) zlib.error: Error -3 while decompressing data: incorrect header check
+    wbits=-15 (raw only ) zlib.error: Error -3 while decompressing data: invalid stored block lengths
+    wbits= 47 (auto     ) zlib.error: Error -3 while decompressing data: incorrect header check</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> <code>zlib.decompress()</code> by default only accepts the zlib format (first bytes <code>78 9c</code> and friends). Gzip data (<code>1f 8b</code>), raw deflate, and data that isn't compressed all fail with <code>Error -3 while decompressing data: incorrect header check</code>. The fix is the <code>wbits</code> argument:</p>
+<ul>
+<li><code>wbits=31</code> (16+15): gzip only, the same as <code>gzip.decompress()</code>.</li>
+<li><code>wbits=47</code> (32+15): auto-detects zlib <em>or</em> gzip. It worked for both above.</li>
+<li><code>wbits=-15</code>: raw deflate with no header (e.g. zip members, some HTTP <code>deflate</code> bodies, PHP <code>gzdeflate</code>). Note that auto mode (47) does <strong>not</strong> detect raw deflate: it gave <code>incorrect header check</code>.</li>
+</ul>
+<p>Using the wrong <code>wbits</code> can also give other <code>Error -3</code> texts, like <code>invalid stored block lengths</code> or <code>invalid block type</code>: we got those when decoding zlib, gzip and plain bytes as raw deflate.</p>
+
+<h2 id="truncated">2. Error -5: incomplete or truncated stream</h2>
+<pre><code>import zlib
+
+data = zlib.compress(bytes(range(256)) * 400)
+cut = data[: len(data) // 2]                     # download stopped halfway
+
+try:
+    zlib.decompress(cut)
+except zlib.error as e:
+    print(&quot;zlib.decompress:&quot;, e)
+
+d = zlib.decompressobj()
+out = d.decompress(cut)                          # streaming API: no exception
+print(f&quot;decompressobj: returned {len(out)} bytes, no error; d.eof = {d.eof}&quot;)
+try:
+    d.flush()
+    print(&quot;flush(): no error either&quot;)
+except zlib.error as e:
+    print(&quot;flush():&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>zlib.decompress: Error -5 while decompressing data: incomplete or truncated stream
+decompressobj: returned 10319 bytes, no error; d.eof = False
+flush(): no error either</code></pre>
+<p><strong>Measured:</strong> half of a valid zlib stream gives <code>Error -5 while decompressing data: incomplete or truncated stream</code> from <code>zlib.decompress()</code>. The streaming <code>decompressobj()</code> API raised nothing: it returned the 10,319 bytes it could decode out of 102,400, and even <code>flush()</code> stayed silent. The only sign was <code>d.eof == False</code>. Check <code>eof</code> after the last chunk whenever you decompress a stream, or you will save truncated data without noticing.</p>
+
+<h2 id="base64">3. Base64 text and str input</h2>
+<pre><code>import base64, zlib
+
+payload = zlib.compress(b&#x27;{&quot;id&quot;: 1, &quot;name&quot;: &quot;widget&quot;}&#x27;)
+as_b64 = base64.b64encode(payload)              # what APIs and JSON fields carry
+as_str = payload.decode(&quot;latin-1&quot;)              # bytes that went through a str
+
+for label, data in [(&quot;base64 text&quot;, as_b64), (&quot;str&quot;, as_str)]:
+    try:
+        zlib.decompress(data)
+    except (zlib.error, TypeError) as e:
+        print(f&quot;{label:12} {type(e).__name__}: {e}&quot;)
+
+def smart_decompress(data):
+    if isinstance(data, str):
+        data = data.encode(&quot;latin-1&quot;)
+    if data[:2] not in (b&quot;\x78\x01&quot;, b&quot;\x78\x5e&quot;, b&quot;\x78\x9c&quot;, b&quot;\x78\xda&quot;, b&quot;\x1f\x8b&quot;):
+        try:                                     # maybe base64 of compressed data
+            data = base64.b64decode(data, validate=True)
+        except ValueError:
+            pass
+    for wbits in (47, -15):                      # zlib/gzip auto, then raw deflate
+        try:
+            return zlib.decompress(data, wbits)
+        except zlib.error as e:
+            err = e
+    raise err
+
+print(&quot;smart:&quot;, smart_decompress(as_b64))
+print(&quot;smart:&quot;, smart_decompress(as_str))</code></pre>
+<p>Output:</p>
+<pre><code>base64 text  error: Error -3 while decompressing data: incorrect header check
+str          TypeError: a bytes-like object is required, not &#x27;str&#x27;
+smart: b&#x27;{&quot;id&quot;: 1, &quot;name&quot;: &quot;widget&quot;}&#x27;
+smart: b&#x27;{&quot;id&quot;: 1, &quot;name&quot;: &quot;widget&quot;}&#x27;</code></pre>
+<p><strong>Measured:</strong> compressed bytes often travel as base64 inside JSON or HTTP headers. Passing the base64 text straight to <code>zlib.decompress()</code> gives <code>incorrect header check</code>, so decode it with <code>base64.b64decode()</code> first. A <code>str</code> raises <code>TypeError: a bytes-like object is required</code>. Bytes that were decoded into a str through Latin-1 can be recovered with <code>.encode("latin-1")</code>; other text encodings (UTF-8 with <code>errors="replace"</code>, for example) lose bytes for good. The helper above sniffs the header, tries base64, then tries <code>wbits=47</code> and <code>-15</code>, and decoded both inputs. If you got the data from requests, you usually don't need zlib at all: requests already decompresses gzip and deflate response bodies listed in <code>Content-Encoding</code>, so <code>r.content</code> is plain.</p>
+
+<aside class="cta"><strong>Not sure what compression a server is sending? Check its Content-Encoding header:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does zlib.error: Error -3 while decompressing data: incorrect header check mean?</summary><p>The data isn&#x27;t in the format the wbits value expects. We measured gzip, raw deflate, base64 text and uncompressed bytes all giving it with the default wbits; use wbits=47 for zlib or gzip, -15 for raw deflate.</p></details>
+<details><summary>How do I decompress gzip data with zlib?</summary><p>zlib.decompress(data, 31) for gzip only, or 47 to auto-detect zlib and gzip. We measured both working on gzip.compress() output.</p></details>
+<details><summary>What does Error -5 incomplete or truncated stream mean?</summary><p>The compressed data was cut off. We measured it with half of a valid stream; decompressobj() returned partial data with no error, so check d.eof.</p></details>
+<details><summary>Does wbits=47 handle raw deflate?</summary><p>No. We measured auto mode (47) failing on raw deflate with incorrect header check; raw deflate needs wbits=-15.</p></details>
+<details><summary>Why does zlib.decompress fail on base64 data?</summary><p>Base64 text isn&#x27;t compressed bytes. Decode it with base64.b64decode() first; we measured the direct call giving incorrect header check.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 on Debian with Python 3.13.5&#x27;s zlib: zlib, gzip, raw deflate and uncompressed input against wbits 15, 31, -15 and 47; a truncated stream through decompress() and decompressobj(); base64 and str input. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; Python&#x27;s zlib is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

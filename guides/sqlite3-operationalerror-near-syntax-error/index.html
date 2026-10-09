@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sqlite3.OperationalError: near &quot;X&quot;: syntax error (Tested)</title>
+<meta name="description" content="We measured the causes of sqlite3 near X: syntax error in Python: reserved words like order, %s placeholders, ? for table names, quotes in f-strings.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite3-operationalerror-near-syntax-error/">
+<meta property="og:title" content="sqlite3.OperationalError: near &quot;X&quot;: syntax error (Tested)">
+<meta property="og:description" content="We measured the causes of sqlite3 near X: syntax error in Python: reserved words like order, %s placeholders, ? for table names, quotes in f-strings.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite3-operationalerror-near-syntax-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does sqlite3.OperationalError near X: syntax error mean?", "acceptedAnswer": {"@type": "Answer", "text": "SQLite's parser hit token X where it didn't fit. The real mistake is often the token just before it; we measured a trailing comma reported as near \")\" with SQLite 3.46.1."}}, {"@type": "Question", "name": "Why do I get near \"order\": syntax error?", "acceptedAnswer": {"@type": "Answer", "text": "order (like group, select, values) is a SQL keyword. We measured an unquoted order column failing and \"order\" in double quotes working."}}, {"@type": "Question", "name": "Why does %s give near \"%\": syntax error in sqlite3?", "acceptedAnswer": {"@type": "Answer", "text": "Python's sqlite3 uses ? or :name placeholders, not %s. We measured %s failing and ? working."}}, {"@type": "Question", "name": "Can I use ? for a table name in sqlite3?", "acceptedAnswer": {"@type": "Answer", "text": "No, placeholders are for values only. We measured SELECT * FROM ? failing with near \"?\": syntax error. Validate the name against an allow-list and format it in."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>sqlite3.OperationalError: near X: syntax error (tested)</h1>
+<p class="lead"><code>sqlite3.OperationalError: near "X": syntax error</code> names the token where SQLite gave up, not always the mistake. We measured the causes that show up most in Python code.</p>
+<h2 id="read">How to read it</h2>
+<p>The quoted token is where SQLite's parser gave up, which is often <em>at or just after</em> the real mistake, not the mistake itself. Look at the token and the word right before it. Below are the causes we hit most in Python code, each measured with SQLite 3.46.1 through Python 3.13.5's <code>sqlite3</code>.</p>
+
+<h2 id="reserved">1. A reserved word as a column name, or a trailing comma</h2>
+<pre><code>import sqlite3
+con = sqlite3.connect(&quot;:memory:&quot;)
+for sql in [&quot;CREATE TABLE t (id INTEGER, order TEXT)&quot;,
+            &quot;CREATE TABLE t (id INTEGER, group TEXT)&quot;,
+            &quot;CREATE TABLE t (id INTEGER, name TEXT,)&quot;]:
+    try:
+        con.execute(sql)
+    except sqlite3.OperationalError as e:
+        print(f&quot;{e!s:32} &lt;- {sql}&quot;)
+con.execute(&#x27;CREATE TABLE t (id INTEGER, &quot;order&quot; TEXT)&#x27;)   # fix: quote the identifier
+print(&quot;quoted works:&quot;, con.execute(&#x27;SELECT &quot;order&quot; FROM t&#x27;).fetchall())</code></pre>
+<p>Output:</p>
+<pre><code>near &quot;order&quot;: syntax error       &lt;- CREATE TABLE t (id INTEGER, order TEXT)
+near &quot;group&quot;: syntax error       &lt;- CREATE TABLE t (id INTEGER, group TEXT)
+near &quot;)&quot;: syntax error           &lt;- CREATE TABLE t (id INTEGER, name TEXT,)
+quoted works: []</code></pre>
+<p><strong>Measured:</strong> <code>order</code> and <code>group</code> are SQL keywords, so an unquoted column with that name fails. Quote it with double quotes (<code>"order"</code>), and keep quoting it in every query, or rename the column. A trailing comma before <code>)</code> is reported as <code>near ")"</code>: the comma is the mistake, the parenthesis is where the parser noticed.</p>
+
+<h2 id="placeholders">2. %s placeholders, and ? for a table name</h2>
+<pre><code>import sqlite3
+con = sqlite3.connect(&quot;:memory:&quot;)
+con.execute(&quot;CREATE TABLE users (name TEXT)&quot;)
+for sql, args in [(&quot;INSERT INTO users VALUES (%s)&quot;, (&quot;ann&quot;,)),       # psycopg/MySQL style
+                  (&quot;SELECT * FROM ?&quot;, (&quot;users&quot;,))]:                  # table name as a parameter
+    try:
+        con.execute(sql, args)
+    except sqlite3.OperationalError as e:
+        print(f&quot;{e!s:28} &lt;- {sql}&quot;)
+con.execute(&quot;INSERT INTO users VALUES (?)&quot;, (&quot;ann&quot;,))               # fix: ? placeholders
+print(con.execute(&quot;SELECT * FROM users&quot;).fetchall())</code></pre>
+<p>Output:</p>
+<pre><code>near &quot;%&quot;: syntax error       &lt;- INSERT INTO users VALUES (%s)
+near &quot;?&quot;: syntax error       &lt;- SELECT * FROM ?
+[(&#x27;ann&#x27;,)]</code></pre>
+<p><strong>Measured:</strong> <code>%s</code> is the psycopg2 / MySQL placeholder; Python's <code>sqlite3</code> uses <code>?</code> (or <code>:name</code>), so <code>%s</code> code ported from Postgres fails with <code>near "%"</code>. Placeholders can only stand for <em>values</em>, never table or column names, so <code>FROM ?</code> fails too. For a dynamic table name, check it against a fixed allow-list and then format it into the SQL.</p>
+
+<h2 id="fstring">3. A quote inside an f-string value</h2>
+<pre><code>import sqlite3
+con = sqlite3.connect(&quot;:memory:&quot;)
+con.execute(&quot;CREATE TABLE users (name TEXT)&quot;)
+name = &quot;O&#x27;Brien&quot;
+try:
+    con.execute(f&quot;INSERT INTO users VALUES (&#x27;{name}&#x27;)&quot;)             # quote breaks the SQL
+except sqlite3.OperationalError as e:
+    print(e)
+con.execute(&quot;INSERT INTO users VALUES (?)&quot;, (name,))                # fix + no SQL injection
+print(con.execute(&quot;SELECT * FROM users&quot;).fetchall())</code></pre>
+<p>Output:</p>
+<pre><code>near &quot;Brien&quot;: syntax error
+[(&quot;O&#x27;Brien&quot;,)]</code></pre>
+<p><strong>Measured:</strong> the apostrophe in <code>O'Brien</code> ends the SQL string early and the parser fails on the rest of the name. This is the same hole SQL injection uses. Pass values as parameters with <code>?</code> and the problem disappears.</p>
+
+<h2 id="built">4. SQL built from pieces</h2>
+<pre><code>import sqlite3
+con = sqlite3.connect(&quot;:memory:&quot;)
+con.execute(&quot;CREATE TABLE t (a, b)&quot;)
+try:   # column list built with join() from an empty list
+    con.execute(f&quot;SELECT {&#x27;, &#x27;.join([])} FROM t&quot;)
+except sqlite3.OperationalError as e:
+    print(e)
+try:
+    con.execute(&quot;SELECT a b c FROM t&quot;)       # missing commas
+except sqlite3.OperationalError as e:
+    print(e)
+print(&quot;sqlite&quot;, sqlite3.sqlite_version)</code></pre>
+<p>Output:</p>
+<pre><code>near &quot;FROM&quot;: syntax error
+near &quot;c&quot;: syntax error
+sqlite 3.46.1</code></pre>
+<p><strong>Measured:</strong> joining an empty column list produces <code>SELECT  FROM t</code>, reported as <code>near "FROM"</code>. Missing commas fail one token late: <code>a b</code> is valid (column <code>a</code> aliased as <code>b</code>), so the error lands on <code>c</code>. When the SQL is generated, <code>print()</code> the final string before executing it. For "incomplete input" and "unrecognized token", see <a href="/guides/sqlite-incomplete-input/">our SQLite parser errors guide</a>.</p>
+
+<aside class="cta"><strong>Building a small API on SQLite? Check the real status and headers it returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does sqlite3.OperationalError near X: syntax error mean?</summary><p>SQLite&#x27;s parser hit token X where it didn&#x27;t fit. The real mistake is often the token just before it; we measured a trailing comma reported as near &quot;)&quot; with SQLite 3.46.1.</p></details>
+<details><summary>Why do I get near &quot;order&quot;: syntax error?</summary><p>order (like group, select, values) is a SQL keyword. We measured an unquoted order column failing and &quot;order&quot; in double quotes working.</p></details>
+<details><summary>Why does %s give near &quot;%&quot;: syntax error in sqlite3?</summary><p>Python&#x27;s sqlite3 uses ? or :name placeholders, not %s. We measured %s failing and ? working.</p></details>
+<details><summary>Can I use ? for a table name in sqlite3?</summary><p>No, placeholders are for values only. We measured SELECT * FROM ? failing with near &quot;?&quot;: syntax error. Validate the name against an allow-list and format it in.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 and SQLite 3.46.1 on Linux: reserved-word column names, a trailing comma, %s placeholders, ? for a table name, an apostrophe in an f-string, an empty joined column list and missing commas. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; SQLite and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

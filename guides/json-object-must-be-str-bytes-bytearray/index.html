@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>&quot;JSON Object Must Be str, bytes or bytearray&quot; — Fixed</title>
+<meta name="description" content="We measured four causes of this TypeError: passing a file object, None, an already-parsed dict, or a custom object to json.loads() instead of json.load().">
+<link rel="canonical" href="https://honestkit.github.io/guides/json-object-must-be-str-bytes-bytearray/">
+<meta property="og:title" content="&quot;JSON Object Must Be str, bytes or bytearray&quot; — Fixed">
+<meta property="og:description" content="We measured four causes of this TypeError: passing a file object, None, an already-parsed dict, or a custom object to json.loads() instead of json.load().">
+<meta property="og:url" content="https://honestkit.github.io/guides/json-object-must-be-str-bytes-bytearray/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why do I get \"not TextIOWrapper\" when parsing a file?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed this means a file object was passed to json.loads() instead of json.load() \u2014 loads() expects a string you already have in memory, while load() takes the file object itself and reads it internally."}}, {"@type": "Question", "name": "Why does json.loads(None) raise this error?", "acceptedAnswer": {"@type": "Answer", "text": "Because we measured that None isn't str, bytes, or bytearray \u2014 this surfaces whenever an upstream lookup silently returns nothing, such as dict.get() with no default, an unset environment variable, or an empty HTTP response body."}}, {"@type": "Question", "name": "Can json.loads() accept bytes directly, or does it need .decode() first?", "acceptedAnswer": {"@type": "Answer", "text": "It accepts bytes and bytearray directly \u2014 we measured json.loads(b'{\"a\": 1}') working with no decode() call, auto-detecting UTF-8/16/32 by BOM or byte pattern, so this error means the input truly isn't text or bytes at all."}}, {"@type": "Question", "name": "Why would json.loads() complain about a dict?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed this happens when data is already parsed \u2014 often because a library like requests' response.json() already returns a dict, and a redundant second json.loads() call gets applied to that already-parsed result."}}, {"@type": "Question", "name": "Does json.loads() automatically call .read() on a response-like object?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we tested a custom object with its own .read() method and json.loads() did not call it automatically; you have to extract the actual text or bytes yourself using whatever accessor that object's own API provides, then pass the result in."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TypeError: the JSON Object Must Be str, bytes or bytearray (tested)</h1>
+<p class="lead"><code>json.loads()</code> only accepts text: a <code>str</code>, <code>bytes</code>, or <code>bytearray</code>. Anything else raises <code>TypeError: the JSON object must be str, bytes or bytearray, not X</code>, naming whatever type you actually passed. We measured the four things people pass by mistake.</p>
+<h2 id="repro1">1. The classic mistake: a file object instead of its contents</h2>
+<pre><code>import json
+
+with open("data.json") as f:
+    json.loads(f)
+TypeError: the JSON object must be str, bytes or bytearray, not TextIOWrapper
+
+with open("data.json") as f:
+    json.load(f)   # correct: note load(), not loads()
+{'a': 1}</code></pre>
+<p><strong>Measured:</strong> this is the single most common cause &mdash; confusing <code>json.load()</code> (takes a file object, reads it internally) with <code>json.loads()</code> (takes a string you already have). The error message names the exact wrapper type, <code>TextIOWrapper</code>, which is the giveaway that a file handle was passed where text was expected.</p>
+
+<h2 id="repro2">2. None &mdash; usually from a lookup that silently failed</h2>
+<pre><code>import os
+val = os.environ.get("NONEXISTENT_VAR")
+json.loads(val)
+TypeError: the JSON object must be str, bytes or bytearray, not NoneType</code></pre>
+<p><strong>Measured:</strong> this fires whenever the value feeding <code>json.loads()</code> turns out to be <code>None</code> &mdash; a dict's <code>.get()</code> with no default, an environment variable that isn't set, or an HTTP client's <code>.text</code>/<code>.content</code> attribute being <code>None</code> on an empty or failed response. The <code>NoneType</code> in the message is the signal that something upstream returned nothing when you expected a string.</p>
+
+<h2 id="repro3">3. A dict that's already parsed (double-parsing)</h2>
+<pre><code>d = {"a": 1}
+json.loads(d)
+TypeError: the JSON object must be str, bytes or bytearray, not dict</code></pre>
+<p><strong>Measured:</strong> this happens when code calls <code>json.loads()</code> on data that's already a Python object &mdash; for example, a library (like <code>requests</code>' <code>response.json()</code>) that already returns a parsed dict, and a second, unnecessary <code>json.loads()</code> call gets applied on top of it.</p>
+
+<h2 id="repro4">4. Any other object without special handling</h2>
+<pre><code>class FakeResponse:
+    def read(self): return b"{}"
+
+json.loads(FakeResponse())
+TypeError: the JSON object must be str, bytes or bytearray, not FakeResponse</code></pre>
+<p><strong>Measured:</strong> a response-like object with its own <code>.read()</code> or <code>.text</code> method isn't automatically unwrapped &mdash; <code>json.loads()</code> has no idea how to extract text from an arbitrary object. You have to call the right accessor yourself first (<code>.read()</code>, <code>.text</code>, <code>.json()</code>, whatever the library provides) and pass <em>that</em> result in.</p>
+
+<h2 id="repro5">5. bytes and bytearray both work fine &mdash; this isn't a strict str-only check</h2>
+<pre><code>json.loads(b'{"a": 1}')
+{'a': 1}</code></pre>
+<p><strong>Measured:</strong> despite the name, this accepts raw bytes directly (UTF-8, UTF-16, or UTF-32, auto-detected by BOM or null-byte pattern) without needing <code>.decode()</code> first &mdash; so if you're getting this error, the input genuinely isn't text or bytes at all, not just the wrong encoding.</p>
+
+<h2 id="fix">6. How to read the message to find the fix</h2>
+<p>The type named at the end of the message tells you exactly what to do: <code>TextIOWrapper</code> (or any file-like type) means swap <code>json.loads()</code> for <code>json.load()</code>, or call <code>.read()</code> first; <code>NoneType</code> means trace back why the value upstream is empty before it ever reaches <code>json.loads()</code>; <code>dict</code> (or <code>list</code>) means the data was already parsed and the call is redundant; anything else means you need to extract the actual text/bytes from that object's own API first.</p>
+
+<aside class="cta"><strong>Debugging what an API response body actually contains before you parse it? Check the real headers and status it sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why do I get &quot;not TextIOWrapper&quot; when parsing a file?</summary><p>We confirmed this means a file object was passed to json.loads() instead of json.load() — loads() expects a string you already have in memory, while load() takes the file object itself and reads it internally.</p></details>
+<details><summary>Why does json.loads(None) raise this error?</summary><p>Because we measured that None isn&#x27;t str, bytes, or bytearray — this surfaces whenever an upstream lookup silently returns nothing, such as dict.get() with no default, an unset environment variable, or an empty HTTP response body.</p></details>
+<details><summary>Can json.loads() accept bytes directly, or does it need .decode() first?</summary><p>It accepts bytes and bytearray directly — we measured json.loads(b&#x27;{&quot;a&quot;: 1}&#x27;) working with no decode() call, auto-detecting UTF-8/16/32 by BOM or byte pattern, so this error means the input truly isn&#x27;t text or bytes at all.</p></details>
+<details><summary>Why would json.loads() complain about a dict?</summary><p>We confirmed this happens when data is already parsed — often because a library like requests&#x27; response.json() already returns a dict, and a redundant second json.loads() call gets applied to that already-parsed result.</p></details>
+<details><summary>Does json.loads() automatically call .read() on a response-like object?</summary><p>No — we tested a custom object with its own .read() method and json.loads() did not call it automatically; you have to extract the actual text or bytes yourself using whatever accessor that object&#x27;s own API provides, then pass the result in.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in json module, calling json.loads() on several non-string inputs and printing the exact exception text. Every message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s json module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TextIOWrapper tell()+N Seeks Can Silently Skip Chars (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: adding 1 to a tell() cookie can crash, but adding 2 lands on a valid boundary and silently skips a character with no error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-io-textiowrapper-seek-tell-cookie-arithmetic/">
+<meta property="og:title" content="TextIOWrapper tell()+N Seeks Can Silently Skip Chars (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: adding 1 to a tell() cookie can crash, but adding 2 lands on a valid boundary and silently skips a character with no error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-io-textiowrapper-seek-tell-cookie-arithmetic/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is TextIOWrapper.tell() allowed to return something other than a byte offset?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured it returning values that matched the UTF-8 byte offset in our simple test, but the documentation explicitly calls it an opaque number, and CPython's implementation can encode extra decoder state in it for some encodings. Treat it as an opaque token, not a byte count, even when it happens to look like one."}}, {"@type": "Question", "name": "Does seek() validate the cookie before accepting it?", "acceptedAnswer": {"@type": "Answer", "text": "We measured no validation at seek() time -- it accepts any integer. The decode error, when one happens, only surfaces on the next read() call, and some invalid-as-intended values don't error at all because they happen to coincide with a valid character boundary."}}, {"@type": "Question", "name": "Why did adding 2 not raise an error if the cookie is opaque?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that byte offset 2 past the start of the 2-byte character \\u00f6 lands exactly on the start of the following single-byte character -- the decoder has no way to know a character was skipped, because from its position alone that's a completely valid place to resume decoding."}}, {"@type": "Question", "name": "Is this specific to multi-byte characters?", "acceptedAnswer": {"@type": "Answer", "text": "The silent-skip failure mode needs a multi-byte character to land in the middle of, so ASCII-only text won't show it this way -- but the underlying problem, treating an opaque cookie as arithmetic-safe, isn't specific to any one encoding and isn't guaranteed safe for ASCII either, since the cookie format isn't part of the documented contract."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>io.TextIOWrapper tell()/seek() Cookie Arithmetic Silently Skips Characters (tested)</h1>
+<p class="lead"><code>io.TextIOWrapper.tell()</code> returns a plain Python <code>int</code>, which invites treating it like a byte offset you can do arithmetic on -- for example, subtracting a few to "go back a little" or adding one to "skip ahead". The documentation calls it an opaque number, but doesn't spell out what actually happens if you ignore that: on UTF-8 text with multi-byte characters, adding 1 to a real cookie can land you mid-character and raise a loud <code>UnicodeDecodeError</code> -- but adding 2 can land you exactly on the start of the <em>next</em> character, which is a perfectly valid position. <code>seek()</code> accepts it with no error or warning, and the character in between is simply never read, with nothing indicating a character went missing.</p>
+<h2 id="repro1">1. The only supported pattern: seek back to an exact tell() value</h2>
+<pre><code>import io
+
+s = "héllo wörld"
+buf = io.BytesIO(s.encode("utf-8"))
+t = io.TextIOWrapper(buf, encoding="utf-8")
+t.read(7)                 # consumes "héllo w"
+cookie = t.tell()
+t.seek(cookie)             # seek back to the exact cookie value
+print(t.read())</code></pre>
+<pre><code>örld</code></pre>
+<p><strong>Measured:</strong> seeking to the exact value <code>tell()</code> returned round-trips correctly -- this is the only pattern the documentation actually supports.</p>
+
+<h2 id="repro2">2. Adding 1 to the same cookie crashes loudly</h2>
+<pre><code>buf2 = io.BytesIO(s.encode("utf-8"))
+t2 = io.TextIOWrapper(buf2, encoding="utf-8")
+t2.read(7)
+cookie2 = t2.tell()
+try:
+    t2.seek(cookie2 + 1)
+    print(t2.read())
+except UnicodeDecodeError as e:
+    print("cookie+1 ->", e)</code></pre>
+<pre><code>cookie+1 -> 'utf-8' codec can't decode byte 0xb6 in position 0: invalid start byte</code></pre>
+<p><strong>Measured:</strong> <code>cookie + 1</code> lands one byte into the two-byte UTF-8 encoding of <code>&ouml;</code>, which isn't a valid character start -- <code>seek()</code> itself succeeds (it doesn't validate), but the next <code>read()</code> raises <code>UnicodeDecodeError</code>. This case is at least loud: something clearly broke.</p>
+
+<h2 id="repro3">3. Adding 2 to the same cookie succeeds and silently skips a character</h2>
+<pre><code>buf3 = io.BytesIO(s.encode("utf-8"))
+t3 = io.TextIOWrapper(buf3, encoding="utf-8")
+t3.read(7)
+cookie3 = t3.tell()
+t3.seek(cookie3 + 2)
+print(repr(t3.read()))</code></pre>
+<pre><code>'rld'</code></pre>
+<p><strong>Measured:</strong> <code>cookie + 2</code> happens to land exactly on the byte where the character after <code>&ouml;</code> starts -- a perfectly valid position as far as the decoder is concerned. <code>seek()</code> raises nothing, <code>read()</code> raises nothing, and the result is simply missing the <code>&ouml;</code> character, with no indication anywhere that a character was skipped. Whether nudging a cookie crashes or silently corrupts depends entirely on exactly where the arithmetic happens to land relative to character boundaries in the underlying encoding.</p>
+
+<h2 id="repro4">4. The fix: never do arithmetic on a tell() cookie</h2>
+<pre><code>buf4 = io.BytesIO(s.encode("utf-8"))
+t4 = io.TextIOWrapper(buf4, encoding="utf-8")
+t4.read(7)
+checkpoint = t4.tell()      # save the exact cookie
+t4.read(2)                   # move forward by reading, not by math
+t4.seek(checkpoint)          # go back using the saved cookie, unmodified
+print(t4.read())</code></pre>
+<pre><code>örld</code></pre>
+<p><strong>Measured:</strong> storing the exact value <code>tell()</code> returned and passing it back to <code>seek()</code> unmodified round-trips correctly every time. To move by a specific number of characters, use <code>read(n)</code> to advance or re-open/re-seek from a known-good cookie -- never add or subtract from the cookie itself.</p>
+<aside class="cta"><strong>Doing arithmetic on a TextIOWrapper.tell() value (like seeking back a few characters) looks reasonable because it returns a plain int -- but it&#x27;s an opaque cookie, and nudging it can silently skip characters with no error at all:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is TextIOWrapper.tell() allowed to return something other than a byte offset?</summary><p>Yes -- we measured it returning values that matched the UTF-8 byte offset in our simple test, but the documentation explicitly calls it an opaque number, and CPython&#x27;s implementation can encode extra decoder state in it for some encodings. Treat it as an opaque token, not a byte count, even when it happens to look like one.</p></details>
+<details><summary>Does seek() validate the cookie before accepting it?</summary><p>We measured no validation at seek() time -- it accepts any integer. The decode error, when one happens, only surfaces on the next read() call, and some invalid-as-intended values don&#x27;t error at all because they happen to coincide with a valid character boundary.</p></details>
+<details><summary>Why did adding 2 not raise an error if the cookie is opaque?</summary><p>We measured that byte offset 2 past the start of the 2-byte character \u00f6 lands exactly on the start of the following single-byte character -- the decoder has no way to know a character was skipped, because from its position alone that&#x27;s a completely valid place to resume decoding.</p></details>
+<details><summary>Is this specific to multi-byte characters?</summary><p>The silent-skip failure mode needs a multi-byte character to land in the middle of, so ASCII-only text won&#x27;t show it this way -- but the underlying problem, treating an opaque cookie as arithmetic-safe, isn&#x27;t specific to any one encoding and isn&#x27;t guaranteed safe for ASCII either, since the cookie format isn&#x27;t part of the documented contract.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in io.TextIOWrapper, reading from a utf-8-encoded io.BytesIO containing multi-byte characters, comparing exact tell()-returned cookies against the same value plus or minus a small integer. PlainHeaders is our extension; Python&#x27;s io module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

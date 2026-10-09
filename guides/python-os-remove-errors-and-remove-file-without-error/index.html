@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python os.remove Errors and How to Remove a File Without Error</title>
+<meta name="description" content="Measured in Python 3.13.5: what os.remove raises for missing files, directories and permissions, and why except OSError: pass leaves files behind.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-os-remove-errors-and-remove-file-without-error/">
+<meta property="og:title" content="Python os.remove Errors and How to Remove a File Without Error">
+<meta property="og:description" content="Measured in Python 3.13.5: what os.remove raises for missing files, directories and permissions, and why except OSError: pass leaves files behind.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-os-remove-errors-and-remove-file-without-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I remove a file in Python without an error if it doesn't exist?", "acceptedAnswer": {"@type": "Answer", "text": "Path(p).unlink(missing_ok=True) or wrap os.remove(p) in contextlib.suppress(FileNotFoundError). We measured both ignoring a missing file."}}, {"@type": "Question", "name": "Why does os.remove give PermissionError on Linux?", "acceptedAnswer": {"@type": "Answer", "text": "Deleting needs write permission on the directory, not the file. We measured a file in a 0o555 directory failing with errno 13 while a 0o444 file in a writable directory was deleted."}}, {"@type": "Question", "name": "Why does os.remove raise IsADirectoryError?", "acceptedAnswer": {"@type": "Answer", "text": "os.remove only deletes files. We measured errno 21 on a directory; use os.rmdir for empty directories or shutil.rmtree for trees."}}, {"@type": "Question", "name": "Does unlink(missing_ok=True) ignore all errors?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured it still raising IsADirectoryError and PermissionError; it only ignores FileNotFoundError."}}, {"@type": "Question", "name": "Is except OSError: pass safe around os.remove?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured it hiding a PermissionError, leaving the file in place with no sign of failure."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>os.remove errors and deleting a file without an error (tested)</h1>
+<p class="lead"><code>os.remove()</code> raises a different <code>OSError</code> subclass for each problem, and the usual ways of ignoring them hide more than you think. We measured each error on Linux and compared the ways to delete a file only if it exists.</p>
+<h2 id="errors">1. What os.remove() raises, and when</h2>
+<pre><code>import os, tempfile
+
+d = tempfile.mkdtemp()
+os.mkdir(os.path.join(d, &quot;subdir&quot;))
+os.makedirs(os.path.join(d, &quot;full&quot;, &quot;x&quot;))
+locked = os.path.join(d, &quot;locked&quot;); os.mkdir(locked)
+open(os.path.join(locked, &quot;f.txt&quot;), &quot;w&quot;).close()
+os.chmod(locked, 0o555)                       # directory not writable
+ro = os.path.join(d, &quot;readonly.txt&quot;); open(ro, &quot;w&quot;).close()
+os.chmod(ro, 0o444)                           # file itself read-only
+
+for label, path, fn in [
+    (&quot;missing file&quot;,              &quot;nope.txt&quot;,          os.remove),
+    (&quot;a directory&quot;,               &quot;subdir&quot;,            os.remove),
+    (&quot;file in read-only dir&quot;,     &quot;locked/f.txt&quot;,      os.remove),
+    (&quot;read-only file (0o444)&quot;,    &quot;readonly.txt&quot;,      os.remove),
+    (&quot;os.rmdir on non-empty dir&quot;, &quot;full&quot;,              os.rmdir),
+]:
+    try:
+        fn(os.path.join(d, path))
+        print(f&quot;{label:27} removed OK&quot;)
+    except OSError as e:
+        print(f&quot;{label:27} {type(e).__name__}: [Errno {e.errno}] {e.strerror}&quot;)
+os.chmod(locked, 0o755)</code></pre>
+<p>Output:</p>
+<pre><code>missing file                FileNotFoundError: [Errno 2] No such file or directory
+a directory                 IsADirectoryError: [Errno 21] Is a directory
+file in read-only dir       PermissionError: [Errno 13] Permission denied
+read-only file (0o444)      removed OK
+os.rmdir on non-empty dir   OSError: [Errno 39] Directory not empty</code></pre>
+<p><strong>Measured on Linux with Python 3.13.5:</strong> a missing file raises <code>FileNotFoundError</code> (errno 2), a directory raises <code>IsADirectoryError</code> (errno 21; use <code>os.rmdir</code> or <code>shutil.rmtree</code>), and a file in a directory you can't write to raises <code>PermissionError</code> (errno 13). A <strong>read-only file in a writable directory was deleted without error</strong>: on Linux and macOS, deleting a file is a change to its directory, so the file's own permissions don't matter. (Windows refuses to delete read-only files; we couldn't measure that here.) <code>os.rmdir</code> on a non-empty directory raises a plain <code>OSError</code> with errno 39.</p>
+
+<h2 id="ignore">2. Removing a file without an error: ignore only "already gone"</h2>
+<pre><code>import contextlib, os, pathlib, shutil, tempfile
+
+d = tempfile.mkdtemp()
+os.mkdir(os.path.join(d, &quot;subdir&quot;))
+locked = os.path.join(d, &quot;locked&quot;); os.mkdir(locked)
+open(os.path.join(locked, &quot;f.txt&quot;), &quot;w&quot;).close()
+os.chmod(locked, 0o555)
+
+# 1) ignore only &quot;already gone&quot;
+with contextlib.suppress(FileNotFoundError):
+    os.remove(os.path.join(d, &quot;nope.txt&quot;))
+print(&quot;suppress(FileNotFoundError): missing file ignored&quot;)
+
+pathlib.Path(d, &quot;nope.txt&quot;).unlink(missing_ok=True)
+print(&quot;Path.unlink(missing_ok=True): missing file ignored&quot;)
+
+# 2) missing_ok does NOT hide the other errors
+for name in (&quot;subdir&quot;, &quot;locked/f.txt&quot;):
+    try:
+        pathlib.Path(d, name).unlink(missing_ok=True)
+    except OSError as e:
+        print(f&quot;unlink(missing_ok=True) on {name}: {type(e).__name__}&quot;)
+
+# 3) the blanket version hides a file that is still there
+try:
+    os.remove(os.path.join(locked, &quot;f.txt&quot;))
+except OSError:
+    pass
+print(&quot;after &#x27;except OSError: pass&#x27;, file still exists:&quot;,
+      os.path.exists(os.path.join(locked, &quot;f.txt&quot;)))
+
+# 4) same trap with rmtree(ignore_errors=True)
+shutil.rmtree(locked, ignore_errors=True)
+print(&quot;after rmtree(ignore_errors=True), dir still exists:&quot;, os.path.exists(locked))
+os.chmod(locked, 0o755)</code></pre>
+<p>Output:</p>
+<pre><code>suppress(FileNotFoundError): missing file ignored
+Path.unlink(missing_ok=True): missing file ignored
+unlink(missing_ok=True) on subdir: IsADirectoryError
+unlink(missing_ok=True) on locked/f.txt: PermissionError
+after &#x27;except OSError: pass&#x27;, file still exists: True
+after rmtree(ignore_errors=True), dir still exists: True</code></pre>
+<p><strong>Measured:</strong> <code>contextlib.suppress(FileNotFoundError)</code> and <code>Path.unlink(missing_ok=True)</code> (Python 3.8+) both delete-if-present with no error. <code>missing_ok</code> only covers the missing case: the directory and the permission problem still raised. That's what you want. The blanket <code>except OSError: pass</code> hid the <code>PermissionError</code>, and the file was <strong>still there</strong> afterwards. <code>shutil.rmtree(ignore_errors=True)</code> did the same with a whole directory. If you need "gone, whatever it is", catch <code>FileNotFoundError</code> only and let the rest raise, or log them. Avoid <code>if os.path.exists(p): os.remove(p)</code>: another process can delete the file between the check and the remove, and you get <code>FileNotFoundError</code> anyway. For permission problems when deleting trees, see our <a href="/guides/python-shutil-rmtree-permissionerror-errno-13/">rmtree PermissionError guide</a>.</p>
+
+<aside class="cta"><strong>Cleaning up downloaded files? Check what a URL serves before you save it:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I remove a file in Python without an error if it doesn&#x27;t exist?</summary><p>Path(p).unlink(missing_ok=True) or wrap os.remove(p) in contextlib.suppress(FileNotFoundError). We measured both ignoring a missing file.</p></details>
+<details><summary>Why does os.remove give PermissionError on Linux?</summary><p>Deleting needs write permission on the directory, not the file. We measured a file in a 0o555 directory failing with errno 13 while a 0o444 file in a writable directory was deleted.</p></details>
+<details><summary>Why does os.remove raise IsADirectoryError?</summary><p>os.remove only deletes files. We measured errno 21 on a directory; use os.rmdir for empty directories or shutil.rmtree for trees.</p></details>
+<details><summary>Does unlink(missing_ok=True) ignore all errors?</summary><p>No. We measured it still raising IsADirectoryError and PermissionError; it only ignores FileNotFoundError.</p></details>
+<details><summary>Is except OSError: pass safe around os.remove?</summary><p>No. We measured it hiding a PermissionError, leaving the file in place with no sign of failure.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 on Debian with Python 3.13.5: os.remove on a missing file, a directory, a file in a 0o555 directory and a 0o444 file; os.rmdir on a non-empty directory; suppress, unlink(missing_ok=True), except OSError: pass and rmtree(ignore_errors=True). Every block was run verbatim and its output pasted from that run. Windows behavior was not measured. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

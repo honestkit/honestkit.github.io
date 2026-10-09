@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Node EADDRINUSE: Address Already in Use – Causes and Fixes</title>
+<meta name="description" content="We reproduced listen EADDRINUSE in Node 24: what holds the port, IPv4 vs IPv6 binds, TIME_WAIT, Ctrl+Z, and how to find and kill the owner by PID.">
+<link rel="canonical" href="https://honestkit.github.io/guides/eaddrinuse-address-already-in-use/">
+<meta property="og:title" content="Node EADDRINUSE: Address Already in Use – Causes and Fixes">
+<meta property="og:description" content="We reproduced listen EADDRINUSE in Node 24: what holds the port, IPv4 vs IPv6 binds, TIME_WAIT, Ctrl+Z, and how to find and kill the owner by PID.">
+<meta property="og:url" content="https://honestkit.github.io/guides/eaddrinuse-address-already-in-use/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does the error say :::3000?", "acceptedAnswer": {"@type": "Answer", "text": "It is the IPv6 'any' address :: followed by :3000. Node binds to :: when you call listen(port) with no host. On Linux with default settings that also covers IPv4, so a server on 0.0.0.0 or 127.0.0.1 blocks it."}}, {"@type": "Question", "name": "How do I find which process is using the port?", "acceptedAnswer": {"@type": "Answer", "text": "Run ss -ltnp 'sport = :3000', or lsof -i :3000, or fuser -v -n tcp 3000. In our test all three showed the same PID. On Node 24 the process name showed as MainThread, so confirm with ps -o pid,args -p PID."}}, {"@type": "Question", "name": "Do I need to wait for TIME_WAIT before restarting?", "acceptedAnswer": {"@type": "Answer", "text": "Not with Node. We killed a server with an open connection and restarted at once while ss showed TIME-WAIT entries; Node listened fine. A raw socket without SO_REUSEADDR failed with Errno 98 in the same state."}}, {"@type": "Question", "name": "Why can't try/catch catch EADDRINUSE?", "acceptedAnswer": {"@type": "Answer", "text": "listen() is asynchronous. The failure arrives as an 'error' event on the server. Attach server.on('error', ...) and check err.code === 'EADDRINUSE'. Without a listener Node crashes with 'Unhandled error event'."}}, {"@type": "Question", "name": "Two apps run on the same port without error. How?", "acceptedAnswer": {"@type": "Answer", "text": "One listens on 127.0.0.1 and the other on ::1. Node 24 resolved 'localhost' to ::1 in our test, so listen(port, 'localhost') did not clash with a 127.0.0.1 server. curl localhost reached one app and curl 127.0.0.1 the other."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>EADDRINUSE: address already in use (tested)</h1>
+<p class="lead"><code>Error: listen EADDRINUSE: address already in use :::3000</code> means another socket is already listening on that port. Usually it is an old copy of your own server. We reproduced it on Node 24 every way we could think of, found the owner with <code>ss</code>, <code>lsof</code> and <code>fuser</code>, and tested the fixes.</p>
+<h2>1. The exact error</h2>
+<p>We started a Node server on port 8983, then ran <code>require('http').createServer().listen(8983)</code> in a second process with no error handler. Node 24.21.0 crashed with exit code 1:</p>
+<pre><code>node:events:505
+    throw er; // Unhandled 'error' event
+    ^
+
+Error: listen EADDRINUSE: address already in use :::8983
+    at Server.setupListenHandle [as _listen2] (node:net:2328:16)
+    at listenInCluster (node:net:2437:12)
+    at Server.listen (node:net:2562:7)
+    ...
+Emitted 'error' event on Server instance at:
+    at emitErrorNT (node:net:2416:8)
+    at process.processTicksAndRejections (node:internal/process/task_queues:90:21) {
+  code: 'EADDRINUSE',
+  errno: -98,
+  syscall: 'listen',
+  address: '::',
+  port: 8983
+}</code></pre>
+<p>The <code>:::8983</code> is not a typo. It is the address <code>::</code> (all IPv6 and IPv4 addresses) followed by <code>:8983</code>. When you call <code>listen(port)</code> with no host, Node binds to <code>::</code>. If you pass <code>'127.0.0.1'</code> the message becomes <code>address already in use 127.0.0.1:8983</code>.</p>
+<p>Note that it is an <em>event</em>, not a thrown exception. A <code>try/catch</code> around <code>listen()</code> does not catch it. You need <code>server.on('error', ...)</code> (section 7).</p>
+
+<h2>2. Find what holds the port</h2>
+<p>All three tools pointed at our own test server (PID 1559926). On Linux, <code>ss</code> is always there; <code>lsof</code> and <code>fuser</code> may need installing.</p>
+<pre><code>$ ss -ltnp 'sport = :8983'
+State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+LISTEN 0      511                *:8983            *:*    users:(("MainThread",pid=1559926,fd=21))
+
+$ lsof -i :8983
+COMMAND       PID   USER FD   TYPE   DEVICE SIZE/OFF NODE NAME
+MainThrea 1559926 jacque 21u  IPv6 21087262      0t0  TCP *:8983 (LISTEN)
+
+$ lsof -t -i :8983 -sTCP:LISTEN
+1559926
+
+$ fuser -v -n tcp 8983
+                     USER        PID ACCESS COMMAND
+8983/tcp:            jacque    1559926 F.... MainThread</code></pre>
+<p>Surprise: on Node 24 the process name shows as <code>MainThread</code>, not <code>node</code>. Do not grep for "node" in this output. Check the PID instead:</p>
+<pre><code>$ ps -o pid,args -p 1559926
+    PID COMMAND
+1559926 node srv.js 8983</code></pre>
+<p>Without <code>-p</code>, <code>ss</code> only shows processes you own. A port held by another user or by root shows no process column unless you run it as root.</p>
+
+<h2>3. Kill it by PID, not by name</h2>
+<pre><code>kill 1559926        # SIGTERM; our server exited with code 143, port free at once
+kill -9 1559926     # only if it ignores SIGTERM</code></pre>
+<p>Avoid <code>killall node</code> or <code>pkill node</code>. They also kill your editor's language server, other projects and anything else running on Node. <code>kill $(lsof -t -i :3000 -sTCP:LISTEN)</code> is fine for a dev box because it only targets the listener.</p>
+
+<h2>4. Common causes we reproduced</h2>
+<table>
+<tr><th>Cause</th><th>What we did</th><th>Result</th></tr>
+<tr><td>Old server still running</td><td>Second <code>node srv.js 8983</code></td><td>EADDRINUSE <code>:::8983</code>, exit 1</td></tr>
+<tr><td>Two copies started together (watchers, two terminals, <code>npm run dev</code> twice)</td><td>Launched two processes at the same moment</td><td>First one listened; second crashed with EADDRINUSE</td></tr>
+<tr><td>Server suspended with Ctrl+Z</td><td><code>kill -STOP</code> on the server</td><td>Process state <code>Tl</code>, still LISTEN in <code>ss</code>, new server got EADDRINUSE. Run <code>fg</code> then Ctrl+C, or kill the PID</td></tr>
+<tr><td>Another program on the port</td><td><code>python3 -m http.server 8983</code></td><td>Node got EADDRINUSE; <code>ss</code> showed <code>python3</code></td></tr>
+<tr><td><code>listen()</code> called twice in one process</td><td><code>s.listen(8983); s.listen(8983)</code></td><td>Different error: <code>ERR_SERVER_ALREADY_LISTEN</code> "Listen method has been called more than once without closing." It is thrown, so try/catch works here</td></tr>
+</table>
+<p>Ctrl+C on a server with no signal handler is not a cause. Our server exited with code 130 and a new one could listen right away.</p>
+
+<h2>5. IPv4 vs IPv6: when two servers share a port</h2>
+<p>We bound Python first, then tried Node with each host. This box has the Linux default <code>bindv6only=0</code>, so <code>::</code> also covers IPv4.</p>
+<table>
+<tr><th>Already bound</th><th>Node host</th><th>Result</th></tr>
+<tr><td rowspan="2">0.0.0.0 (Python default)</td><td>none, <code>::</code>, <code>0.0.0.0</code>, <code>127.0.0.1</code></td><td>EADDRINUSE</td></tr>
+<tr><td><code>::1</code>, <code>'localhost'</code></td><td>OK, listening on <code>::1</code></td></tr>
+<tr><td rowspan="2">127.0.0.1</td><td>none, <code>::</code>, <code>0.0.0.0</code>, <code>127.0.0.1</code></td><td>EADDRINUSE</td></tr>
+<tr><td><code>::1</code>, <code>'localhost'</code></td><td>OK, listening on <code>::1</code></td></tr>
+<tr><td><code>::</code> (dual-stack)</td><td>none, <code>0.0.0.0</code>, <code>127.0.0.1</code></td><td>EADDRINUSE</td></tr>
+<tr><td>127.0.0.1</td><td><code>{host:'::', ipv6Only:true}</code></td><td>OK</td></tr>
+</table>
+<p>The trap is <code>listen(port, 'localhost')</code>. Node 24 resolved <code>localhost</code> to <code>::1</code>, so it did <em>not</em> conflict with Python on 127.0.0.1. Both ran on the same port. Then <code>curl http://localhost:8983/</code> and Node <code>fetch</code> reached the Node server, while <code>curl http://127.0.0.1:8983/</code> reached Python. No error, just the wrong app answering. If a request hits "the old version" of your app, run <code>ss -ltnp 'sport = :PORT'</code> and look for two lines.</p>
+
+<h2>6. TIME_WAIT is not the problem in Node</h2>
+<p>We held a client connection open, killed the server (SIGKILL and SIGTERM), and restarted at once. <code>ss -tan</code> showed the old connections in <code>TIME-WAIT</code> on port 8983. Results:</p>
+<ul>
+<li>Node <code>listen(8983)</code> right after: <strong>OK</strong>, both times.</li>
+<li>Raw Python socket with no <code>SO_REUSEADDR</code>: <code>[Errno 98] Address already in use</code>.</li>
+<li>Raw Python socket with <code>SO_REUSEADDR</code>: OK.</li>
+</ul>
+<p>So Node behaves like a socket with <code>SO_REUSEADDR</code> set (libuv sets it on Unix, per the libuv source, not traced here). If Node reports EADDRINUSE, a process really is listening. Look for it; do not wait for TIME_WAIT to expire.</p>
+
+<h2>7. Fixes in code</h2>
+<p><strong>Handle the 'error' event</strong> so you get a clear message instead of a stack trace:</p>
+<pre><code>const server = app.listen(PORT);
+server.on('error', (err) =&gt; {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is in use. Find it: ss -ltnp 'sport = :${PORT}'`);
+    process.exit(1);
+  }
+  throw err;
+});</code></pre>
+<p>We measured the fields on <code>err</code>: <code>code</code> 'EADDRINUSE', <code>errno</code> -98, <code>syscall</code> 'listen', <code>address</code> '::', <code>port</code> 8983. Don't silently switch to another port in production; your proxy will still point at the old one.</p>
+
+<p><strong>Close the server on SIGTERM and SIGINT</strong> so watchers and process managers can restart cleanly:</p>
+<pre><code>for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () =&gt; {
+    server.close(() =&gt; process.exit(0));
+    setTimeout(() =&gt; server.closeAllConnections(), 5000).unref();
+  });
+}</code></pre>
+<p>Measured: with only an idle keep-alive client, <code>server.close()</code> finished in 2 ms (Node 24 drops idle connections). With a 2 s request in flight, it waited 1718 ms, the request completed (<code>slow done</code>), then the process exited 0. The timeout is a safety net for clients that never finish.</p>
+
+<p><strong>Use port 0 in tests.</strong> The OS picks a free port, so parallel test runs never collide:</p>
+<pre><code>server.listen(0, '127.0.0.1', () =&gt; {
+  const { port } = server.address();   // we got 36081
+  // fetch(`http://127.0.0.1:${port}/`) ...
+});</code></pre>
+
+<h2>8. Quick checklist</h2>
+<ol>
+<li>Run <code>ss -ltnp 'sport = :PORT'</code> (or <code>lsof -i :PORT</code>).</li>
+<li>Check the PID with <code>ps -o pid,args -p PID</code>. On Node 24 the name may say MainThread.</li>
+<li>If it is yours, <code>kill PID</code>. If it is suspended (state T), <code>fg</code> and Ctrl+C, or kill it.</li>
+<li>If it is not yours, pick another port with <code>PORT=3001</code>.</li>
+<li>Add the error handler and signal handlers above.</li>
+</ol>
+<p>The opposite problem, nothing listening at all, gives <a href="/guides/err-connection-refused-econnrefused/">ERR_CONNECTION_REFUSED / ECONNREFUSED</a>. If a server dies mid-request you see <a href="/guides/err-connection-reset-econnreset/">ECONNRESET</a> or <a href="/guides/socket-hang-up-nodejs/">socket hang up</a>.</p>
+<aside class="cta"><strong>Once your server is back up, check the status and headers it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does the error say :::3000?</summary><p>It is the IPv6 &#x27;any&#x27; address :: followed by :3000. Node binds to :: when you call listen(port) with no host. On Linux with default settings that also covers IPv4, so a server on 0.0.0.0 or 127.0.0.1 blocks it.</p></details>
+<details><summary>How do I find which process is using the port?</summary><p>Run ss -ltnp &#x27;sport = :3000&#x27;, or lsof -i :3000, or fuser -v -n tcp 3000. In our test all three showed the same PID. On Node 24 the process name showed as MainThread, so confirm with ps -o pid,args -p PID.</p></details>
+<details><summary>Do I need to wait for TIME_WAIT before restarting?</summary><p>Not with Node. We killed a server with an open connection and restarted at once while ss showed TIME-WAIT entries; Node listened fine. A raw socket without SO_REUSEADDR failed with Errno 98 in the same state.</p></details>
+<details><summary>Why can&#x27;t try/catch catch EADDRINUSE?</summary><p>listen() is asynchronous. The failure arrives as an &#x27;error&#x27; event on the server. Attach server.on(&#x27;error&#x27;, ...) and check err.code === &#x27;EADDRINUSE&#x27;. Without a listener Node crashes with &#x27;Unhandled error event&#x27;.</p></details>
+<details><summary>Two apps run on the same port without error. How?</summary><p>One listens on 127.0.0.1 and the other on ::1. Node 24 resolved &#x27;localhost&#x27; to ::1 in our test, so listen(port, &#x27;localhost&#x27;) did not clash with a 127.0.0.1 server. curl localhost reached one app and curl 127.0.0.1 the other.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0, Python 3.13.5, curl, ss (iproute2), lsof and fuser on Debian 13 (Linux 6.12, net.ipv6.bindv6only=0). We only inspected and killed our own test processes, by PID. PlainHeaders is our extension; Node.js, ss, lsof and fuser are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

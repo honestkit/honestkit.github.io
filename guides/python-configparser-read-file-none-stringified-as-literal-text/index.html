@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>configparser.read_file() Stringifies None as Text (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: configparser.read_file() never checks line types -- a None line becomes the literal text &#x27;None&#x27; and gets blamed in the parse error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-configparser-read-file-none-stringified-as-literal-text/">
+<meta property="og:title" content="configparser.read_file() Stringifies None as Text (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: configparser.read_file() never checks line types -- a None line becomes the literal text &#x27;None&#x27; and gets blamed in the parse error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-configparser-read-file-none-stringified-as-literal-text/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "configparser's documentation says read_file() takes an iterable yielding Unicode strings, such as the lines of a file. It does not say what happens if an item isn't a string. We measured that a None item is accepted without error at the point it's read -- it's silently coerced by _Line's str.__new__(cls, val) call, which behaves exactly like str(None)."}}, {"@type": "Question", "name": "Why does the error say 'None' instead of raising a clean TypeError?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that configparser never calls isinstance() or any type check on the incoming lines -- it wraps each one directly in its internal _Line(str) subclass. str.__new__(cls, None) doesn't raise; it returns the string 'None', just like calling str(None) would. By the time any parsing logic runs, the None object is already gone, replaced by three characters of text."}}, {"@type": "Question", "name": "Does this depend on where the None line appears?", "acceptedAnswer": {"@type": "Answer", "text": "We measured two different exception types depending on position: a None before any [section] header raises MissingSectionHeaderError (since 'None' doesn't look like a section line), while a None after a section header raises ParsingError. Both quote the fabricated 'None' text as the problem line; neither hints that a non-string value was the actual cause."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "It's in the same family as the None-sentinel findings already confirmed in json.load(), csv.reader(), shutil.copyfileobj, and others, but it's a different flavor: those crash or silently drop data when a stream's None is mishandled. configparser.read_file() does neither -- it successfully converts the None into real-looking text and lets parsing continue, which is more likely to send you looking for a typo in your file instead of a None leaking out of your line source."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>configparser.read_file() Stringifies a None Line as Text (tested)</h1>
+<p class="lead"><code>read_file()</code> accepts any iterable of lines, not just a real file -- a common choice when lines come from a generator, a queue, or a non-blocking source that can emit a transient <code>None</code> sentinel for "nothing ready yet." We measured that <code>read_file()</code> never checks: each line is wrapped in configparser's internal <code>_Line(str)</code> subclass via <code>str.__new__(cls, val)</code>, which is exactly what <code>str(None)</code> does -- it silently turns the <code>None</code> object into the three-character string <code>'None'</code>, with no exception at the point of conversion. That fabricated text then gets parsed as if it were real file content, and the resulting <code>ParsingError</code> or <code>MissingSectionHeaderError</code> quotes <code>'None'</code> as the offending line -- making it look like the literal word "None" was typed into the config, when actually a sentinel value reached a function that only accepts real text lines.</p>
+<h2 id="repro1">1. A real, valid config with one None line in the middle</h2>
+<pre><code>import configparser
+
+class FlakySource:
+    """Yields real config lines, but one read returns None -- the same
+    kind of transient sentinel a non-blocking line source can produce."""
+    def __init__(self, lines):
+        self.lines = lines
+        self.i = 0
+    def __iter__(self):
+        return self
+    def __next__(self):
+        if self.i >= len(self.lines):
+            raise StopIteration
+        v = self.lines[self.i]
+        self.i += 1
+        return v
+
+payload = ["[server]\n", None, "host = example.com\n", "port = 8080\n"]
+cp = configparser.ConfigParser()
+try:
+    cp.read_file(FlakySource(payload))
+    print("parsed OK:", cp.sections())
+except Exception as e:
+    print("CRASHED:", type(e).__name__, "--", e)</code></pre>
+<pre><code>CRASHED: ParsingError -- Source contains parsing errors: '&lt;???&gt;'
+	[line  2]: 'None'</code></pre>
+<p><strong>Measured:</strong> the config is valid -- three real lines around one sentinel. <code>read_file()</code> wraps every line in <code>_Line(str)</code>, whose <code>__new__</code> calls <code>str.__new__(cls, val)</code> -- the same thing <code>str(None)</code> does. The <code>None</code> becomes the text <code>'None'</code> before any parsing logic ever runs, so the error message reports a line of actual file content that was never in the source.</p>
+
+<h2 id="repro2">2. The fix: filter None out of the line source before read_file() sees it</h2>
+<pre><code>def skip_none_lines(source):
+    for line in source:
+        if line is None:
+            continue  # retry: a sentinel, not a real line
+        yield line
+
+cp2 = configparser.ConfigParser()
+cp2.read_file(skip_none_lines(FlakySource(payload)))
+print("parsed OK:", cp2.sections(), dict(cp2["server"]))</code></pre>
+<pre><code>parsed OK: ['server'] {'host': 'example.com', 'port': '8080'}</code></pre>
+<p><strong>Measured:</strong> dropping <code>None</code> before it reaches <code>read_file()</code> parses the same lines correctly. If a <code>ParsingError</code> or <code>MissingSectionHeaderError</code> quotes a line that reads exactly <code>'None'</code> and you know you never wrote that into the file, the real cause is almost certainly a line source that occasionally yields the <code>None</code> object itself, not text containing the word.</p>
+<aside class="cta"><strong>Feeding configparser.read_file() lines from a custom generator or non-blocking source? A single None line doesn&#x27;t crash with a type error -- it gets silently stringified into the literal text &#x27;None&#x27; and blamed in the parse error:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>configparser&#x27;s documentation says read_file() takes an iterable yielding Unicode strings, such as the lines of a file. It does not say what happens if an item isn&#x27;t a string. We measured that a None item is accepted without error at the point it&#x27;s read -- it&#x27;s silently coerced by _Line&#x27;s str.__new__(cls, val) call, which behaves exactly like str(None).</p></details>
+<details><summary>Why does the error say &#x27;None&#x27; instead of raising a clean TypeError?</summary><p>We measured that configparser never calls isinstance() or any type check on the incoming lines -- it wraps each one directly in its internal _Line(str) subclass. str.__new__(cls, None) doesn&#x27;t raise; it returns the string &#x27;None&#x27;, just like calling str(None) would. By the time any parsing logic runs, the None object is already gone, replaced by three characters of text.</p></details>
+<details><summary>Does this depend on where the None line appears?</summary><p>We measured two different exception types depending on position: a None before any [section] header raises MissingSectionHeaderError (since &#x27;None&#x27; doesn&#x27;t look like a section line), while a None after a section header raises ParsingError. Both quote the fabricated &#x27;None&#x27; text as the problem line; neither hints that a non-string value was the actual cause.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>It&#x27;s in the same family as the None-sentinel findings already confirmed in json.load(), csv.reader(), shutil.copyfileobj, and others, but it&#x27;s a different flavor: those crash or silently drop data when a stream&#x27;s None is mishandled. configparser.read_file() does neither -- it successfully converts the None into real-looking text and lets parsing continue, which is more likely to send you looking for a typo in your file instead of a None leaking out of your line source.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in configparser.ConfigParser.read_file(), feeding it a custom line iterator (not a real file) whose sequence of real, valid config lines includes one None in the middle. PlainHeaders is our extension; Python&#x27;s configparser module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ValueError: signal only works in main thread, Tested</title>
+<meta name="description" content="We measured Python&#x27;s &#x27;signal only works in main thread of the main interpreter&#x27;, asyncio&#x27;s set_wakeup_fd variant, and a clean SIGTERM shutdown for threads.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-valueerror-signal-only-works-in-main-thread/">
+<meta property="og:title" content="ValueError: signal only works in main thread, Tested">
+<meta property="og:description" content="We measured Python&#x27;s &#x27;signal only works in main thread of the main interpreter&#x27;, asyncio&#x27;s set_wakeup_fd variant, and a clean SIGTERM shutdown for threads.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-valueerror-signal-only-works-in-main-thread/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does ValueError: signal only works in main thread of the main interpreter mean?", "acceptedAnswer": {"@type": "Answer", "text": "signal.signal() was called from a thread other than the main thread. We measured it from a threading.Thread on Python 3.13.5; the same call in the main thread works."}}, {"@type": "Question", "name": "Why do I get set_wakeup_fd only works in main thread?", "acceptedAnswer": {"@type": "Answer", "text": "That's asyncio's version of the same rule: loop.add_signal_handler() called from another thread. We measured it raising RuntimeError."}}, {"@type": "Question", "name": "How do I stop worker threads when the process gets SIGTERM?", "acceptedAnswer": {"@type": "Answer", "text": "Install the handler in the main thread and have it set a threading.Event the workers check. We measured a worker exiting cleanly 0.3 s after SIGTERM."}}, {"@type": "Question", "name": "Can a thread receive a signal in Python?", "acceptedAnswer": {"@type": "Answer", "text": "No. Python runs signal handlers in the main thread only, so handlers must be installed there and pass the news to other threads."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ValueError: signal only works in main thread (tested)</h1>
+<p class="lead"><code>ValueError: signal only works in main thread of the main interpreter</code> means something called <code>signal.signal()</code> outside the main thread. We reproduced it and its asyncio variant on Python 3.13.5, then measured the standard fix.</p>
+<h2 id="thread">1. signal.signal() called from a thread</h2>
+<pre><code>import signal, threading
+def handler(signum, frame):
+    print(&quot;got&quot;, signum)
+def setup():
+    try:
+        signal.signal(signal.SIGTERM, handler)
+    except ValueError as e:
+        print(threading.current_thread().name, &quot;-&gt;&quot;, type(e).__name__, e)
+t = threading.Thread(target=setup)
+t.start(); t.join()
+signal.signal(signal.SIGTERM, handler)
+print(&quot;MainThread -&gt; OK&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>Thread-1 (setup) -&gt; ValueError signal only works in main thread of the main interpreter
+MainThread -&gt; OK</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> installing a handler from any thread other than the main one raises <code>ValueError: signal only works in main thread of the main interpreter</code>. The same call in the main thread works. You usually hit this indirectly: a library that sets a handler (a timeout decorator using <code>signal.alarm</code>, a CLI framework, a server) is called from a web server's worker thread, a thread pool, or a GUI callback.</p>
+
+<h2 id="asyncio">2. asyncio's add_signal_handler: a different error</h2>
+<pre><code>import asyncio, signal
+async def main():
+    loop = asyncio.get_running_loop()
+    def setup():
+        try:
+            loop.add_signal_handler(signal.SIGTERM, print, &quot;stop&quot;)
+        except Exception as e:
+            print(&quot;add_signal_handler in a thread -&gt;&quot;, type(e).__name__, e)
+    await asyncio.to_thread(setup)
+    loop.add_signal_handler(signal.SIGTERM, print, &quot;stop&quot;)
+    print(&quot;add_signal_handler in the loop&#x27;s thread -&gt; OK&quot;)
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>add_signal_handler in a thread -&gt; RuntimeError set_wakeup_fd only works in main thread of the main interpreter
+add_signal_handler in the loop&#x27;s thread -&gt; OK</code></pre>
+<p><strong>Measured:</strong> <code>loop.add_signal_handler()</code> from a thread raises <code>RuntimeError</code> mentioning <code>set_wakeup_fd</code>, not the <code>ValueError</code> above, but it's the same rule. Register signal handlers in the thread that runs the event loop, and run that loop in the main thread.</p>
+
+<h2 id="fix">3. Fix: handle the signal in main, tell the threads</h2>
+<pre><code>import os, signal, threading, time
+stop = threading.Event()
+signal.signal(signal.SIGTERM, lambda signum, frame: stop.set())   # main thread only
+
+def worker():
+    while not stop.is_set():
+        time.sleep(0.05)
+    print(&quot;worker saw the stop flag, cleaning up&quot;)
+
+t = threading.Thread(target=worker)
+t.start()
+threading.Timer(0.3, os.kill, (os.getpid(), signal.SIGTERM)).start()
+t.join()
+print(&quot;exited cleanly&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>worker saw the stop flag, cleaning up
+exited cleanly</code></pre>
+<p><strong>Measured:</strong> the main thread installs the handler, which only sets a <code>threading.Event</code>; the worker checks the event and shuts down cleanly when <code>SIGTERM</code> arrives. Signal handlers always run in the main thread anyway, so this is the pattern the rule pushes you towards. For Ctrl+C specifically, see our <a href="/guides/python-keyboardinterrupt-not-working-ctrl-c/">KeyboardInterrupt not working guide</a>.</p>
+
+<aside class="cta"><strong>Running a web service in threads? Check the real status and headers it returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does ValueError: signal only works in main thread of the main interpreter mean?</summary><p>signal.signal() was called from a thread other than the main thread. We measured it from a threading.Thread on Python 3.13.5; the same call in the main thread works.</p></details>
+<details><summary>Why do I get set_wakeup_fd only works in main thread?</summary><p>That&#x27;s asyncio&#x27;s version of the same rule: loop.add_signal_handler() called from another thread. We measured it raising RuntimeError.</p></details>
+<details><summary>How do I stop worker threads when the process gets SIGTERM?</summary><p>Install the handler in the main thread and have it set a threading.Event the workers check. We measured a worker exiting cleanly 0.3 s after SIGTERM.</p></details>
+<details><summary>Can a thread receive a signal in Python?</summary><p>No. Python runs signal handlers in the main thread only, so handlers must be installed there and pass the news to other threads.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: signal.signal() from a thread and from main, asyncio add_signal_handler from a thread, and a SIGTERM-to-Event shutdown with a worker thread. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

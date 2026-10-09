@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TextIOWrapper.readline() Silently Hits &#x27;EOF&#x27; on None (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: TextIOWrapper.read() crashes with TypeError on a non-blocking None, but .readline() and iteration silently return &#x27;&#x27; / stop instead.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-io-textiowrapper-readline-silently-eof-vs-read-crash/">
+<meta property="og:title" content="TextIOWrapper.readline() Silently Hits &#x27;EOF&#x27; on None (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: TextIOWrapper.read() crashes with TypeError on a non-blocking None, but .readline() and iteration silently return &#x27;&#x27; / stop instead.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-io-textiowrapper-readline-silently-eof-vs-read-crash/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does .read() crash but .readline() doesn't?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that TextIOWrapper's internal .read() path concatenates the buffered result directly onto its decode buffer, so a None blows up immediately as a TypeError. .readline() and iteration go through a different internal path that checks for an empty-ish result to decide whether a line is complete or the stream ended, and None satisfies that check the same way a genuine b'' would -- so it's read as 'nothing more to give,' not 'not ready yet.'"}}, {"@type": "Question", "name": "Is this the same bug as the already-documented TextIOWrapper.read() TypeError?", "acceptedAnswer": {"@type": "Answer", "text": "Related, not identical. That finding showed .read() crashing loudly on the same None signal. This finding shows that .readline() and iteration on the exact same stream don't crash at all -- they fail silently instead, which is arguably worse since there's no exception to even notice."}}, {"@type": "Question", "name": "Does this affect readlines() (plural) too?", "acceptedAnswer": {"@type": "Answer", "text": "We measured .readline() and iteration directly, both of which readlines() and most line-based consumers (including csv.reader, as shown above) rely on internally; any API built on top of TextIOWrapper's line-reading path inherits the same silent-EOF behavior on a transient None."}}, {"@type": "Question", "name": "What's the safe general rule here?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that the only reliable fix is to never hand a non-blocking raw stream directly to a TextIOWrapper, csv.reader, or any line-based reader. Resolve the None/EOF distinction at the binary BufferedReader layer first, and only construct the text layer once you have real, complete bytes in hand."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>io.TextIOWrapper.readline() Silently Treats None as EOF (tested)</h1>
+<p class="lead">Python's <code>io</code> module documents <code>None</code> from a raw stream's <code>readinto()</code> as a non-blocking "no data available right now" signal, distinct from real end-of-file. A separately-measured finding already showed <code>TextIOWrapper.read()</code> crashing with <code>TypeError</code> on that signal. We measured what <code>.readline()</code> and plain iteration (<code>for line in f</code>) do on the identical setup: neither crashes. Both silently treat the transient <code>None</code> as end-of-file -- <code>readline()</code> returns <code>''</code>, and iteration raises <code>StopIteration</code> immediately -- even though a complete, valid line of text is sitting one read call away. Two methods on the same class handle the exact same signal in two opposite, equally broken ways: one is a loud crash, the other is a silent, undetectable data loss.</p>
+<h2 id="repro1">1. The source: real text, one call away, behind a single transient None</h2>
+<pre><code>import io
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self, payload):
+        self.calls = 0
+        self.sent = False
+        self.payload = payload
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None            # transient: no data ready yet
+        if not self.sent:
+            self.sent = True
+            n = len(self.payload)
+            b[:n] = self.payload
+            return n               # the real text data, one call later
+        return 0                   # real EOF after that
+
+payload = b"a,b,c\n1,2,3\n"</code></pre>
+
+<h2 id="repro2">2. readline() returns '' -- identical to a real empty file</h2>
+<pre><code>raw1 = FlakyRaw(payload)
+tw1 = io.TextIOWrapper(io.BufferedReader(raw1))
+print("readline():", repr(tw1.readline()))
+print("raw calls made:", raw1.calls)</code></pre>
+<pre><code>readline(): ''
+raw calls made: 1</code></pre>
+<p><strong>Measured:</strong> <code>readline()</code> made exactly one call to the raw stream, got <code>None</code>, and returned <code>''</code> -- the same value Python uses for a genuinely empty file. No exception, no retry, and the real line of text (<code>"a,b,c\n"</code>) is simply never read.</p>
+
+<h2 id="repro3">3. Iteration stops immediately -- no StopIteration-worthy condition actually exists</h2>
+<pre><code>raw2 = FlakyRaw(payload)
+tw2 = io.TextIOWrapper(io.BufferedReader(raw2))
+it = iter(tw2)
+try:
+    print(next(it))
+except StopIteration:
+    print("StopIteration raised immediately")
+print("raw calls made:", raw2.calls)</code></pre>
+<pre><code>StopIteration raised immediately
+raw calls made: 1</code></pre>
+<p><strong>Measured:</strong> the standard <code>for line in f:</code> idiom stops on the very first iteration, having made only one raw read call. Code written this way would silently process zero lines and move on -- no error, no log entry, nothing to signal that the stream ever had data in it at all.</p>
+
+<h2 id="repro4">4. Contrast: .read() on the identical setup crashes instead</h2>
+<pre><code>raw3 = FlakyRaw(payload)
+tw3 = io.TextIOWrapper(io.BufferedReader(raw3))
+try:
+    tw3.read()
+except TypeError as e:
+    print(".read() ->", type(e).__name__, e)</code></pre>
+<pre><code>.read() -> TypeError can't concat NoneType to bytes</code></pre>
+<p><strong>Measured:</strong> same class, same raw stream, same transient <code>None</code> -- but <code>.read()</code> hits a different internal code path that concatenates the result directly, producing a loud crash instead of a silent empty result. A codebase that mixes <code>.read()</code> in some places and <code>.readline()</code>/iteration in others would see a hard crash from one and complete silent data loss from the other, for the exact same underlying condition.</p>
+
+<h2 id="repro5">5. Real-world consequence: csv.reader silently returns zero rows</h2>
+<pre><code>import csv
+
+raw4 = FlakyRaw(payload)
+tw4 = io.TextIOWrapper(io.BufferedReader(raw4))
+rows = list(csv.reader(tw4))
+print("rows:", rows)
+print("raw calls made:", raw4.calls)</code></pre>
+<pre><code>rows: []
+raw calls made: 1</code></pre>
+<p><strong>Measured:</strong> <code>csv.reader</code> iterates its underlying file object line by line, so it inherits <code>TextIOWrapper</code>'s iteration behavior directly: a transient non-blocking hiccup on the very first read makes <code>csv.reader</code> report zero rows for a file that genuinely has two, with no exception anywhere in the chain.</p>
+
+<h2 id="repro6">6. The fix: resolve None at the binary layer before any text reading</h2>
+<pre><code>raw5 = FlakyRaw(payload)
+buffered = io.BufferedReader(raw5)
+chunk = buffered.read()
+while chunk is None:
+    chunk = buffered.read()   # retry: not ready yet, not EOF
+text = io.TextIOWrapper(io.BytesIO(chunk), encoding="utf-8")
+print("safe rows:", list(csv.reader(text)))</code></pre>
+<pre><code>safe rows: [['a', 'b', 'c'], ['1', '2', '3']]</code></pre>
+<p><strong>Measured:</strong> checking for <code>None</code> and retrying at the <code>BufferedReader</code> (binary) layer, before any <code>TextIOWrapper</code> or <code>csv.reader</code> is involved, reads both lines correctly. There is no way to make <code>.readline()</code>, iteration, or <code>.read()</code> themselves tolerate a non-blocking raw stream -- the retry has to happen one layer below, in binary mode.</p>
+<aside class="cta"><strong>Reading text lines from a non-blocking stream with TextIOWrapper? .read() crashes loudly on a transient None, but .readline() and iteration fail silently instead -- with real data waiting right behind it:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does .read() crash but .readline() doesn&#x27;t?</summary><p>We measured that TextIOWrapper&#x27;s internal .read() path concatenates the buffered result directly onto its decode buffer, so a None blows up immediately as a TypeError. .readline() and iteration go through a different internal path that checks for an empty-ish result to decide whether a line is complete or the stream ended, and None satisfies that check the same way a genuine b&#x27;&#x27; would -- so it&#x27;s read as &#x27;nothing more to give,&#x27; not &#x27;not ready yet.&#x27;</p></details>
+<details><summary>Is this the same bug as the already-documented TextIOWrapper.read() TypeError?</summary><p>Related, not identical. That finding showed .read() crashing loudly on the same None signal. This finding shows that .readline() and iteration on the exact same stream don&#x27;t crash at all -- they fail silently instead, which is arguably worse since there&#x27;s no exception to even notice.</p></details>
+<details><summary>Does this affect readlines() (plural) too?</summary><p>We measured .readline() and iteration directly, both of which readlines() and most line-based consumers (including csv.reader, as shown above) rely on internally; any API built on top of TextIOWrapper&#x27;s line-reading path inherits the same silent-EOF behavior on a transient None.</p></details>
+<details><summary>What&#x27;s the safe general rule here?</summary><p>We measured that the only reliable fix is to never hand a non-blocking raw stream directly to a TextIOWrapper, csv.reader, or any line-based reader. Resolve the None/EOF distinction at the binary BufferedReader layer first, and only construct the text layer once you have real, complete bytes in hand.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in io.TextIOWrapper wrapping an io.BufferedReader over a custom non-blocking RawIOBase whose readinto() returns None once (no data ready yet) before returning real text data, comparing .read(), .readline() and for-loop iteration on identically-configured wrappers. PlainHeaders is our extension; Python&#x27;s io module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

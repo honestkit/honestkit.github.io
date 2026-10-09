@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dataclasses: Default Instances Are Unhashable by Default</title>
+<meta name="description" content="We measured Python 3.13.5: a plain @dataclass raises TypeError &#x27;unhashable type&#x27;, and unsafe_hash=True&#x27;s hash changes after mutation, breaking lookup.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-dataclasses-default-instances-unhashable-unsafe-hash-breaks-on-mutation/">
+<meta property="og:title" content="dataclasses: Default Instances Are Unhashable by Default">
+<meta property="og:description" content="We measured Python 3.13.5: a plain @dataclass raises TypeError &#x27;unhashable type&#x27;, and unsafe_hash=True&#x27;s hash changes after mutation, breaking lookup.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-dataclasses-default-instances-unhashable-unsafe-hash-breaks-on-mutation/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does hash() raise TypeError on a plain Python dataclass?", "acceptedAnswer": {"@type": "Answer", "text": "Because @dataclass with its default options (eq=True, frozen=False) explicitly sets __hash__ = None -- we measured this raising TypeError('unhashable type') even though == between two instances with equal fields correctly returns True."}}, {"@type": "Question", "name": "How do I make a dataclass usable as a dict key or set element?", "acceptedAnswer": {"@type": "Answer", "text": "Use @dataclass(frozen=True), which both blocks mutation and gives a stable __hash__ based on field values -- we confirmed instances of a frozen dataclass hash correctly and can be looked up from a set reliably."}}, {"@type": "Question", "name": "What does unsafe_hash=True actually do differently from frozen=True?", "acceptedAnswer": {"@type": "Answer", "text": "It forces a __hash__ method onto a dataclass that is still mutable -- we measured that mutating a field after hashing an unsafe_hash instance changes its hash value, so a set already containing that exact object can no longer find it with 'in'."}}, {"@type": "Question", "name": "Is it safe to put a mutable @dataclass instance in a Python set?", "acceptedAnswer": {"@type": "Answer", "text": "Only if you never mutate it after insertion -- we measured that mutating a field of an unsafe_hash dataclass instance already in a set breaks lookup for that object, silently leaving it unreachable even though it's still present."}}, {"@type": "Question", "name": "Does a dataclass with eq=False support hashing by default?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- setting eq=False on @dataclass leaves __hash__ at the default identity-based hash from object, since the None override only happens when eq=True and frozen=False together, per the dataclasses module's documented rule."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>dataclasses: Default Instances Are Unhashable by Default (tested)</h1>
+<p class="lead">A plain <code>@dataclass</code> gets <code>__eq__</code> for free, so two instances with the same field values compare equal. We measured whether it also gets a usable <code>__hash__</code> -- the kind you'd need to put instances in a <code>set</code> or use as a <code>dict</code> key -- and what happens if you force one with <code>unsafe_hash=True</code>.</p>
+<h2 id="repro1">1. A plain @dataclass instance is unhashable, even though == works</h2>
+<pre><code>from dataclasses import dataclass
+
+@dataclass
+class Point:
+    x: int
+    y: int
+
+p = Point(1, 2)
+print(p == Point(1, 2))
+hash(p)</code></pre>
+<pre><code>True
+TypeError: unhashable type: 'Point'</code></pre>
+<p><strong>Measured:</strong> with the default decorator options (<code>eq=True</code>, <code>frozen=False</code>), <code>dataclass</code> sets <code>__hash__</code> to <code>None</code> -- equality works, but <code>hash()</code>, <code>set()</code>, and using the instance as a dict key all raise <code>TypeError</code> immediately. This is intentional per the docs (a mutable object that compares by value shouldn't silently hash by identity), but it surprises anyone used to plain classes or namedtuples, which hash by identity or value by default without complaint.</p>
+
+<h2 id="repro2">2. frozen=True gives a safe hash; unsafe_hash=True gives a hash that changes on mutation</h2>
+<pre><code>from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class FPoint:
+    x: int
+    y: int
+
+fp = FPoint(1, 2)
+print(hash(fp))  # works -- can't mutate, so hash is stable
+
+@dataclass(unsafe_hash=True)
+class UPoint:
+    x: int
+    y: int
+
+up = UPoint(1, 2)
+s = {up}
+print(hash(up))
+up.x = 99
+print(hash(up))
+print(up in s)</code></pre>
+<pre><code>-3550055125485641917
+-3550055125485641917
+-5595863157221763179
+False</code></pre>
+<p><strong>Measured:</strong> <code>frozen=True</code> blocks mutation entirely, so its hash is always safe. <code>unsafe_hash=True</code> forces a hash onto a still-mutable class -- the name is a real warning, not decoration. After inserting <code>up</code> into a set and then mutating one field, <code>hash(up)</code> changes and <code>up in s</code> returns <code>False</code> even though <code>up</code> is the exact same object that was just inserted. The set now silently contains an item that can no longer be found by its own identity.</p>
+
+<h2 id="repro3">3. The fix: use frozen=True for anything you'll hash, or implement __hash__ yourself</h2>
+<pre><code>from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class SafePoint:
+    x: int
+    y: int
+
+sp = SafePoint(1, 2)
+s = {sp}
+print(sp in s)  # always True -- SafePoint can never mutate after creation</code></pre>
+<pre><code>True</code></pre>
+<p><strong>Measured:</strong> if you need a dataclass that works correctly in a <code>set</code> or as a <code>dict</code> key, <code>frozen=True</code> is the option that's actually safe -- it prevents the mutation that would otherwise strand the object in whatever hash-based container it was placed in. Reach for <code>unsafe_hash=True</code> only when you're certain the fields used in the hash will never change after the object is first hashed.</p>
+<aside class="cta"><strong>Putting a @dataclass instance in a set or using it as a dict key? Check what hash it actually gets first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does hash() raise TypeError on a plain Python dataclass?</summary><p>Because @dataclass with its default options (eq=True, frozen=False) explicitly sets __hash__ = None -- we measured this raising TypeError(&#x27;unhashable type&#x27;) even though == between two instances with equal fields correctly returns True.</p></details>
+<details><summary>How do I make a dataclass usable as a dict key or set element?</summary><p>Use @dataclass(frozen=True), which both blocks mutation and gives a stable __hash__ based on field values -- we confirmed instances of a frozen dataclass hash correctly and can be looked up from a set reliably.</p></details>
+<details><summary>What does unsafe_hash=True actually do differently from frozen=True?</summary><p>It forces a __hash__ method onto a dataclass that is still mutable -- we measured that mutating a field after hashing an unsafe_hash instance changes its hash value, so a set already containing that exact object can no longer find it with &#x27;in&#x27;.</p></details>
+<details><summary>Is it safe to put a mutable @dataclass instance in a Python set?</summary><p>Only if you never mutate it after insertion -- we measured that mutating a field of an unsafe_hash dataclass instance already in a set breaks lookup for that object, silently leaving it unreachable even though it&#x27;s still present.</p></details>
+<details><summary>Does a dataclass with eq=False support hashing by default?</summary><p>Yes -- setting eq=False on @dataclass leaves __hash__ at the default identity-based hash from object, since the None override only happens when eq=True and frozen=False together, per the dataclasses module&#x27;s documented rule.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in dataclasses module: created a plain @dataclass, tried to hash it and put it in a set, then compared against @dataclass(frozen=True) and @dataclass(unsafe_hash=True), including mutating an unsafe_hash instance after inserting it into a set. PlainHeaders is our extension; Python&#x27;s dataclasses module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

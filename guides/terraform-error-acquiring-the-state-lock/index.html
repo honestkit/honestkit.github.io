@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terraform: &#x27;Error Acquiring the State Lock&#x27; — Fixed</title>
+<meta name="description" content="We reproduced Terraform&#x27;s state lock error with real concurrent runs and found force-unlock fails on a local backend — the lock had already released.">
+<link rel="canonical" href="https://honestkit.github.io/guides/terraform-error-acquiring-the-state-lock/">
+<meta property="og:title" content="Terraform: &#x27;Error Acquiring the State Lock&#x27; — Fixed">
+<meta property="og:description" content="We reproduced Terraform&#x27;s state lock error with real concurrent runs and found force-unlock fails on a local backend — the lock had already released.">
+<meta property="og:url" content="https://honestkit.github.io/guides/terraform-error-acquiring-the-state-lock/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does terraform force-unlock fix 'Error acquiring the state lock'?", "acceptedAnswer": {"@type": "Answer", "text": "It depends on your backend. We measured that for the default local backend, force-unlock actively refuses to run ('Local state cannot be unlocked by another process') \u2014 and it isn't needed anyway, because the OS releases the underlying file lock automatically the moment the holding process dies. For remote backends (S3+DynamoDB, Consul, Terraform Cloud), the lock is a separate record that can genuinely get stuck, and force-unlock is the documented real fix there."}}, {"@type": "Question", "name": "Why did my stuck-looking lock clear itself without me doing anything?", "acceptedAnswer": {"@type": "Answer", "text": "We reproduced this exact scenario: killing a terraform process mid-apply with kill -9 (simulating a crashed CI job), then testing immediately after. The lock was still showing as held right after the kill, but the very next command succeeded with zero errors \u2014 the local backend's lock is tied to the OS process via flock, which releases automatically on process death, often faster than you'd expect to check."}}, {"@type": "Question", "name": "What does -lock-timeout actually do?", "acceptedAnswer": {"@type": "Answer", "text": "It controls how long a command will wait and retry before giving up, not whether it ignores the lock. We measured terraform plan -lock-timeout=15s actually blocking for the full 15.035 seconds before still failing, because the holding process hadn't released the lock yet in that window. Set it comfortably longer than your typical apply/plan duration."}}, {"@type": "Question", "name": "Is it safe to just add -lock=false to make this error go away?", "acceptedAnswer": {"@type": "Answer", "text": "Only if you're certain no concurrent run exists \u2014 -lock=false disables the exact safety check that's protecting you from two processes corrupting the same state file simultaneously. We didn't need it in any of our reproductions; waiting out a real lock, or confirming a crashed process already released it, are both safer."}}, {"@type": "Question", "name": "Does this local-backend auto-release behavior apply to Terraform Cloud or remote state too?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 per HashiCorp's own documentation (not something we could measure without real cloud infrastructure), remote backends like S3+DynamoDB, Consul, and Terraform Cloud store the lock as an independent record with no OS process tied to its lifetime, so a crashed run there really can leave a permanently stuck lock. That's the one case where terraform force-unlock is the genuine, necessary fix \u2014 confirm via your CI/team first that nothing is actually still running before using it."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Terraform: Error acquiring the state lock (tested)</h1>
+<p class="lead"><code>Error: Error acquiring the state lock</code> means another Terraform run already holds the lock on your state file, so this run refuses to touch it and risk corrupting it. We reproduced the error for real with two genuinely concurrent runs on Terraform v1.16.5, and found something most generic advice gets wrong for the local backend: <code>force-unlock</code> is often neither the right fix nor even accepted.</p>
+<h2 id="repro">1. The exact error, from two real concurrent runs</h2>
+<p>We ran <code>terraform apply</code> in the background against a resource with a 10-second provisioner, then immediately ran <code>terraform plan</code> in the same working directory:</p>
+<pre><code>Error: Error acquiring the state lock
+
+Error message: resource temporarily unavailable
+Lock Info:
+  ID:        96997dec-6398-dc52-2181-cb385000739c
+  Path:      terraform.tfstate
+  Operation: OperationTypeApply
+  Who:       jacque@jacque-homelab
+  Version:   1.16.5
+  Created:   2026-10-03 13:50:17 UTC</code></pre>
+<p>This is Terraform working correctly, not a bug: the <code>Who</code>/<code>Operation</code>/<code>Created</code> fields tell you exactly which run holds it. Once the first run finished (10s later), a retried <code>plan</code> succeeded immediately with no error &mdash; the lock had already been released normally.</p>
+
+<h2 id="timeout">2. The polite fix: -lock-timeout waits, it doesn't skip the lock</h2>
+<p>We re-ran the same scenario with <code>terraform plan -lock-timeout=15s</code>. It did not fail instantly &mdash; it waited the full window (measured: <code>real 0m15.035s</code>), retrying internally, then still failed with the identical error because the holding apply hadn't finished yet. <code>-lock-timeout</code> is a patience setting, not a guarantee: set it longer than your typical run takes (CI pipelines commonly use 5-10 minutes) rather than assuming any value "fixes" the error.</p>
+
+<h2 id="stale">3. A real stale lock: killing the process, then testing force-unlock</h2>
+<p>Generic advice says: if a run crashes and leaves the state locked, run <code>terraform force-unlock &lt;LOCK_ID&gt;</code>. We tested this for real by starting an apply, then sending it <code>kill -9</code> mid-run (simulating a killed CI job or a crashed laptop) &mdash; the realistic cause of a "stuck" lock. A following <code>plan</code> still showed the lock as held, confirming it was genuinely stuck. We then ran:</p>
+<pre><code>terraform force-unlock 1fd358e5-ce0c-5959-8ec2-5c0eb0fb1345</code></pre>
+<pre><code>Local state cannot be unlocked by another process</code></pre>
+<p><strong>force-unlock itself errored.</strong> But the very next <code>terraform plan</code> we ran, with no other action taken, succeeded immediately with no lock error at all. The lock had already released itself.</p>
+<p><strong>Why:</strong> the local backend's lock is an OS-level advisory file lock (<code>flock</code>), tied to the holding process's lifetime. When the process dies &mdash; crash, OOM kill, <code>kill -9</code>, even a laptop losing power &mdash; the operating system itself releases the lock immediately as part of process cleanup, before Terraform's own <code>force-unlock</code> command ever gets a chance to matter. <code>force-unlock</code> is explicitly rejected for the local backend precisely because the backend doesn't track locks as data Terraform can override &mdash; the OS already owns that job.</p>
+
+<h2 id="remote">4. Remote backends are genuinely different (per HashiCorp's docs, not measured on this box)</h2>
+<p>This local-backend behavior does not generalize. Backends like S3 (with a DynamoDB lock table), Consul, or Terraform Cloud store the lock as a <strong>separate record</strong> that a crashed process cannot clean up on its own &mdash; there is no OS process to tie the lock's lifetime to. For those backends, a genuinely crashed run really can leave a permanently stuck lock, and <code>terraform force-unlock &lt;LOCK_ID&gt;</code> is the real, necessary fix (per HashiCorp's own docs; we did not reproduce this ourselves since it needs real cloud infrastructure). Before running it anywhere, confirm via your team/CI dashboard that no run is actually still in progress &mdash; force-unlocking a lock that's still legitimately held risks exactly the state corruption the lock exists to prevent.</p>
+
+<h2 id="summary">5. How to tell which situation you're in</h2>
+<table>
+<tr><th>Symptom</th><th>Likely real state</th><th>Right move</th></tr>
+<tr><td>Error appears, another run is actively running (CI dashboard, a teammate says so)</td><td>Lock is legitimately held</td><td>Wait, or set <code>-lock-timeout</code> long enough to wait it out</td></tr>
+<tr><td>Local backend, the holding process is confirmed dead</td><td>OS already released the lock</td><td>Just retry the command &mdash; we measured it works immediately, no force-unlock needed or accepted</td></tr>
+<tr><td>Remote backend (S3/DynamoDB, Consul, TFC), holding run confirmed dead/cancelled</td><td>Lock record can genuinely be stuck</td><td><code>terraform force-unlock &lt;LOCK_ID&gt;</code> (per docs) after confirming no run is actually in progress</td></tr>
+</table>
+
+<aside class="cta"><strong>Debugging infra that talks to an API? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does terraform force-unlock fix &#x27;Error acquiring the state lock&#x27;?</summary><p>It depends on your backend. We measured that for the default local backend, force-unlock actively refuses to run (&#x27;Local state cannot be unlocked by another process&#x27;) — and it isn&#x27;t needed anyway, because the OS releases the underlying file lock automatically the moment the holding process dies. For remote backends (S3+DynamoDB, Consul, Terraform Cloud), the lock is a separate record that can genuinely get stuck, and force-unlock is the documented real fix there.</p></details>
+<details><summary>Why did my stuck-looking lock clear itself without me doing anything?</summary><p>We reproduced this exact scenario: killing a terraform process mid-apply with kill -9 (simulating a crashed CI job), then testing immediately after. The lock was still showing as held right after the kill, but the very next command succeeded with zero errors — the local backend&#x27;s lock is tied to the OS process via flock, which releases automatically on process death, often faster than you&#x27;d expect to check.</p></details>
+<details><summary>What does -lock-timeout actually do?</summary><p>It controls how long a command will wait and retry before giving up, not whether it ignores the lock. We measured terraform plan -lock-timeout=15s actually blocking for the full 15.035 seconds before still failing, because the holding process hadn&#x27;t released the lock yet in that window. Set it comfortably longer than your typical apply/plan duration.</p></details>
+<details><summary>Is it safe to just add -lock=false to make this error go away?</summary><p>Only if you&#x27;re certain no concurrent run exists — -lock=false disables the exact safety check that&#x27;s protecting you from two processes corrupting the same state file simultaneously. We didn&#x27;t need it in any of our reproductions; waiting out a real lock, or confirming a crashed process already released it, are both safer.</p></details>
+<details><summary>Does this local-backend auto-release behavior apply to Terraform Cloud or remote state too?</summary><p>No — per HashiCorp&#x27;s own documentation (not something we could measure without real cloud infrastructure), remote backends like S3+DynamoDB, Consul, and Terraform Cloud store the lock as an independent record with no OS process tied to its lifetime, so a crashed run there really can leave a permanently stuck lock. That&#x27;s the one case where terraform force-unlock is the genuine, necessary fix — confirm via your CI/team first that nothing is actually still running before using it.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Terraform v1.16.5 on Linux, using the default local backend (no cloud credentials involved) with a terraform_data resource and a local-exec provisioner to hold the lock for a controlled window. Every message, timing and exit path below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Terraform is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

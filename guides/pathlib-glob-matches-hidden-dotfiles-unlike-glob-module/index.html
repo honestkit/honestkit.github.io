@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Path.glob(&#x27;*&#x27;) Matches Dotfiles, glob.glob() Skips Them (Tested)</title>
+<meta name="description" content="We measured Path.glob(&#x27;*.txt&#x27;) matching a hidden .txt file that glob.glob(&#x27;*.txt&#x27;) skips -- pathlib has no dotfile-skipping rule, unlike the glob module.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pathlib-glob-matches-hidden-dotfiles-unlike-glob-module/">
+<meta property="og:title" content="Path.glob(&#x27;*&#x27;) Matches Dotfiles, glob.glob() Skips Them (Tested)">
+<meta property="og:description" content="We measured Path.glob(&#x27;*.txt&#x27;) matching a hidden .txt file that glob.glob(&#x27;*.txt&#x27;) skips -- pathlib has no dotfile-skipping rule, unlike the glob module.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pathlib-glob-matches-hidden-dotfiles-unlike-glob-module/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Path.glob() skip hidden files by default?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it matching dot-prefixed files and directories with a plain '*' or '*.ext' pattern, with no dotfile-skipping behaviour built in."}}, {"@type": "Question", "name": "Does the glob module skip hidden files?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we confirmed glob.glob() excludes dot-prefixed names from '*' matches and refuses to descend into dot-prefixed directories even with recursive=True, matching shell glob conventions."}}, {"@type": "Question", "name": "Will Path.rglob() recurse into a hidden directory?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured it walking into a directory named '.hidden' and returning matching files inside, where glob.glob(..., recursive=True) excluded that directory entirely."}}, {"@type": "Question", "name": "Is there a pathlib option to skip dotfiles like glob does?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we confirmed Path.glob() and Path.rglob() take no include_hidden parameter in Python 3.13.5. The glob module has that keyword, but pathlib doesn't; filtering on a leading dot yourself is the only way to match glob's default."}}, {"@type": "Question", "name": "Why does this matter for scripts migrating from glob to pathlib?", "acceptedAnswer": {"@type": "Answer", "text": "A script rewritten from glob.glob() to Path.glob() can silently start picking up dotfiles (like .git, .env, or editor swap files) that the original never touched, with no error to flag the change."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pathlib glob() Matches Hidden Dotfiles, glob Module Does Not (tested)</h1>
+<p class="lead">Shell globbing and Python's <code>glob</code> module both skip dot-prefixed files by convention. We measured <code>pathlib.Path.glob()</code> and <code>Path.rglob()</code> on the same directory and found they don't follow that convention at all -- dotfiles and dot-directories match like any other name.</p>
+<h2 id="repro1">1. Same pattern, different results</h2>
+<pre><code>from pathlib import Path
+import glob
+
+base = Path("/tmp/globtest")
+# layout: visible.txt, .hidden.txt, sub/normal.txt, .hidden/secret.txt
+
+print("pathlib glob(*.txt):", sorted(p.name for p in base.glob("*.txt")))
+print("glob.glob(*.txt):   ", sorted(glob.glob("*.txt", root_dir=base)))</code></pre>
+<pre><code>pathlib glob(*.txt): ['.hidden.txt', 'visible.txt']
+glob.glob(*.txt):    ['visible.txt']</code></pre>
+<p><strong>Measured:</strong> the identical pattern <code>"*.txt"</code> matches the hidden file under <code>pathlib</code> but not under the <code>glob</code> module. No warning, no flag to toggle -- the two stdlib APIs just disagree on whether a leading dot is special.</p>
+
+<h2 id="repro2">2. The gap gets wider with recursion</h2>
+<pre><code>print("pathlib rglob(*.txt):", sorted(str(p.relative_to(base)) for p in base.rglob("*.txt")))
+print("glob.glob(**/*.txt):", sorted(glob.glob("**/*.txt", root_dir=base, recursive=True)))</code></pre>
+<pre><code>pathlib rglob(*.txt): ['.hidden/secret.txt', 'sub/normal.txt', 'visible.txt']
+glob.glob(**/*.txt):  ['sub/normal.txt', 'visible.txt']</code></pre>
+<p><strong>Measured:</strong> <code>Path.rglob()</code> walks straight into the <code>.hidden</code> directory and returns the file inside it. <code>glob.glob(..., recursive=True)</code> never descends into <code>.hidden</code> at all -- it is excluded at the directory level, not just the filename level, matching how a shell's <code>**</code> behaves.</p>
+
+<h2 id="fix">3. Fix: filter dot-names explicitly if you need shell-like behaviour</h2>
+<pre><code>def is_hidden(p):
+    return any(part.startswith(".") for part in p.relative_to(base).parts)
+
+visible_only = [p for p in base.rglob("*.txt") if not is_hidden(p)]
+print(sorted(str(p.relative_to(base)) for p in visible_only))</code></pre>
+<pre><code>['sub/normal.txt', 'visible.txt']</code></pre>
+<p><strong>Measured:</strong> <code>pathlib.Path.glob()</code>/<code>rglob()</code> take no <code>include_hidden</code> parameter at all in 3.13.5 -- there's no built-in switch to opt into shell-like behaviour. The <code>glob</code> module's own <code>glob.glob()</code> does have an <code>include_hidden</code> keyword (added in 3.11), but it defaults to <code>False</code>, which is just the already-measured default -- it only helps if you want to go the other way and make <code>glob.glob()</code> match dotfiles too. Filtering on <code>str.startswith(".")</code> per path segment is the straightforward way to restore the skip-dotfiles convention when using <code>pathlib</code>.</p>
+<aside class="cta"><strong>Debugging a script that picked up files it shouldn&#x27;t have? Check the real request/response behind it:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Path.glob() skip hidden files by default?</summary><p>No -- we measured it matching dot-prefixed files and directories with a plain &#x27;*&#x27; or &#x27;*.ext&#x27; pattern, with no dotfile-skipping behaviour built in.</p></details>
+<details><summary>Does the glob module skip hidden files?</summary><p>Yes -- we confirmed glob.glob() excludes dot-prefixed names from &#x27;*&#x27; matches and refuses to descend into dot-prefixed directories even with recursive=True, matching shell glob conventions.</p></details>
+<details><summary>Will Path.rglob() recurse into a hidden directory?</summary><p>Yes -- we measured it walking into a directory named &#x27;.hidden&#x27; and returning matching files inside, where glob.glob(..., recursive=True) excluded that directory entirely.</p></details>
+<details><summary>Is there a pathlib option to skip dotfiles like glob does?</summary><p>No -- we confirmed Path.glob() and Path.rglob() take no include_hidden parameter in Python 3.13.5. The glob module has that keyword, but pathlib doesn&#x27;t; filtering on a leading dot yourself is the only way to match glob&#x27;s default.</p></details>
+<details><summary>Why does this matter for scripts migrating from glob to pathlib?</summary><p>A script rewritten from glob.glob() to Path.glob() can silently start picking up dotfiles (like .git, .env, or editor swap files) that the original never touched, with no error to flag the change.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in pathlib and glob modules: created a directory with a mix of hidden (dot-prefixed) and visible files and subdirectories, then compared Path.glob()/Path.rglob() against glob.glob() with recursive=True on the same patterns. PlainHeaders is our extension; Python&#x27;s pathlib and glob modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

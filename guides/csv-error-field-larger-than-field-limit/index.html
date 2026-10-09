@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>csv.Error: Field Larger Than Field Limit (131072) &amp;mdash; Tested</title>
+<meta name="description" content="We measured Python&#x27;s csv field size limit: exactly 131072 characters (not bytes), global across every reader, and a negative limit silently breaks all parsing.">
+<link rel="canonical" href="https://honestkit.github.io/guides/csv-error-field-larger-than-field-limit/">
+<meta property="og:title" content="csv.Error: Field Larger Than Field Limit (131072) &amp;mdash; Tested">
+<meta property="og:description" content="We measured Python&#x27;s csv field size limit: exactly 131072 characters (not bytes), global across every reader, and a negative limit silently breaks all parsing.">
+<meta property="og:url" content="https://honestkit.github.io/guides/csv-error-field-larger-than-field-limit/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is Python's default csv field size limit?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it's exactly 131072 characters \u2014 confirmed by calling csv.field_size_limit() with no arguments, and by testing that a field of exactly 131072 characters parses fine while 131073 raises _csv.Error: field larger than field limit (131072)."}}, {"@type": "Question", "name": "Is the csv field size limit in characters or bytes?", "acceptedAnswer": {"@type": "Answer", "text": "Characters \u2014 we tested with multi-byte Unicode text and confirmed the limit triggers at the same character count (131073) regardless of how many UTF-8 bytes those characters take up on disk."}}, {"@type": "Question", "name": "Does csv.field_size_limit() apply to one reader or the whole program?", "acceptedAnswer": {"@type": "Answer", "text": "The whole program \u2014 we confirmed it's a single global module-level setting, not a per-reader option, so calling it anywhere affects every csv.reader() and csv.DictReader() created afterward in that process."}}, {"@type": "Question", "name": "How do I fix 'field larger than field limit' permanently?", "acceptedAnswer": {"@type": "Answer", "text": "We'd call csv.field_size_limit(sys.maxsize) once, near the top of the script, before any CSV is read \u2014 never pass an arbitrary large number or a negative value."}}, {"@type": "Question", "name": "What happens if I pass a negative number to csv.field_size_limit()?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that it's silently accepted with no validation error, and then breaks parsing of every field afterward, including a one-character field \u2014 the resulting error message (field limit (-1)) still looks like a size problem, not a misconfiguration."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>csv.Error: field larger than field limit (131072) (tested)</h1>
+<p class="lead"><code>_csv.Error: field larger than field limit (131072)</code> shows up the moment one CSV cell &mdash; a notes column, an embedded JSON blob, a base64 image &mdash; crosses 131,072 characters. We measured the exact threshold, confirmed it's a global module setting rather than a per-reader one, and found a sharp edge in <code>csv.field_size_limit()</code> itself.</p>
+<h2 id="repro1">1. The exact threshold</h2>
+<pre><code>import csv, io
+
+def try_size(n):
+    data = "a,b\n1," + ("x" * n) + "\n"
+    r = csv.reader(io.StringIO(data))
+    list(r)
+
+try_size(131071)   # ok
+try_size(131072)   # ok
+try_size(131073)   # _csv.Error: field larger than field limit (131072)</code></pre>
+<p><strong>Measured:</strong> the default limit is exactly 131072, confirmed by <code>csv.field_size_limit()</code> called with no arguments (it returns the current limit). A field of exactly 131072 characters parses fine; one character over raises. The number in the error message is the limit, not the field's actual length &mdash; the message never says how long your field actually was.</p>
+
+<h2 id="repro2">2. It's characters, not bytes</h2>
+<pre><code>try_size_unicode = "a,b\n1," + ("\u65e5" * 131073) + "\n"   # each char is 3 bytes in UTF-8
+csv.reader(io.StringIO(try_size_unicode))
+list(_)
+_csv.Error: field larger than field limit (131072)</code></pre>
+<p><strong>Measured:</strong> 131,073 multi-byte Unicode characters hit the same limit at the same character count as ASCII &mdash; the limit counts decoded Python string characters, not UTF-8 bytes. A field that's well under 131072 bytes on disk can still trip this if it's not actually that many characters once decoded, and vice versa a field can be far more than 131072 raw bytes and still pass if most characters are multi-byte.</p>
+
+<h2 id="repro3">3. DictReader hits the identical error</h2>
+<pre><code>dr = csv.DictReader(io.StringIO(data))
+list(dr)
+_csv.Error: field larger than field limit (131072)</code></pre>
+<p><strong>Measured:</strong> <code>csv.DictReader</code> wraps <code>csv.reader</code> internally and doesn't add its own limit or catch this one &mdash; same exception, same message, no extra context about which column name was too long.</p>
+
+<h2 id="repro4">4. The limit is global, not per-reader</h2>
+<pre><code>csv.field_size_limit(500_000)   # raises the limit for every reader from now on
+# ... later, in unrelated code ...
+csv.reader(some_other_file)     # also gets the raised limit</code></pre>
+<p><strong>Measured:</strong> <code>csv.field_size_limit()</code> changes a single module-wide value, not a setting on one particular <code>reader</code> or <code>writer</code> object. Calling it in one function silently changes behavior for every other csv reader running in the same process afterward, including ones in other modules that never touched this setting themselves.</p>
+
+<h2 id="repro5">5. A negative limit is silently accepted and breaks every field</h2>
+<pre><code>csv.field_size_limit(-1)
+csv.reader(io.StringIO("a,b\n1,x\n"))
+list(_)
+_csv.Error: field larger than field limit (-1)</code></pre>
+<p><strong>Measured:</strong> <code>field_size_limit()</code> does not validate that its argument is positive &mdash; it only checks that it's an <code>int</code> (a string raises <code>TypeError: limit must be an integer</code>). Passing <code>-1</code> is accepted with no error at set time, and then breaks parsing of even a single-character field like <code>"x"</code>, since any field length is greater than <code>-1</code>. If this value came from a miscalculated config (e.g. "no limit" mistakenly coded as <code>-1</code> instead of <code>sys.maxsize</code>), every CSV read in the process fails with a message that looks like a huge-field problem when the real bug is the limit itself.</p>
+
+<h2 id="fix">6. The actual fix</h2>
+<p>Raise the limit deliberately with <code>csv.field_size_limit(sys.maxsize)</code> near the top of the script that needs it &mdash; not an arbitrary large number, and never a negative one. Because the setting is global, do this once at startup rather than scattered across functions, and expect it to affect every other csv reader in the same process. If a field is routinely hundreds of kilobytes (a stored JSON blob, base64 data), consider whether CSV is the right format for that column at all &mdash; the limit exists because csv's C parser buffers an entire field in memory before returning it, so pathologically large fields are also a memory-usage signal, not just a configuration one.</p>
+
+<aside class="cta"><strong>Debugging a CSV export an API streams back instead of a database dump? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is Python&#x27;s default csv field size limit?</summary><p>We measured it&#x27;s exactly 131072 characters — confirmed by calling csv.field_size_limit() with no arguments, and by testing that a field of exactly 131072 characters parses fine while 131073 raises _csv.Error: field larger than field limit (131072).</p></details>
+<details><summary>Is the csv field size limit in characters or bytes?</summary><p>Characters — we tested with multi-byte Unicode text and confirmed the limit triggers at the same character count (131073) regardless of how many UTF-8 bytes those characters take up on disk.</p></details>
+<details><summary>Does csv.field_size_limit() apply to one reader or the whole program?</summary><p>The whole program — we confirmed it&#x27;s a single global module-level setting, not a per-reader option, so calling it anywhere affects every csv.reader() and csv.DictReader() created afterward in that process.</p></details>
+<details><summary>How do I fix &#x27;field larger than field limit&#x27; permanently?</summary><p>We&#x27;d call csv.field_size_limit(sys.maxsize) once, near the top of the script, before any CSV is read — never pass an arbitrary large number or a negative value.</p></details>
+<details><summary>What happens if I pass a negative number to csv.field_size_limit()?</summary><p>We measured that it&#x27;s silently accepted with no validation error, and then breaks parsing of every field afterward, including a one-character field — the resulting error message (field limit (-1)) still looks like a size problem, not a misconfiguration.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in csv module, feeding csv.reader() and csv.DictReader() fields of exactly 131071, 131072 and 131073 characters (both ASCII and multi-byte Unicode) and recording the exact point the error appears, plus csv.field_size_limit()&#x27;s own behavior with sys.maxsize, negative, and non-integer arguments. PlainHeaders is our extension; Python&#x27;s csv module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

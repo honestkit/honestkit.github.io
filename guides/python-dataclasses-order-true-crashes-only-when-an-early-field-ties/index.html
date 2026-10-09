@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dataclasses: order=True Crashes Only When an Early Field Ties</title>
+<meta name="description" content="We measured Python 3.13.5: sorted() on @dataclass(order=True) objects works fine until two items tie on the first field, then raises TypeError.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-dataclasses-order-true-crashes-only-when-an-early-field-ties/">
+<meta property="og:title" content="dataclasses: order=True Crashes Only When an Early Field Ties">
+<meta property="og:description" content="We measured Python 3.13.5: sorted() on @dataclass(order=True) objects works fine until two items tie on the first field, then raises TypeError.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-dataclasses-order-true-crashes-only-when-an-early-field-ties/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does sorting a list of @dataclass(order=True) objects sometimes raise TypeError and sometimes not?", "acceptedAnswer": {"@type": "Answer", "text": "Because the generated comparison methods compare fields as a tuple in declaration order, short-circuiting on the first field that differs -- we measured sorting working fine when a leading int field was always unique, then raising TypeError the moment two objects tied on that field and comparison fell through to an unorderable dict field."}}, {"@type": "Question", "name": "Does @dataclass(order=True) check that all fields are orderable when the class is defined?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured a dataclass with a dict field (which has no __lt__) defining successfully under order=True, with no error until two instances actually tied on an earlier field during a real comparison at runtime."}}, {"@type": "Question", "name": "How do I prevent a trailing unorderable field from breaking sort on an order=True dataclass?", "acceptedAnswer": {"@type": "Answer", "text": "Mark it field(compare=False) -- we confirmed this excludes the field from the generated comparison methods entirely, so tied leading fields fall back to Python's stable sort order instead of attempting to compare the excluded field."}}, {"@type": "Question", "name": "Is it safe to test sorting on an order=True dataclass with unique field values and assume it always works?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured identical code and class definitions working with unique leading-field values and crashing with duplicate ones, since the crash only happens when comparison falls through to a later, unorderable field. Test data should include tied values on every leading field."}}, {"@type": "Question", "name": "Does Python's sorted() guarantee stable order for equal elements?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, per Python's documented sort stability -- we confirmed that once the unorderable field is excluded from comparison via compare=False, objects with equal priority values keep their original relative input order rather than being reordered arbitrarily."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>dataclasses: order=True Crashes Only When an Early Field Ties (tested)</h1>
+<p class="lead"><code>@dataclass(order=True)</code> generates <code>__lt__</code>/<code>__le__</code>/etc. by comparing each instance's fields as a tuple, in field-declaration order. We measured what happens when a later field in that tuple -- a <code>dict</code>, which has no ordering defined -- is only ever reached when an earlier field happens to be equal between two instances.</p>
+<h2 id="repro1">1. Sorting works fine as long as the first field is always different</h2>
+<pre><code>from dataclasses import dataclass, field
+
+@dataclass(order=True)
+class Task:
+    priority: int
+    config: dict = field(default_factory=dict)
+
+tasks = [Task(3, {"a": 1}), Task(1, {"b": 2}), Task(2, {"c": 3})]
+print(sorted(tasks))</code></pre>
+<pre><code>[Task(priority=1, config={'b': 2}), Task(priority=2, config={'c': 3}), Task(priority=3, config={'a': 1})]</code></pre>
+<p><strong>Measured:</strong> sorting works cleanly. Tuple comparison short-circuits on the first field that differs -- since every <code>priority</code> value here is unique, the generated <code>__lt__</code> never needs to look at <code>config</code> at all to decide the order.</p>
+
+<h2 id="repro2">2. The exact same code crashes the moment two priorities tie</h2>
+<pre><code>from dataclasses import dataclass, field
+
+@dataclass(order=True)
+class Task:
+    priority: int
+    config: dict = field(default_factory=dict)
+
+tasks = [Task(3, {"a": 1}), Task(1, {"b": 2}), Task(1, {"c": 3})]
+sorted(tasks)</code></pre>
+<pre><code>TypeError: '&lt;' not supported between instances of 'dict' and 'dict'</code></pre>
+<p><strong>Measured:</strong> with two <code>Task</code> objects sharing <code>priority=1</code>, tuple comparison can't decide from the first field alone, so it falls through to compare <code>config</code> -- and <code>dict</code> has no <code>&lt;</code> operator, so <code>sorted()</code> raises <code>TypeError</code>. The class, the data shape, and the calling code are all identical to the working example; only whether two priorities happen to collide determines whether this crashes. Test data with distinct priorities will pass every time; real data with a duplicate priority value fails the first time it occurs, often far from wherever the objects were created.</p>
+
+<h2 id="repro3">3. The fix: mark trailing non-orderable fields compare=False</h2>
+<pre><code>from dataclasses import dataclass, field
+
+@dataclass(order=True)
+class Task:
+    priority: int
+    config: dict = field(default_factory=dict, compare=False)
+
+tasks = [Task(3, {"a": 1}), Task(1, {"b": 2}), Task(1, {"c": 3})]
+print(sorted(tasks))</code></pre>
+<pre><code>[Task(priority=1, config={'b': 2}), Task(priority=1, config={'c': 3}), Task(priority=3, config={'a': 1})]</code></pre>
+<p><strong>Measured:</strong> setting <code>compare=False</code> on <code>config</code> removes it from the generated comparison methods entirely, so tied priorities simply keep their relative input order (Python's sort is stable) instead of ever touching the unorderable field. If an <code>order=True</code> dataclass has any field after the first that isn't itself always orderable, mark it <code>compare=False</code> unless you genuinely want it to participate in tie-breaking.</p>
+<aside class="cta"><strong>Sorting @dataclass(order=True) objects by a priority field with other data fields behind it? Check what happens on a tie first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does sorting a list of @dataclass(order=True) objects sometimes raise TypeError and sometimes not?</summary><p>Because the generated comparison methods compare fields as a tuple in declaration order, short-circuiting on the first field that differs -- we measured sorting working fine when a leading int field was always unique, then raising TypeError the moment two objects tied on that field and comparison fell through to an unorderable dict field.</p></details>
+<details><summary>Does @dataclass(order=True) check that all fields are orderable when the class is defined?</summary><p>No -- we measured a dataclass with a dict field (which has no __lt__) defining successfully under order=True, with no error until two instances actually tied on an earlier field during a real comparison at runtime.</p></details>
+<details><summary>How do I prevent a trailing unorderable field from breaking sort on an order=True dataclass?</summary><p>Mark it field(compare=False) -- we confirmed this excludes the field from the generated comparison methods entirely, so tied leading fields fall back to Python&#x27;s stable sort order instead of attempting to compare the excluded field.</p></details>
+<details><summary>Is it safe to test sorting on an order=True dataclass with unique field values and assume it always works?</summary><p>No -- we measured identical code and class definitions working with unique leading-field values and crashing with duplicate ones, since the crash only happens when comparison falls through to a later, unorderable field. Test data should include tied values on every leading field.</p></details>
+<details><summary>Does Python&#x27;s sorted() guarantee stable order for equal elements?</summary><p>Yes, per Python&#x27;s documented sort stability -- we confirmed that once the unorderable field is excluded from comparison via compare=False, objects with equal priority values keep their original relative input order rather than being reordered arbitrarily.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in dataclasses module: created @dataclass(order=True) objects with a leading int field and a trailing dict field, then sorted a list where the int field values were all unique, and separately a list where two objects shared the same int value. PlainHeaders is our extension; Python&#x27;s dataclasses module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

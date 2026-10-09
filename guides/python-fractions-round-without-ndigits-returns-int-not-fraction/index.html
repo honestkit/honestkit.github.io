@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fractions: round(Fraction) Silently Changes Type</title>
+<meta name="description" content="We measured Python 3.13.5: round(Fraction(5,2)) returns a plain int (2), but round(Fraction(5,2), 0) returns a Fraction (2) -- same value, different type.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-fractions-round-without-ndigits-returns-int-not-fraction/">
+<meta property="og:title" content="fractions: round(Fraction) Silently Changes Type">
+<meta property="og:description" content="We measured Python 3.13.5: round(Fraction(5,2)) returns a plain int (2), but round(Fraction(5,2), 0) returns a Fraction (2) -- same value, different type.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-fractions-round-without-ndigits-returns-int-not-fraction/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does round() on a Fraction return a Fraction?", "acceptedAnswer": {"@type": "Answer", "text": "Only if you pass an explicit ndigits argument. We measured round(Fraction(5, 2)) returning the plain int 2, while round(Fraction(5, 2), 0) returns the Fraction 2 -- same value, different type."}}, {"@type": "Question", "name": "Why does round(Fraction(5, 2), 0) have a different type than round(Fraction(5, 2))?", "acceptedAnswer": {"@type": "Answer", "text": "Python's round() protocol specifies that the no-argument form returns an Integral (int), while the ndigits form returns the same type as the input. We confirmed this split holds for every Fraction value and sign we tested, including negatives."}}, {"@type": "Question", "name": "Why did my code break with AttributeError after I added round() to a Fraction calculation?", "acceptedAnswer": {"@type": "Answer", "text": "If you called round(f) without an ndigits argument, the result is a plain int, which doesn't have Fraction-only attributes like .numerator, .denominator, or methods like .limit_denominator(). Use round(f, 0) instead if you need to keep it a Fraction."}}, {"@type": "Question", "name": "Is this round() type-switching specific to Fraction?", "acceptedAnswer": {"@type": "Answer", "text": "No -- it follows the general __round__ protocol used by any numbers.Real type, including Decimal and float. It's just easy to hit by surprise on Fraction because both round(f) and round(f, 0) look interchangeable and both commonly appear in the same code paths."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>fractions: round() Without ndigits Returns int, Not Fraction (tested)</h1>
+<p class="lead"><code>round()</code> on a <code>Fraction</code> looks like it should just round the value and hand back another <code>Fraction</code>. We measured what actually comes back with and without an explicit <code>ndigits</code> argument, and the return type silently changes depending on which form you use -- even though the numeric result is identical.</p>
+<h2 id="repro1">1. round(fraction) with no second argument returns a plain int</h2>
+<pre><code>from fractions import Fraction
+
+f = Fraction(5, 2)
+r1 = round(f)
+print(r1, type(r1))</code></pre>
+<pre><code>2 &lt;class 'int'&gt;</code></pre>
+<p><strong>Measured:</strong> <code>round(Fraction(5, 2))</code> returns the plain Python <code>int</code> <code>2</code>, not a <code>Fraction</code>. Fraction's tie-breaking is also round-half-to-even here, same as the builtin <code>round()</code> on floats.</p>
+
+<h2 id="repro2">2. round(fraction, 0) returns a Fraction instead -- same value, different type</h2>
+<pre><code>from fractions import Fraction
+
+f = Fraction(5, 2)
+r2 = round(f, 0)
+print(r2, type(r2))
+print(r2 == round(f))</code></pre>
+<pre><code>2 &lt;class 'fractions.Fraction'&gt;
+True</code></pre>
+<p><strong>Measured:</strong> passing an explicit <code>ndigits=0</code> returns a <code>Fraction</code> (<code>Fraction(2, 1)</code>, displayed as <code>2</code>), not an <code>int</code>. It's numerically equal to the no-argument result, but the type differs -- <code>type(round(f)) is not type(round(f, 0))</code> even though <code>round(f) == round(f, 0)</code>.</p>
+
+<h2 id="repro3">3. The split follows Python's general round() protocol, not a fractions-specific quirk</h2>
+<pre><code>from fractions import Fraction
+
+for val in (Fraction(7, 2), Fraction(-5, 2)):
+    print(val, "->", round(val), type(round(val)).__name__,
+          "|", round(val, 0), type(round(val, 0)).__name__)</code></pre>
+<pre><code>7/2 -> 4 int | 4 Fraction
+-5/2 -> -2 int | -2 Fraction</code></pre>
+<p><strong>Measured:</strong> the split holds for every value and sign we tried: <code>round(x)</code> with no <code>ndigits</code> always returns <code>int</code>, <code>round(x, n)</code> with an explicit <code>ndigits</code> (including <code>0</code>) always returns <code>Fraction</code>. This matches Python's documented <code>__round__</code> protocol for any <code>numbers.Real</code> type -- <code>round(x)</code> is specified to return an <code>Integral</code>, while <code>round(x, n)</code> returns the same type as <code>x</code> -- so the same split applies to <code>Decimal</code> and <code>float</code> too, but it's easy to hit by surprise on <code>Fraction</code> specifically because both forms look like "just round it" and both commonly appear mid-expression, e.g. <code>round(total)</code> added during debugging versus <code>round(total, 0)</code> copy-pasted from code that rounds to other precisions. If downstream code calls <code>.limit_denominator()</code>, compares <code>.numerator</code>/<code>.denominator</code>, or otherwise relies on a <code>Fraction</code> interface, swapping in the zero-argument form of <code>round()</code> breaks it with an <code>AttributeError</code> even though the printed value looks unchanged. Use <code>round(f, 0)</code> (or <code>Fraction(round(f))</code>) when a <code>Fraction</code> result is required, and the bare <code>round(f)</code> only when an <code>int</code> is actually wanted.</p>
+<aside class="cta"><strong>Calling round() on a Fraction and expecting a Fraction back? Check whether you passed ndigits first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does round() on a Fraction return a Fraction?</summary><p>Only if you pass an explicit ndigits argument. We measured round(Fraction(5, 2)) returning the plain int 2, while round(Fraction(5, 2), 0) returns the Fraction 2 -- same value, different type.</p></details>
+<details><summary>Why does round(Fraction(5, 2), 0) have a different type than round(Fraction(5, 2))?</summary><p>Python&#x27;s round() protocol specifies that the no-argument form returns an Integral (int), while the ndigits form returns the same type as the input. We confirmed this split holds for every Fraction value and sign we tested, including negatives.</p></details>
+<details><summary>Why did my code break with AttributeError after I added round() to a Fraction calculation?</summary><p>If you called round(f) without an ndigits argument, the result is a plain int, which doesn&#x27;t have Fraction-only attributes like .numerator, .denominator, or methods like .limit_denominator(). Use round(f, 0) instead if you need to keep it a Fraction.</p></details>
+<details><summary>Is this round() type-switching specific to Fraction?</summary><p>No -- it follows the general __round__ protocol used by any numbers.Real type, including Decimal and float. It&#x27;s just easy to hit by surprise on Fraction because both round(f) and round(f, 0) look interchangeable and both commonly appear in the same code paths.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in fractions module: called round() on the same Fraction value with no second argument, with ndigits=0, and with a negative Fraction, and compared the return type and value in each case. PlainHeaders is our extension; Python&#x27;s fractions module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

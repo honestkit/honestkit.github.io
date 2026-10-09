@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why str.strip() Doesn&#x27;t Remove Zero-Width Unicode Characters</title>
+<meta name="description" content="We measured Python 3.13.5: str.strip() leaves zero-width space (U+200B) in place because it&#x27;s category Cf (Format), not whitespace.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-zero-width-characters-survive-strip-not-whitespace/">
+<meta property="og:title" content="Why str.strip() Doesn&#x27;t Remove Zero-Width Unicode Characters">
+<meta property="og:description" content="We measured Python 3.13.5: str.strip() leaves zero-width space (U+200B) in place because it&#x27;s category Cf (Format), not whitespace.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-zero-width-characters-survive-strip-not-whitespace/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Python's str.strip() remove zero-width spaces?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured this directly: a trailing U+200B (ZERO WIDTH SPACE) survives .strip() unchanged, because strip() only removes characters in Unicode's whitespace categories, and zero-width space isn't one of them."}}, {"@type": "Question", "name": "What Unicode category is zero-width space?", "acceptedAnswer": {"@type": "Answer", "text": "Cf, 'Format' -- we confirmed this for ZERO WIDTH SPACE, ZERO WIDTH NON-JOINER, ZERO WIDTH JOINER, ZERO WIDTH NO-BREAK SPACE, and SOFT HYPHEN. None of them are in the Zs (space) or Cc (control) categories that strip() and isspace() actually check."}}, {"@type": "Question", "name": "Why can two identical-looking strings fail == in Python?", "acceptedAnswer": {"@type": "Answer", "text": "One may contain an invisible Unicode character like zero-width space that the other doesn't. We measured this directly: both strings print identically, but == correctly returns False because the characters are genuinely different."}}, {"@type": "Question", "name": "Does str.isspace() return True for zero-width characters?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured isspace() returning False for every zero-width character we tested, which is consistent with strip() also leaving them in place; both functions are driven by the same whitespace-category definition."}}, {"@type": "Question", "name": "How do I actually remove zero-width characters from a string in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Filter by Unicode category explicitly, e.g. \\\"\\\".join(c for c in s if unicodedata.category(c) != \\\"Cf\\\"). We confirmed strip() alone does not remove them, since they fall outside the categories it checks."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Zero-Width Characters Survive str.strip() in Python (tested)</h1>
+<p class="lead">Pasted text sometimes carries invisible characters like zero-width space -- they take up zero width on screen, so two strings can look pixel-for-pixel identical while one has an extra, invisible character. We measured whether <code>str.strip()</code> removes them. It doesn't, and the reason is specific: Python's whitespace definition is based on Unicode category, and zero-width characters aren't in it.</p>
+<h2 id="repro1">1. str.strip() leaves a trailing zero-width space in place</h2>
+<pre><code>zwsp = "\u200b"
+clean = "hello"
+dirty = "hello" + zwsp
+
+print(clean, "/", dirty)
+print(clean == dirty)
+print(dirty.strip() == clean)
+print(repr(dirty.strip()))</code></pre>
+<pre><code>hello / hello&#8203;
+False
+False
+'hello\u200b'</code></pre>
+<p><strong>Measured:</strong> <code>dirty</code> prints as plain <code>hello</code> -- the zero-width space is, by definition, invisible -- but it's a real character, so <code>==</code> correctly returns <code>False</code>. The surprise is that <code>.strip()</code> doesn't fix it either: the character comes back unchanged in the output, because <code>strip()</code> with no arguments only removes characters Python classifies as whitespace, and zero-width space isn't one of them.</p>
+
+<h2 id="repro2">2. The reason: its Unicode category is Format (Cf), not Space (Zs)</h2>
+<pre><code>import unicodedata
+
+for ch in ["\u200b", "\u200c", "\u200d", "\ufeff", "\xad"]:
+    print(unicodedata.name(ch), "->", unicodedata.category(ch), "isspace():", ch.isspace())</code></pre>
+<pre><code>ZERO WIDTH SPACE -> Cf isspace(): False
+ZERO WIDTH NON-JOINER -> Cf isspace(): False
+ZERO WIDTH JOINER -> Cf isspace(): False
+ZERO WIDTH NO-BREAK SPACE -> Cf isspace(): False
+SOFT HYPHEN -> Cf isspace(): False
+</code></pre>
+<p><strong>Measured:</strong> every zero-width character we checked is category <code>Cf</code> ("Format"), and <code>str.isspace()</code> returns <code>False</code> for all of them. Compare that to actual whitespace: regular space and tab are categories <code>Zs</code>/<code>Cc</code>, and both <code>strip()</code> and <code>isspace()</code> handle them correctly, along with less obvious ones like non-breaking space (<code>\xa0</code>) and em space (<code>\u2003</code>), which are category <code>Zs</code> and do get stripped.</p>
+
+<h2 id="repro3">3. Ordinary whitespace, for contrast, strips cleanly</h2>
+<pre><code>import unicodedata
+
+for ch in [" ", "\t", "\n", "\xa0", "\u2003"]:
+    padded = ch + "hello" + ch
+    print(repr(ch), unicodedata.category(ch), "stripped clean:", padded.strip() == "hello")</code></pre>
+<pre><code>' ' Zs stripped clean: True
+'\t' Cc stripped clean: True
+'\n' Cc stripped clean: True
+'\xa0' Zs stripped clean: True
+'\u2003' Zs stripped clean: True</code></pre>
+<p><strong>Measured:</strong> all five of these strip cleanly, including the two that are easy to miss visually (non-breaking space and em space) -- Python's <code>strip()</code> already handles the full range of actual whitespace categories correctly. Zero-width characters are a different problem entirely: they're invisible like whitespace, but they're semantically "format" characters (used for things like controlling Arabic/Indic text shaping), so no amount of calling <code>strip()</code> will remove them. If you need to clean pasted or user-submitted text, strip zero-width characters explicitly, e.g. <code>"".join(c for c in s if unicodedata.category(c) != "Cf")</code>, rather than relying on <code>strip()</code> or <code>isspace()</code>.</p>
+<aside class="cta"><strong>Comparing header values or form fields that might contain pasted text? Check for invisible characters first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Python&#x27;s str.strip() remove zero-width spaces?</summary><p>No -- we measured this directly: a trailing U+200B (ZERO WIDTH SPACE) survives .strip() unchanged, because strip() only removes characters in Unicode&#x27;s whitespace categories, and zero-width space isn&#x27;t one of them.</p></details>
+<details><summary>What Unicode category is zero-width space?</summary><p>Cf, &#x27;Format&#x27; -- we confirmed this for ZERO WIDTH SPACE, ZERO WIDTH NON-JOINER, ZERO WIDTH JOINER, ZERO WIDTH NO-BREAK SPACE, and SOFT HYPHEN. None of them are in the Zs (space) or Cc (control) categories that strip() and isspace() actually check.</p></details>
+<details><summary>Why can two identical-looking strings fail == in Python?</summary><p>One may contain an invisible Unicode character like zero-width space that the other doesn&#x27;t. We measured this directly: both strings print identically, but == correctly returns False because the characters are genuinely different.</p></details>
+<details><summary>Does str.isspace() return True for zero-width characters?</summary><p>No -- we measured isspace() returning False for every zero-width character we tested, which is consistent with strip() also leaving them in place; both functions are driven by the same whitespace-category definition.</p></details>
+<details><summary>How do I actually remove zero-width characters from a string in Python?</summary><p>Filter by Unicode category explicitly, e.g. \&quot;\&quot;.join(c for c in s if unicodedata.category(c) != \&quot;Cf\&quot;). We confirmed strip() alone does not remove them, since they fall outside the categories it checks.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in unicodedata module: built strings containing zero-width Unicode characters (ZERO WIDTH SPACE U+200B and others), checked their unicodedata category, and tested str.strip() and str.isspace() against them, contrasted with ordinary whitespace characters (space, tab, non-breaking space, em space). PlainHeaders is our extension; Python&#x27;s unicodedata module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

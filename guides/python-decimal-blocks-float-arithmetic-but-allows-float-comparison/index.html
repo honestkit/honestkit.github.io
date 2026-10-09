@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>decimal: float Mixing Raises on Math, Not Comparison</title>
+<meta name="description" content="We measured Python 3.13.5: Decimal(&#x27;0.1&#x27;) + 0.1 raises TypeError, but Decimal(&#x27;0.1&#x27;) == 0.1 and sorted() with a float silently run and can mislead.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-decimal-blocks-float-arithmetic-but-allows-float-comparison/">
+<meta property="og:title" content="decimal: float Mixing Raises on Math, Not Comparison">
+<meta property="og:description" content="We measured Python 3.13.5: Decimal(&#x27;0.1&#x27;) + 0.1 raises TypeError, but Decimal(&#x27;0.1&#x27;) == 0.1 and sorted() with a float silently run and can mislead.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-decimal-blocks-float-arithmetic-but-allows-float-comparison/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Python's decimal module allow comparing a Decimal to a float?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, measurably -- unlike arithmetic (+, -, *, /), which raises TypeError when mixing Decimal and float, comparison operators (==, <, >, etc.) and functions like sorted() run without error on mixed Decimal/float values."}}, {"@type": "Question", "name": "Why does Decimal('0.1') + 0.1 raise an error but Decimal('0.1') == 0.1 doesn't?", "acceptedAnswer": {"@type": "Answer", "text": "Decimal intentionally blocks arithmetic with float to force an explicit, deliberate conversion, avoiding silent precision loss. We measured that this protection doesn't extend to comparisons -- == and < between Decimal and float are permitted and use the float's imprecise binary value directly."}}, {"@type": "Question", "name": "Is Decimal('0.1') == 0.1 True or False in Python?", "acceptedAnswer": {"@type": "Answer", "text": "False -- we measured this directly. The float 0.1 is a binary approximation, not the exact value 0.1, so comparing it against the exact Decimal('0.1') correctly reports them as unequal, but silently (no error) rather than via the loud TypeError you'd get from trying to add them."}}, {"@type": "Question", "name": "Can sorted() silently mix Decimal and float values?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured sorted() on a list containing both Decimal and float values running without error, using the same imprecision-prone comparison that arithmetic would have rejected. A stray float in otherwise-Decimal data can pass through sorting and filtering undetected."}}, {"@type": "Question", "name": "How do I prevent floats from silently leaking into Decimal comparisons?", "acceptedAnswer": {"@type": "Answer", "text": "Convert every float to Decimal (via str(), not the float constructor directly) at the point it enters your system, rather than relying on errors to catch mixed types later -- we confirmed comparisons and sorted() give no error signal when a float is present, unlike arithmetic."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>decimal: Mixing With float Raises on Arithmetic, Not on Comparison (tested)</h1>
+<p class="lead">Python's <code>decimal</code> module famously refuses to let you add a <code>Decimal</code> and a <code>float</code> directly, forcing you to convert explicitly -- a safety net against silently mixing exact and imprecise numbers. We measured whether that same protection extends to comparison operators and <code>sorted()</code>, which also mix the two types.</p>
+<h2 id="repro1">1. Arithmetic between Decimal and float raises TypeError</h2>
+<pre><code>from decimal import Decimal
+
+try:
+    Decimal("0.1") + 0.1
+except TypeError as e:
+    print("TypeError:", e)</code></pre>
+<pre><code>TypeError: unsupported operand type(s) for +: 'decimal.Decimal' and 'float'</code></pre>
+<p><strong>Measured:</strong> adding a <code>Decimal</code> and a <code>float</code> raises immediately -- this is the well-known, intentional guard rail. It forces an explicit choice: convert the float to <code>Decimal</code> (and decide whether via <code>str()</code> or <code>from_float()</code>) before combining them.</p>
+
+<h2 id="repro2">2. Comparison between Decimal and float runs silently -- and can give a surprising answer</h2>
+<pre><code>from decimal import Decimal
+
+print(Decimal("0.1") == 0.1)
+print(Decimal("0.1") < 0.10000000000000001)</code></pre>
+<pre><code>False
+True</code></pre>
+<p><strong>Measured:</strong> no <code>TypeError</code> here -- <code>==</code> and <code>&lt;</code> between <code>Decimal</code> and <code>float</code> work without complaint. But <code>Decimal('0.1') == 0.1</code> is <code>False</code> (the float <code>0.1</code> isn't exactly <code>0.1</code>, the same binary-imprecision issue as constructing <code>Decimal(0.1)</code> directly), and <code>Decimal('0.1')</code> compares as strictly less than a float that's supposed to represent an even tinier increment above it, because the comparison silently uses the float's imprecise binary value. Unlike arithmetic, there's no error to signal that a precision-sensitive mismatch just happened.</p>
+
+<h2 id="repro3">3. sorted() and list membership inherit the same silent mixing</h2>
+<pre><code>from decimal import Decimal
+
+mixed = [Decimal("0.3"), 0.1, Decimal("0.2")]
+print(sorted(mixed))</code></pre>
+<pre><code>[0.1, Decimal('0.2'), Decimal('0.3')]</code></pre>
+<p><strong>Measured:</strong> <code>sorted()</code> on a list mixing <code>Decimal</code> and <code>float</code> values runs without error and produces a plausible-looking, correctly-ordered result here -- but it did so by comparing a <code>Decimal</code> against a <code>float</code> at every step, the exact operation that silently uses the float's imprecise value. A codebase that got a loud <code>TypeError</code> the first time it tried to add a stray <code>float</code> into Decimal-typed data can still have that same stray float pass through comparisons, sorting, and filtering completely unnoticed, carrying its imprecision into every comparison it's part of. Convert floats to <code>Decimal</code> at the boundary where they enter the system, rather than relying on arithmetic errors to catch every place a float might leak in -- comparisons won't catch it for you.</p>
+<aside class="cta"><strong>Mixing Decimal and float in the same expression? Check whether you&#x27;re comparing or computing first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Python&#x27;s decimal module allow comparing a Decimal to a float?</summary><p>Yes, measurably -- unlike arithmetic (+, -, *, /), which raises TypeError when mixing Decimal and float, comparison operators (==, &lt;, &gt;, etc.) and functions like sorted() run without error on mixed Decimal/float values.</p></details>
+<details><summary>Why does Decimal(&#x27;0.1&#x27;) + 0.1 raise an error but Decimal(&#x27;0.1&#x27;) == 0.1 doesn&#x27;t?</summary><p>Decimal intentionally blocks arithmetic with float to force an explicit, deliberate conversion, avoiding silent precision loss. We measured that this protection doesn&#x27;t extend to comparisons -- == and &lt; between Decimal and float are permitted and use the float&#x27;s imprecise binary value directly.</p></details>
+<details><summary>Is Decimal(&#x27;0.1&#x27;) == 0.1 True or False in Python?</summary><p>False -- we measured this directly. The float 0.1 is a binary approximation, not the exact value 0.1, so comparing it against the exact Decimal(&#x27;0.1&#x27;) correctly reports them as unequal, but silently (no error) rather than via the loud TypeError you&#x27;d get from trying to add them.</p></details>
+<details><summary>Can sorted() silently mix Decimal and float values?</summary><p>Yes -- we measured sorted() on a list containing both Decimal and float values running without error, using the same imprecision-prone comparison that arithmetic would have rejected. A stray float in otherwise-Decimal data can pass through sorting and filtering undetected.</p></details>
+<details><summary>How do I prevent floats from silently leaking into Decimal comparisons?</summary><p>Convert every float to Decimal (via str(), not the float constructor directly) at the point it enters your system, rather than relying on errors to catch mixed types later -- we confirmed comparisons and sorted() give no error signal when a float is present, unlike arithmetic.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in decimal module: added a Decimal and a float together, then compared and sorted the same mixed pair, to see whether decimal&#x27;s protection against mixing types with float applies equally to arithmetic and comparison. PlainHeaders is our extension; Python&#x27;s decimal module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

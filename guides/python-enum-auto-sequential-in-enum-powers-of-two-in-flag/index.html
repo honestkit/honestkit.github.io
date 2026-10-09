@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>enum: auto() Gives Sequential Ints in Enum, Powers of 2 in Flag</title>
+<meta name="description" content="We measured Python 3.13.5: enum.auto() yields 1,2,3 in a plain Enum but 1,2,4 in a Flag -- switching base classes silently changes every value.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-enum-auto-sequential-in-enum-powers-of-two-in-flag/">
+<meta property="og:title" content="enum: auto() Gives Sequential Ints in Enum, Powers of 2 in Flag">
+<meta property="og:description" content="We measured Python 3.13.5: enum.auto() yields 1,2,3 in a plain Enum but 1,2,4 in a Flag -- switching base classes silently changes every value.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-enum-auto-sequential-in-enum-powers-of-two-in-flag/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does enum.auto() produce the same values in Enum and Flag?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured enum.auto() giving sequential integers (1, 2, 3) in a plain Enum, but powers of two (1, 2, 4) for the identical member definitions in a Flag, because Flag overrides auto()'s value-generation to keep each member a distinct bit."}}, {"@type": "Question", "name": "What happens if I change an Enum's base class to Flag but keep using auto()?", "acceptedAnswer": {"@type": "Answer", "text": "Every member's underlying value silently changes from sequential integers to powers of two -- we confirmed this with identical code differing only in base class. Anything that stored, serialized, or compared the old integer values will see different numbers after the switch."}}, {"@type": "Question", "name": "Can a Flag member have a value that's not a power of two?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, if assigned explicitly (e.g. A = 3) -- we measured auto() for a later member still correctly picking the next unused single bit, but the non-power-of-two member itself disappears from list(Flag) iteration, similar to how a duplicate-value alias disappears."}}, {"@type": "Question", "name": "Does a Flag member with a composite value still work even though it's missing from list()?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured Weird.A and Weird['A'] still resolving correctly by name with its correct value (3), even though it was absent from list(Weird) and from the set of values auto() considers already used."}}, {"@type": "Question", "name": "How do I make sure every Flag member shows up when iterating the class?", "acceptedAnswer": {"@type": "Answer", "text": "Only use single power-of-two values (1, 2, 4, 8, ...) for explicit Flag members, or use enum.auto() for all of them -- we confirmed auto() always picks the next free single bit, keeping every member visible in iteration."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>enum: auto() Gives Sequential Ints in Enum, Powers of 2 in Flag (tested)</h1>
+<p class="lead"><code>enum.auto()</code> looks like a base-class-independent way to say "just pick the next value" -- the same call, used the same way, regardless of which enum flavor you inherit from. We measured whether it actually produces the same sequence in a plain <code>Enum</code> versus a <code>Flag</code>, the kind of thing you'd hit switching a status-code enum to a bitwise-combinable one.</p>
+<h2 id="repro1">1. Plain Enum: auto() counts up 1, 2, 3, ...</h2>
+<pre><code>import enum
+
+class Color(enum.Enum):
+    RED = enum.auto()
+    GREEN = enum.auto()
+    BLUE = enum.auto()
+
+print([c.value for c in Color])</code></pre>
+<pre><code>[1, 2, 3]</code></pre>
+<p><strong>Measured:</strong> in a plain <code>Enum</code>, <code>auto()</code> assigns sequential integers starting at 1 -- exactly the behavior most people expect from "just number them."</p>
+
+<h2 id="repro2">2. Flag: the identical code gives powers of two instead</h2>
+<pre><code>import enum
+
+class ColorFlag(enum.Flag):
+    RED = enum.auto()
+    GREEN = enum.auto()
+    BLUE = enum.auto()
+
+print([c.value for c in ColorFlag])</code></pre>
+<pre><code>[1, 2, 4]</code></pre>
+<p><strong>Measured:</strong> the exact same three lines of member definitions, only changing the base class from <code>Enum</code> to <code>Flag</code>, produce <code>1, 2, 4</code> instead of <code>1, 2, 3</code>. <code>auto()</code> is base-class-aware: <code>Flag</code> (and <code>IntFlag</code>) override its value-picking logic to hand out the next unused power of two, so members can be combined with <code>|</code> without colliding bits. If any of these values were ever stored, serialized, or compared against a hardcoded int (a database column, a JSON field, an API contract), converting the class from <code>Enum</code> to <code>Flag</code> for bitwise-combination support silently changes what every member's underlying value is.</p>
+
+<h2 id="repro3">3. A non-power-of-two explicit value still lets auto() continue correctly -- but becomes invisible</h2>
+<pre><code>import enum
+
+class Weird(enum.Flag):
+    A = 3           # explicit, not a single bit (binary 11)
+    B = enum.auto()
+
+print([m.value for m in Weird])
+print(list(Weird))
+print(Weird.A, Weird.A.value)</code></pre>
+<pre><code>[4]
+[&lt;Weird.B: 4&gt;]
+Weird.A 3</code></pre>
+<p><strong>Measured:</strong> <code>auto()</code> for <code>B</code> correctly continues from the next free bit (4, since 3 already uses bits 1 and 2), but <code>A</code> itself -- having a composite, multi-bit value instead of a single flag bit -- is treated as a pseudo-member and vanishes from <code>list(Weird)</code>, the same way a duplicate-value alias does. <code>Weird.A</code> still resolves by name and still reports its correct value; it just doesn't appear when iterating the class. If you need every value to show up consistently in <code>list()</code>/iteration, keep every explicit Flag value a single power of two and let <code>auto()</code> handle the rest.</p>
+<aside class="cta"><strong>Switching a plain Enum to Flag to support bitwise combination? Check what that does to auto() values first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does enum.auto() produce the same values in Enum and Flag?</summary><p>No -- we measured enum.auto() giving sequential integers (1, 2, 3) in a plain Enum, but powers of two (1, 2, 4) for the identical member definitions in a Flag, because Flag overrides auto()&#x27;s value-generation to keep each member a distinct bit.</p></details>
+<details><summary>What happens if I change an Enum&#x27;s base class to Flag but keep using auto()?</summary><p>Every member&#x27;s underlying value silently changes from sequential integers to powers of two -- we confirmed this with identical code differing only in base class. Anything that stored, serialized, or compared the old integer values will see different numbers after the switch.</p></details>
+<details><summary>Can a Flag member have a value that&#x27;s not a power of two?</summary><p>Yes, if assigned explicitly (e.g. A = 3) -- we measured auto() for a later member still correctly picking the next unused single bit, but the non-power-of-two member itself disappears from list(Flag) iteration, similar to how a duplicate-value alias disappears.</p></details>
+<details><summary>Does a Flag member with a composite value still work even though it&#x27;s missing from list()?</summary><p>Yes -- we measured Weird.A and Weird[&#x27;A&#x27;] still resolving correctly by name with its correct value (3), even though it was absent from list(Weird) and from the set of values auto() considers already used.</p></details>
+<details><summary>How do I make sure every Flag member shows up when iterating the class?</summary><p>Only use single power-of-two values (1, 2, 4, 8, ...) for explicit Flag members, or use enum.auto() for all of them -- we confirmed auto() always picks the next free single bit, keeping every member visible in iteration.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in enum module: defined the same three member names using enum.auto() in a plain Enum, then in a Flag, and compared the resulting values, plus checked what happens when a Flag member has an explicit non-power-of-2 value followed by auto(). PlainHeaders is our extension; Python&#x27;s enum module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

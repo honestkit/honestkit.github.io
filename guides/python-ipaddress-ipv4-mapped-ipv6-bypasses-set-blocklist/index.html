@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ipaddress: IPv4-Mapped IPv6 Can Bypass a Set-Based Blocklist</title>
+<meta name="description" content="We measured Python 3.13.5: &#x27;::ffff:127.0.0.1&#x27; in {IPv4Address(&#x27;127.0.0.1&#x27;)} is False, even though is_loopback correctly says True.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-ipaddress-ipv4-mapped-ipv6-bypasses-set-blocklist/">
+<meta property="og:title" content="ipaddress: IPv4-Mapped IPv6 Can Bypass a Set-Based Blocklist">
+<meta property="og:description" content="We measured Python 3.13.5: &#x27;::ffff:127.0.0.1&#x27; in {IPv4Address(&#x27;127.0.0.1&#x27;)} is False, even though is_loopback correctly says True.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-ipaddress-ipv4-mapped-ipv6-bypasses-set-blocklist/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Python's ipaddress module treat ::ffff:127.0.0.1 and 127.0.0.1 as equal?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured ipaddress.ip_address('::ffff:127.0.0.1') == ipaddress.ip_address('127.0.0.1') returning False, and the IPv6 form failing membership in a set containing the IPv4 form, even though they represent the same host."}}, {"@type": "Question", "name": "Does is_loopback work correctly on IPv4-mapped IPv6 addresses?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured ipaddress.ip_address('::ffff:127.0.0.1').is_loopback returning True, correctly identifying it as loopback despite being parsed as an IPv6Address object."}}, {"@type": "Question", "name": "Can an IP blocklist in Python be bypassed with IPv4-mapped IPv6 notation?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, if the blocklist is a set/list of address objects compared with == or in -- we measured a blocked IPv4 address's IPv4-mapped IPv6 spelling passing the membership check undetected, while per-address checks like is_loopback still caught it correctly."}}, {"@type": "Question", "name": "How do I compare an IPv4-mapped IPv6 address against a list of IPv4 addresses?", "acceptedAnswer": {"@type": "Answer", "text": "Use the .ipv4_mapped attribute on the IPv6Address object to get the embedded IPv4Address first, then compare that. We confirmed this normalized form correctly matches the equivalent plain IPv4 entry in a set."}}, {"@type": "Question", "name": "What does IPv6Address.ipv4_mapped return for a normal IPv6 address?", "acceptedAnswer": {"@type": "Answer", "text": "None -- it's only populated for addresses in the ::ffff:a.b.c.d mapped form, per the ipaddress module's design; we measured it returning the embedded IPv4Address object only for that specific address shape."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>IPv4-Mapped IPv6 Addresses Bypass a Set-Based ipaddress Blocklist (tested)</h1>
+<p class="lead">An IPv6 address can embed an IPv4 address inside it -- <code>::ffff:127.0.0.1</code> means the same host as <code>127.0.0.1</code>. We measured whether Python's <code>ipaddress</code> module treats them as equal for blocklist purposes. Checking attributes like <code>is_loopback</code> correctly recognizes it. Checking set membership against a list of plain <code>IPv4Address</code> objects does not.</p>
+<h2 id="repro1">1. is_loopback/is_private correctly recognize the IPv4-mapped form</h2>
+<pre><code>import ipaddress
+
+mapped = ipaddress.ip_address("::ffff:127.0.0.1")
+print(type(mapped).__name__)
+print(mapped.is_loopback)
+print(ipaddress.ip_address("::ffff:192.168.1.1").is_private)</code></pre>
+<pre><code>IPv6Address
+True
+True</code></pre>
+<p><strong>Measured:</strong> <code>ipaddress</code> parses <code>"::ffff:127.0.0.1"</code> as an <code>IPv6Address</code> object, but its <code>is_loopback</code> and <code>is_private</code> properties correctly see through the IPv4-mapped encoding and return the same answer as the equivalent plain IPv4 address. This part works exactly as you'd hope.</p>
+
+<h2 id="repro2">2. But it silently fails a set-based blocklist check</h2>
+<pre><code>import ipaddress
+
+blocklist = {ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("10.0.0.5")}
+candidate = ipaddress.ip_address("::ffff:127.0.0.1")
+
+print(candidate in blocklist)
+print(candidate.is_loopback)</code></pre>
+<pre><code>False
+True</code></pre>
+<p><strong>Measured:</strong> the exact address that <code>is_loopback</code> just confirmed is loopback -- i.e. the same host as an entry already in the blocklist -- returns <code>False</code> for membership in a <code>set</code> of <code>IPv4Address</code> objects. <code>IPv4Address</code> and <code>IPv6Address</code> instances are never equal to each other in Python, regardless of what address they represent, so a blocklist built by collecting IP objects and comparing with <code>in</code> or <code>==</code> silently lets the IPv4-mapped IPv6 form through.</p>
+
+<h2 id="repro3">3. The fix: normalize with .ipv4_mapped before comparing</h2>
+<pre><code>import ipaddress
+
+blocklist = {ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("10.0.0.5")}
+candidate = ipaddress.ip_address("::ffff:127.0.0.1")
+
+normalized = candidate.ipv4_mapped
+print(normalized)
+print(normalized in blocklist)</code></pre>
+<pre><code>127.0.0.1
+True</code></pre>
+<p><strong>Measured:</strong> <code>IPv6Address.ipv4_mapped</code> returns the embedded <code>IPv4Address</code> (or <code>None</code> if the address isn't in that mapped form), and comparing <em>that</em> against the blocklist correctly matches. If any code path accepts raw IP strings from a client and checks them against an address-object blocklist, it needs to call <code>.ipv4_mapped</code> (falling back to the address itself when it's <code>None</code>) before comparing -- otherwise an attacker can reach a blocked address just by sending its IPv4-mapped IPv6 spelling instead of the plain IPv4 form.</p>
+<aside class="cta"><strong>Blocklisting IPs by comparing ipaddress objects directly? Normalize IPv4-mapped IPv6 first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Python&#x27;s ipaddress module treat ::ffff:127.0.0.1 and 127.0.0.1 as equal?</summary><p>No -- we measured ipaddress.ip_address(&#x27;::ffff:127.0.0.1&#x27;) == ipaddress.ip_address(&#x27;127.0.0.1&#x27;) returning False, and the IPv6 form failing membership in a set containing the IPv4 form, even though they represent the same host.</p></details>
+<details><summary>Does is_loopback work correctly on IPv4-mapped IPv6 addresses?</summary><p>Yes -- we measured ipaddress.ip_address(&#x27;::ffff:127.0.0.1&#x27;).is_loopback returning True, correctly identifying it as loopback despite being parsed as an IPv6Address object.</p></details>
+<details><summary>Can an IP blocklist in Python be bypassed with IPv4-mapped IPv6 notation?</summary><p>Yes, if the blocklist is a set/list of address objects compared with == or in -- we measured a blocked IPv4 address&#x27;s IPv4-mapped IPv6 spelling passing the membership check undetected, while per-address checks like is_loopback still caught it correctly.</p></details>
+<details><summary>How do I compare an IPv4-mapped IPv6 address against a list of IPv4 addresses?</summary><p>Use the .ipv4_mapped attribute on the IPv6Address object to get the embedded IPv4Address first, then compare that. We confirmed this normalized form correctly matches the equivalent plain IPv4 entry in a set.</p></details>
+<details><summary>What does IPv6Address.ipv4_mapped return for a normal IPv6 address?</summary><p>None -- it&#x27;s only populated for addresses in the ::ffff:a.b.c.d mapped form, per the ipaddress module&#x27;s design; we measured it returning the embedded IPv4Address object only for that specific address shape.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in ipaddress module: built a blocklist as a set of IPv4Address objects, then checked membership for the IPv4-mapped IPv6 form of a blocked address (&#x27;::ffff:127.0.0.1&#x27;) both directly and after normalizing with the .ipv4_mapped attribute, and separately checked .is_loopback/.is_private on the same address. PlainHeaders is our extension; Python&#x27;s ipaddress module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

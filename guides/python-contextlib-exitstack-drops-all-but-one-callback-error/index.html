@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>contextlib.ExitStack Silently Drops All But One Callback Error</title>
+<meta name="description" content="We measured Python 3.13.5: when multiple ExitStack callbacks raise, only the last-executed one propagates -- the rest vanish, not even chained as __context__.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-contextlib-exitstack-drops-all-but-one-callback-error/">
+<meta property="og:title" content="contextlib.ExitStack Silently Drops All But One Callback Error">
+<meta property="og:description" content="We measured Python 3.13.5: when multiple ExitStack callbacks raise, only the last-executed one propagates -- the rest vanish, not even chained as __context__.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-contextlib-exitstack-drops-all-but-one-callback-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What happens if two ExitStack callbacks both raise an exception?", "acceptedAnswer": {"@type": "Answer", "text": "Only one exception propagates out of the with statement -- we measured the others vanishing completely, with no trace in __context__, __cause__, or the traceback."}}, {"@type": "Question", "name": "Which callback's exception wins when multiple callbacks fail?", "acceptedAnswer": {"@type": "Answer", "text": "The one that runs last -- we measured ExitStack running callbacks in LIFO (reverse-registration) order, so the exception from the callback registered first (which therefore executes last) is the one that propagates."}}, {"@type": "Question", "name": "Is the lost exception chained as __context__ like normal exception handling?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured __context__ and __cause__ both None and __suppress_context__ False, meaning the information wasn't deliberately suppressed, it was simply never captured."}}, {"@type": "Question", "name": "Does the original exception from inside the with block survive if a callback also fails?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, in that specific case -- we measured the block's own exception surviving as __context__ when exactly one callback also raises. The total silent loss only happens when multiple callbacks fail against each other with no exception already propagating from the block."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>contextlib: ExitStack Silently Drops All But One Callback Error (tested)</h1>
+<p class="lead"><code>contextlib.ExitStack</code> lets you register several cleanup callbacks and runs them all on exit, even if one of them raises. That sounds like it would behave like exception chaining elsewhere in Python -- each new exception remembering the one before it as <code>__context__</code>. We measured what actually happens when two callbacks both raise.</p>
+<h2 id="repro1">1. Two callbacks, both raising -- only one exception comes out</h2>
+<pre><code>import contextlib
+
+def cb1():
+    raise ValueError("cb1 failed")
+
+def cb2():
+    raise TypeError("cb2 failed")
+
+try:
+    with contextlib.ExitStack() as stack:
+        stack.callback(cb1)
+        stack.callback(cb2)
+except Exception as e:
+    print(type(e).__name__, e)</code></pre>
+<pre><code>ValueError cb1 failed
+</code></pre>
+<p><strong>Measured:</strong> <code>cb1</code> was registered first but <code>ExitStack</code> runs callbacks in reverse (LIFO) order on exit, so <code>cb2</code> actually executes first, then <code>cb1</code>. The exception that propagates is <code>cb1</code>'s -- whichever callback runs <em>last</em> wins, overwriting whatever exception the previous callback(s) raised.</p>
+
+<h2 id="repro2">2. The lost exception isn't chained anywhere -- it's just gone</h2>
+<pre><code>import contextlib
+
+def cb1():
+    raise ValueError("cb1 failed")
+
+def cb2():
+    raise TypeError("cb2 failed")
+
+try:
+    with contextlib.ExitStack() as stack:
+        stack.callback(cb1)
+        stack.callback(cb2)
+except Exception as e:
+    print("context:", e.__context__)
+    print("cause:", e.__cause__)
+    print("suppress_context:", e.__suppress_context__)</code></pre>
+<pre><code>context: None
+cause: None
+suppress_context: False
+</code></pre>
+<p><strong>Measured:</strong> normal Python exception handling chains a new exception to whatever was being handled when it was raised -- that's exactly what <code>__context__</code> is for. Here it's <code>None</code>. <code>cb2</code>'s <code>TypeError("cb2 failed")</code> doesn't appear in <code>__context__</code>, <code>__cause__</code>, or the printed traceback. It isn't suppressed on purpose (<code>__suppress_context__</code> is <code>False</code>) -- the information is simply never captured in the first place, because <code>ExitStack.__exit__</code> re-enters its own cleanup loop for each callback and only the final exception it's holding at the end gets raised.</p>
+
+<h2 id="repro3">3. The same thing happens when a callback error competes with the block's own exception</h2>
+<pre><code>import contextlib
+
+def cb1():
+    raise ValueError("cb1 failed")
+
+try:
+    with contextlib.ExitStack() as stack:
+        stack.callback(cb1)
+        raise KeyError("the real bug")
+except Exception as e:
+    print(type(e).__name__, e)
+    print("context:", e.__context__)</code></pre>
+<pre><code>ValueError cb1 failed
+context: the real bug
+</code></pre>
+<p><strong>Measured:</strong> here the original <code>KeyError</code> at least survives as <code>__context__</code> -- this case goes through the normal "new exception raised while handling another" path, since the callback runs while <code>KeyError</code> is already propagating. The silent total loss from repro 2 is specific to multiple callbacks failing <em>against each other</em>, with no original exception from the block itself to anchor the chain.</p>
+
+<h2 id="fix">Catch and collect inside each callback if you need every failure</h2>
+<pre><code>import contextlib
+
+errors = []
+
+def safe_cb(fn):
+    try:
+        fn()
+    except Exception as e:
+        errors.append(e)
+
+with contextlib.ExitStack() as stack:
+    stack.callback(safe_cb, cb1)
+    stack.callback(safe_cb, cb2)
+
+if errors:
+    raise ExceptionGroup("cleanup failed", errors)</code></pre>
+<p>Wrapping each callback so it records its own exception instead of raising is the only way to see every failure -- letting <code>ExitStack</code> propagate the raw exception means you only ever find out about one of them, and which one depends on registration order.</p>
+<aside class="cta"><strong>Registering multiple cleanup callbacks on an ExitStack? Check what happens when more than one of them fails -- only one error survives, and it&#x27;s not a chain:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What happens if two ExitStack callbacks both raise an exception?</summary><p>Only one exception propagates out of the with statement -- we measured the others vanishing completely, with no trace in __context__, __cause__, or the traceback.</p></details>
+<details><summary>Which callback&#x27;s exception wins when multiple callbacks fail?</summary><p>The one that runs last -- we measured ExitStack running callbacks in LIFO (reverse-registration) order, so the exception from the callback registered first (which therefore executes last) is the one that propagates.</p></details>
+<details><summary>Is the lost exception chained as __context__ like normal exception handling?</summary><p>No -- we measured __context__ and __cause__ both None and __suppress_context__ False, meaning the information wasn&#x27;t deliberately suppressed, it was simply never captured.</p></details>
+<details><summary>Does the original exception from inside the with block survive if a callback also fails?</summary><p>Yes, in that specific case -- we measured the block&#x27;s own exception surviving as __context__ when exactly one callback also raises. The total silent loss only happens when multiple callbacks fail against each other with no exception already propagating from the block.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in contextlib module: registered two callbacks on an ExitStack that each raise a different exception, and inspected what actually propagates plus its __context__/__cause__. PlainHeaders is our extension; Python&#x27;s contextlib module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

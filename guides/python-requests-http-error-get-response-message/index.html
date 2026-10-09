@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python requests: Get the Error Message From an HTTP Response</title>
+<meta name="description" content="We measured requests not raising on 4xx/5xx, HTTPError hiding the server&#x27;s message, and reading it from e.response.json()/.text; plus urllib&#x27;s e.read().">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-requests-http-error-get-response-message/">
+<meta property="og:title" content="Python requests: Get the Error Message From an HTTP Response">
+<meta property="og:description" content="We measured requests not raising on 4xx/5xx, HTTPError hiding the server&#x27;s message, and reading it from e.response.json()/.text; plus urllib&#x27;s e.read().">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-requests-http-error-get-response-message/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I get the error message from an HTTP response in Python requests?", "acceptedAnswer": {"@type": "Answer", "text": "Call r.raise_for_status(), catch requests.HTTPError, and read e.response.json() or e.response.text. We measured the HTTPError message containing only status, reason and URL, while e.response held the server's message."}}, {"@type": "Question", "name": "Does requests raise an exception for 404 or 500?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured requests.get() returning normally for a 422 with r.ok False. You need r.raise_for_status() to get an exception."}}, {"@type": "Question", "name": "How do I get the response body from urllib HTTPError?", "acceptedAnswer": {"@type": "Answer", "text": "e.read(). We measured e.code 422, e.reason 'Unprocessable Content' and the JSON body via e.read().decode()."}}, {"@type": "Question", "name": "What if the error response is HTML, not JSON?", "acceptedAnswer": {"@type": "Answer", "text": "response.json() raises requests.JSONDecodeError; fall back to response.text. We measured a 502 HTML page handled that way."}}, {"@type": "Question", "name": "What does r.reason contain?", "acceptedAnswer": {"@type": "Answer", "text": "The HTTP reason phrase sent by the server, e.g. 'Unprocessable Content' or 'Bad Gateway'. We measured both."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python requests: get the HTTP error response message (tested)</h1>
+<p class="lead">When an API call fails, the server usually explains why in the response body. But Python's <code>HTTPError</code> message doesn't include it, and <code>requests</code> doesn't even raise by default. We measured both libraries against a local server.</p>
+<p>Every block below imports this tiny local test server, which returns a JSON error (422), an HTML error page (502), and a success (200):</p>
+<pre><code># tiny test API on 127.0.0.1:8963, started in a thread by each block
+import json, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        routes = {&quot;/json&quot;: (422, &quot;application/json&quot;, json.dumps({&quot;error&quot;: &quot;email is invalid&quot;, &quot;field&quot;: &quot;email&quot;})),
+                  &quot;/html&quot;: (502, &quot;text/html&quot;, &quot;&lt;html&gt;&lt;body&gt;&lt;h1&gt;502 Bad Gateway&lt;/h1&gt;&lt;/body&gt;&lt;/html&gt;&quot;),
+                  &quot;/ok&quot;:   (200, &quot;application/json&quot;, &#x27;{&quot;ok&quot;: true}&#x27;)}
+        code, ctype, body = routes[self.path]
+        self.send_response(code); self.send_header(&quot;Content-Type&quot;, ctype); self.end_headers()
+        self.wfile.write(body.encode())
+srv = HTTPServer((&quot;127.0.0.1&quot;, 8963), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()</code></pre>
+
+<h2 id="silent">1. requests doesn't raise on 4xx/5xx, and the exception hides the body</h2>
+<pre><code>import requests, server
+r = requests.get(&quot;http://127.0.0.1:8963/json&quot;)
+print(&quot;no exception! status:&quot;, r.status_code, &quot;ok:&quot;, r.ok)
+try:
+    r.raise_for_status()
+except requests.HTTPError as e:
+    print(&quot;str(e):&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>no exception! status: 422 ok: False
+str(e): 422 Client Error: Unprocessable Content for url: http://127.0.0.1:8963/json</code></pre>
+<p><strong>Measured with requests 2.32.3:</strong> a 422 response raises nothing: <code>requests.get()</code> returns normally and only <code>r.ok</code> is <code>False</code>. <code>raise_for_status()</code> turns it into an <code>HTTPError</code>, but its message has only the status, reason and URL. The server's explanation (<code>"email is invalid"</code>) isn't in it. That's why logs often say just "422 Client Error" and nobody knows why.</p>
+
+<h2 id="body">2. Getting the actual error message: e.response</h2>
+<pre><code>import requests, server
+def get(url):
+    r = requests.get(url, timeout=5)
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        resp = e.response
+        try:
+            detail = resp.json()
+        except requests.JSONDecodeError:
+            detail = resp.text[:80]
+        raise RuntimeError(f&quot;{resp.status_code} {resp.reason} from {resp.url}: {detail}&quot;) from e
+    return r.json()
+for path in (&quot;/ok&quot;, &quot;/json&quot;, &quot;/html&quot;):
+    try:
+        print(get(&quot;http://127.0.0.1:8963&quot; + path))
+    except RuntimeError as e:
+        print(e)</code></pre>
+<p>Output:</p>
+<pre><code>{&#x27;ok&#x27;: True}
+422 Unprocessable Content from http://127.0.0.1:8963/json: {&#x27;error&#x27;: &#x27;email is invalid&#x27;, &#x27;field&#x27;: &#x27;email&#x27;}
+502 Bad Gateway from http://127.0.0.1:8963/html: &lt;html&gt;&lt;body&gt;&lt;h1&gt;502 Bad Gateway&lt;/h1&gt;&lt;/body&gt;&lt;/html&gt;</code></pre>
+<p><strong>Measured:</strong> the <code>HTTPError</code> carries the full response in <code>e.response</code>. Try <code>.json()</code> first for APIs, fall back to <code>.text</code> (truncated) for HTML error pages from proxies and load balancers, and re-raise with status, reason, URL and detail in one line. <code>raise ... from e</code> keeps the original traceback. Catch <code>requests.JSONDecodeError</code> (not <code>json.JSONDecodeError</code> only) so it works whichever JSON library requests is using.</p>
+
+<h2 id="urllib">3. urllib: HTTPError is also the response</h2>
+<pre><code>import urllib.request, urllib.error, server
+try:
+    urllib.request.urlopen(&quot;http://127.0.0.1:8963/json&quot;)
+except urllib.error.HTTPError as e:
+    print(&quot;str(e):&quot;, e)
+    print(&quot;code:&quot;, e.code, &quot;| reason:&quot;, e.reason, &quot;| body:&quot;, e.read().decode())</code></pre>
+<p>Output:</p>
+<pre><code>str(e): HTTP Error 422: Unprocessable Content
+code: 422 | reason: Unprocessable Content | body: {&quot;error&quot;: &quot;email is invalid&quot;, &quot;field&quot;: &quot;email&quot;}</code></pre>
+<p><strong>Measured:</strong> the standard library's <code>urlopen()</code> <em>does</em> raise on 4xx/5xx, and again the message (<code>HTTP Error 422: Unprocessable Content</code>) has no body. The <code>HTTPError</code> object is itself a file-like response: <code>e.code</code>, <code>e.reason</code>, <code>e.headers</code>, and <code>e.read()</code> for the body. You can only read the body once.</p>
+
+<aside class="cta"><strong>Want to see the full error response a server sends, headers included? Inspect it in the browser:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I get the error message from an HTTP response in Python requests?</summary><p>Call r.raise_for_status(), catch requests.HTTPError, and read e.response.json() or e.response.text. We measured the HTTPError message containing only status, reason and URL, while e.response held the server&#x27;s message.</p></details>
+<details><summary>Does requests raise an exception for 404 or 500?</summary><p>No. We measured requests.get() returning normally for a 422 with r.ok False. You need r.raise_for_status() to get an exception.</p></details>
+<details><summary>How do I get the response body from urllib HTTPError?</summary><p>e.read(). We measured e.code 422, e.reason &#x27;Unprocessable Content&#x27; and the JSON body via e.read().decode().</p></details>
+<details><summary>What if the error response is HTML, not JSON?</summary><p>response.json() raises requests.JSONDecodeError; fall back to response.text. We measured a 502 HTML page handled that way.</p></details>
+<details><summary>What does r.reason contain?</summary><p>The HTTP reason phrase sent by the server, e.g. &#x27;Unprocessable Content&#x27; or &#x27;Bad Gateway&#x27;. We measured both.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 and requests 2.32.3 against a local http.server returning a 422 JSON error, a 502 HTML page and a 200: requests without and with raise_for_status(), e.response.json()/text, and urllib&#x27;s HTTPError. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; requests and urllib are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

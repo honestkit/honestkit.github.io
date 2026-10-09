@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TextIOWrapper.reconfigure() Silently Mixes Encodings (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: reconfigure(encoding=...) is unrestricted on the write side, letting a file end up with mixed byte encodings and no warning.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-io-textiowrapper-reconfigure-encoding-mid-write/">
+<meta property="og:title" content="TextIOWrapper.reconfigure() Silently Mixes Encodings (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: reconfigure(encoding=...) is unrestricted on the write side, letting a file end up with mixed byte encodings and no warning.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-io-textiowrapper-reconfigure-encoding-mid-write/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does TextIOWrapper.reconfigure(encoding=...) check anything before switching on the write side?", "acceptedAnswer": {"@type": "Answer", "text": "We measured no restriction at all on the write side -- it can be called after any number of writes and takes effect immediately for subsequent writes, with nothing re-encoding what was already written in the old encoding."}}, {"@type": "Question", "name": "Why does the read side block reconfigure() but the write side doesn't?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that reconfigure() raises UnsupportedOperation on the read side as soon as any read() has happened, because the internal incremental decoder has state that can't be swapped mid-stream. The write side doesn't have an equivalent check, even though re-encoding mid-write has the same kind of consequence -- a single stream ending up with inconsistent byte encodings."}}, {"@type": "Question", "name": "How do I detect a file that was written with a mid-stream encoding switch?", "acceptedAnswer": {"@type": "Answer", "text": "There's no general way from the file alone -- we measured that reading it back with one encoding can either crash (if a later segment isn't valid in that encoding) or silently produce mojibake (if it happens to decode without error, just incorrectly) for the segment written in the other encoding."}}, {"@type": "Question", "name": "Is this specific to switching between utf-8 and latin-1?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we used those two because the difference is easy to see in the raw bytes, but the underlying issue is reconfigure(encoding=...)'s lack of a write-side guard, which applies to any pair of encodings, not just that specific combination."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>io.TextIOWrapper.reconfigure() Mid-Write Encoding Switch Is Silent (tested)</h1>
+<p class="lead"><code>io.TextIOWrapper.reconfigure()</code> lets you change <code>encoding</code>, <code>errors</code>, or <code>newline</code> on an already-open text stream. On the read side, it enforces a safety rule: calling it after any <code>read()</code> has already happened raises <code>UnsupportedOperation</code>, because the internal decoder's state can't be swapped out mid-stream. The write side has no such restriction -- you can call <code>reconfigure(encoding=...)</code> after writing any amount of text, and it takes effect immediately for everything written afterward. Nothing re-encodes what was already written, so a single file can end up with two different byte encodings concatenated together, with no error or warning raised at write time.</p>
+<h2 id="repro1">1. Switching encoding mid-write succeeds with no error</h2>
+<pre><code>import io
+
+buf = io.BytesIO()
+text = io.TextIOWrapper(buf, encoding="utf-8")
+text.write("café ")          # encoded as UTF-8
+text.reconfigure(encoding="latin-1")
+text.write("café")           # encoded as Latin-1, same stream
+text.flush()
+print(buf.getvalue())</code></pre>
+<pre><code>b'caf\xc3\xa9 caf\xe9'</code></pre>
+<p><strong>Measured:</strong> the first "caf&eacute; " is encoded as UTF-8 (<code>\xc3\xa9</code> for <code>&eacute;</code>), the second "caf&eacute;" right after it is encoded as Latin-1 (<code>\xe9</code> for the same character) -- two different byte sequences for the same character, concatenated in one file, produced without any exception or warning.</p>
+
+<h2 id="repro2">2. The read side refuses the exact same thing</h2>
+<pre><code>reader = io.TextIOWrapper(io.BytesIO(b"hello"), encoding="utf-8")
+reader.read(1)
+try:
+    reader.reconfigure(encoding="latin-1")
+except Exception as e:
+    print("reconfigure after a read ->", type(e).__name__, e)</code></pre>
+<pre><code>reconfigure after a read -> UnsupportedOperation It is not possible to set the encoding or newline of stream after the first read</code></pre>
+<p><strong>Measured:</strong> reconfiguring the encoding on the read side raises immediately if even one character has already been read. The write side has no equivalent check -- the asymmetry is real, not an oversight you'd expect from symmetry between reading and writing the same class.</p>
+
+<h2 id="repro3">3. Reading the mixed-encoding file back goes wrong in two different ways</h2>
+<pre><code>raw = b'caf\xc3\xa9 caf\xe9'
+try:
+    io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8").read()
+except UnicodeDecodeError as e:
+    print("read back as utf-8 ->", e)
+
+print("read back as latin-1 ->", repr(io.TextIOWrapper(io.BytesIO(raw), encoding="latin-1").read()))</code></pre>
+<pre><code>read back as utf-8 -> 'utf-8' codec can't decode byte 0xe9 in position 9: unexpected end of data
+read back as latin-1 -> 'cafÃ© café'</code></pre>
+<p><strong>Measured:</strong> reading the file back as UTF-8 (the encoding it started with) crashes with <code>UnicodeDecodeError</code> on the Latin-1-encoded tail. Reading it back as Latin-1 (the encoding it ended with) doesn't crash at all -- it silently decodes the UTF-8-encoded head as mojibake (<code>caf&Atilde;&copy;</code> instead of <code>caf&eacute;</code>) with no error to flag that anything is wrong.</p>
+
+<h2 id="repro4">4. The fix: never reconfigure(encoding=...) on a stream you're actively writing</h2>
+<pre><code>buf2 = io.BytesIO()
+text2 = io.TextIOWrapper(buf2, encoding="utf-8")
+text2.write("café ")
+text2.write("café")   # stay on the original encoding for the whole stream
+text2.flush()
+print(io.TextIOWrapper(io.BytesIO(buf2.getvalue()), encoding="utf-8").read())</code></pre>
+<pre><code>café café</code></pre>
+<p><strong>Measured:</strong> keeping a single <code>TextIOWrapper</code> on one encoding for its entire lifetime -- never calling <code>reconfigure(encoding=...)</code> mid-write -- round-trips correctly. If different parts of a file genuinely need different encodings, write them through separate streams and concatenate the raw bytes explicitly, so the encoding boundary is visible in the code instead of hidden inside one stream's state.</p>
+<aside class="cta"><strong>Calling TextIOWrapper.reconfigure(encoding=...) partway through writing to a file? It&#x27;s allowed with no restriction on the write side -- unlike reads, which lock the encoding after the first one:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does TextIOWrapper.reconfigure(encoding=...) check anything before switching on the write side?</summary><p>We measured no restriction at all on the write side -- it can be called after any number of writes and takes effect immediately for subsequent writes, with nothing re-encoding what was already written in the old encoding.</p></details>
+<details><summary>Why does the read side block reconfigure() but the write side doesn&#x27;t?</summary><p>We measured that reconfigure() raises UnsupportedOperation on the read side as soon as any read() has happened, because the internal incremental decoder has state that can&#x27;t be swapped mid-stream. The write side doesn&#x27;t have an equivalent check, even though re-encoding mid-write has the same kind of consequence -- a single stream ending up with inconsistent byte encodings.</p></details>
+<details><summary>How do I detect a file that was written with a mid-stream encoding switch?</summary><p>There&#x27;s no general way from the file alone -- we measured that reading it back with one encoding can either crash (if a later segment isn&#x27;t valid in that encoding) or silently produce mojibake (if it happens to decode without error, just incorrectly) for the segment written in the other encoding.</p></details>
+<details><summary>Is this specific to switching between utf-8 and latin-1?</summary><p>No -- we used those two because the difference is easy to see in the raw bytes, but the underlying issue is reconfigure(encoding=...)&#x27;s lack of a write-side guard, which applies to any pair of encodings, not just that specific combination.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in io.TextIOWrapper: wrote text, called reconfigure(encoding=...) to switch encodings mid-stream, wrote more text, then inspected the raw bytes and tried reading the result back with a single encoding. PlainHeaders is our extension; Python&#x27;s io module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

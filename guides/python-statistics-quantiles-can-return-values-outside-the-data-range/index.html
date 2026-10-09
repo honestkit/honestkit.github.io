@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>statistics: quantiles() Can Go Outside Min/Max</title>
+<meta name="description" content="We measured Python 3.13.5: statistics.quantiles(range(1,11), n=100) returns values as low as 0.11 and as high as 10.89 -- outside the data&#x27;s actual 1-10 range.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-statistics-quantiles-can-return-values-outside-the-data-range/">
+<meta property="og:title" content="statistics: quantiles() Can Go Outside Min/Max">
+<meta property="og:description" content="We measured Python 3.13.5: statistics.quantiles(range(1,11), n=100) returns values as low as 0.11 and as high as 10.89 -- outside the data&#x27;s actual 1-10 range.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-statistics-quantiles-can-return-values-outside-the-data-range/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can statistics.quantiles() return values below the minimum or above the maximum of the input data?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured statistics.quantiles(range(1, 11), n=100) returning values from 0.11 to 10.89, even though the input data only ranges from 1 to 10. This happens when n is large relative to the number of data points."}}, {"@type": "Question", "name": "Why does statistics.quantiles() extrapolate beyond the data's range?", "acceptedAnswer": {"@type": "Answer", "text": "Its default interpolation method computes cut points by linear interpolation between ranks, and with a high n relative to a small sample, some of those computed ranks fall just past the first or last data point -- the function doesn't clamp the result to the observed min/max."}}, {"@type": "Question", "name": "How do I keep statistics.quantiles() results within the data's actual range?", "acceptedAnswer": {"@type": "Answer", "text": "Clamp each returned value to min(data)/max(data) explicitly after calling quantiles(), or keep n well below the number of data points -- we confirmed modest values like n=3 or n=4 stay safely inside the observed range for the same data."}}, {"@type": "Question", "name": "Does a small n avoid the out-of-range problem in statistics.quantiles()?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured quantiles(range(1,11), n=4) returning [3.25, 5.5, 7.75], all comfortably inside the data's 1-10 range. The extrapolation only becomes visible once n is pushed high relative to the sample size."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>statistics: quantiles() Can Extrapolate Past the Data&#x27;s Range (tested)</h1>
+<p class="lead"><code>statistics.quantiles()</code> cuts a dataset into equal-probability intervals, and it's natural to assume every returned cut point falls somewhere between the data's minimum and maximum. We measured what happens when <code>n</code> (the number of intervals) is large relative to the number of data points, and the cut points aren't clamped to the observed range at all.</p>
+<h2 id="repro1">1. With n=100 on 10 data points, some quantile values fall outside the data entirely</h2>
+<pre><code>import statistics as st
+
+data = list(range(1, 11))
+qs = st.quantiles(data, n=100)
+print("data range:", min(data), "-", max(data))
+print("quantile range:", min(qs), "-", max(qs))</code></pre>
+<pre><code>data range: 1 - 10
+quantile range: 0.11 - 10.89</code></pre>
+<p><strong>Measured:</strong> the 10 data points range from <code>1</code> to <code>10</code>, but the 99 returned quantile cut points range from <code>0.11</code> to <code>10.89</code> -- 18 of the 99 values fall outside <code>[1, 10]</code> entirely, both below the minimum and above the maximum observed value.</p>
+
+<h2 id="repro2">2. This is linear extrapolation, not an error or a clamp</h2>
+<pre><code>import statistics as st
+
+data = list(range(1, 11))
+qs = st.quantiles(data, n=100)
+outside = [q for q in qs if q < min(data) or q > max(data)]
+print(len(outside), "of", len(qs), "values outside the data range")
+print(outside[:3], "...", outside[-3:])</code></pre>
+<pre><code>18 of 99 values outside the data range
+[0.11, 0.22, 0.33] ... [10.67, 10.78, 10.89]</code></pre>
+<p><strong>Measured:</strong> the default <code>exclusive</code> method interpolates linearly between ranks that extend slightly past the first and last data points when <code>n</code> is large relative to the sample size -- it never raises, never clamps to <code>min(data)</code>/<code>max(data)</code>, and produces no warning that any value is outside what was actually observed.</p>
+
+<h2 id="repro3">3. A smaller n relative to the data stays safely inside the range</h2>
+<pre><code>import statistics as st
+
+data = list(range(1, 11))
+print(st.quantiles(data, n=3))
+print(st.quantiles(data, n=4))</code></pre>
+<pre><code>[3.6666666666666665, 7.333333333333333]
+[3.25, 5.5, 7.75]</code></pre>
+<p><strong>Measured:</strong> with a modest <code>n</code> (quartiles, terciles), every returned value stays comfortably inside the data's actual range -- this is almost certainly why the extrapolation goes unnoticed in typical use, since most code calls <code>quantiles()</code> with a small fixed <code>n</code> like 4 or 10. The problem only shows up once <code>n</code> is pushed high relative to a small sample (a common pattern when building a percentile table or a fine-grained histogram from limited data). If downstream code treats a quantile result as "a value this data could plausibly contain" (e.g. clamping a measurement into a percentile bucket, or asserting a result is within the sample's bounds), it will silently fail once a large <code>n</code> is used on a small dataset. Clamp the output to <code>min(data)</code>/<code>max(data)</code> explicitly if values outside the observed range aren't valid for your use case, or keep <code>n</code> well below the data's point count.</p>
+<aside class="cta"><strong>Calling statistics.quantiles() with a high n on a small dataset? Check whether the output values can actually occur in your data:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can statistics.quantiles() return values below the minimum or above the maximum of the input data?</summary><p>Yes -- we measured statistics.quantiles(range(1, 11), n=100) returning values from 0.11 to 10.89, even though the input data only ranges from 1 to 10. This happens when n is large relative to the number of data points.</p></details>
+<details><summary>Why does statistics.quantiles() extrapolate beyond the data&#x27;s range?</summary><p>Its default interpolation method computes cut points by linear interpolation between ranks, and with a high n relative to a small sample, some of those computed ranks fall just past the first or last data point -- the function doesn&#x27;t clamp the result to the observed min/max.</p></details>
+<details><summary>How do I keep statistics.quantiles() results within the data&#x27;s actual range?</summary><p>Clamp each returned value to min(data)/max(data) explicitly after calling quantiles(), or keep n well below the number of data points -- we confirmed modest values like n=3 or n=4 stay safely inside the observed range for the same data.</p></details>
+<details><summary>Does a small n avoid the out-of-range problem in statistics.quantiles()?</summary><p>Yes -- we measured quantiles(range(1,11), n=4) returning [3.25, 5.5, 7.75], all comfortably inside the data&#x27;s 1-10 range. The extrapolation only becomes visible once n is pushed high relative to the sample size.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in statistics module: called quantiles() with n much larger than the number of data points, and compared the returned values to the data&#x27;s actual min and max. PlainHeaders is our extension; Python&#x27;s statistics module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

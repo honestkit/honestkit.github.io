@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python IncompleteRead / Connection broken: IncompleteRead</title>
+<meta name="description" content="We measured urlopen and requests on bodies cut short: requests calls it ChunkedEncodingError even when not chunked, and Retry(read=3) never retries it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-incompleteread-chunkedencodingerror-connection-broken/">
+<meta property="og:title" content="Python IncompleteRead / Connection broken: IncompleteRead">
+<meta property="og:description" content="We measured urlopen and requests on bodies cut short: requests calls it ChunkedEncodingError even when not chunked, and Retry(read=3) never retries it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-incompleteread-chunkedencodingerror-connection-broken/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does requests say ChunkedEncodingError when my response isn't chunked?", "acceptedAnswer": {"@type": "Answer", "text": "requests wraps urllib3's ProtocolError for any body that ends early in ChunkedEncodingError. We measured it for a plain Content-Length: 20 response that sent 11 bytes. The name is historical; read the message inside it instead."}}, {"@type": "Question", "name": "What does IncompleteRead(11 bytes read, 9 more expected) mean?", "acceptedAnswer": {"@type": "Answer", "text": "The headers announced a body length (Content-Length, or a chunk size), 11 bytes of it arrived, and the connection closed with 9 still missing. The client is reporting what it saw; the cut happened on the server side or somewhere in between."}}, {"@type": "Question", "name": "Will HTTPAdapter(max_retries=Retry(...)) fix it?", "acceptedAnswer": {"@type": "Answer", "text": "No. We mounted Retry(total=3, read=3, connect=3) and the server was hit exactly once. Retry applies while urllib3 is getting the response; requests reads the body after that, so a broken body raises straight to your code. Wrap the call in your own retry loop."}}, {"@type": "Question", "name": "Can I just use the partial data?", "acceptedAnswer": {"@type": "Answer", "text": "With urllib, e.partial holds bytes received, but for a chunked response cut mid-chunk we measured e.partial == b'' even though 11 bytes arrived. Treat a broken body as failed and retry, or resume with a Range header if the server supports it."}}, {"@type": "Question", "name": "Does http.client raise IncompleteRead for anything else?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We separately measured that a transient None from a non-blocking socket makes HTTPResponse.read() raise IncompleteRead(0 bytes read) on a chunked body even though the server sent everything -- see our guide on resp.read() failing three different ways. With ordinary blocking sockets, IncompleteRead means a real early close."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>IncompleteRead and &quot;Connection broken: IncompleteRead&quot; in Python (tested)</h1>
+<p class="lead"><code>http.client.IncompleteRead</code> and requests' <code>ChunkedEncodingError: ('Connection broken: IncompleteRead(11 bytes read, 9 more expected)')</code> both mean the connection closed before the body the server promised was complete. We built a local server that cuts bodies short three ways and measured what <code>urllib</code> and <code>requests</code> report. Two surprises: <code>requests</code> raises <code>ChunkedEncodingError</code> even for plain <code>Content-Length</code> responses, and mounting <code>Retry(read=3)</code> does not retry it at all -- the server was hit once.</p>
+<h2 id="repro1">1. Three ways a server can cut a body short</h2>
+<p>A tiny local server sends a valid status line and headers, then closes the connection before the body is complete. We read each response with <code>urllib.request.urlopen()</code> (which uses <code>http.client</code>) and with <code>requests</code>:</p>
+<pre><code>import socket, threading, time, urllib.request, requests
+
+PORT = 8963
+RESPONSES = {
+    # Content-Length says 20, server sends 11 bytes and closes
+    "/short": b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nhello world",
+    # chunked: announces a 0x14 (20) byte chunk, sends 11 and closes
+    "/chunk-cut": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n14\r\nhello world",
+    # chunked: one complete chunk, but no terminating 0-size chunk
+    "/no-final-chunk": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nb\r\nhello world\r\n",
+}
+def serve():
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", PORT))
+    srv.listen()
+    while True:
+        conn, _ = srv.accept()
+        path = conn.recv(65536).split()[1].decode()
+        conn.sendall(RESPONSES[path])
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+time.sleep(0.2)
+
+for path in RESPONSES:
+    url = f"http://127.0.0.1:{PORT}{path}"
+    try:
+        urllib.request.urlopen(url).read()
+    except Exception as e:
+        print(f"urlopen  {path:15} {type(e).__name__}: {e!r}  e.partial={e.partial!r}")
+    try:
+        requests.get(url)
+    except Exception as e:
+        print(f"requests {path:15} {type(e).__name__}: {e}")</code></pre>
+<pre><code>urlopen  /short          IncompleteRead: IncompleteRead(11 bytes read, 9 more expected)  e.partial=b'hello world'
+requests /short          ChunkedEncodingError: ('Connection broken: IncompleteRead(11 bytes read, 9 more expected)', IncompleteRead(11 bytes read, 9 more expected))
+urlopen  /chunk-cut      IncompleteRead: IncompleteRead(0 bytes read)  e.partial=b''
+requests /chunk-cut      ChunkedEncodingError: ('Connection broken: IncompleteRead(11 bytes read, 9 more expected)', IncompleteRead(11 bytes read, 9 more expected))
+urlopen  /no-final-chunk IncompleteRead: IncompleteRead(11 bytes read)  e.partial=b'hello world'
+requests /no-final-chunk ChunkedEncodingError: Response ended prematurely</code></pre>
+<table><thead><tr><th>Server did</th><th>urlopen().read()</th><th>requests.get()</th></tr></thead><tbody>
+<tr><td>Content-Length: 20, sent 11 bytes</td><td><code>IncompleteRead(11 bytes read, 9 more expected)</code>, <code>e.partial</code> has the 11 bytes</td><td><code>ChunkedEncodingError</code> -- although the response was <strong>not</strong> chunked</td></tr>
+<tr><td>chunked, cut inside a 20-byte chunk</td><td><code>IncompleteRead(0 bytes read)</code>, <code>e.partial == b''</code> -- the 11 bytes of the cut chunk are dropped</td><td><code>ChunkedEncodingError</code>, says 11 bytes read</td></tr>
+<tr><td>chunked, no terminating <code>0</code> chunk</td><td><code>IncompleteRead(11 bytes read)</code></td><td><code>ChunkedEncodingError: Response ended prematurely</code></td></tr>
+</tbody></table>
+<p><strong>Measured:</strong> all six are the same event -- the connection closed before the body the server promised was complete. <code>requests</code> wraps every one of them in <code>ChunkedEncodingError</code>, even for a plain <code>Content-Length</code> response, so the exception name is not evidence that chunked encoding is involved. "Connection broken: IncompleteRead(X bytes read, Y more expected)" means the server (or a proxy, load balancer, or timeout in between) closed the connection after X bytes.</p>
+
+<h2 id="retry">2. Retry(read=3) does not retry it</h2>
+<pre><code>import socket, threading, time, requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+PORT = 8963
+hits = 0
+def serve():
+    global hits
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", PORT))
+    srv.listen()
+    while True:
+        conn, _ = srv.accept()
+        conn.recv(65536)
+        hits += 1
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nhello world")
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+time.sleep(0.2)
+
+s = requests.Session()
+s.mount("http://", HTTPAdapter(max_retries=Retry(total=3, read=3, connect=3)))
+try:
+    s.get(f"http://127.0.0.1:{PORT}/file")
+except Exception as e:
+    print(type(e).__name__, "| server hits:", hits)</code></pre>
+<pre><code>ChunkedEncodingError | server hits: 1</code></pre>
+<p><strong>Measured:</strong> with <code>Retry(total=3, read=3, connect=3)</code> mounted, the server was hit exactly once. urllib3's <code>Retry</code> covers failures while getting the response (connecting, sending, reading the status line and headers). <code>requests</code> reads the body afterwards, outside that retry loop, so a body cut short is never retried. You need your own retry around the whole call.</p>
+
+<h2 id="fix">3. The fix: retry the whole request on a broken body</h2>
+<p>Here the server cuts the first response short and sends the complete body on the next attempt:</p>
+<pre><code>import socket, threading, time, requests
+
+PORT = 8963
+hits = 0
+def serve():
+    global hits
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", PORT))
+    srv.listen()
+    while True:
+        conn, _ = srv.accept()
+        conn.recv(65536)
+        hits += 1
+        if hits == 1:   # first attempt: body cut short
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nhello world")
+        else:           # later attempts: complete body
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nhello world, 20 byte")
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+time.sleep(0.2)
+
+def get_with_body_retry(url, attempts=3, **kw):
+    for i in range(attempts):
+        try:
+            return requests.get(url, **kw)   # body is read inside get() unless stream=True
+        except (requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError):
+            if i == attempts - 1:
+                raise
+            time.sleep(0.5 * 2 ** i)
+
+r = get_with_body_retry(f"http://127.0.0.1:{PORT}/file")
+print(r.status_code, r.content, "server hits:", hits)</code></pre>
+<pre><code>200 b'hello world, 20 byte' server hits: 2</code></pre>
+<p><strong>Measured:</strong> the first attempt raised <code>ChunkedEncodingError</code>, the helper retried, and the second attempt returned the full 20 bytes. Only retry requests that are safe to repeat (GET, HEAD, idempotent PUT). For large downloads, retrying with a <code>Range: bytes=N-</code> header (where N is how much you already saved) avoids starting over, if the server supports ranges. With <code>urllib</code>, catch <code>http.client.IncompleteRead</code> the same way; <code>e.partial</code> holds what arrived, but as measured above it can be empty for a cut chunk even when bytes were received, so don't treat it as everything the server sent.</p>
+<p>If it happens on every attempt, the cause is on the server side or in between: an application crashing mid-response, a proxy or load balancer idle timeout (common at 30-60 seconds on long downloads), or a wrong <code>Content-Length</code> header. Check with <code>curl -sv URL -o /tmp/out</code>: curl reports the same problem as <code>curl: (18) end of response with N bytes missing</code>.</p>
+<aside class="cta"><strong>Getting IncompleteRead or ChunkedEncodingError? Check the Content-Length and Transfer-Encoding headers the server actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does requests say ChunkedEncodingError when my response isn&#x27;t chunked?</summary><p>requests wraps urllib3&#x27;s ProtocolError for any body that ends early in ChunkedEncodingError. We measured it for a plain Content-Length: 20 response that sent 11 bytes. The name is historical; read the message inside it instead.</p></details>
+<details><summary>What does IncompleteRead(11 bytes read, 9 more expected) mean?</summary><p>The headers announced a body length (Content-Length, or a chunk size), 11 bytes of it arrived, and the connection closed with 9 still missing. The client is reporting what it saw; the cut happened on the server side or somewhere in between.</p></details>
+<details><summary>Will HTTPAdapter(max_retries=Retry(...)) fix it?</summary><p>No. We mounted Retry(total=3, read=3, connect=3) and the server was hit exactly once. Retry applies while urllib3 is getting the response; requests reads the body after that, so a broken body raises straight to your code. Wrap the call in your own retry loop.</p></details>
+<details><summary>Can I just use the partial data?</summary><p>With urllib, e.partial holds bytes received, but for a chunked response cut mid-chunk we measured e.partial == b&#x27;&#x27; even though 11 bytes arrived. Treat a broken body as failed and retry, or resume with a Range header if the server supports it.</p></details>
+<details><summary>Does http.client raise IncompleteRead for anything else?</summary><p>Yes. We separately measured that a transient None from a non-blocking socket makes HTTPResponse.read() raise IncompleteRead(0 bytes read) on a chunked body even though the server sent everything -- see our guide on resp.read() failing three different ways. With ordinary blocking sockets, IncompleteRead means a real early close.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 (urllib.request and http.client), requests 2.32.3 and urllib3 2.3.0, against a local socket server that sends valid headers and then closes the connection before the body is complete, framed three ways. PlainHeaders is our extension; Python, requests and urllib3 are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

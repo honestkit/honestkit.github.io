@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python argparse Custom Error Message: 4 Ways, Tested</title>
+<meta name="description" content="We measured four ways to customize argparse errors: parser.error(), ArgumentTypeError (ValueError text is thrown away), overriding error(), exit_on_error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-argparse-custom-error-message/">
+<meta property="og:title" content="Python argparse Custom Error Message: 4 Ways, Tested">
+<meta property="og:description" content="We measured four ways to customize argparse errors: parser.error(), ArgumentTypeError (ValueError text is thrown away), overriding error(), exit_on_error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-argparse-custom-error-message/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I raise a custom error in argparse?", "acceptedAnswer": {"@type": "Answer", "text": "Call parser.error('message'). We measured it printing usage plus 'prog: error: message' and exiting with code 2, the same as argparse's own errors."}}, {"@type": "Question", "name": "How do I customize the argparse error message for an invalid value?", "acceptedAnswer": {"@type": "Answer", "text": "Raise argparse.ArgumentTypeError('...') in your type function. We measured a ValueError's custom message being discarded and replaced with 'invalid <function name> value'."}}, {"@type": "Question", "name": "How do I change the argparse error format or exit code?", "acceptedAnswer": {"@type": "Answer", "text": "Subclass ArgumentParser and override error(self, message); it must exit or raise. We measured a version printing a help hint and exiting with code 1."}}, {"@type": "Question", "name": "How do I stop argparse from exiting on error?", "acceptedAnswer": {"@type": "Answer", "text": "Pass exit_on_error=False to catch argparse.ArgumentError for bad values. We measured that parser.error() still exits with code 2, so override error() if you need it to raise."}}, {"@type": "Question", "name": "What exit code does argparse use on error?", "acceptedAnswer": {"@type": "Answer", "text": "2. We measured exit code 2 for parser.error() and for invalid values."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python argparse custom error message (tested)</h1>
+<p class="lead">argparse gives you four ways to control its error messages, and the most obvious one (raising <code>ValueError</code> with a nice message from your <code>type=</code> function) silently throws your message away. We measured all four on Python 3.13.5.</p>
+<h2 id="perror">1. Your own checks: parser.error()</h2>
+<pre><code>import argparse, sys
+p = argparse.ArgumentParser(prog=&quot;tool&quot;)
+p.add_argument(&quot;--start&quot;, type=int); p.add_argument(&quot;--end&quot;, type=int)
+a = p.parse_args(sys.argv[1:])
+if a.start is not None and a.end is not None and a.start &gt; a.end:
+    p.error(f&quot;--start ({a.start}) must be &lt;= --end ({a.end})&quot;)
+print(&quot;ok&quot;, a)</code></pre>
+<p>Output of <code>python3 b1.py --start 5 --end 2; echo exit code $?</code>:</p>
+<pre><code>usage: tool [-h] [--start START] [--end END]
+tool: error: --start (5) must be &lt;= --end (2)
+exit code 2</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> <code>parser.error(msg)</code> prints the usage line and <code>prog: error: msg</code> to stderr and exits with code 2, exactly like argparse's built-in errors. Use it for checks argparse can't express (one option relative to another) instead of <code>print()</code> + <code>sys.exit()</code>, so all errors look the same.</p>
+
+<h2 id="type">2. Custom message for a bad value: raise ArgumentTypeError, not ValueError</h2>
+<pre><code>import argparse
+def port(s):
+    n = int(s)                      # ValueError text is thrown away
+    if not 1 &lt;= n &lt;= 65535:
+        raise argparse.ArgumentTypeError(f&quot;{n} is not a valid port (1-65535)&quot;)
+    return n
+def port_strict(s):
+    if not s.isdigit():
+        raise ValueError(f&quot;&#x27;{s}&#x27; is not a number, dummy&quot;)   # also discarded
+    return int(s)
+p = argparse.ArgumentParser(prog=&quot;tool&quot;)
+p.add_argument(&quot;--port&quot;, type=port); p.add_argument(&quot;--port2&quot;, type=port_strict)
+for argv in ([&quot;--port&quot;, &quot;99999&quot;], [&quot;--port&quot;, &quot;abc&quot;], [&quot;--port2&quot;, &quot;abc&quot;]):
+    try:
+        p.parse_args(argv)
+    except SystemExit as e:
+        print(&quot;exit code&quot;, e.code)</code></pre>
+<p>Output:</p>
+<pre><code>usage: tool [-h] [--port PORT] [--port2 PORT2]
+tool: error: argument --port: 99999 is not a valid port (1-65535)
+exit code 2
+usage: tool [-h] [--port PORT] [--port2 PORT2]
+tool: error: argument --port: invalid port value: &#x27;abc&#x27;
+exit code 2
+usage: tool [-h] [--port PORT] [--port2 PORT2]
+tool: error: argument --port2: invalid port_strict value: &#x27;abc&#x27;
+exit code 2</code></pre>
+<p><strong>Measured:</strong> only <code>argparse.ArgumentTypeError</code> keeps your message. A <code>ValueError</code> from your type function, <em>even one with a custom message</em>, is replaced by the generic <code>invalid &lt;function name&gt; value: 'abc'</code>. Since argparse puts the function's name in that message, name type functions for the user (<code>port</code>, not <code>port_strict</code> or <code>validate_p</code>).</p>
+
+<h2 id="override">3. Change the format or exit code: override error()</h2>
+<pre><code>import argparse, sys
+class MyParser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write(f&quot;tool: {message}\nRun &#x27;tool --help&#x27; for usage.\n&quot;)
+        sys.exit(1)
+p = MyParser(prog=&quot;tool&quot;)
+p.add_argument(&quot;name&quot;)
+try:
+    p.parse_args([])
+except SystemExit as e:
+    print(&quot;exit code&quot;, e.code)</code></pre>
+<p>Output:</p>
+<pre><code>tool: the following arguments are required: name
+Run &#x27;tool --help&#x27; for usage.
+exit code 1</code></pre>
+<p><strong>Measured:</strong> subclassing <code>ArgumentParser</code> and overriding <code>error()</code> changes every argparse error message (here: no usage dump, a help hint instead, exit code 1). <code>error()</code> must not return: it has to exit or raise. Sub-commands are covered too: <code>add_subparsers()</code> creates sub-parsers of the same class by default (we checked: a missing argument to a sub-command went through the override and exited with code 1).</p>
+
+<h2 id="raise">4. Raise instead of exiting: exit_on_error=False</h2>
+<pre><code>import argparse
+p = argparse.ArgumentParser(prog=&quot;tool&quot;, exit_on_error=False)
+p.add_argument(&quot;--n&quot;, type=int)
+try:
+    p.parse_args([&quot;--n&quot;, &quot;x&quot;])
+except argparse.ArgumentError as e:
+    print(&quot;caught ArgumentError:&quot;, e)
+try:
+    p.error(&quot;custom check failed&quot;)
+except SystemExit as e:
+    print(&quot;p.error still exits:&quot;, e.code)</code></pre>
+<p>Output:</p>
+<pre><code>caught ArgumentError: argument --n: invalid int value: &#x27;x&#x27;
+usage: tool [-h] [--n N]
+tool: error: custom check failed
+p.error still exits: 2</code></pre>
+<p><strong>Measured:</strong> with <code>exit_on_error=False</code> a bad value raises <code>argparse.ArgumentError</code>, which you can catch. Your own <code>p.error()</code> calls still print and exit with code 2. To make those raise too, use the <code>error()</code> override from section 3 and raise from it. For unrecognised or missing arguments see our <a href="/guides/python-argparse-error-unrecognized-arguments-required/">argparse unrecognized/required guide</a>.</p>
+
+<aside class="cta"><strong>Building a CLI that talks to an API? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I raise a custom error in argparse?</summary><p>Call parser.error(&#x27;message&#x27;). We measured it printing usage plus &#x27;prog: error: message&#x27; and exiting with code 2, the same as argparse&#x27;s own errors.</p></details>
+<details><summary>How do I customize the argparse error message for an invalid value?</summary><p>Raise argparse.ArgumentTypeError(&#x27;...&#x27;) in your type function. We measured a ValueError&#x27;s custom message being discarded and replaced with &#x27;invalid &lt;function name&gt; value&#x27;.</p></details>
+<details><summary>How do I change the argparse error format or exit code?</summary><p>Subclass ArgumentParser and override error(self, message); it must exit or raise. We measured a version printing a help hint and exiting with code 1.</p></details>
+<details><summary>How do I stop argparse from exiting on error?</summary><p>Pass exit_on_error=False to catch argparse.ArgumentError for bad values. We measured that parser.error() still exits with code 2, so override error() if you need it to raise.</p></details>
+<details><summary>What exit code does argparse use on error?</summary><p>2. We measured exit code 2 for parser.error() and for invalid values.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5: parser.error() for a cross-option check, ArgumentTypeError vs ValueError in a type function, an ArgumentParser subclass overriding error(), and exit_on_error=False with a bad value and with parser.error(). Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

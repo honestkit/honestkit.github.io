@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ipaddress vs socket.inet_aton: Leading Zeros Parse Differently</title>
+<meta name="description" content="We measured Python 3.13.5: socket.inet_aton(&#x27;0177.0.0.1&#x27;) silently returns 127.0.0.1 (octal), while ipaddress.ip_address() rejects the same string outright.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-ipaddress-rejects-leading-zeros-socket-inet-aton-does-not/">
+<meta property="og:title" content="ipaddress vs socket.inet_aton: Leading Zeros Parse Differently">
+<meta property="og:description" content="We measured Python 3.13.5: socket.inet_aton(&#x27;0177.0.0.1&#x27;) silently returns 127.0.0.1 (octal), while ipaddress.ip_address() rejects the same string outright.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-ipaddress-rejects-leading-zeros-socket-inet-aton-does-not/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Python's ipaddress module accept IPv4 octets with leading zeros?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured ipaddress.ip_address() raising ValueError on every leading-zero octet we tried (e.g. '010.0.0.1', '0177.0.0.1'), even though each octet is a normally-valid number once the leading zero is removed."}}, {"@type": "Question", "name": "Does socket.inet_aton() accept leading zeros in IPv4 addresses?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, and it interprets them as octal -- we measured socket.inet_aton('0177.0.0.1') returning 127.0.0.1, since octal 177 equals decimal 127, not the digits read literally as decimal."}}, {"@type": "Question", "name": "Why does '010.0.0.1' mean two different things in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Because socket.inet_aton() parses leading-zero octets as octal (010 octal = 8 decimal), while ipaddress.ip_address() rejects the string entirely rather than guess. We measured both behaviors on the identical input string."}}, {"@type": "Question", "name": "Is parsing leading-zero IP addresses a security risk?", "acceptedAnswer": {"@type": "Answer", "text": "It can be -- we measured that two stdlib functions disagree on what a leading-zero address string resolves to. If one part of a system validates with one parser and another part connects with the other, an attacker-supplied address string can mean different things to each, which is a known IP-validation bypass pattern."}}, {"@type": "Question", "name": "Which Python function should I use to validate untrusted IP address strings?", "acceptedAnswer": {"@type": "Answer", "text": "ipaddress.ip_address() (or ip_network()) -- we measured it being the stricter of the two, rejecting ambiguous leading-zero input that socket.inet_aton() silently accepts and reinterprets as octal."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ipaddress.ip_address() Rejects Leading Zeros, socket.inet_aton() Silently Treats Them as Octal (tested)</h1>
+<p class="lead">If an IPv4 octet has a leading zero, is <code>010</code> the number ten, or the octal value eight? We measured Python's two different IPv4 parsers on exactly this input, and they disagree: one silently interprets it as octal, the other refuses to guess and raises an error instead.</p>
+<h2 id="repro1">1. socket.inet_aton() silently reads leading-zero octets as octal</h2>
+<pre><code>import socket
+
+for s in ["0177.0.0.1", "010.0.0.1", "192.168.01.1"]:
+    b = socket.inet_aton(s)
+    print(s, "->", ".".join(str(x) for x in b))</code></pre>
+<pre><code>0177.0.0.1 -> 127.0.0.1
+010.0.0.1 -> 8.0.0.1
+192.168.01.1 -> 192.168.1.1</code></pre>
+<p><strong>Measured:</strong> <code>socket.inet_aton()</code> accepts all three strings without complaint. <code>0177</code> becomes <code>127</code> (octal 177 = decimal 127), <code>010</code> becomes <code>8</code> (octal 10 = decimal 8), and <code>01</code> becomes <code>1</code>. It's quietly applying C's classic octal-if-leading-zero numeric parsing rule to each octet -- the same rule <code>int("010", 0)</code> would apply, not the rule most people assume for a dotted-quad string.</p>
+
+<h2 id="repro2">2. ipaddress.ip_address() rejects every one of the same strings</h2>
+<pre><code>import ipaddress
+
+for s in ["0177.0.0.1", "010.0.0.1", "192.168.01.1"]:
+    try:
+        print(s, "->", ipaddress.ip_address(s))
+    except ValueError as e:
+        print(s, "-> REJECTED:", e)</code></pre>
+<pre><code>0177.0.0.1 -> REJECTED: '0177.0.0.1' does not appear to be an IPv4 or IPv6 address
+010.0.0.1 -> REJECTED: '010.0.0.1' does not appear to be an IPv4 or IPv6 address
+192.168.01.1 -> REJECTED: '192.168.01.1' does not appear to be an IPv4 or IPv6 address</code></pre>
+<p><strong>Measured:</strong> the modern <code>ipaddress</code> module refuses all three inputs outright -- it treats a leading zero in any octet as invalid rather than guessing at octal-vs-decimal. Ordinary addresses with no leading zeros, like <code>127.0.0.1</code>, parse identically and successfully in both modules; the disagreement only shows up on this specific, easy-to-miss input shape.</p>
+
+<h2 id="repro3">3. Why this matters: two parsers, one input, two different trusted addresses</h2>
+<pre><code>import ipaddress, socket
+
+candidate = "0177.0.0.1"
+try:
+    ipaddress.ip_address(candidate)
+    allowed = True
+except ValueError:
+    allowed = False
+print("ipaddress says valid:", allowed)
+print("socket.inet_aton resolves it to:", ".".join(str(x) for x in socket.inet_aton(candidate)))</code></pre>
+<pre><code>ipaddress says valid: False
+socket.inet_aton resolves it to: 127.0.0.1</code></pre>
+<p><strong>Measured:</strong> if one part of a codebase validates or blocklists an IP string with <code>ipaddress</code> (which correctly rejects <code>"0177.0.0.1"</code>) while another part actually connects or compares using <code>socket.inet_aton()</code> or C-level address parsing (which silently resolves the same string to <code>127.0.0.1</code>, i.e. localhost), the two parts disagree about what address the string means. This exact ambiguity -- the same dotted-quad string meaning two different IPs depending on which parser reads it -- is a known class of IP-validation bypass bug, which is why <code>ipaddress</code> deliberately refuses to parse leading zeros at all rather than picking one interpretation. If you're validating untrusted IP strings, use <code>ipaddress</code> everywhere in that path, not <code>socket.inet_aton()</code> or manual splitting.</p>
+<aside class="cta"><strong>Validating a client IP from a header before trusting it? Check which parser you&#x27;re actually using:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Python&#x27;s ipaddress module accept IPv4 octets with leading zeros?</summary><p>No -- we measured ipaddress.ip_address() raising ValueError on every leading-zero octet we tried (e.g. &#x27;010.0.0.1&#x27;, &#x27;0177.0.0.1&#x27;), even though each octet is a normally-valid number once the leading zero is removed.</p></details>
+<details><summary>Does socket.inet_aton() accept leading zeros in IPv4 addresses?</summary><p>Yes, and it interprets them as octal -- we measured socket.inet_aton(&#x27;0177.0.0.1&#x27;) returning 127.0.0.1, since octal 177 equals decimal 127, not the digits read literally as decimal.</p></details>
+<details><summary>Why does &#x27;010.0.0.1&#x27; mean two different things in Python?</summary><p>Because socket.inet_aton() parses leading-zero octets as octal (010 octal = 8 decimal), while ipaddress.ip_address() rejects the string entirely rather than guess. We measured both behaviors on the identical input string.</p></details>
+<details><summary>Is parsing leading-zero IP addresses a security risk?</summary><p>It can be -- we measured that two stdlib functions disagree on what a leading-zero address string resolves to. If one part of a system validates with one parser and another part connects with the other, an attacker-supplied address string can mean different things to each, which is a known IP-validation bypass pattern.</p></details>
+<details><summary>Which Python function should I use to validate untrusted IP address strings?</summary><p>ipaddress.ip_address() (or ip_network()) -- we measured it being the stricter of the two, rejecting ambiguous leading-zero input that socket.inet_aton() silently accepts and reinterprets as octal.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in ipaddress and socket modules: parsed IPv4 strings with a leading zero in one octet (e.g. &#x27;0177.0.0.1&#x27;, &#x27;010.0.0.1&#x27;, &#x27;192.168.01.1&#x27;) with both ipaddress.ip_address() and socket.inet_aton(), and compared the results. PlainHeaders is our extension; Python&#x27;s ipaddress and socket modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JSONDecodeError: Invalid Control Character — Cause and Fix</title>
+<meta name="description" content="We measured why a raw newline or tab inside a JSON string breaks json.loads(), why json.dumps() never does it, and the strict=False fix, in Python 3.13.">
+<link rel="canonical" href="https://honestkit.github.io/guides/json-decode-error-invalid-control-character/">
+<meta property="og:title" content="JSONDecodeError: Invalid Control Character — Cause and Fix">
+<meta property="og:description" content="We measured why a raw newline or tab inside a JSON string breaks json.loads(), why json.dumps() never does it, and the strict=False fix, in Python 3.13.">
+<meta property="og:url" content="https://honestkit.github.io/guides/json-decode-error-invalid-control-character/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does \"Invalid control character\" mean in a JSONDecodeError?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed it means a literal control-character byte (newline, tab, carriage return, or similar, anything below U+0020) sits unescaped inside a JSON string literal \u2014 the JSON spec requires these to be written as escape sequences like \\n, not as raw bytes."}}, {"@type": "Question", "name": "Can json.dumps() ever produce output that causes this error?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured that json.dumps() always writes control characters as their escaped two-character form (\\n, \\t, etc.), never as a raw byte, so round-tripping data through Python's own json module cannot trigger this; it comes from hand-written or externally-generated JSON."}}, {"@type": "Question", "name": "Does the error message say which control character caused it?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed the message text is identical (\"Invalid control character at: line X column Y\") regardless of whether it's a newline, tab, or an obscure byte like 0x01; only the position differs, so you have to inspect the source at that offset yourself."}}, {"@type": "Question", "name": "What does strict=False actually do in json.loads()?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that it accepts the raw control character as-is inside the string and returns it successfully, with no error \u2014 a deliberate, documented relaxation of the JSON spec for parsing data from non-conformant producers you don't control."}}, {"@type": "Question", "name": "What's the real-world cause of this error in a hand-edited config file?", "acceptedAnswer": {"@type": "Answer", "text": "Usually someone pasted multi-line text into what's meant to be a single-line JSON string value in a text editor, leaving a literal line break in the file instead of an escaped \\n \u2014 replacing the raw line breaks with \\n, or switching to a JSON array of lines, fixes it at the source."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>json.decoder.JSONDecodeError: Invalid Control Character (tested)</h1>
+<p class="lead">JSON strings are not allowed to contain a literal newline, tab, or other control character &mdash; they must be escaped as <code>\n</code>, <code>\t</code>, and so on. If one sneaks in unescaped, <code>json.loads()</code> raises <code>Invalid control character at: line X column Y</code>. We measured exactly which characters trigger it and the fix.</p>
+<h2 id="repro1">1. The error, from a raw newline inside a string value</h2>
+<pre><code>import json
+
+json.loads('{"a": "line1\nline2"}')  # literal newline byte, not an escape sequence
+json.decoder.JSONDecodeError: Invalid control character at: line 1 column 13 (char 12)</code></pre>
+<p><strong>Measured:</strong> this is not <code>"\\n"</code> (backslash-n, the valid two-character escape) &mdash; it's an actual newline byte sitting inside the quotes. The JSON spec (RFC 8259) forbids unescaped control characters (anything below U+0020, which includes newline, tab, carriage return, and more obscure ones) inside string literals, full stop.</p>
+
+<h2 id="repro2">2. Other control characters trigger the same error</h2>
+<pre><code>json.loads('{"a": "col1\tcol2"}')   # literal tab byte
+json.decoder.JSONDecodeError: Invalid control character at: line 1 column 12 (char 11)
+
+json.loads('{"a": "x\x01y"}')       # literal 0x01 byte
+json.decoder.JSONDecodeError: Invalid control character at: line 1 column 9 (char 8)</code></pre>
+<p><strong>Measured:</strong> the message and format are identical regardless of which control character it is &mdash; tab, a rare byte like <code>0x01</code>, carriage return, all report the same "Invalid control character at" text with just the position changing. You can't tell which character it was from the message alone; you have to inspect the source bytes at that position yourself.</p>
+
+<h2 id="repro3">3. json.dumps() never produces this &mdash; it always escapes</h2>
+<pre><code>json.dumps({"a": "line1\nline2"})
+'{"a": "line1\\nline2"}'
+
+json.loads('{"a": "line1\\nline2"}')
+{'a': 'line1\nline2'}</code></pre>
+<p><strong>Measured:</strong> <code>json.dumps()</code> always writes the escaped two-character form <code>\n</code>, never a raw newline byte, so this error cannot come from round-tripping data through Python's own <code>json</code> module. It shows up when the JSON was built by hand (a human editing a config file in a text editor, or multi-line text pasted straight into a string value without escaping), generated by string concatenation instead of <code>json.dumps()</code>, or produced by another language's serializer that doesn't escape correctly.</p>
+
+<h2 id="repro4">4. The escape hatch: strict=False</h2>
+<pre><code>json.loads('{"a": "line1\nline2"}', strict=False)
+{'a': 'line1\nline2'}</code></pre>
+<p><strong>Measured:</strong> passing <code>strict=False</code> to <code>json.loads()</code> accepts the raw control character and includes it as-is in the resulting string &mdash; no error, no transformation. This is a deliberate spec violation on the parsing side: per the <a href="https://docs.python.org/3/library/json.html#json.loads">Python docs</a>, it exists for compatibility with "non-conformant" JSON producers. It's a reasonable one-line fix if you don't control the source and need the data, but the output is then not valid JSON if you write it back out verbatim with something other than <code>json.dumps()</code>.</p>
+
+<h2 id="fix">5. How to actually fix it at the source</h2>
+<ul>
+<li>If you're generating the JSON yourself: always use <code>json.dumps()</code> (or your language's equivalent serializer) instead of building the string by hand with f-strings or concatenation &mdash; it escapes every control character automatically, so this error becomes structurally impossible on your own output.</li>
+<li>If you're consuming JSON from an external source you don't control: try <code>strict=False</code> first since it's a one-line change; if the data needs to be re-serialized correctly afterward, run it back through <code>json.dumps()</code>, which re-escapes everything properly on the way out.</li>
+<li>If it's a hand-edited config file: the usual cause is someone pasting multi-line text into a single-line string field in a text editor &mdash; replace the literal line breaks with <code>\n</code>, or switch the field to a JSON array of lines.</li>
+</ul>
+
+<aside class="cta"><strong>Debugging a config file an API rejects instead of a database row? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &quot;Invalid control character&quot; mean in a JSONDecodeError?</summary><p>We confirmed it means a literal control-character byte (newline, tab, carriage return, or similar, anything below U+0020) sits unescaped inside a JSON string literal — the JSON spec requires these to be written as escape sequences like \n, not as raw bytes.</p></details>
+<details><summary>Can json.dumps() ever produce output that causes this error?</summary><p>No — we measured that json.dumps() always writes control characters as their escaped two-character form (\n, \t, etc.), never as a raw byte, so round-tripping data through Python&#x27;s own json module cannot trigger this; it comes from hand-written or externally-generated JSON.</p></details>
+<details><summary>Does the error message say which control character caused it?</summary><p>No — we confirmed the message text is identical (&quot;Invalid control character at: line X column Y&quot;) regardless of whether it&#x27;s a newline, tab, or an obscure byte like 0x01; only the position differs, so you have to inspect the source at that offset yourself.</p></details>
+<details><summary>What does strict=False actually do in json.loads()?</summary><p>We measured that it accepts the raw control character as-is inside the string and returns it successfully, with no error — a deliberate, documented relaxation of the JSON spec for parsing data from non-conformant producers you don&#x27;t control.</p></details>
+<details><summary>What&#x27;s the real-world cause of this error in a hand-edited config file?</summary><p>Usually someone pasted multi-line text into what&#x27;s meant to be a single-line JSON string value in a text editor, leaving a literal line break in the file instead of an escaped \n — replacing the raw line breaks with \n, or switching to a JSON array of lines, fixes it at the source.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in json module, calling json.loads() on strings containing raw control characters and printing the exact exception text. Every message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s json module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>asyncio RuntimeError: Event loop is closed &amp;mdash; Tested Fix</title>
+<meta name="description" content="We reproduced asyncio&#x27;s Event loop is closed with a client reused across asyncio.run() calls, plus the one-loop async with fix. Python 3.13, tested.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-asyncio-runtimeerror-event-loop-is-closed/">
+<meta property="og:title" content="asyncio RuntimeError: Event loop is closed &amp;mdash; Tested Fix">
+<meta property="og:description" content="We reproduced asyncio&#x27;s Event loop is closed with a client reused across asyncio.run() calls, plus the one-loop async with fix. Python 3.13, tested.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-asyncio-runtimeerror-event-loop-is-closed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes RuntimeError: Event loop is closed?", "acceptedAnswer": {"@type": "Answer", "text": "Something tried to schedule work on a loop that has already been closed. We measured it from loop.run_until_complete() after loop.close(), and from closing a connection in a second asyncio.run() call when it was opened in the first."}}, {"@type": "Question", "name": "Why does a second asyncio.run() call break my client?", "acceptedAnswer": {"@type": "Answer", "text": "asyncio.run() closes its loop when it returns. We measured that a connection created in the first call then raised 'attached to a different loop' when read and 'Event loop is closed' when closed in the second call."}}, {"@type": "Question", "name": "How do I fix Event loop is closed?", "acceptedAnswer": {"@type": "Answer", "text": "Create, use and close the client inside one coroutine and call asyncio.run() once. We measured that pattern with async with: two requests and a clean exit. For repeated sync-to-async calls, keep one loop with asyncio.Runner (Python 3.11+)."}}, {"@type": "Question", "name": "What does 'asyncio.run() cannot be called from a running event loop' mean?", "acceptedAnswer": {"@type": "Answer", "text": "You're already inside a loop, for example in an async function or a Jupyter cell. We measured the error and confirmed that awaiting the coroutine directly works."}}, {"@type": "Question", "name": "Why do I only see Event loop is closed on Windows at exit?", "acceptedAnswer": {"@type": "Answer", "text": "That 'Exception ignored in _ProactorBasePipeTransport.__del__' traceback is Windows-specific; we could not reproduce it on Linux. It is reported to come from transports that were never closed before the loop closed, so close them inside the loop."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>RuntimeError: Event loop is closed (asyncio, tested)</h1>
+<p class="lead"><code>RuntimeError: Event loop is closed</code> almost always means an object created under one event loop is being used or closed after that loop shut down. We reproduced it with a plain <code>asyncio</code> client and a local server, measured the two different errors it produces, and tested the fix.</p>
+<h2 id="basic">1. The plain version: reusing a closed loop</h2>
+<pre><code>import asyncio
+
+async def main():
+    return &quot;done&quot;
+
+loop = asyncio.new_event_loop()
+print(loop.run_until_complete(main()))
+loop.close()
+
+coro = main()
+try:
+    loop.run_until_complete(coro)
+except RuntimeError as e:
+    coro.close()
+    print(repr(e))</code></pre>
+<pre><code>done
+RuntimeError(&#x27;Event loop is closed&#x27;)</code></pre>
+<p><strong>Measured:</strong> once <code>loop.close()</code> has run, anything that schedules work on that loop raises <code>RuntimeError: Event loop is closed</code>. <code>asyncio.run()</code> creates a new loop and <em>closes it when it returns</em>, so the same thing happens to anything that kept a reference to the loop from an earlier <code>asyncio.run()</code>.</p>
+
+<h2 id="real">2. The real-world version: a client that outlives <code>asyncio.run()</code></h2>
+<p>The usual cause in practice: a connection, session or client object (an HTTP session, a DB pool, a stream) is created during one <code>asyncio.run()</code> call and used or closed during a later one. We reproduced it with plain <code>asyncio</code> streams against a local echo server (the helper in <code>server.py</code> runs <code>asyncio.start_server</code> in a background thread):</p>
+<pre><code>import asyncio
+from server import start_echo_server   # local echo server on port 8963
+
+class Client:
+    def __init__(self):
+        self.writer = None
+
+    async def ping(self):
+        if self.writer is None:   # connect lazily, then reuse
+            self.reader, self.writer = await asyncio.open_connection(&quot;127.0.0.1&quot;, 8963)
+        self.writer.write(b&quot;ping\n&quot;)
+        await self.writer.drain()
+        return await self.reader.readline()
+
+    async def close(self):
+        self.writer.close()
+
+start_echo_server()
+client = Client()
+print(asyncio.run(client.ping()))          # first loop: works
+
+try:
+    asyncio.run(client.ping())             # second loop: stale connection
+except RuntimeError as e:
+    print(&quot;ping: ...&quot;, str(e)[-30:])
+
+try:
+    asyncio.run(client.close())
+except RuntimeError as e:
+    print(&quot;close:&quot;, repr(e))</code></pre>
+<pre><code>b&#x27;ping\n&#x27;
+ping: ... &gt; attached to a different loop
+close: RuntimeError(&#x27;Event loop is closed&#x27;)</code></pre>
+<p><strong>Measured:</strong> the first call works. The second <code>asyncio.run()</code> starts a new loop, but the connection still belongs to the first, now closed, loop. Reading from it raised <code>RuntimeError: ... attached to a different loop</code>, and closing it raised <code>RuntimeError: Event loop is closed</code>, because <code>close()</code> schedules the transport's cleanup on the loop it was created on. Same root cause, two different messages, depending on which method you call first. This is the pattern behind the error in scripts that call <code>asyncio.run()</code> once per request, in test suites where each test gets a fresh loop but a fixture is shared, and in sync wrappers around async libraries.</p>
+
+<h2 id="fix">3. Fix: one loop, and the client lives inside it</h2>
+<pre><code>import asyncio
+from server import start_echo_server
+
+class Client:
+    async def __aenter__(self):
+        self.reader, self.writer = await asyncio.open_connection(&quot;127.0.0.1&quot;, 8963)
+        return self
+
+    async def __aexit__(self, *exc):
+        self.writer.close()
+        await self.writer.wait_closed()
+
+    async def ping(self):
+        self.writer.write(b&quot;ping\n&quot;)
+        await self.writer.drain()
+        return await self.reader.readline()
+
+async def main():
+    async with Client() as client:      # created, used and closed in ONE loop
+        print(await client.ping())
+        print(await client.ping())
+
+start_echo_server()
+asyncio.run(main())
+print(&quot;clean exit&quot;)</code></pre>
+<pre><code>b&#x27;ping\n&#x27;
+b&#x27;ping\n&#x27;
+clean exit</code></pre>
+<p><strong>Measured:</strong> create the client inside the coroutine that <code>asyncio.run()</code> runs, use it there, and close it there (<code>async with</code> makes the close automatic). Call <code>asyncio.run()</code> once, at the top of the program, and <code>await</code> everything below it. If you need to call async code from synchronous code repeatedly, keep one loop alive for the whole program (<code>asyncio.Runner</code> on Python 3.11+, used as <code>with asyncio.Runner() as r: r.run(...)</code>) rather than a new <code>asyncio.run()</code> per call.</p>
+
+<h2 id="running">4. The opposite error: a loop that's already running</h2>
+<pre><code>import asyncio
+
+async def work():
+    return 42
+
+async def handler():
+    coro = work()
+    try:
+        asyncio.run(coro)       # already inside a running loop
+    except RuntimeError as e:
+        coro.close()
+        print(repr(e))
+    print(await work())         # the fix: just await it
+
+asyncio.run(handler())</code></pre>
+<pre><code>RuntimeError(&#x27;asyncio.run() cannot be called from a running event loop&#x27;)
+42</code></pre>
+<p><strong>Measured:</strong> calling <code>asyncio.run()</code> from code that's already inside a loop (an async handler, a Jupyter cell, which runs its own loop) raises <code>asyncio.run() cannot be called from a running event loop</code>. Just <code>await</code> the coroutine instead (Jupyter supports top-level <code>await</code>).</p>
+
+<h2 id="windows">5. The Windows-only &ldquo;Exception ignored&rdquo; variant</h2>
+<p>Many reports of this error are a traceback printed at exit on Windows, <code>Exception ignored in: ... _ProactorBasePipeTransport.__del__ ... RuntimeError: Event loop is closed</code>, after a script that otherwise worked. We tested on Linux only and could not reproduce it there: dropping an unclosed stream after <code>asyncio.run()</code> returned printed nothing. The cause reported for it is the same as section 2, a transport that was never closed being garbage-collected after its loop was closed, so the fix in section 3 (close what you open, inside the loop) is the one to try first.</p>
+
+<aside class="cta"><strong>Debugging an async HTTP client? Check what the server actually sends back, headers and status included:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes RuntimeError: Event loop is closed?</summary><p>Something tried to schedule work on a loop that has already been closed. We measured it from loop.run_until_complete() after loop.close(), and from closing a connection in a second asyncio.run() call when it was opened in the first.</p></details>
+<details><summary>Why does a second asyncio.run() call break my client?</summary><p>asyncio.run() closes its loop when it returns. We measured that a connection created in the first call then raised &#x27;attached to a different loop&#x27; when read and &#x27;Event loop is closed&#x27; when closed in the second call.</p></details>
+<details><summary>How do I fix Event loop is closed?</summary><p>Create, use and close the client inside one coroutine and call asyncio.run() once. We measured that pattern with async with: two requests and a clean exit. For repeated sync-to-async calls, keep one loop with asyncio.Runner (Python 3.11+).</p></details>
+<details><summary>What does &#x27;asyncio.run() cannot be called from a running event loop&#x27; mean?</summary><p>You&#x27;re already inside a loop, for example in an async function or a Jupyter cell. We measured the error and confirmed that awaiting the coroutine directly works.</p></details>
+<details><summary>Why do I only see Event loop is closed on Windows at exit?</summary><p>That &#x27;Exception ignored in _ProactorBasePipeTransport.__del__&#x27; traceback is Windows-specific; we could not reproduce it on Linux. It is reported to come from transports that were never closed before the loop closed, so close them inside the loop.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: loop.run_until_complete() after loop.close(); an asyncio streams client against a local echo server, created in one asyncio.run() and used and closed in a second; the async-with fix; and asyncio.run() inside a running loop. Every code block was run verbatim and its output pasted from that run. The Windows ProactorEventLoop variant was not tested. PlainHeaders is our extension; asyncio is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

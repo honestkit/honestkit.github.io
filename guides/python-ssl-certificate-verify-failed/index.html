@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python SSL: CERTIFICATE_VERIFY_FAILED &amp;mdash; 5 Causes, Tested</title>
+<meta name="description" content="We measured Python&#x27;s CERTIFICATE_VERIFY_FAILED reasons, the new 3.13 key usage error, and why SSL_CERT_FILE fixes urllib but not requests.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-ssl-certificate-verify-failed/">
+<meta property="og:title" content="Python SSL: CERTIFICATE_VERIFY_FAILED &amp;mdash; 5 Causes, Tested">
+<meta property="og:description" content="We measured Python&#x27;s CERTIFICATE_VERIFY_FAILED reasons, the new 3.13 key usage error, and why SSL_CERT_FILE fixes urllib but not requests.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-ssl-certificate-verify-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does SSL: CERTIFICATE_VERIFY_FAILED mean in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Python couldn't verify the server's certificate. The text after 'certificate verify failed:' is the reason; we measured self-signed certificate, unable to get local issuer certificate, Hostname mismatch, certificate has expired and, new in 3.13, CA cert does not include key usage extension."}}, {"@type": "Question", "name": "How do I fix unable to get local issuer certificate in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Give Python the CA that signed the server's certificate: ssl.create_default_context(cafile='ca.pem') or SSL_CERT_FILE for urllib, verify='ca.pem' or REQUESTS_CA_BUNDLE for requests. We measured that each setting only affects its own library."}}, {"@type": "Question", "name": "Why did my self-made CA stop working on Python 3.13?", "acceptedAnswer": {"@type": "Answer", "text": "Python 3.13 enables VERIFY_X509_STRICT by default. We measured a CA made with plain openssl req -x509 failing with 'CA cert does not include key usage extension'; reissuing it with keyUsage=critical,keyCertSign,cRLSign fixed it."}}, {"@type": "Question", "name": "Does requests use SSL_CERT_FILE?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured SSL_CERT_FILE fixing urllib but not requests; requests reads REQUESTS_CA_BUNDLE (or verify=)."}}, {"@type": "Question", "name": "Is verify=False safe?", "acceptedAnswer": {"@type": "Answer", "text": "It removes the check that you're talking to the real server. Only use it for a throwaway test against localhost; otherwise trust the right CA instead."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SSL: CERTIFICATE_VERIFY_FAILED in Python (tested)</h1>
+<p class="lead"><code>ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed</code> has at least five different causes, and the fix depends on which one. We generated each broken certificate locally, recorded the exact reason Python 3.13.5 gives, and tested which trust setting fixes urllib and which fixes requests.</p>
+<p>Setup for every block: a test root CA and leaf certificates made with <code>openssl</code> 3.5.7, served by a small helper (<code>tlsserver.py</code>: <code>http.server</code> wrapped in <code>ssl.SSLContext.wrap_socket</code>, one port per certificate). The part after <code>certificate verify failed:</code> is the reason; it is also on the exception as <code>e.reason.verify_message</code>.</p>
+
+<h2 id="reasons">1. Read the reason, not just CERTIFICATE_VERIFY_FAILED</h2>
+<pre><code>import urllib.request, ssl
+from tlsserver import serve
+
+servers = {&quot;self-signed&quot;: &quot;selfsigned.pem&quot;, &quot;private CA&quot;: &quot;leaf.pem&quot;,
+           &quot;wrong name&quot;: &quot;wrongname.pem&quot;, &quot;expired&quot;: &quot;expired.pem&quot;}
+ca_ctx = ssl.create_default_context(cafile=&quot;ca.pem&quot;)   # trusts our test CA
+for port, (label, cert) in enumerate(servers.items(), start=8963):
+    serve(cert, port)
+    ctx = None if label in (&quot;self-signed&quot;, &quot;private CA&quot;) else ca_ctx
+    try:
+        urllib.request.urlopen(f&quot;https://localhost:{port}/&quot;, context=ctx, timeout=5)
+        print(f&quot;{label}: ok&quot;)
+    except urllib.error.URLError as e:
+        print(f&quot;{label}: {e.reason.verify_message}&quot;)
+        print(f&quot;    {e.reason}&quot;)</code></pre>
+<pre><code>self-signed: self-signed certificate
+    [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1029)
+private CA: unable to get local issuer certificate
+    [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1029)
+wrong name: CA cert does not include key usage extension
+    [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: CA cert does not include key usage extension (_ssl.c:1029)
+expired: CA cert does not include key usage extension
+    [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: CA cert does not include key usage extension (_ssl.c:1029)</code></pre>
+<p><strong>Measured:</strong> the same <code>[SSL: CERTIFICATE_VERIFY_FAILED]</code> prefix, four different reasons:</p>
+<ul>
+<li><code>self-signed certificate</code> &mdash; the server's certificate signed itself. Trust that exact certificate (<code>cafile=</code>, below) or replace it.</li>
+<li><code>unable to get local issuer certificate</code> &mdash; signed by a CA your Python doesn't trust: a private/company CA, a TLS-inspecting corporate proxy, or a server that forgot to send its intermediate certificate.</li>
+<li><code>CA cert does not include key usage extension</code> &mdash; see section 2. Here it masked the name and expiry problems, because chain validation runs first.</li>
+</ul>
+
+<h2 id="strict">2. New in Python 3.13: &ldquo;CA cert does not include key usage extension&rdquo;</h2>
+<pre><code>import urllib.request, ssl
+from tlsserver import serve
+
+serve(&quot;leaf.pem&quot;, 8963)    # leaf signed by a CA made with plain `openssl req -x509`
+serve(&quot;leaf2.pem&quot;, 8964)   # leaf signed by a CA that has keyUsage=keyCertSign
+for port, cafile in [(8963, &quot;ca.pem&quot;), (8964, &quot;ca2.pem&quot;)]:
+    ctx = ssl.create_default_context(cafile=cafile)
+    try:
+        urllib.request.urlopen(f&quot;https://localhost:{port}/&quot;, context=ctx, timeout=5)
+        print(cafile, &quot;ok&quot;)
+    except urllib.error.URLError as e:
+        print(cafile, e.reason.verify_message)
+    ctx.verify_flags &amp;= ~ssl.VERIFY_X509_STRICT
+    urllib.request.urlopen(f&quot;https://localhost:{port}/&quot;, context=ctx, timeout=5)
+    print(cafile, &quot;ok without VERIFY_X509_STRICT&quot;)</code></pre>
+<pre><code>ca.pem CA cert does not include key usage extension
+ca.pem ok without VERIFY_X509_STRICT
+ca2.pem ok
+ca2.pem ok without VERIFY_X509_STRICT</code></pre>
+<p><strong>Measured:</strong> Python 3.13 turned on <code>ssl.VERIFY_X509_STRICT</code> in <code>create_default_context()</code>. A root CA made with plain <code>openssl req -x509</code> has no <code>keyUsage</code> extension and is now rejected, even though <code>cafile=</code> points straight at it and the same code worked on older Pythons. Clearing the flag makes it pass, but the real fix is to reissue the CA with <code>-addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"</code>: the second CA, made that way, passed with strict mode on. Public CAs already comply; this mostly hits home-made, test and internal CAs.</p>
+
+<h2 id="name">3. Hostname mismatch and expired</h2>
+<pre><code>import urllib.request, ssl
+from tlsserver import serve
+
+serve(&quot;wrongname2.pem&quot;, 8965)
+serve(&quot;expired2.pem&quot;, 8966)
+ctx = ssl.create_default_context(cafile=&quot;ca2.pem&quot;)
+for port in (8965, 8966):
+    try:
+        urllib.request.urlopen(f&quot;https://localhost:{port}/&quot;, context=ctx, timeout=5)
+    except urllib.error.URLError as e:
+        print(e.reason.verify_message)
+        print(&quot;   &quot;, e.reason)</code></pre>
+<pre><code>Hostname mismatch, certificate is not valid for &#x27;localhost&#x27;.
+    [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for &#x27;localhost&#x27;. (_ssl.c:1029)
+certificate has expired
+    [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: certificate has expired (_ssl.c:1029)</code></pre>
+<p><strong>Measured:</strong> with a valid chain, the reason names the real problem. A hostname mismatch means the URL's host is not in the certificate's subjectAltName list; our test certificate had <code>CN=localhost</code> and was still rejected, because the CN is ignored when subjectAltName is present; connect with the name on the certificate, or reissue it with the right names. <code>certificate has expired</code> also appears when the <em>client's</em> clock is wrong, so check the date on the machine running Python before blaming the server.</p>
+
+<h2 id="trust">4. Fix: trust your CA &mdash; urllib and requests read different settings</h2>
+<pre><code>import os, subprocess, sys
+
+client = &quot;&quot;&quot;
+import urllib.request, requests
+from tlsserver import serve
+serve(&quot;leaf2.pem&quot;, 8967)
+url = &quot;https://localhost:8967/&quot;
+for name, get in [(&quot;urllib&quot;, lambda: urllib.request.urlopen(url, timeout=5)),
+                  (&quot;requests&quot;, lambda: requests.get(url, timeout=5))]:
+    try:
+        get(); print(f&quot;  {name}: ok&quot;)
+    except Exception as e:
+        print(f&quot;  {name}: failed&quot;)
+&quot;&quot;&quot;
+for env_var in [None, &quot;SSL_CERT_FILE&quot;, &quot;REQUESTS_CA_BUNDLE&quot;]:
+    env = {k: v for k, v in os.environ.items()
+           if k not in (&quot;SSL_CERT_FILE&quot;, &quot;REQUESTS_CA_BUNDLE&quot;)}
+    if env_var:
+        env[env_var] = &quot;ca2.pem&quot;
+    print(env_var or &quot;no env var&quot;)
+    subprocess.run([sys.executable, &quot;-c&quot;, client], env=env)</code></pre>
+<pre><code>no env var
+  urllib: failed
+  requests: failed
+SSL_CERT_FILE
+  urllib: ok
+  requests: failed
+REQUESTS_CA_BUNDLE
+  urllib: failed
+  requests: ok</code></pre>
+<p><strong>Measured:</strong> <code>SSL_CERT_FILE</code> fixed <code>urllib</code> (and anything using <code>ssl.create_default_context()</code>) but not <code>requests</code>. <code>REQUESTS_CA_BUNDLE</code> fixed <code>requests</code> but not <code>urllib</code>. <code>requests</code> uses its own CA bundle (<code>certifi</code> on a pip install; Debian's packaged <code>requests</code>, which we used, points at <code>/etc/ssl/certs/ca-certificates.crt</code>). In code, pass <code>cafile=</code> to <code>ssl.create_default_context()</code> for urllib, or <code>verify="/path/ca.pem"</code> for requests. The file needs the CA (or the self-signed certificate itself), in PEM format. On a corporate network, export the proxy's root CA and point these at a bundle that includes it.</p>
+
+<h2 id="dont">What not to do</h2>
+<p><code>verify=False</code> or <code>ssl._create_unverified_context()</code> make the error go away by switching off the check that tells you whether you're talking to the right server. They are fine for a one-off against <code>localhost</code>; in anything that sends credentials or runs unattended, use one of the fixes above.</p>
+
+<aside class="cta"><strong>Got past TLS? Check the headers and status the server actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does SSL: CERTIFICATE_VERIFY_FAILED mean in Python?</summary><p>Python couldn&#x27;t verify the server&#x27;s certificate. The text after &#x27;certificate verify failed:&#x27; is the reason; we measured self-signed certificate, unable to get local issuer certificate, Hostname mismatch, certificate has expired and, new in 3.13, CA cert does not include key usage extension.</p></details>
+<details><summary>How do I fix unable to get local issuer certificate in Python?</summary><p>Give Python the CA that signed the server&#x27;s certificate: ssl.create_default_context(cafile=&#x27;ca.pem&#x27;) or SSL_CERT_FILE for urllib, verify=&#x27;ca.pem&#x27; or REQUESTS_CA_BUNDLE for requests. We measured that each setting only affects its own library.</p></details>
+<details><summary>Why did my self-made CA stop working on Python 3.13?</summary><p>Python 3.13 enables VERIFY_X509_STRICT by default. We measured a CA made with plain openssl req -x509 failing with &#x27;CA cert does not include key usage extension&#x27;; reissuing it with keyUsage=critical,keyCertSign,cRLSign fixed it.</p></details>
+<details><summary>Does requests use SSL_CERT_FILE?</summary><p>No. We measured SSL_CERT_FILE fixing urllib but not requests; requests reads REQUESTS_CA_BUNDLE (or verify=).</p></details>
+<details><summary>Is verify=False safe?</summary><p>It removes the check that you&#x27;re talking to the real server. Only use it for a throwaway test against localhost; otherwise trust the right CA instead.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 (OpenSSL 3.5.7) urllib and requests 2.32.3 against local HTTPS servers using six certificates we generated with openssl: self-signed, signed by a private CA, wrong hostname, expired, and signed by CAs with and without keyUsage. Also tested SSL_CERT_FILE vs REQUESTS_CA_BUNDLE. Every code block was run verbatim and its output pasted from that run. macOS and Windows trust stores were not tested. PlainHeaders is our extension; ssl and urllib are built in, requests is a third-party library.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

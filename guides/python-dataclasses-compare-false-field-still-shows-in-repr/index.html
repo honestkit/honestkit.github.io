@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dataclasses: compare=False Fields Still Show Up in repr()</title>
+<meta name="description" content="We measured Python 3.13.5: two @dataclass instances with compare=False on a field compare equal via == while repr() shows their differing values.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-dataclasses-compare-false-field-still-shows-in-repr/">
+<meta property="og:title" content="dataclasses: compare=False Fields Still Show Up in repr()">
+<meta property="og:description" content="We measured Python 3.13.5: two @dataclass instances with compare=False on a field compare equal via == while repr() shows their differing values.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-dataclasses-compare-false-field-still-shows-in-repr/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does field(compare=False) in a Python dataclass also remove the field from repr()?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured a dataclass with compare=False on a field still printing that field's value via repr(), even though the field no longer affects == between two instances."}}, {"@type": "Question", "name": "Can two unequal-looking dataclass instances compare as equal in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured two @dataclass instances with different repr() output (different field values) comparing as == True, because the differing field had compare=False set, excluding it from the generated __eq__."}}, {"@type": "Question", "name": "How do I fully exclude a dataclass field from both equality and string representation?", "acceptedAnswer": {"@type": "Answer", "text": "Set both compare=False and repr=False on the same field() call -- we confirmed this makes two otherwise-equal instances print identically, matching their equality result."}}, {"@type": "Question", "name": "Are compare and repr independent options on a dataclasses.field()?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured that setting compare=False alone has no effect on whether the field appears in repr(); each field() option (compare, repr, hash, init) only controls the one generated method it names."}}, {"@type": "Question", "name": "What's the risk of using field(compare=False) without also setting repr=False?", "acceptedAnswer": {"@type": "Answer", "text": "Deduplication logic using == or set/dict membership will silently treat instances with different values in that field as the same object, while logs or debugger output using repr() will still show the differing values -- we measured this exact mismatch, which can look like a bug in whatever discarded the 'duplicate'."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>dataclasses: compare=False Fields Still Show Up in repr() (tested)</h1>
+<p class="lead"><code>field(compare=False)</code> lets you exclude a field from the auto-generated <code>__eq__</code> -- useful for things like a cache timestamp or a mutable log buffer that shouldn't affect identity. We measured whether excluding a field from equality also excludes it from the auto-generated <code>repr()</code>, since both are generated from the same field list.</p>
+<h2 id="repro1">1. By default, every field counts toward both equality and repr</h2>
+<pre><code>from dataclasses import dataclass
+
+@dataclass
+class User:
+    id: int
+    name: str
+
+a = User(1, "alice")
+b = User(1, "bob")
+print(a == b)
+print(a)</code></pre>
+<pre><code>False
+User(id=1, name='alice')</code></pre>
+<p><strong>Measured:</strong> without any field options, <code>name</code> is part of both <code>__eq__</code> and <code>__repr__</code> -- two instances with different names compare unequal, exactly as expected.</p>
+
+<h2 id="repro2">2. field(compare=False) removes it from == but not from repr()</h2>
+<pre><code>from dataclasses import dataclass, field
+
+@dataclass
+class User:
+    id: int
+    name: str = field(compare=False)
+
+a = User(1, "alice")
+b = User(1, "bob")
+print(a == b)
+print(a)
+print(b)</code></pre>
+<pre><code>True
+User(id=1, name='alice')
+User(id=1, name='bob')</code></pre>
+<p><strong>Measured:</strong> <code>a == b</code> is now <code>True</code> -- <code>name</code> no longer affects equality, so these two objects with different names are considered the same. But <code>repr(a)</code> and <code>repr(b)</code> still print their own distinct <code>name</code> values. <code>compare</code> and <code>repr</code> are independent field options; setting one has no effect on the other. Anything that dedupes by <code>==</code> or inserts into a <code>set</code>/<code>dict</code> keyed by these objects will silently keep whichever instance arrived first and drop the other as a "duplicate" -- while a log line printing <code>repr()</code> of the kept object shows one name, and the dropped object (if logged separately before being discarded) shows a different one, with nothing in the output explaining why they were treated as equal.</p>
+
+<h2 id="repro3">3. The fix: set repr=False too if the field shouldn't influence identity</h2>
+<pre><code>from dataclasses import dataclass, field
+
+@dataclass
+class User:
+    id: int
+    name: str = field(compare=False, repr=False)
+
+a = User(1, "alice")
+b = User(1, "bob")
+print(a == b)
+print(a)
+print(b)</code></pre>
+<pre><code>True
+User(id=1)
+User(id=1)
+</code></pre>
+<p><strong>Measured:</strong> adding <code>repr=False</code> alongside <code>compare=False</code> makes both instances print identically (<code>User(id=1)</code>), matching the fact that they already compare equal. If a field is excluded from equality because it genuinely shouldn't define the object's identity, exclude it from <code>repr()</code> too -- otherwise logs and debugger output will show "different" objects that your own code already treats as the same thing.</p>
+<aside class="cta"><strong>Excluding a field from equality with field(compare=False)? Check what that does to logging and dedup first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does field(compare=False) in a Python dataclass also remove the field from repr()?</summary><p>No -- we measured a dataclass with compare=False on a field still printing that field&#x27;s value via repr(), even though the field no longer affects == between two instances.</p></details>
+<details><summary>Can two unequal-looking dataclass instances compare as equal in Python?</summary><p>Yes -- we measured two @dataclass instances with different repr() output (different field values) comparing as == True, because the differing field had compare=False set, excluding it from the generated __eq__.</p></details>
+<details><summary>How do I fully exclude a dataclass field from both equality and string representation?</summary><p>Set both compare=False and repr=False on the same field() call -- we confirmed this makes two otherwise-equal instances print identically, matching their equality result.</p></details>
+<details><summary>Are compare and repr independent options on a dataclasses.field()?</summary><p>Yes -- we measured that setting compare=False alone has no effect on whether the field appears in repr(); each field() option (compare, repr, hash, init) only controls the one generated method it names.</p></details>
+<details><summary>What&#x27;s the risk of using field(compare=False) without also setting repr=False?</summary><p>Deduplication logic using == or set/dict membership will silently treat instances with different values in that field as the same object, while logs or debugger output using repr() will still show the differing values -- we measured this exact mismatch, which can look like a bug in whatever discarded the &#x27;duplicate&#x27;.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in dataclasses module: defined a dataclass with one field marked compare=False, created two instances that differ only in that field, and checked both == and repr() on them, plus whether the field still appears in __eq__ by default without compare=False. PlainHeaders is our extension; Python&#x27;s dataclasses module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

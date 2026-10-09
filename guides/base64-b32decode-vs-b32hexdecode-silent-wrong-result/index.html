@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mixing Up base64.b32decode() and b32hexdecode() Fails Silently</title>
+<meta name="description" content="We measured Python 3.13.5: decoding standard Base32 with b32hexdecode() can return the wrong bytes with no error at all, for some inputs.">
+<link rel="canonical" href="https://honestkit.github.io/guides/base64-b32decode-vs-b32hexdecode-silent-wrong-result/">
+<meta property="og:title" content="Mixing Up base64.b32decode() and b32hexdecode() Fails Silently">
+<meta property="og:description" content="We measured Python 3.13.5: decoding standard Base32 with b32hexdecode() can return the wrong bytes with no error at all, for some inputs.">
+<meta property="og:url" content="https://honestkit.github.io/guides/base64-b32decode-vs-b32hexdecode-silent-wrong-result/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What's the difference between base64.b32decode() and b32hexdecode()?", "acceptedAnswer": {"@type": "Answer", "text": "They decode two different RFC 4648 Base32 alphabets: b32decode() expects A-Z2-7 (standard), b32hexdecode() expects 0-9A-V (Extended Hex). We measured that the two assign different numeric values to the same letters."}}, {"@type": "Question", "name": "Does Python raise an error if I decode Base32 with the wrong variant?", "acceptedAnswer": {"@type": "Answer", "text": "Not always -- we measured this directly: if the encoded text happens to use only letters A-V, which are valid digits in both alphabets, the wrong decoder runs without error and returns completely different, wrong bytes."}}, {"@type": "Question", "name": "Can base32 decoding fail silently in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, for this specific mismatch -- we confirmed that decoding standard-alphabet Base32 output with b32hexdecode() (or vice versa) can return wrong bytes with no exception, when the ciphertext doesn't contain any character unique to the other alphabet."}}, {"@type": "Question", "name": "How do I avoid mixing up Base32 variants?", "acceptedAnswer": {"@type": "Answer", "text": "Always pair b32encode() with b32decode(), and b32hexencode() with b32hexdecode() -- never assume the decoder will catch a mismatch, since we measured that it only raises for some inputs, not all."}}, {"@type": "Question", "name": "Why did my Base32 decode return garbage instead of an error?", "acceptedAnswer": {"@type": "Answer", "text": "Likely a standard/Extended-Hex alphabet mismatch. We measured that this silently succeeds whenever the encoded text only contains characters valid in both alphabets (digits and letters A-V), producing wrong output with no error to flag it."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>base64.b32decode() vs b32hexdecode(): Wrong Variant Decodes Silently (tested)</h1>
+<p class="lead">Python's base64 module has two different Base32 alphabets: the standard one (<code>b32encode</code>/<code>b32decode</code>) and the RFC 4648 'Extended Hex' one (<code>b32hexencode</code>/<code>b32hexdecode</code>). We measured what happens if you encode with one and accidentally decode with the other -- for some inputs it raises an error, but for others it silently returns completely wrong bytes with no error at all.</p>
+<h2 id="repro1">1. The two alphabets overlap on letters A-V</h2>
+<pre><code>import base64
+
+print(base64.b32encode(b"hello world"))
+print(base64.b32hexencode(b"hello world"))</code></pre>
+<pre><code>b'NBSWY3DPEB3W64TMMQ======'
+b'D1IMOR3F41RMUSJCCG======'</code></pre>
+<p><strong>Measured:</strong> the standard alphabet is <code>A-Z2-7</code>; the Extended Hex alphabet is <code>0-9A-V</code>. They assign different numeric values to the same letters -- in standard Base32, <code>A</code> is digit 0 and letters run through <code>Z</code>=25 before digits <code>2-7</code> cover 26-31; in Extended Hex, <code>0-9</code> cover 0-9 and letters <code>A-V</code> cover 10-31. A letter like <code>A</code> means a different value in each scheme.</p>
+
+<h2 id="repro2">2. Mismatched input that uses only A-V decodes silently -- to the wrong bytes</h2>
+<pre><code>import base64
+
+data = b"\x01\x01\x01\x01\x01"
+encoded = base64.b32encode(data)
+print(encoded)
+print(base64.b32decode(encoded))      # correct function
+print(base64.b32hexdecode(encoded))   # wrong function</code></pre>
+<pre><code>b'AEAQCAIB'
+b'\x01\x01\x01\x01\x01'
+b'S\x95\xa6*K'</code></pre>
+<p><strong>Measured:</strong> this particular standard-Base32 output happens to use only the letters A-V, which are all valid digits in the Extended Hex alphabet too. So <code>b32hexdecode()</code> doesn't raise -- it runs to completion and returns 5 bytes that look like a normal, valid result, but are nothing like the original data. There is no exception, no warning, and no length mismatch to tip you off.</p>
+
+<h2 id="repro3">3. Input containing a digit or W-Z does raise -- but you can't rely on that</h2>
+<pre><code>import base64
+
+encoded = base64.b32encode(b"hello world")
+print(encoded)
+try:
+    base64.b32hexdecode(encoded)
+except Exception as e:
+    print(type(e).__name__, e)</code></pre>
+<pre><code>b'NBSWY3DPEB3W64TMMQ======'
+Error Non-base32 digit found</code></pre>
+<p><strong>Measured:</strong> this encoded value contains digits (<code>3</code>, <code>6</code>, <code>4</code>) and letters outside <code>A-V</code> (<code>W</code>, <code>Y</code>), neither of which are valid in the Extended Hex alphabet, so this particular mismatch correctly raises <code>binascii.Error</code>. But whether a given mismatch raises or silently succeeds depends entirely on which characters the ciphertext-of-the-moment happens to contain -- there's no way to know in advance, and nothing in the API protects you. If your code might receive either variant, record which one was used alongside the encoded value, or always normalize to one variant before it leaves your system.</p>
+<aside class="cta"><strong>Decoding a Base32 value from a header or token? Make sure you&#x27;ve got the right variant:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What&#x27;s the difference between base64.b32decode() and b32hexdecode()?</summary><p>They decode two different RFC 4648 Base32 alphabets: b32decode() expects A-Z2-7 (standard), b32hexdecode() expects 0-9A-V (Extended Hex). We measured that the two assign different numeric values to the same letters.</p></details>
+<details><summary>Does Python raise an error if I decode Base32 with the wrong variant?</summary><p>Not always -- we measured this directly: if the encoded text happens to use only letters A-V, which are valid digits in both alphabets, the wrong decoder runs without error and returns completely different, wrong bytes.</p></details>
+<details><summary>Can base32 decoding fail silently in Python?</summary><p>Yes, for this specific mismatch -- we confirmed that decoding standard-alphabet Base32 output with b32hexdecode() (or vice versa) can return wrong bytes with no exception, when the ciphertext doesn&#x27;t contain any character unique to the other alphabet.</p></details>
+<details><summary>How do I avoid mixing up Base32 variants?</summary><p>Always pair b32encode() with b32decode(), and b32hexencode() with b32hexdecode() -- never assume the decoder will catch a mismatch, since we measured that it only raises for some inputs, not all.</p></details>
+<details><summary>Why did my Base32 decode return garbage instead of an error?</summary><p>Likely a standard/Extended-Hex alphabet mismatch. We measured that this silently succeeds whenever the encoded text only contains characters valid in both alphabets (digits and letters A-V), producing wrong output with no error to flag it.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in base64 module: encoded several short byte strings with base32encode() (RFC 4648 standard alphabet), then decoded the result with base32hexdecode() (RFC 4648 &#x27;Extended Hex&#x27; alphabet) instead of the matching base32decode(), and compared outputs. PlainHeaders is our extension; Python&#x27;s base64 module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

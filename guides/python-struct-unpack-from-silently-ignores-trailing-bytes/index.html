@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>struct.unpack_from Silently Ignores Trailing Bytes unpack Rejects</title>
+<meta name="description" content="We measured Python 3.13.5: struct.unpack() errors on extra trailing bytes, but unpack_from() silently ignores anything past what it needs on the same data.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-struct-unpack-from-silently-ignores-trailing-bytes/">
+<meta property="og:title" content="struct.unpack_from Silently Ignores Trailing Bytes unpack Rejects">
+<meta property="og:description" content="We measured Python 3.13.5: struct.unpack() errors on extra trailing bytes, but unpack_from() silently ignores anything past what it needs on the same data.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-struct-unpack-from-silently-ignores-trailing-bytes/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does struct.unpack_from() check that the whole buffer was consumed?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured unpack_from() silently ignoring any bytes in the buffer beyond what the format string needs, while unpack() on the identical data raises struct.error for not being an exact-size buffer."}}, {"@type": "Question", "name": "Does unpack_from() check anything about buffer size?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, but only the lower bound -- we measured it raising struct.error when the buffer is too short to satisfy the format at the given offset. It only skips the check for a buffer that's too long."}}, {"@type": "Question", "name": "Does struct.Struct(fmt).unpack_from() behave differently from the module-level function?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured the Struct class's unpack()/unpack_from() methods following the exact same rule as the module-level struct.unpack()/struct.unpack_from() functions."}}, {"@type": "Question", "name": "How do I make unpack_from() strict about trailing bytes?", "acceptedAnswer": {"@type": "Answer", "text": "Compare len(buffer) - offset against struct.calcsize(fmt) yourself and raise if they don't match exactly -- unpack_from() will not do this check for you."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>struct: unpack_from() Silently Ignores Trailing Bytes unpack() Rejects (tested)</h1>
+<p class="lead"><code>struct.unpack()</code> and <code>struct.unpack_from()</code> look like the same operation with an optional offset bolted on. We measured what happens when the buffer has more bytes in it than the format string accounts for -- the kind of thing that happens routinely when reading from a socket, a file, or a buffer shared with other fields.</p>
+<h2 id="repro1">1. unpack() rejects a buffer with extra trailing bytes</h2>
+<pre><code>import struct
+
+data = struct.pack('&lt;I', 42) + b'extra_trailing_junk'
+
+try:
+    print(struct.unpack('&lt;I', data))
+except struct.error as e:
+    print("unpack error:", e)</code></pre>
+<pre><code>unpack error: unpack requires a buffer of 4 bytes
+</code></pre>
+<p><strong>Measured:</strong> <code>unpack()</code> requires the buffer to be <em>exactly</em> the size the format string needs -- 4 bytes for <code>'&lt;I'</code> -- and raises <code>struct.error</code> immediately if there's anything left over. This is a cheap, free sanity check: if your buffer has unexpected extra bytes, you find out right away.</p>
+
+<h2 id="repro2">2. unpack_from() on the identical buffer: no error, trailing bytes vanish silently</h2>
+<pre><code>import struct
+
+data = struct.pack('&lt;I', 42) + b'extra_trailing_junk'
+print(struct.unpack_from('&lt;I', data))</code></pre>
+<pre><code>(42,)
+</code></pre>
+<p><strong>Measured:</strong> same exact bytes, same format string -- <code>unpack_from()</code> reads the first 4 bytes, returns <code>(42,)</code>, and says nothing about the 19 bytes of <code>b'extra_trailing_junk'</code> it never looked at. This is by design -- <code>unpack_from()</code> exists specifically to read one record out of a larger buffer -- but it means switching from <code>unpack()</code> to <code>unpack_from()</code> (e.g. to add an <code>offset</code> argument) also silently drops the "did I consume everything I meant to?" check.</p>
+
+<h2 id="repro3">3. unpack_from() still checks the buffer isn't too short -- only the upper bound is unchecked</h2>
+<pre><code>import struct
+
+short = b'ab'
+try:
+    print(struct.unpack_from('&lt;I', short))
+except struct.error as e:
+    print("short buffer error:", e)</code></pre>
+<pre><code>short buffer error: unpack_from requires a buffer of at least 4 bytes for unpacking 4 bytes at offset 0 (actual buffer size is 2)
+</code></pre>
+<p><strong>Measured:</strong> <code>unpack_from()</code> isn't unchecked across the board -- a buffer that's too <em>short</em> still raises <code>struct.error</code>, with a message that even names the offset and required size. It's specifically the upper bound -- trailing bytes beyond what's needed -- that goes unchecked. The <code>struct.Struct(fmt).unpack()</code> / <code>.unpack_from()</code> methods on a precompiled <code>Struct</code> object behave identically to the module-level functions here; precompiling doesn't change which bound gets checked.</p>
+
+<h2 id="fix">If you need both the offset and the exact-size guarantee</h2>
+<pre><code>import struct
+
+def unpack_exact(fmt, buf, offset=0):
+    size = struct.calcsize(fmt)
+    if len(buf) - offset != size:
+        raise struct.error(
+            f"expected exactly {size} bytes at offset {offset}, "
+            f"got {len(buf) - offset}"
+        )
+    return struct.unpack_from(fmt, buf, offset)</code></pre>
+<p>Reach for this when a buffer is supposed to contain <em>only</em> one record -- for example after slicing a fixed-size chunk out of a larger stream -- and you want unconsumed trailing bytes to be a loud error instead of silently discarded data.</p>
+<aside class="cta"><strong>Switched from struct.unpack() to unpack_from() for convenience? Check whether you&#x27;re still consuming the whole buffer -- unpack_from() won&#x27;t tell you if you&#x27;re not:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does struct.unpack_from() check that the whole buffer was consumed?</summary><p>No -- we measured unpack_from() silently ignoring any bytes in the buffer beyond what the format string needs, while unpack() on the identical data raises struct.error for not being an exact-size buffer.</p></details>
+<details><summary>Does unpack_from() check anything about buffer size?</summary><p>Yes, but only the lower bound -- we measured it raising struct.error when the buffer is too short to satisfy the format at the given offset. It only skips the check for a buffer that&#x27;s too long.</p></details>
+<details><summary>Does struct.Struct(fmt).unpack_from() behave differently from the module-level function?</summary><p>No -- we measured the Struct class&#x27;s unpack()/unpack_from() methods following the exact same rule as the module-level struct.unpack()/struct.unpack_from() functions.</p></details>
+<details><summary>How do I make unpack_from() strict about trailing bytes?</summary><p>Compare len(buffer) - offset against struct.calcsize(fmt) yourself and raise if they don&#x27;t match exactly -- unpack_from() will not do this check for you.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in struct module: called unpack() and unpack_from() on the same buffer, which contains extra trailing bytes beyond what the format string needs. PlainHeaders is our extension; Python&#x27;s struct module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

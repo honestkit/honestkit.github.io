@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>contextlib.redirect_stdout Redirects Every Thread, Not Just Yours</title>
+<meta name="description" content="We measured Python 3.13.5: redirect_stdout() reassigns the global sys.stdout -- a concurrent threads print() calls get silently captured into your buffer too.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-contextlib-redirect-stdout-affects-every-thread/">
+<meta property="og:title" content="contextlib.redirect_stdout Redirects Every Thread, Not Just Yours">
+<meta property="og:description" content="We measured Python 3.13.5: redirect_stdout() reassigns the global sys.stdout -- a concurrent threads print() calls get silently captured into your buffer too.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-contextlib-redirect-stdout-affects-every-thread/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does contextlib.redirect_stdout() only affect the thread that entered the with block?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it reassigning the global sys.stdout for the entire process, so print() calls from any other thread running concurrently get captured into the same buffer too."}}, {"@type": "Question", "name": "Where does a concurrent thread's print() output go while redirect_stdout is active?", "acceptedAnswer": {"@type": "Answer", "text": "Into the buffer passed to redirect_stdout(), not the real terminal -- we measured a background thread's message appearing only in the redirected buffer, with no error or warning that it had been captured."}}, {"@type": "Question", "name": "Is this behavior consistent, or does it depend on timing?", "acceptedAnswer": {"@type": "Answer", "text": "It depends on timing -- we measured output from a thread that prints before the with block exits getting captured, while an identical call from a thread that prints after the block has already exited goes to the real stdout normally."}}, {"@type": "Question", "name": "How do you safely capture output in a multithreaded program?", "acceptedAnswer": {"@type": "Answer", "text": "Avoid contextlib.redirect_stdout() for that case -- redirect at the source by passing an explicit stream or logger into the code you want to capture, since sys.stdout is one shared global, not scoped per thread or per with block."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>contextlib: redirect_stdout() Redirects Every Thread, Not Just Yours (tested)</h1>
+<p class="lead"><code>contextlib.redirect_stdout(buf)</code> reads like it scopes the redirect to the code inside its <code>with</code> block -- the way a local variable or a thread-local setting would. We measured what happens to <code>print()</code> calls made by a <em>different thread</em> while one thread is inside the block.</p>
+<h2 id="repro1">1. A background thread's print() lands in the main thread's buffer</h2>
+<pre><code>import contextlib, io, threading, time
+
+def other_thread_work():
+    time.sleep(0.05)
+    print("from other thread")
+
+t = threading.Thread(target=other_thread_work)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    t.start()
+    time.sleep(0.1)
+    print("from main thread")
+    t.join()
+
+print("captured in buf:", repr(buf.getvalue()))</code></pre>
+<pre><code>captured in buf: 'from other thread\nfrom main thread\n'
+</code></pre>
+<p><strong>Measured:</strong> <code>"from other thread"</code> was printed by a thread that never entered the <code>with contextlib.redirect_stdout(buf):</code> block, has no reference to <code>buf</code>, and has no idea the redirect exists. It still ends up captured. <code>redirect_stdout()</code> works by doing <code>sys.stdout = new_target</code> and restoring the old value on exit -- <code>sys.stdout</code> is one global, process-wide object, not something scoped per-thread or per-<code>with</code>-block.</p>
+
+<h2 id="repro2">2. That output never reaches the real terminal at all</h2>
+<pre><code>import contextlib, io, threading, time
+
+def other_thread_work():
+    time.sleep(0.05)
+    print("you will not see this on the real terminal")
+
+t = threading.Thread(target=other_thread_work)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    t.start()
+    time.sleep(0.1)
+    t.join()
+# by now the redirect has already ended</code></pre>
+<p><strong>Measured:</strong> running this prints nothing to the actual terminal -- the other thread's message is sitting in <code>buf</code> instead, silently, with no error, no warning, and nothing to indicate a thread's output went somewhere other than where that thread's own code implies it should go. In a real program this looks like a log line or print statement that simply never happened.</p>
+
+<h2 id="repro3">3. The redirect's own exit can race with the other thread, too</h2>
+<pre><code>import contextlib, io, threading, time
+
+def slow_other_thread():
+    time.sleep(0.2)
+    print("printed after the with block already exited")
+
+t = threading.Thread(target=slow_other_thread)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    t.start()
+    time.sleep(0.05)  # with block exits long before the other thread prints
+print("buf has:", repr(buf.getvalue()))
+t.join()</code></pre>
+<pre><code>buf has: ''
+</code></pre>
+<p><strong>Measured:</strong> if the other thread is slow enough that it prints <em>after</em> <code>redirect_stdout</code> has already restored the original <code>sys.stdout</code>, its output goes to the real terminal instead -- correctly, this time, but only by accident of timing. Whether a concurrent thread's <code>print()</code> gets silently swallowed or shows up normally depends entirely on which side of the <code>with</code> block's exit it happens to land on.</p>
+
+<h2 id="fix">Don't rely on redirect_stdout across threads</h2>
+<pre><code>import contextlib, io
+
+# only safe if nothing else in the process writes to stdout
+# while this block is active
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    do_single_threaded_work()</code></pre>
+<p><code>redirect_stdout()</code> is fine for single-threaded code, or for capturing a call you know won't spawn concurrent output elsewhere. For multithreaded programs, redirect at the source instead -- pass an explicit stream/logger into the code you want to capture, rather than relying on the shared, global <code>sys.stdout</code>.</p>
+<aside class="cta"><strong>Using contextlib.redirect_stdout() to capture output in a multithreaded program? Check what other threads print while you&#x27;re inside the block -- it&#x27;s going into your buffer, not the terminal:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does contextlib.redirect_stdout() only affect the thread that entered the with block?</summary><p>No -- we measured it reassigning the global sys.stdout for the entire process, so print() calls from any other thread running concurrently get captured into the same buffer too.</p></details>
+<details><summary>Where does a concurrent thread&#x27;s print() output go while redirect_stdout is active?</summary><p>Into the buffer passed to redirect_stdout(), not the real terminal -- we measured a background thread&#x27;s message appearing only in the redirected buffer, with no error or warning that it had been captured.</p></details>
+<details><summary>Is this behavior consistent, or does it depend on timing?</summary><p>It depends on timing -- we measured output from a thread that prints before the with block exits getting captured, while an identical call from a thread that prints after the block has already exited goes to the real stdout normally.</p></details>
+<details><summary>How do you safely capture output in a multithreaded program?</summary><p>Avoid contextlib.redirect_stdout() for that case -- redirect at the source by passing an explicit stream or logger into the code you want to capture, since sys.stdout is one shared global, not scoped per thread or per with block.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in contextlib module: started a background thread that calls print() while the main thread is inside a contextlib.redirect_stdout() block, and checked where the background thread&#x27;s output actually went. PlainHeaders is our extension; Python&#x27;s contextlib module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

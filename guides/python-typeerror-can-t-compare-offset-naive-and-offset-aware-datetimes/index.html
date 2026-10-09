@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Can&#x27;t Compare Offset-Naive and Offset-Aware Datetimes (Fix)</title>
+<meta name="description" content="We measured Python&#x27;s naive vs aware datetime TypeError: utcnow() vs parsed Z timestamps, why == silently returns False, and replace() vs astimezone().">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-typeerror-can-t-compare-offset-naive-and-offset-aware-datetimes/">
+<meta property="og:title" content="Can&#x27;t Compare Offset-Naive and Offset-Aware Datetimes (Fix)">
+<meta property="og:description" content="We measured Python&#x27;s naive vs aware datetime TypeError: utcnow() vs parsed Z timestamps, why == silently returns False, and replace() vs astimezone().">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-typeerror-can-t-compare-offset-naive-and-offset-aware-datetimes/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I fix can't compare offset-naive and offset-aware datetimes?", "acceptedAnswer": {"@type": "Answer", "text": "Make both sides aware. If the naive value is UTC, use dt.replace(tzinfo=timezone.utc); create new times with datetime.now(timezone.utc) instead of utcnow(). We measured both on Python 3.13.5."}}, {"@type": "Question", "name": "Should I use astimezone() or replace(tzinfo=...)?", "acceptedAnswer": {"@type": "Answer", "text": "replace() attaches a zone without changing the clock. astimezone() on a naive value assumes local time and shifts it; we measured 12:00 meant as UTC becoming 16:00 UTC under America/New_York."}}, {"@type": "Question", "name": "Why does == between naive and aware datetimes not raise an error?", "acceptedAnswer": {"@type": "Answer", "text": "Equality is defined to return False for a naive/aware mix instead of raising. We measured the same 12:00 instant comparing unequal, so equality checks fail silently."}}, {"@type": "Question", "name": "Is datetime.utcnow() naive?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We measured tzinfo None, and on Python 3.12+ it emits a DeprecationWarning. Use datetime.now(timezone.utc)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TypeError: can&#x27;t compare offset-naive and offset-aware datetimes (tested)</h1>
+<p class="lead"><code>TypeError: can't compare offset-naive and offset-aware datetimes</code> means one datetime has a timezone and the other doesn't. We measured where each comes from and the fix that doesn't silently shift your times, on Python 3.13.5.</p>
+<h2 id="what">What raises it</h2>
+<p>A datetime is <em>naive</em> if <code>tzinfo</code> is <code>None</code> and <em>aware</em> if it carries an offset. Python refuses to order or subtract a mix of the two, because it can't know what zone the naive one is in.</p>
+<pre><code>from datetime import datetime, timezone
+naive = datetime(2026, 10, 9, 12, 0)
+aware = datetime(2026, 10, 9, 12, 0, tzinfo=timezone.utc)
+try:
+    print(naive &lt; aware)
+except TypeError as e:
+    print(&quot;TypeError:&quot;, e)
+try:
+    print(aware - naive)
+except TypeError as e:
+    print(&quot;TypeError:&quot;, e)
+print(&quot;== :&quot;, naive == aware)</code></pre>
+<p>Output:</p>
+<pre><code>TypeError: can&#x27;t compare offset-naive and offset-aware datetimes
+TypeError: can&#x27;t subtract offset-naive and offset-aware datetimes
+== : False</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> <code>&lt;</code> and <code>-</code> raise <code>TypeError</code>, but <code>==</code> does <em>not</em>: it silently returns <code>False</code>, even though both values say 12:00. An equality check between a naive and an aware datetime is always false, so <code>if ts == deadline</code> can quietly never fire.</p>
+
+<h2 id="source">2. Where the naive one usually comes from</h2>
+<pre><code>from datetime import datetime, timezone
+# the usual culprits: utcnow() and now() are naive, fromisoformat(&quot;...Z&quot;) is aware
+print(datetime.utcnow().tzinfo)
+print(datetime.now().tzinfo)
+print(datetime.fromisoformat(&quot;2026-10-09T12:00:00Z&quot;).tzinfo)
+print(datetime.fromisoformat(&quot;2026-10-09T12:00:00&quot;).tzinfo)
+print(datetime.now(timezone.utc).tzinfo)</code></pre>
+<p>Output:</p>
+<pre><code>/tmp/nv/b2.py:3: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  print(datetime.utcnow().tzinfo)
+None
+None
+UTC
+None
+UTC</code></pre>
+<p><strong>Measured:</strong> <code>datetime.utcnow()</code> and <code>datetime.now()</code> return naive values (and <code>utcnow()</code> is deprecated on 3.12+, with the warning shown). <code>fromisoformat()</code> returns aware only when the string has an offset or <code>Z</code>. So comparing <code>utcnow()</code> against a parsed API timestamp like <code>...Z</code> is the classic trigger.</p>
+
+<h2 id="fix">3. Fix: replace() vs astimezone()</h2>
+<pre><code>from datetime import datetime, timezone
+naive = datetime(2026, 10, 9, 12, 0)   # meant as UTC
+# WRONG for UTC-meaning values: astimezone() assumes the naive value is LOCAL time
+print(naive.astimezone(timezone.utc))
+# RIGHT: attach the zone without shifting the clock
+print(naive.replace(tzinfo=timezone.utc))</code></pre>
+<p>Output:</p>
+<pre><code>2026-10-09 16:00:00+00:00
+2026-10-09 12:00:00+00:00</code></pre>
+<p><strong>Measured with <code>TZ=America/New_York</code>:</strong> calling <code>astimezone()</code> on a naive value treats it as <em>local</em> time and shifts it, so a value you meant as 12:00 UTC becomes 16:00 UTC, 4 hours off with no error. If the naive value is already UTC, use <code>replace(tzinfo=timezone.utc)</code>, which attaches the zone without moving the clock. Use <code>astimezone()</code> only when the naive value really is local time. More on that trap in <a href="/guides/datetime-astimezone-on-naive-datetime-silently-assumes-local-tz/">astimezone on a naive datetime</a>.</p>
+
+<h2 id="aware">4. Prevent it: make everything aware</h2>
+<pre><code>from datetime import datetime, timezone
+deadline = datetime.fromisoformat(&quot;2026-10-09T12:00:00+00:00&quot;)
+now = datetime.now(timezone.utc)          # aware, not utcnow()
+print(type(now &lt; deadline).__name__)
+# a set/dict mixing both silently treats them as different keys
+s = {datetime(2026, 1, 1), datetime(2026, 1, 1, tzinfo=timezone.utc)}
+print(len(s))</code></pre>
+<p>Output:</p>
+<pre><code>bool
+2</code></pre>
+<p>Create times with <code>datetime.now(timezone.utc)</code> and parse with offsets, and comparisons just work. <strong>Measured:</strong> a set holding the naive and aware versions of the same instant keeps <em>both</em> (length 2), so mixed values also break de-duplication and dict lookups silently.</p>
+
+<aside class="cta"><strong>Comparing against a timestamp from an API? Check the real Date and Last-Modified headers a server sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I fix can&#x27;t compare offset-naive and offset-aware datetimes?</summary><p>Make both sides aware. If the naive value is UTC, use dt.replace(tzinfo=timezone.utc); create new times with datetime.now(timezone.utc) instead of utcnow(). We measured both on Python 3.13.5.</p></details>
+<details><summary>Should I use astimezone() or replace(tzinfo=...)?</summary><p>replace() attaches a zone without changing the clock. astimezone() on a naive value assumes local time and shifts it; we measured 12:00 meant as UTC becoming 16:00 UTC under America/New_York.</p></details>
+<details><summary>Why does == between naive and aware datetimes not raise an error?</summary><p>Equality is defined to return False for a naive/aware mix instead of raising. We measured the same 12:00 instant comparing unequal, so equality checks fail silently.</p></details>
+<details><summary>Is datetime.utcnow() naive?</summary><p>Yes. We measured tzinfo None, and on Python 3.12+ it emits a DeprecationWarning. Use datetime.now(timezone.utc).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux (TZ=America/New_York for the astimezone block): naive vs aware ordering, subtraction and equality, where naive values come from, replace vs astimezone, and set de-duplication. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is the standard library.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>statistics: stdev() Crashes on NaN, variance() Doesn&#x27;t</title>
+<meta name="description" content="We measured Python 3.13.5: variance([1,2,float(&#x27;nan&#x27;),4]) correctly returns nan, but stdev() on the identical data raises AttributeError instead.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-statistics-stdev-raises-attributeerror-on-nan-but-variance-doesnt/">
+<meta property="og:title" content="statistics: stdev() Crashes on NaN, variance() Doesn&#x27;t">
+<meta property="og:description" content="We measured Python 3.13.5: variance([1,2,float(&#x27;nan&#x27;),4]) correctly returns nan, but stdev() on the identical data raises AttributeError instead.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-statistics-stdev-raises-attributeerror-on-nan-but-variance-doesnt/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does statistics.stdev() raise an error for NaN input?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, but not the expected one -- we measured stdev([1,2,float('nan'),4]) raising AttributeError: 'float' object has no attribute 'numerator', not the module's own StatisticsError."}}, {"@type": "Question", "name": "Does statistics.variance() handle NaN differently than stdev()?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured variance() on data containing NaN returning nan cleanly, while stdev() on the identical data crashes with AttributeError. The same split holds for pvariance() (clean) versus pstdev() (crashes)."}}, {"@type": "Question", "name": "Will catching StatisticsError protect a stdev() call from NaN input?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured the exception raised being AttributeError, not StatisticsError, so an except StatisticsError clause around stdev() won't catch it and the crash propagates as unhandled."}}, {"@type": "Question", "name": "Why does stdev() crash on NaN when variance() doesn't?", "acceptedAnswer": {"@type": "Answer", "text": "stdev() computes variance internally as an exact Fraction and expects a .numerator attribute to take an exact square root. A NaN value collapses that internal computation to a plain float, which has no .numerator attribute, so the AttributeError comes from stdev()'s own implementation rather than from the input itself."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>statistics: stdev() Crashes on NaN, variance() Doesn&#x27;t (tested)</h1>
+<p class="lead">A stray <code>NaN</code> in numeric data usually propagates quietly through arithmetic -- any operation touching it just produces another <code>NaN</code>. We measured whether Python's <code>statistics</code> module follows that pattern consistently across its variance-family functions, and it doesn't.</p>
+<h2 id="repro1">1. variance() propagates NaN cleanly; stdev() on the same data raises AttributeError</h2>
+<pre><code>import statistics as st
+
+nan = float("nan")
+data = [1, 2, nan, 4]
+
+print(st.variance(data))
+print(st.stdev(data))</code></pre>
+<pre><code>nan
+Traceback (most recent call last):
+  ...
+  File ".../statistics.py", line 1211, in stdev
+    return _float_sqrt_of_frac(mss.numerator, mss.denominator)
+                               ^^^^^^^^^^^^^
+AttributeError: 'float' object has no attribute 'numerator'</code></pre>
+<p><strong>Measured:</strong> <code>variance()</code> on data containing a <code>NaN</code> returns <code>nan</code> -- the expected, quiet propagation. <code>stdev()</code> on the exact same list doesn't return <code>nan</code>; it raises <code>AttributeError</code> from deep inside the module's internals. <code>stdev()</code> computes variance as an exact <code>Fraction</code> internally and expects a <code>.numerator</code> attribute to take the square root precisely, but a <code>NaN</code> in the input collapses that internal value to a plain <code>float</code>, which has no such attribute -- the exception leaks an implementation detail instead of surfacing as a clean, catchable error.</p>
+
+<h2 id="repro2">2. The population variants have the exact same split</h2>
+<pre><code>import statistics as st
+
+nan = float("nan")
+data = [1, 2, nan, 4]
+
+print(st.pvariance(data))
+print(st.pstdev(data))</code></pre>
+<pre><code>nan
+Traceback (most recent call last):
+  ...
+AttributeError: 'float' object has no attribute 'numerator'</code></pre>
+<p><strong>Measured:</strong> <code>pvariance()</code> (population variance) also returns <code>nan</code> cleanly, while <code>pstdev()</code> raises the identical <code>AttributeError</code> as <code>stdev()</code>. The split is consistent across both the sample and population variants: the two functions that return variance directly handle <code>NaN</code> fine; the two that take a square root of it don't.</p>
+
+<h2 id="repro3">3. Position and list size don't matter -- any NaN anywhere triggers it</h2>
+<pre><code>import statistics as st
+
+nan = float("nan")
+
+try:
+    st.stdev([nan, 1, 2, 4])
+except AttributeError as e:
+    print("leading nan:", e)
+
+try:
+    st.stdev([1] * 100 + [nan])
+except AttributeError as e:
+    print("trailing nan in 101 values:", e)</code></pre>
+<pre><code>leading nan: 'float' object has no attribute 'numerator'
+trailing nan in 101 values: 'float' object has no attribute 'numerator'</code></pre>
+<p><strong>Measured:</strong> the crash happens regardless of where the <code>NaN</code> sits in the list or how many other values surround it -- a single <code>NaN</code> anywhere is enough. Code that checks for bad data by catching <code>StatisticsError</code> around a <code>stdev()</code> call (the module's documented exception type) won't catch this -- <code>AttributeError</code> is a different exception class entirely, so the <code>except</code> clause silently lets it through as an unhandled crash.</p>
+<aside class="cta"><strong>Got a NaN in a dataset you&#x27;re about to run through statistics.stdev()? Check variance() first -- stdev() crashes where it doesn&#x27;t:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does statistics.stdev() raise an error for NaN input?</summary><p>Yes, but not the expected one -- we measured stdev([1,2,float(&#x27;nan&#x27;),4]) raising AttributeError: &#x27;float&#x27; object has no attribute &#x27;numerator&#x27;, not the module&#x27;s own StatisticsError.</p></details>
+<details><summary>Does statistics.variance() handle NaN differently than stdev()?</summary><p>Yes -- we measured variance() on data containing NaN returning nan cleanly, while stdev() on the identical data crashes with AttributeError. The same split holds for pvariance() (clean) versus pstdev() (crashes).</p></details>
+<details><summary>Will catching StatisticsError protect a stdev() call from NaN input?</summary><p>No -- we measured the exception raised being AttributeError, not StatisticsError, so an except StatisticsError clause around stdev() won&#x27;t catch it and the crash propagates as unhandled.</p></details>
+<details><summary>Why does stdev() crash on NaN when variance() doesn&#x27;t?</summary><p>stdev() computes variance internally as an exact Fraction and expects a .numerator attribute to take an exact square root. A NaN value collapses that internal computation to a plain float, which has no .numerator attribute, so the AttributeError comes from stdev()&#x27;s own implementation rather than from the input itself.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in statistics module: called variance(), stdev(), pvariance(), and pstdev() on the same data containing a float(&#x27;nan&#x27;) value. PlainHeaders is our extension; Python&#x27;s statistics module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

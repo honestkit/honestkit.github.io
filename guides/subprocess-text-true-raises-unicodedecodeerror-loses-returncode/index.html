@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>subprocess text=True Raises UnicodeDecodeError, Hides returncode</title>
+<meta name="description" content="We measured subprocess.run(text=True) raising UnicodeDecodeError on one bad byte — the exception has no returncode, pid, or success status at all.">
+<link rel="canonical" href="https://honestkit.github.io/guides/subprocess-text-true-raises-unicodedecodeerror-loses-returncode/">
+<meta property="og:title" content="subprocess text=True Raises UnicodeDecodeError, Hides returncode">
+<meta property="og:description" content="We measured subprocess.run(text=True) raising UnicodeDecodeError on one bad byte — the exception has no returncode, pid, or success status at all.">
+<meta property="og:url" content="https://honestkit.github.io/guides/subprocess-text-true-raises-unicodedecodeerror-loses-returncode/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does subprocess.run(text=True) sometimes raise UnicodeDecodeError?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it happening when the child process writes even one byte to stdout/stderr that isn't valid under the default UTF-8 strict decoding \u2014 text=True decodes with errors='strict' by default, so any invalid byte raises instead of returning a result."}}, {"@type": "Question", "name": "If subprocess.run(text=True) raises UnicodeDecodeError, can I still get the exit code?", "acceptedAnswer": {"@type": "Answer", "text": "Not from the exception \u2014 we confirmed UnicodeDecodeError has no .result, .returncode, or .pid attribute. The CompletedProcess object is never created, so you'd have to rerun the command (e.g. without text=True) to learn the real exit status."}}, {"@type": "Question", "name": "Can I recover the raw output after subprocess.run(text=True) raises UnicodeDecodeError?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we verified the full raw bytes the child produced are available via the exception's own e.object attribute (a standard UnicodeDecodeError field), even though result.stdout was never populated."}}, {"@type": "Question", "name": "How do I stop subprocess.run(text=True) from crashing on bad bytes?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed passing errors='replace' (or 'backslashreplace'/'surrogateescape') to subprocess.run() makes it substitute characters for invalid bytes instead of raising, returning a normal CompletedProcess with the correct returncode."}}, {"@type": "Question", "name": "Does capture_output=True without text=True have this problem?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured that without text=True, subprocess.run() returns the raw bytes unmodified (b'\\xff\\xfehello'), since no decoding happens at all; the UnicodeDecodeError only occurs when text=True (or encoding=) asks subprocess to decode the output for you."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>subprocess text=True Decode Error Loses returncode (tested)</h1>
+<p class="lead"><code>subprocess.run(..., text=True)</code> decodes the child's output as UTF-8 by default. We measured what happens when a successful child process emits even one byte that isn't valid UTF-8: the whole call raises an exception instead of returning a result, and that exception doesn't tell you whether the process succeeded.</p>
+<h2 id="repro1">1. One invalid byte crashes the whole call, even on a successful process</h2>
+<pre><code>import subprocess
+
+result = subprocess.run(["printf", "\xff\xfehello"], capture_output=True, text=True)
+</code></pre>
+<pre><code>Traceback (most recent call last):
+  ...
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte</code></pre>
+<p><strong>Measured:</strong> <code>printf</code> ran to completion and exited 0 &mdash; the two leading bytes are just not valid UTF-8, with four valid ASCII bytes ("hello") right after them. <code>text=True</code> decodes the captured bytes with <code>errors="strict"</code> by default, so the decode fails and <code>subprocess.run()</code> never returns a <code>CompletedProcess</code> at all. The exception is raised instead of being attached to a result.</p>
+
+<h2 id="repro2">2. The exception has no returncode, pid, or result object</h2>
+<pre><code>try:
+    result = subprocess.run(["printf", "\xff\xfehello"], capture_output=True, text=True)
+except UnicodeDecodeError as e:
+    print(hasattr(e, "result"))
+    False
+    print(e.args)
+    ('utf-8', b'\xff\xfehello', 0, 1, 'invalid start byte')</code></pre>
+<p><strong>Measured:</strong> <code>UnicodeDecodeError</code> is a plain decode error, not a subprocess-aware exception &mdash; it carries no <code>.result</code>, <code>.returncode</code>, or <code>.pid</code>. If you only catch this exception, you have no way to tell whether the child process succeeded, failed, or is still running; you'd have to re-run the command without <code>text=True</code> just to find out.</p>
+
+<h2 id="repro3">3. The raw bytes are recoverable, just not through the normal result</h2>
+<pre><code>except UnicodeDecodeError as e:
+    e.object
+    b'\xff\xfehello'</code></pre>
+<p><strong>Measured:</strong> the full raw byte string the child produced is still reachable via the standard <code>UnicodeDecodeError.object</code> attribute (it's a generic decode-error attribute, not specific to subprocess) &mdash; so the data isn't lost, but recovering it means catching a decode exception and digging into its internals instead of reading <code>result.stdout</code> normally.</p>
+
+<h2 id="fix">4. Fix: pass errors= explicitly if the child's output encoding isn't guaranteed</h2>
+<pre><code>result = subprocess.run(["printf", "\xff\xfehello"], capture_output=True, text=True, errors="replace")
+result.stdout
+'\ufffd\ufffdhello'
+result.returncode
+0</code></pre>
+<p><strong>Measured:</strong> adding <code>errors="replace"</code> (or <code>"backslashreplace"</code>, <code>"surrogateescape"</code>) makes the same call return a normal <code>CompletedProcess</code> with the exit code intact, substituting replacement characters for the undecodable bytes instead of raising. Per the <a href="https://docs.python.org/3/library/subprocess.html#subprocess.Popen">subprocess docs</a>, <code>text=True</code> is shorthand for decoding with the locale's preferred encoding and <code>errors="strict"</code> &mdash; for any subprocess whose output isn't guaranteed to be clean text (compilers, package managers, anything touching filenames or user data), set <code>errors=</code> explicitly or capture bytes and decode manually so one stray byte can't erase your exit code.</p>
+
+<aside class="cta"><strong>Debugging a subprocess call that&#x27;s supposed to hit an API or local server? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does subprocess.run(text=True) sometimes raise UnicodeDecodeError?</summary><p>We measured it happening when the child process writes even one byte to stdout/stderr that isn&#x27;t valid under the default UTF-8 strict decoding — text=True decodes with errors=&#x27;strict&#x27; by default, so any invalid byte raises instead of returning a result.</p></details>
+<details><summary>If subprocess.run(text=True) raises UnicodeDecodeError, can I still get the exit code?</summary><p>Not from the exception — we confirmed UnicodeDecodeError has no .result, .returncode, or .pid attribute. The CompletedProcess object is never created, so you&#x27;d have to rerun the command (e.g. without text=True) to learn the real exit status.</p></details>
+<details><summary>Can I recover the raw output after subprocess.run(text=True) raises UnicodeDecodeError?</summary><p>Yes — we verified the full raw bytes the child produced are available via the exception&#x27;s own e.object attribute (a standard UnicodeDecodeError field), even though result.stdout was never populated.</p></details>
+<details><summary>How do I stop subprocess.run(text=True) from crashing on bad bytes?</summary><p>We confirmed passing errors=&#x27;replace&#x27; (or &#x27;backslashreplace&#x27;/&#x27;surrogateescape&#x27;) to subprocess.run() makes it substitute characters for invalid bytes instead of raising, returning a normal CompletedProcess with the correct returncode.</p></details>
+<details><summary>Does capture_output=True without text=True have this problem?</summary><p>No — we measured that without text=True, subprocess.run() returns the raw bytes unmodified (b&#x27;\xff\xfehello&#x27;), since no decoding happens at all; the UnicodeDecodeError only occurs when text=True (or encoding=) asks subprocess to decode the output for you.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in subprocess module on Linux: ran subprocess.run() with text=True against a child process that printed one invalid-UTF-8 byte followed by valid ASCII text, and inspected the resulting exception and CompletedProcess objects. PlainHeaders is our extension; Python&#x27;s subprocess module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

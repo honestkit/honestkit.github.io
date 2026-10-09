@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>_csv.Error: line contains NUL &amp;mdash; Fixed and Tested</title>
+<meta name="description" content="Python 3.11+ no longer raises line contains NUL: csv keeps the \x00 in your fields silently. We measured the UTF-16 cause and two fixes that work.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-csv-error-line-contains-nul/">
+<meta property="og:title" content="_csv.Error: line contains NUL &amp;mdash; Fixed and Tested">
+<meta property="og:description" content="Python 3.11+ no longer raises line contains NUL: csv keeps the \x00 in your fields silently. We measured the UTF-16 cause and two fixes that work.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-csv-error-line-contains-nul/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why don't I get 'line contains NUL' any more?", "acceptedAnswer": {"@type": "Answer", "text": "CPython 3.11 added NUL support to the csv module (bpo-27580, in 3.11.0a2). We measured on Python 3.13.5 that csv.reader now returns the NUL inside the field ('widget\\x00') with no error, so the data is still dirty but nothing tells you."}}, {"@type": "Question", "name": "What does 'line contains NUL' mean?", "acceptedAnswer": {"@type": "Answer", "text": "A line in the file contains a \\x00 byte. Most often the file is UTF-16 (Excel 'Unicode Text', PowerShell 5 redirection), which we confirmed starts with b'\\xff\\xfe' and has a NUL after every ASCII character; less often it is a stray NUL from a truncated or padded write."}}, {"@type": "Question", "name": "How do I read a UTF-16 CSV in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Open it with open(path, newline='', encoding='utf-16'). We measured that this reads the byte order mark, strips it, and returns clean rows like ['name', 'qty']."}}, {"@type": "Question", "name": "How do I remove NUL bytes before csv.reader?", "acceptedAnswer": {"@type": "Answer", "text": "Pass a generator: csv.reader(line.replace('\\0', '') for line in f). We confirmed it turns ['widget\\x00', '3'] into ['widget', '3'] and it works on every Python version."}}, {"@type": "Question", "name": "Does errors='ignore' fix it?", "acceptedAnswer": {"@type": "Answer", "text": "No. It hides the decoding error but the NUL bytes stay in the text; on Python 3.10 and older that is exactly the path that leads to line contains NUL, and on 3.11+ you get NUL-padded fields with no error."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>_csv.Error: line contains NUL (tested on Python 3.13)</h1>
+<p class="lead"><code>_csv.Error: line contains NUL</code> means a <code>\x00</code> byte reached <code>csv.reader</code>. On Python 3.11 and newer you won't even see that error: we measured that the NUL now ends up inside your field values with no warning. Here is how to tell a UTF-16 file from a stray byte, and the fix for each.</p>
+<h2 id="old">1. Where the error went</h2>
+<p><code>_csv.Error: line contains NUL</code> (older wording: <code>line contains NULL byte</code>) is what <code>csv.reader</code> raised on Python 3.10 and earlier when a line held a <code>\x00</code> byte. CPython 3.11.0a2 changed that (bpo-27580, changelog entry: &ldquo;Add support of null characters in csv&rdquo;). We tested on Python 3.13.5 only, so the old message above is from the changelog and the many existing reports of it, not our own run. What we did measure is what happens now:</p>
+<pre><code>import csv
+
+with open(&quot;data.csv&quot;, &quot;wb&quot;) as f:
+    f.write(b&quot;name,qty\nwidget\x00,3\n&quot;)
+
+with open(&quot;data.csv&quot;, newline=&quot;&quot;) as f:
+    rows = list(csv.reader(f))
+print(rows)
+print(rows[1][0] == &quot;widget&quot;)</code></pre>
+<pre><code>[['name', 'qty'], ['widget\x00', '3']]
+False</code></pre>
+<p><strong>Measured:</strong> no error at all. The NUL byte is kept inside the field, so <code>"widget\x00"</code> is not equal to <code>"widget"</code>. Lookups, joins, de-duplication and database inserts that compare on that column now fail quietly instead of loudly. If you upgraded from 3.10 and the error &ldquo;went away&rdquo;, the bad bytes are still in your data.</p>
+
+<h2 id="utf16">2. The usual real cause: a UTF-16 file</h2>
+<p>A file with a NUL in almost every other byte is rarely corrupt. It is usually UTF-16 text: Excel's &ldquo;Unicode Text&rdquo; save option, PowerShell 5's <code>Out-File</code>/<code>&gt;</code> redirection, and many Windows exports write UTF-16, where every ASCII character is followed by a <code>\x00</code>.</p>
+<pre><code>import csv
+
+# what Excel&#x27;s &quot;Unicode Text&quot; export (and many Windows tools) produce
+with open(&quot;export.csv&quot;, &quot;w&quot;, encoding=&quot;utf-16&quot;, newline=&quot;&quot;) as f:
+    f.write(&quot;name,qty\r\nwidget,3\r\n&quot;)
+
+print(open(&quot;export.csv&quot;, &quot;rb&quot;).read()[:10])
+
+with open(&quot;export.csv&quot;, newline=&quot;&quot;, encoding=&quot;latin-1&quot;) as f:
+    print(list(csv.reader(f))[:2])</code></pre>
+<pre><code>b'\xff\xfen\x00a\x00m\x00e\x00'
+[['ÿþn\x00a\x00m\x00e\x00', '\x00q\x00t\x00y\x00'], ['\x00']]</code></pre>
+<p><strong>Measured:</strong> the file starts with <code>b'\xff\xfe'</code> (the UTF-16 little-endian byte order mark). Decoded as a single-byte encoding, every value comes back padded with NULs and extra rows of just <code>'\x00'</code> appear between the real ones, with no exception. With Python's default UTF-8 decoding you get a different error instead: <code>UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte</code> (see our <a href="/guides/python-unicodedecodeerror/">UnicodeDecodeError guide</a>). On Python 3.10 and older, the latin-1 / <code>errors="ignore"</code> route is exactly where &ldquo;line contains NUL&rdquo; came from.</p>
+
+<h2 id="fix">3. Fix: open it with the right encoding</h2>
+<pre><code>import csv
+
+def open_csv(path):
+    with open(path, &quot;rb&quot;) as f:
+        head = f.read(4)
+    if head.startswith((b&quot;\xff\xfe&quot;, b&quot;\xfe\xff&quot;)):
+        enc = &quot;utf-16&quot;
+    elif head.startswith(b&quot;\xef\xbb\xbf&quot;):
+        enc = &quot;utf-8-sig&quot;
+    else:
+        enc = &quot;utf-8&quot;
+    return open(path, newline=&quot;&quot;, encoding=enc)
+
+with open_csv(&quot;export.csv&quot;) as f:
+    print(list(csv.reader(f)))
+with open_csv(&quot;data.csv&quot;) as f:
+    print(list(csv.reader(f)))</code></pre>
+<pre><code>[['name', 'qty'], ['widget', '3']]
+[['name', 'qty'], ['widget\x00', '3']]</code></pre>
+<p><strong>Measured:</strong> checking the first bytes for a byte order mark and opening with <code>encoding="utf-16"</code> gives clean rows. <code>"utf-16"</code> reads the BOM itself and strips it, so you don't need to know the byte order. The second file has no BOM; it is UTF-8 with a stray NUL, so the encoding fix correctly leaves it alone. That case needs the next step.</p>
+
+<h2 id="strip">4. Fix: strip stray NUL bytes</h2>
+<pre><code>import csv
+
+with open(&quot;data.csv&quot;, newline=&quot;&quot;) as f:
+    rows = list(csv.reader(line.replace(&quot;\0&quot;, &quot;&quot;) for line in f))
+print(rows)</code></pre>
+<pre><code>[['name', 'qty'], ['widget', '3']]</code></pre>
+<p><strong>Measured:</strong> <code>csv.reader</code> accepts any iterable of strings, so a generator that removes <code>"\0"</code> from each line works on every Python version, old and new. Only do this after ruling out UTF-16 (section 3); stripping NULs from UTF-16 text decoded as a single-byte encoding leaves the BOM characters and stray rows behind.</p>
+
+<h2 id="find">5. Find the bytes first</h2>
+<pre><code>with open(&quot;data.csv&quot;, &quot;rb&quot;) as f:
+    data = f.read()
+print(data.count(b&quot;\x00&quot;), &quot;NUL bytes, first at offset&quot;, data.find(b&quot;\x00&quot;))</code></pre>
+<pre><code>1 NUL bytes, first at offset 15</code></pre>
+<p>One or a few NULs at random offsets points to a truncated write, a fixed-width field padded with zeros, or a binary column dumped as text: strip them. NULs at every other byte points to UTF-16: re-open it. A file that is mostly NULs is probably not CSV at all (a zero-filled file after a crash, or a <code>.xlsx</code> renamed to <code>.csv</code>).</p>
+
+<aside class="cta"><strong>Pulling the CSV from an API or download link? Check the real Content-Type and charset the server sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why don&#x27;t I get &#x27;line contains NUL&#x27; any more?</summary><p>CPython 3.11 added NUL support to the csv module (bpo-27580, in 3.11.0a2). We measured on Python 3.13.5 that csv.reader now returns the NUL inside the field (&#x27;widget\x00&#x27;) with no error, so the data is still dirty but nothing tells you.</p></details>
+<details><summary>What does &#x27;line contains NUL&#x27; mean?</summary><p>A line in the file contains a \x00 byte. Most often the file is UTF-16 (Excel &#x27;Unicode Text&#x27;, PowerShell 5 redirection), which we confirmed starts with b&#x27;\xff\xfe&#x27; and has a NUL after every ASCII character; less often it is a stray NUL from a truncated or padded write.</p></details>
+<details><summary>How do I read a UTF-16 CSV in Python?</summary><p>Open it with open(path, newline=&#x27;&#x27;, encoding=&#x27;utf-16&#x27;). We measured that this reads the byte order mark, strips it, and returns clean rows like [&#x27;name&#x27;, &#x27;qty&#x27;].</p></details>
+<details><summary>How do I remove NUL bytes before csv.reader?</summary><p>Pass a generator: csv.reader(line.replace(&#x27;\0&#x27;, &#x27;&#x27;) for line in f). We confirmed it turns [&#x27;widget\x00&#x27;, &#x27;3&#x27;] into [&#x27;widget&#x27;, &#x27;3&#x27;] and it works on every Python version.</p></details>
+<details><summary>Does errors=&#x27;ignore&#x27; fix it?</summary><p>No. It hides the decoding error but the NUL bytes stay in the text; on Python 3.10 and older that is exactly the path that leads to line contains NUL, and on 3.11+ you get NUL-padded fields with no error.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in csv module: wrote a UTF-8 file with one stray \x00 byte and a UTF-16 file the way Excel&#x27;s Unicode Text export does, read each with csv.reader under utf-8, latin-1 and utf-16, and ran every code block on this page verbatim. Python 3.10 behavior is from CPython&#x27;s changelog (bpo-27580), not our own run. PlainHeaders is our extension; Python&#x27;s csv module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

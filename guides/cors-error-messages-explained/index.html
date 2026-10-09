@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CORS Error Messages in Chrome: Every Cause and Fix (Tested)</title>
+<meta name="description" content="We triggered 16 CORS failures in Chromium 153 and copied the exact console message for each. Match your error, see the cause, and copy the Express fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/cors-error-messages-explained/">
+<meta property="og:title" content="CORS Error Messages in Chrome: Every Cause and Fix (Tested)">
+<meta property="og:description" content="We triggered 16 CORS failures in Chromium 153 and copied the exact console message for each. Match your error, see the cause, and copy the Express fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/cors-error-messages-explained/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does my API work in curl or Postman but not in the browser?", "acceptedAnswer": {"@type": "Answer", "text": "CORS is only enforced by browsers. In our test, curl and Node.js fetch got 200 and the full body from a route with no CORS headers at all. Chromium got the same 200 but blocked the page from reading it."}}, {"@type": "Question", "name": "Does a CORS error mean my server never got the request?", "acceptedAnswer": {"@type": "Answer", "text": "Not always. For simple GET requests our server ran the handler and returned 200 every time; the browser hid the response. For PUT, DELETE, JSON bodies or custom headers, a failed preflight means only the OPTIONS request arrived."}}, {"@type": "Question", "name": "Can I see which CORS rule failed from JavaScript?", "acceptedAnswer": {"@type": "Answer", "text": "No. Every failure we tested rejected with the same TypeError: Failed to fetch. The specific reason is only in the browser console."}}, {"@type": "Question", "name": "Why does Content-Type: application/json cause a CORS error?", "acceptedAnswer": {"@type": "Answer", "text": "application/json is not one of the content types allowed without a preflight. Chromium sent an OPTIONS request and reported 'Request header field content-type is not allowed by Access-Control-Allow-Headers in preflight response' until we added Access-Control-Allow-Headers: Content-Type."}}, {"@type": "Question", "name": "Can I use Access-Control-Allow-Origin: * with cookies?", "acceptedAnswer": {"@type": "Answer", "text": "No. With credentials: 'include', Chromium 153 rejected * and also required Access-Control-Allow-Credentials: true in lowercase. Echo the exact allowed origin and add Vary: Origin."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>CORS error messages explained (tested)</h1>
+<p class="lead">Every CORS error in Chrome starts with <code>Access to fetch at '...' from origin '...' has been blocked by CORS policy:</code>. The part after the colon tells you the cause. We broke an Express API in 16 different ways and recorded the exact message Chromium 153 printed for each one.</p>
+<h2>1. How we tested</h2>
+<p>One Express 5.2.1 server on port 8986 served a blank page and an API. The page was loaded from <code>http://127.0.0.1:8986</code> and called the API at <code>http://localhost:8986</code>. Different host means different origin, so every call was cross-origin. Each API route sent a different set of CORS headers. A Playwright script ran <code>fetch()</code> in the page and collected messages with <code>page.on('console')</code>.</p>
+<p>Every failed case printed two console errors: the CORS message and <code>Failed to load resource: net::ERR_FAILED</code>. In JavaScript, every failed <code>fetch()</code> rejected with the same <code>TypeError: Failed to fetch</code>. The script cannot see which rule failed. Only the console can.</p>
+
+<h2>2. Every message, its cause and the fix</h2>
+<p>Each message below starts with <code>Access to fetch at 'http://localhost:8986/api/...' from origin 'http://127.0.0.1:8986' has been blocked by CORS policy:</code>. We show only the part after that.</p>
+<table>
+<tr><th>What the server did</th><th>Exact console message (after the prefix)</th><th>Fix (Express)</th></tr>
+<tr><td>No <code>Access-Control-Allow-Origin</code> at all</td><td>No 'Access-Control-Allow-Origin' header is present on the requested resource.</td><td><code>res.set('Access-Control-Allow-Origin', 'https://app.example.com')</code></td></tr>
+<tr><td>ACAO set to a different origin (<code>https://example.com</code>)</td><td>The 'Access-Control-Allow-Origin' header has a value 'https://example.com' that is not equal to the supplied origin. Have the server send the header with a valid value.</td><td>Send the caller's exact origin: scheme, host and port must all match.</td></tr>
+<tr><td>ACAO with two origins, comma-separated</td><td>The 'Access-Control-Allow-Origin' header contains multiple values 'http://127.0.0.1:8986, https://example.com', but only one is allowed. Have the server send the header with a valid value.</td><td>Check <code>req.headers.origin</code> against an allow-list and echo back one value.</td></tr>
+<tr><td>Two separate ACAO headers (<code>res.append</code> twice)</td><td>Same "contains multiple values" message as above.</td><td>Set the header once. Look for a proxy that adds a second copy.</td></tr>
+<tr><td>ACAO <code>*</code>, fetch with <code>credentials: 'include'</code></td><td>The value of the 'Access-Control-Allow-Origin' header in the response must not be the wildcard '*' when the request's credentials mode is 'include'.</td><td>Echo the exact origin instead of <code>*</code>, and add <code>Vary: Origin</code>.</td></tr>
+<tr><td>Correct ACAO, credentials included, no <code>Access-Control-Allow-Credentials</code></td><td>The value of the 'Access-Control-Allow-Credentials' header in the response is '' which must be 'true' when the request's credentials mode is 'include'.</td><td><code>res.set('Access-Control-Allow-Credentials', 'true')</code></td></tr>
+<tr><td><code>Access-Control-Allow-Credentials: TRUE</code></td><td>The value of the 'Access-Control-Allow-Credentials' header in the response is 'TRUE' which must be 'true' when the request's credentials mode is 'include'.</td><td>Lowercase <code>true</code> only.</td></tr>
+<tr><td>Preflight (OPTIONS) returns 404 with no CORS headers</td><td>Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource.</td><td>Answer OPTIONS with 204 and the CORS headers (see section 4).</td></tr>
+<tr><td>Preflight returns 404 but with ACAO</td><td>Response to preflight request doesn't pass access control check: It does not have HTTP ok status.</td><td>Return 200 or 204 to OPTIONS.</td></tr>
+<tr><td>Preflight returns 500 with ACAO</td><td>Response to preflight request doesn't pass access control check: It does not have HTTP ok status.</td><td>Same. Check auth middleware is not rejecting OPTIONS.</td></tr>
+<tr><td>Custom header <code>X-Api-Key</code>, preflight has no <code>Access-Control-Allow-Headers</code></td><td>Request header field x-api-key is not allowed by Access-Control-Allow-Headers in preflight response.</td><td><code>Access-Control-Allow-Headers: X-Api-Key</code></td></tr>
+<tr><td>POST with <code>Content-Type: application/json</code>, no Allow-Headers</td><td>Request header field content-type is not allowed by Access-Control-Allow-Headers in preflight response.</td><td><code>Access-Control-Allow-Headers: Content-Type</code></td></tr>
+<tr><td>PUT, preflight allows only <code>GET, POST</code></td><td>Method PUT is not allowed by Access-Control-Allow-Methods in preflight response.</td><td><code>Access-Control-Allow-Methods: GET, POST, PUT, DELETE</code></td></tr>
+<tr><td>DELETE, preflight allows only <code>GET, POST</code></td><td>Method DELETE is not allowed by Access-Control-Allow-Methods in preflight response.</td><td>Same as above.</td></tr>
+<tr><td>Preflight answered with a 301 redirect</td><td>Response to preflight request doesn't pass access control check: Redirect is not allowed for a preflight request.</td><td>Call the final URL directly (trailing slash, http to https, www).</td></tr>
+<tr><td>Preflight OK, but the real PUT returns 500 without ACAO (error handler skipped CORS)</td><td>No 'Access-Control-Allow-Origin' header is present on the requested resource.</td><td>Set CORS headers before any route or error handler runs.</td></tr>
+</table>
+<p>Note the last row. The server really did return 500, but the console only says the header is missing. If you see "No 'Access-Control-Allow-Origin'" on an endpoint that usually works, check the server log for an error first. See <a href="/guides/500-internal-server-error/">500 Internal Server Error</a>.</p>
+
+<h2>3. The request often reached your server</h2>
+<p>CORS is enforced by the browser, not the server. Our server log shows that for every simple GET (the first 7 rows), the handler ran and returned 200. The browser received the body and then refused to hand it to the page.</p>
+<p>For requests that need a preflight (PUT, DELETE, custom headers, JSON body), only the OPTIONS request arrived when the preflight failed. The real request was never sent.</p>
+<pre><code>GET none origin=http://127.0.0.1:8986
+OPTIONS put origin=http://127.0.0.1:8986 acrm=PUT
+OPTIONS json origin=http://127.0.0.1:8986 acrm=POST acrh=content-type
+OPTIONS err500 origin=http://127.0.0.1:8986 acrm=PUT
+PUT err500 origin=http://127.0.0.1:8986</code></pre>
+<p>curl and Node.js never show CORS errors, even with a fake <code>Origin</code> header. Against the route with no CORS headers at all:</p>
+<pre><code>$ curl -sS -i -H 'Origin: https://evil.example' http://localhost:8986/api/none
+HTTP/1.1 200 OK
+X-Powered-By: Express
+Content-Type: text/html; charset=utf-8
+...
+ok-none
+
+$ node -e "fetch('http://localhost:8986/api/none',{headers:{Origin:'https://evil.example'}})
+  .then(async r=&gt;console.log(r.status, r.headers.get('access-control-allow-origin'), await r.text()))"
+200 null ok-none</code></pre>
+<p>So "it works in curl / Postman" proves nothing about CORS. And CORS is not access control: anyone outside a browser can still call your API.</p>
+
+<h2>4. A preflight trap in Express</h2>
+<p>If you set the CORS header only inside <code>app.put()</code>, Express answers OPTIONS on its own. We measured it: status 200, <code>Allow: PUT</code>, body <code>PUT</code>, and no CORS headers. Chromium then reports "Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource." Put CORS in middleware that runs before the routes.</p>
+
+<h2>5. A working Express setup</h2>
+<p>This middleware passed our hardest test: a PUT with <code>credentials: 'include'</code>, <code>Content-Type: application/json</code> and <code>X-Api-Key</code>. Chromium sent one OPTIONS and one PUT, and the fetch returned 200.</p>
+<pre><code>const ALLOWED = new Set(['https://app.example.com', 'http://localhost:5173']);
+
+app.use((req, res, next) =&gt; {
+  const origin = req.headers.origin;
+  if (ALLOWED.has(origin)) {
+    res.set('Access-Control-Allow-Origin', origin);
+    res.set('Access-Control-Allow-Credentials', 'true');
+  }
+  res.vary('Origin');
+  if (req.method === 'OPTIONS') {
+    res.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, X-Api-Key');
+    res.set('Access-Control-Max-Age', '600');
+    return res.sendStatus(204);
+  }
+  next();
+});</code></pre>
+<p>For the allow-list pattern in more servers, read <a href="/guides/cors-allow-multiple-origins/">CORS: allow multiple origins</a>. Why <code>Vary: Origin</code> matters for caches is in <a href="/guides/vary-origin-header-cors-cache/">Vary: Origin and CORS caching</a>. To cut repeat preflights, see <a href="/guides/access-control-max-age/">Access-Control-Max-Age</a>.</p>
+<p>Header deep dives: <a href="/guides/access-control-allow-credentials/">Access-Control-Allow-Credentials</a>, <a href="/guides/access-control-allow-headers/">Access-Control-Allow-Headers</a>, <a href="/guides/access-control-allow-methods/">Access-Control-Allow-Methods</a>, <a href="/guides/origin-header/">the Origin header</a>.</p>
+
+<h2>6. Debug checklist</h2>
+<ul>
+<li>Copy the text after "blocked by CORS policy:" and find it in the table above.</li>
+<li>If it says "Response to preflight request", look at the OPTIONS request in the Network tab, not the real one.</li>
+<li>Check the actual headers with curl: <code>curl -i -X OPTIONS -H 'Origin: https://your.site' -H 'Access-Control-Request-Method: PUT' URL</code>.</li>
+<li>If the message is "No 'Access-Control-Allow-Origin'" on a route that usually works, check for a server error or a proxy that strips headers.</li>
+<li>Do not "fix" CORS with <code>mode: 'no-cors'</code>. Per the Fetch spec (not measured here), it gives your code an opaque response it cannot read.</li>
+</ul>
+<aside class="cta"><strong>See the exact CORS headers your API sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does my API work in curl or Postman but not in the browser?</summary><p>CORS is only enforced by browsers. In our test, curl and Node.js fetch got 200 and the full body from a route with no CORS headers at all. Chromium got the same 200 but blocked the page from reading it.</p></details>
+<details><summary>Does a CORS error mean my server never got the request?</summary><p>Not always. For simple GET requests our server ran the handler and returned 200 every time; the browser hid the response. For PUT, DELETE, JSON bodies or custom headers, a failed preflight means only the OPTIONS request arrived.</p></details>
+<details><summary>Can I see which CORS rule failed from JavaScript?</summary><p>No. Every failure we tested rejected with the same TypeError: Failed to fetch. The specific reason is only in the browser console.</p></details>
+<details><summary>Why does Content-Type: application/json cause a CORS error?</summary><p>application/json is not one of the content types allowed without a preflight. Chromium sent an OPTIONS request and reported &#x27;Request header field content-type is not allowed by Access-Control-Allow-Headers in preflight response&#x27; until we added Access-Control-Allow-Headers: Content-Type.</p></details>
+<details><summary>Can I use Access-Control-Allow-Origin: * with cookies?</summary><p>No. With credentials: &#x27;include&#x27;, Chromium 153 rejected * and also required Access-Control-Allow-Credentials: true in lowercase. Echo the exact allowed origin and add Vary: Origin.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright, page.on(&#x27;console&#x27;)), Express 5.2.1 on Node.js 24.21.0, and curl 8.14.1. The page ran at http://127.0.0.1:8986 and the API at http://localhost:8986, which are two different origins. PlainHeaders is our extension; Chromium, Express, Node.js and curl are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

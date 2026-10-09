@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zlib.crc32() Per-Chunk Checksums Can&#x27;t Just Be Added</title>
+<meta name="description" content="We measured adding two zlib.crc32() chunk checksums together producing a completely wrong value — the correct way is to chain the running value forward.">
+<link rel="canonical" href="https://honestkit.github.io/guides/zlib-crc32-chunk-checksums-cannot-be-added-together/">
+<meta property="og:title" content="zlib.crc32() Per-Chunk Checksums Can&#x27;t Just Be Added">
+<meta property="og:description" content="We measured adding two zlib.crc32() chunk checksums together producing a completely wrong value — the correct way is to chain the running value forward.">
+<meta property="og:url" content="https://honestkit.github.io/guides/zlib-crc32-chunk-checksums-cannot-be-added-together/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can you add two zlib.crc32() checksums from different chunks to get the checksum of the combined data?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured the summed value being completely unrelated to the real checksum of the combined data. zlib.crc32() has no way to detect or correct for checksums computed independently."}}, {"@type": "Question", "name": "What is the second argument to zlib.crc32() actually for?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it working as the running checksum value from everything processed so far \u2014 passing chunk 1's result as the starting value for chunk 2's crc32() call reproduces the exact whole-data checksum."}}, {"@type": "Question", "name": "Does zlib.crc32() raise an error if you combine chunk checksums incorrectly?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured it returning a valid-looking 32-bit number either way, with no indication that the chaining was done wrong. There's no exception to catch this mistake."}}, {"@type": "Question", "name": "Why can't CRC-32 checksums just be summed like a simple total?", "acceptedAnswer": {"@type": "Answer", "text": "Based on the Python docs and our test, CRC-32 is computed via polynomial division over the entire bitstream, not an additive process over independent pieces, so there's no shortcut that lets separate chunk checksums be combined by addition afterward."}}, {"@type": "Question", "name": "How do I correctly checksum a large file in chunks with zlib.crc32()?", "acceptedAnswer": {"@type": "Answer", "text": "We'd pass each chunk's result as the value argument to the next crc32() call, starting from 0 (the default) for the first chunk, so the checksum threads through the whole stream in order."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>zlib crc32 Per-Chunk Sums Are Wrong (tested)</h1>
+<p class="lead">Computing <code>zlib.crc32()</code> separately on each chunk of a file and adding the results looks like a reasonable way to get a whole-file checksum without holding everything in memory. We measured what that actually produces: a number with no relationship to the real checksum.</p>
+<h2 id="repro1">1. Adding independent chunk checksums gives the wrong answer</h2>
+<pre><code>import zlib
+
+data = b"hello world this is a test"
+mid = len(data) // 2
+c1, c2 = data[:mid], data[mid:]
+
+zlib.crc32(data)
+477349405
+
+(zlib.crc32(c1) + zlib.crc32(c2)) & 0xffffffff
+3481577407</code></pre>
+<p><strong>Measured:</strong> the summed value isn't close to the real checksum &mdash; it's not even a valid CRC-32 of anything. No exception is raised; <code>zlib.crc32()</code> has no way to know the two calls were meant to represent parts of the same stream, so it just returns two independent, unrelated 32-bit values.</p>
+
+<h2 id="repro2">2. Passing the running value forward is the correct way</h2>
+<pre><code>zlib.crc32(c2, zlib.crc32(c1))
+477349405</code></pre>
+<p><strong>Measured:</strong> <code>zlib.crc32()</code>'s second argument is the running checksum from everything processed so far, not a value to combine afterward. Chaining it &mdash; feeding each chunk's result into the next call as the starting value &mdash; reproduces the exact same checksum as computing it over the whole string in one call.</p>
+
+<h2 id="repro3">3. Why: CRC-32 isn't a simple additive checksum</h2>
+<p>Per the <a href="https://docs.python.org/3/library/zlib.html#zlib.crc32">Python zlib docs</a>, <code>crc32(data[, value])</code> explicitly describes <code>value</code> as "the starting value of the checksum," meant to be threaded through successive calls on the pieces of one stream. CRC-32 is computed via polynomial division over the whole bitstream, not a sum over independent pieces, so there's no mathematical shortcut that lets you checksum chunks in isolation and combine the results with ordinary addition afterward.</p>
+
+<h2 id="fix">4. What to actually do</h2>
+<p>When checksumming a stream in chunks (e.g., validating a large download as it arrives), always pass the previous chunk's result as the <code>value</code> argument to the next <code>zlib.crc32()</code> call, starting from the default of <code>0</code> for the first chunk. Never compute <code>crc32()</code> on each chunk independently and add, XOR, or otherwise combine the results after the fact &mdash; only the running-value chain produces the correct whole-stream checksum.</p>
+
+<aside class="cta"><strong>Debugging a checksum mismatch on a file an API streamed back in chunks? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can you add two zlib.crc32() checksums from different chunks to get the checksum of the combined data?</summary><p>No — we measured the summed value being completely unrelated to the real checksum of the combined data. zlib.crc32() has no way to detect or correct for checksums computed independently.</p></details>
+<details><summary>What is the second argument to zlib.crc32() actually for?</summary><p>We measured it working as the running checksum value from everything processed so far — passing chunk 1&#x27;s result as the starting value for chunk 2&#x27;s crc32() call reproduces the exact whole-data checksum.</p></details>
+<details><summary>Does zlib.crc32() raise an error if you combine chunk checksums incorrectly?</summary><p>No — we measured it returning a valid-looking 32-bit number either way, with no indication that the chaining was done wrong. There&#x27;s no exception to catch this mistake.</p></details>
+<details><summary>Why can&#x27;t CRC-32 checksums just be summed like a simple total?</summary><p>Based on the Python docs and our test, CRC-32 is computed via polynomial division over the entire bitstream, not an additive process over independent pieces, so there&#x27;s no shortcut that lets separate chunk checksums be combined by addition afterward.</p></details>
+<details><summary>How do I correctly checksum a large file in chunks with zlib.crc32()?</summary><p>We&#x27;d pass each chunk&#x27;s result as the value argument to the next crc32() call, starting from 0 (the default) for the first chunk, so the checksum threads through the whole stream in order.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in zlib module: split data into two chunks, computed the whole-data crc32 directly, then compared it against chaining zlib.crc32(chunk2, zlib.crc32(chunk1)) versus naively adding zlib.crc32(chunk1) + zlib.crc32(chunk2). PlainHeaders is our extension; Python&#x27;s zlib module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Postgres: &#x27;Must Be Owner Of&#x27; &amp; &#x27;Permission Denied for Schema&#x27;</title>
+<meta name="description" content="We reproduced Postgres&#x27;s &#x27;must be owner of table&#x27; and &#x27;permission denied for schema&#x27; errors with two roles and measured the exact GRANT/ALTER fix for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/postgres-must-be-owner-permission-denied-for-schema/">
+<meta property="og:title" content="Postgres: &#x27;Must Be Owner Of&#x27; &amp; &#x27;Permission Denied for Schema&#x27;">
+<meta property="og:description" content="We reproduced Postgres&#x27;s &#x27;must be owner of table&#x27; and &#x27;permission denied for schema&#x27; errors with two roles and measured the exact GRANT/ALTER fix for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/postgres-must-be-owner-permission-denied-for-schema/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What's the difference between 'must be owner of table' and 'permission denied for schema'?", "acceptedAnswer": {"@type": "Answer", "text": "They check different layers. 'Permission denied for schema' means your role lacks USAGE on the containing schema, so Postgres won't even look at the table \u2014 it's checked first. 'Must be owner of table' means you can see and even query the table, but structural changes (ALTER, DROP) are reserved for its owner or a superuser regardless of your other grants. We reproduced both with two distinct roles on PostgreSQL 16.15."}}, {"@type": "Question", "name": "I granted SELECT on the table but my role still can't query it \u2014 why?", "acceptedAnswer": {"@type": "Answer", "text": "You likely granted the table-level privilege but not schema-level USAGE. We confirmed both grants are required together: GRANT USAGE ON SCHEMA <schema> TO <role>, plus GRANT SELECT ON <schema>.<table> TO <role>. Without USAGE, the table-level grant alone does nothing \u2014 the role can't even resolve the schema to find the table."}}, {"@type": "Question", "name": "Does granting SELECT on a schema's existing tables cover new tables created later?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 grants in Postgres are not retroactive by default. A table created after your GRANT statement needs its own grant. Use ALTER DEFAULT PRIVILEGES IN SCHEMA <schema> GRANT SELECT ON TABLES TO <role> (run by the role that will own future tables) so new tables automatically inherit the grant."}}, {"@type": "Question", "name": "Can I avoid 'must be owner of table' without transferring ownership to the other role?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 run the DDL (ALTER TABLE, DROP TABLE, etc.) as the actual table owner or a superuser instead of ALTER TABLE ... OWNER TO. We only used OWNER TO here because the goal was to let bob run DDL himself going forward; if that's not the goal, just execute the statement under the owning role's connection."}}, {"@type": "Question", "name": "Why did CREATE DATABASE fail when I ran it together with other CREATE statements via psql -c?", "acceptedAnswer": {"@type": "Answer", "text": "psql -c with multiple semicolon-separated statements runs them as one implicit transaction, and CREATE DATABASE refuses to execute inside any transaction block \u2014 we measured the exact error, and that the whole batch (including unrelated CREATE ROLE statements before it) rolled back as a result. Run CREATE DATABASE as its own separate statement/connection."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>postgres: must be owner of / permission denied for schema (tested)</h1>
+<p class="lead"><code>ERROR: must be owner of table X</code> and <code>ERROR: permission denied for schema X</code> are two different permission failures that look similar. One is about who owns an object; the other is about whether your role can even see inside a schema. We reproduced both on PostgreSQL 16.15 with two real roles and measured the exact fix for each.</p>
+<h2 id="owner">1. ERROR: must be owner of table X</h2>
+<p>We created a table as role <code>alice</code>, then tried to modify it as a different role, <code>bob</code>:</p>
+<pre><code>-- as alice
+CREATE TABLE secrets (id int);
+
+-- as bob
+ALTER TABLE secrets ADD COLUMN x int;
+ERROR:  must be owner of table secrets
+
+DROP TABLE secrets;
+ERROR:  must be owner of table secrets</code></pre>
+<p><strong>Why:</strong> structural changes to a table &mdash; <code>ALTER TABLE</code>, <code>DROP TABLE</code>, <code>TRUNCATE</code> in some configurations, ownership/permission changes &mdash; are restricted to the table's owner (or a superuser), regardless of what <code>SELECT</code>/<code>INSERT</code>/<code>UPDATE</code> grants <code>bob</code> has on it. This is deliberate: anyone could otherwise drop a table they only had read access to.</p>
+<p><strong>The fix</strong> we confirmed, run by a superuser or the current owner:</p>
+<pre><code>ALTER TABLE secrets OWNER TO bob;</code></pre>
+<p>After that single statement, <code>bob</code>'s identical <code>ALTER TABLE secrets ADD COLUMN x int;</code> succeeded. If you don't actually want to transfer ownership (e.g. a shared service role should own everything, not individual users), the alternative is running the DDL as the actual owner or a superuser instead of changing ownership.</p>
+
+<h2 id="schema">2. ERROR: permission denied for schema X</h2>
+<p>We created a second schema as <code>alice</code> with a table inside it, then had <code>bob</code> &mdash; who has no grants on that schema at all &mdash; try to use it:</p>
+<pre><code>-- as alice
+CREATE SCHEMA priv_schema;
+CREATE TABLE priv_schema.t2 (id int);
+
+-- as bob
+SELECT * FROM priv_schema.t2;
+ERROR:  permission denied for schema priv_schema
+
+CREATE TABLE priv_schema.t3 (id int);
+ERROR:  permission denied for schema priv_schema</code></pre>
+<p><strong>Why:</strong> a schema is itself a permissioned object, separate from the tables inside it. <code>bob</code> was blocked before Postgres even checked table-level grants &mdash; without <code>USAGE</code> on the schema, a role can't look inside it at all, even to find out a table exists. This is the single most common cause of "permission denied" surprises on a fresh role: table-level <code>GRANT SELECT</code> alone does nothing without schema-level <code>USAGE</code> too.</p>
+<p><strong>The fix</strong> we confirmed, run by the schema owner or a superuser:</p>
+<pre><code>GRANT USAGE ON SCHEMA priv_schema TO bob;
+GRANT SELECT ON priv_schema.t2 TO bob;</code></pre>
+<p>Both grants were required &mdash; we tested that <code>USAGE</code> on the schema alone is not sufficient for <code>bob</code> to read <code>t2</code>'s rows; the table-level <code>SELECT</code> grant above it is still checked separately. After both, <code>bob</code>'s <code>SELECT * FROM priv_schema.t2;</code> returned successfully (0 rows, as expected for an empty table). For every table a role needs now and in the future inside a schema, consider <code>ALTER DEFAULT PRIVILEGES IN SCHEMA priv_schema GRANT SELECT ON TABLES TO bob;</code> so new tables don't repeat this error.</p>
+
+<h2 id="bonus">3. A related error we hit setting this up: CREATE DATABASE cannot run inside a transaction block</h2>
+<p>While preparing the test roles, running <code>CREATE ROLE alice ...; CREATE ROLE bob ...; CREATE DATABASE testdb OWNER alice;</code> as one multi-statement <code>psql -c</code> call failed:</p>
+<pre><code>ERROR:  CREATE DATABASE cannot run inside a transaction block</code></pre>
+<p>psql's <code>-c</code> flag wraps multiple semicolon-separated statements in a single implicit transaction, and <code>CREATE DATABASE</code> (like a few other commands: <code>CREATE TABLESPACE</code>, <code>DROP DATABASE</code>, <code>VACUUM</code>) refuses to run inside any transaction block, even an implicit one &mdash; and the whole batch rolled back, silently undoing the two <code>CREATE ROLE</code> statements too. Running each statement as its own separate <code>psql -c</code> call (or outside an explicit <code>BEGIN</code>) fixed it immediately.</p>
+
+<aside class="cta"><strong>Debugging an API that talks to this database? Check the real headers and status it sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What&#x27;s the difference between &#x27;must be owner of table&#x27; and &#x27;permission denied for schema&#x27;?</summary><p>They check different layers. &#x27;Permission denied for schema&#x27; means your role lacks USAGE on the containing schema, so Postgres won&#x27;t even look at the table — it&#x27;s checked first. &#x27;Must be owner of table&#x27; means you can see and even query the table, but structural changes (ALTER, DROP) are reserved for its owner or a superuser regardless of your other grants. We reproduced both with two distinct roles on PostgreSQL 16.15.</p></details>
+<details><summary>I granted SELECT on the table but my role still can&#x27;t query it — why?</summary><p>You likely granted the table-level privilege but not schema-level USAGE. We confirmed both grants are required together: GRANT USAGE ON SCHEMA &lt;schema&gt; TO &lt;role&gt;, plus GRANT SELECT ON &lt;schema&gt;.&lt;table&gt; TO &lt;role&gt;. Without USAGE, the table-level grant alone does nothing — the role can&#x27;t even resolve the schema to find the table.</p></details>
+<details><summary>Does granting SELECT on a schema&#x27;s existing tables cover new tables created later?</summary><p>No — grants in Postgres are not retroactive by default. A table created after your GRANT statement needs its own grant. Use ALTER DEFAULT PRIVILEGES IN SCHEMA &lt;schema&gt; GRANT SELECT ON TABLES TO &lt;role&gt; (run by the role that will own future tables) so new tables automatically inherit the grant.</p></details>
+<details><summary>Can I avoid &#x27;must be owner of table&#x27; without transferring ownership to the other role?</summary><p>Yes — run the DDL (ALTER TABLE, DROP TABLE, etc.) as the actual table owner or a superuser instead of ALTER TABLE ... OWNER TO. We only used OWNER TO here because the goal was to let bob run DDL himself going forward; if that&#x27;s not the goal, just execute the statement under the owning role&#x27;s connection.</p></details>
+<details><summary>Why did CREATE DATABASE fail when I ran it together with other CREATE statements via psql -c?</summary><p>psql -c with multiple semicolon-separated statements runs them as one implicit transaction, and CREATE DATABASE refuses to execute inside any transaction block — we measured the exact error, and that the whole batch (including unrelated CREATE ROLE statements before it) rolled back as a result. Run CREATE DATABASE as its own separate statement/connection.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with PostgreSQL 16.15 (Alpine) in a disposable Docker container, using psql with SET SESSION AUTHORIZATION to act as two distinct non-superuser roles against the same database. Every message and SQL below is copy-pasted output, not paraphrased. PlainHeaders is our extension; PostgreSQL is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

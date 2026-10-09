@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BlockingIOError: [Errno 11] Resource temporarily unavailable</title>
+<meta name="description" content="We measured Python&#x27;s errno 11 (EAGAIN): recv on a non-blocking socket, settimeout(0), flock with LOCK_NB, and how to wait with selectors instead.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-blockingioerror-errno-11-resource-temporarily-unavailable/">
+<meta property="og:title" content="BlockingIOError: [Errno 11] Resource temporarily unavailable">
+<meta property="og:description" content="We measured Python&#x27;s errno 11 (EAGAIN): recv on a non-blocking socket, settimeout(0), flock with LOCK_NB, and how to wait with selectors instead.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-blockingioerror-errno-11-resource-temporarily-unavailable/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does BlockingIOError: [Errno 11] Resource temporarily unavailable mean?", "acceptedAnswer": {"@type": "Answer", "text": "A non-blocking operation would have had to wait. We measured it from recv() on a non-blocking socket with no data, and from flock with LOCK_NB on a locked file, on Python 3.13.5."}}, {"@type": "Question", "name": "Is socket error 11 the same as EAGAIN and EWOULDBLOCK?", "acceptedAnswer": {"@type": "Answer", "text": "Yes on Linux: we checked errno.EAGAIN and errno.EWOULDBLOCK are both 11, and the exception class is BlockingIOError, a subclass of OSError."}}, {"@type": "Question", "name": "Why do I get errno 11 after settimeout?", "acceptedAnswer": {"@type": "Answer", "text": "settimeout(0) makes the socket non-blocking. We measured settimeout(0.5) raising TimeoutError and settimeout(0) raising BlockingIOError errno 11."}}, {"@type": "Question", "name": "How do I fix Resource temporarily unavailable on a socket?", "acceptedAnswer": {"@type": "Answer", "text": "Wait until it's ready with selectors (or asyncio), or keep it blocking with a timeout. We measured selectors waking after 0.3 s when data arrived."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>BlockingIOError [Errno 11] Resource temporarily unavailable (tested)</h1>
+<p class="lead"><code>BlockingIOError: [Errno 11] Resource temporarily unavailable</code> means a non-blocking call had nothing to do yet. We reproduced it from sockets and file locks on Python 3.13.5 and measured the fix.</p>
+<h2 id="nonblocking">1. A non-blocking socket with nothing to read</h2>
+<pre><code>import socket
+a, b = socket.socketpair()
+a.setblocking(False)
+try:
+    a.recv(1024)          # nothing has been sent yet
+except BlockingIOError as e:
+    print(type(e).__name__, e.errno, e)
+    print(&quot;is OSError:&quot;, isinstance(e, OSError))
+b.send(b&quot;hello&quot;)
+print(&quot;after send:&quot;, a.recv(1024))</code></pre>
+<p>Output:</p>
+<pre><code>BlockingIOError 11 [Errno 11] Resource temporarily unavailable
+is OSError: True
+after send: b&#x27;hello&#x27;</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> on a non-blocking socket, <code>recv()</code> with no data waiting raises <code>BlockingIOError</code> with errno 11 (<code>EAGAIN</code>, the same number as <code>EWOULDBLOCK</code> on Linux). It isn't a failure: it means "try again later". Once data arrives the same call works. <code>socket.error</code> is just <code>OSError</code>, so old <code>except socket.error</code> code catches this too.</p>
+
+<h2 id="timeout">2. settimeout(0) is non-blocking</h2>
+<pre><code>import socket
+a, b = socket.socketpair()
+a.settimeout(0.5)         # a timeout, not non-blocking
+try:
+    a.recv(1024)
+except Exception as e:
+    print(&quot;settimeout(0.5):&quot;, type(e).__name__, e)
+a.settimeout(0)           # 0 means non-blocking
+try:
+    a.recv(1024)
+except Exception as e:
+    print(&quot;settimeout(0):  &quot;, type(e).__name__, e)</code></pre>
+<p>Output:</p>
+<pre><code>settimeout(0.5): TimeoutError timed out
+settimeout(0):   BlockingIOError [Errno 11] Resource temporarily unavailable</code></pre>
+<p><strong>Measured:</strong> a positive timeout gives <code>TimeoutError</code> after waiting; <code>settimeout(0)</code> is the same as <code>setblocking(False)</code> and gives errno 11 immediately. If you see errno 11 and meant to wait, check for a timeout of 0 (or a computed timeout that hit 0).</p>
+
+<h2 id="flock">3. fcntl.flock with LOCK_NB: someone else holds the lock</h2>
+<pre><code>import fcntl, subprocess, sys
+# Another process holds an exclusive lock on app.lock for 2 seconds
+holder = subprocess.Popen([sys.executable, &quot;-c&quot;,
+    &quot;import fcntl,time; f=open(&#x27;app.lock&#x27;,&#x27;w&#x27;); fcntl.flock(f, fcntl.LOCK_EX); print(&#x27;locked&#x27;, flush=True); time.sleep(2)&quot;],
+    stdout=subprocess.PIPE, text=True)
+holder.stdout.readline()
+f = open(&quot;app.lock&quot;, &quot;w&quot;)
+try:
+    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError as e:
+    print(&quot;LOCK_NB:&quot;, type(e).__name__, e)
+fcntl.flock(f, fcntl.LOCK_EX)   # without LOCK_NB: waits for the holder to exit
+print(&quot;got the lock after waiting&quot;)
+holder.wait()</code></pre>
+<p>Output:</p>
+<pre><code>LOCK_NB: BlockingIOError [Errno 11] Resource temporarily unavailable
+got the lock after waiting</code></pre>
+<p><strong>Measured:</strong> the same error comes from file locks. With <code>LOCK_NB</code>, <code>flock()</code> raises errno 11 at once when another process holds the lock; without it, the call waits. This is the usual way to stop a second copy of a cron script: catch <code>BlockingIOError</code> and exit.</p>
+
+<h2 id="select">4. Wait until the socket is ready instead of retrying</h2>
+<pre><code>import selectors, socket, threading, time
+a, b = socket.socketpair()
+a.setblocking(False)
+threading.Timer(0.3, lambda: b.send(b&quot;late data&quot;)).start()
+sel = selectors.DefaultSelector()
+sel.register(a, selectors.EVENT_READ)
+t = time.monotonic()
+sel.select(timeout=2)          # wait until a is readable
+print(f&quot;readable after {time.monotonic() - t:.1f}s:&quot;, a.recv(1024))</code></pre>
+<p>Output:</p>
+<pre><code>readable after 0.3s: b&#x27;late data&#x27;</code></pre>
+<p><strong>Measured:</strong> <code>selectors</code> blocks until the socket is readable (0.3 s here), then <code>recv()</code> succeeds. Use this instead of a <code>while True: try recv</code> retry loop. If you don't need non-blocking I/O, just leave the socket blocking with a timeout. More errno numbers in our <a href="/guides/python-oserror-errno-codes-list/">errno codes list</a>.</p>
+
+<aside class="cta"><strong>Debugging a network client? Check the real status and headers the server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does BlockingIOError: [Errno 11] Resource temporarily unavailable mean?</summary><p>A non-blocking operation would have had to wait. We measured it from recv() on a non-blocking socket with no data, and from flock with LOCK_NB on a locked file, on Python 3.13.5.</p></details>
+<details><summary>Is socket error 11 the same as EAGAIN and EWOULDBLOCK?</summary><p>Yes on Linux: we checked errno.EAGAIN and errno.EWOULDBLOCK are both 11, and the exception class is BlockingIOError, a subclass of OSError.</p></details>
+<details><summary>Why do I get errno 11 after settimeout?</summary><p>settimeout(0) makes the socket non-blocking. We measured settimeout(0.5) raising TimeoutError and settimeout(0) raising BlockingIOError errno 11.</p></details>
+<details><summary>How do I fix Resource temporarily unavailable on a socket?</summary><p>Wait until it&#x27;s ready with selectors (or asyncio), or keep it blocking with a timeout. We measured selectors waking after 0.3 s when data arrived.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: recv() on a non-blocking socketpair, settimeout(0.5) vs settimeout(0), fcntl.flock LOCK_NB against a second process, and selectors waiting for data. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hashlib.shake_128/256 Need a Length Argument, Unlike Other Hashes</title>
+<meta name="description" content="We measured Python 3.13.5: shake_128().hexdigest() raises TypeError without a length argument, and can produce output of any requested length.">
+<link rel="canonical" href="https://honestkit.github.io/guides/hashlib-shake-128-256-require-length-argument-extendable-output/">
+<meta property="og:title" content="hashlib.shake_128/256 Need a Length Argument, Unlike Other Hashes">
+<meta property="og:description" content="We measured Python 3.13.5: shake_128().hexdigest() raises TypeError without a length argument, and can produce output of any requested length.">
+<meta property="og:url" content="https://honestkit.github.io/guides/hashlib-shake-128-256-require-length-argument-extendable-output/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does hashlib.shake_128().hexdigest() raise TypeError?", "acceptedAnswer": {"@type": "Answer", "text": "Because shake_128 and shake_256 are extendable-output functions (XOFs), not fixed-size hashes -- we measured hexdigest() requiring an explicit length argument, unlike every other hashlib algorithm which takes none."}}, {"@type": "Question", "name": "Is a short SHAKE digest related to a longer one from the same input?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured this directly: requesting 4 bytes and 1000 bytes from the same shake_128 object and input produces outputs where the 4-byte result is an exact prefix of the 1000-byte one."}}, {"@type": "Question", "name": "What's the maximum output length for hashlib.shake_128 or shake_256?", "acceptedAnswer": {"@type": "Answer", "text": "There isn't a fixed one -- we measured generating a 1000-byte digest from a 5-byte input with no error, unlike sha256, which is capped at its fixed 32-byte digest_size and rejects a length argument entirely."}}, {"@type": "Question", "name": "Can I swap hashlib.sha256 for hashlib.shake_128 without changing my code?", "acceptedAnswer": {"@type": "Answer", "text": "Not without changes -- we measured code calling .hexdigest() with no arguments working fine for sha256 but raising TypeError for shake_128, since SHAKE variants require a length argument every call."}}, {"@type": "Question", "name": "What's the difference between hashlib.shake_128 and shake_256?", "acceptedAnswer": {"@type": "Answer", "text": "Both are SHA-3 extendable-output functions; shake_256 offers a higher security level at the same requested output length. We confirmed both share the same length-argument requirement and prefix-consistency behavior in this testing."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>hashlib.shake_128/256 Require a Length Argument and Have No Fixed Size (tested)</h1>
+<p class="lead">Every hashlib algorithm works the same way -- call <code>.hexdigest()</code> with no arguments and get a fixed-size string back. We measured that <code>shake_128</code> and <code>shake_256</code> break this pattern: they're 'extendable output functions,' and calling <code>.hexdigest()</code> the normal way raises an error.</p>
+<h2 id="repro1">1. hexdigest() with no arguments raises TypeError</h2>
+<pre><code>import hashlib
+
+h = hashlib.sha256(b"hello")
+print(h.hexdigest())
+
+s = hashlib.shake_128(b"hello")
+print(s.hexdigest())</code></pre>
+<pre><code>2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+Traceback (most recent call last):
+  ...
+TypeError: hexdigest() missing required argument 'length' (pos 1)</code></pre>
+<p><strong>Measured:</strong> every other hashlib algorithm's <code>hexdigest()</code>/<code>digest()</code> takes no arguments and returns a fixed-size result (32 bytes for sha256, regardless of input). <code>shake_128</code> and <code>shake_256</code> require you to say how many bytes you want, every time you call it.</p>
+
+<h2 id="repro2">2. Different requested lengths are deterministic prefixes of each other</h2>
+<pre><code>import hashlib
+
+s = hashlib.shake_128(b"hello")
+short = s.hexdigest(4)
+long = s.hexdigest(1000)
+print(short)
+print(long.startswith(short))</code></pre>
+<pre><code>8eb4b6a9
+True</code></pre>
+<p><strong>Measured:</strong> asking the same SHAKE object for a 4-byte digest and a 1000-byte digest on the same input returns outputs where the short one is an exact prefix of the long one. This is the actual property that makes it an "extendable output function" (XOF) rather than just a hash with a configurable truncation -- you can keep asking for more bytes of the same deterministic output stream.</p>
+
+<h2 id="repro3">3. The output length is unbounded, unlike a fixed-digest hash</h2>
+<pre><code>import hashlib
+
+s = hashlib.shake_128(b"hello")
+print(len(s.hexdigest(1000)))   # hex chars
+
+h = hashlib.sha256(b"hello")
+print(h.digest_size)
+try:
+    h.hexdigest(1000)
+except TypeError as e:
+    print(e)</code></pre>
+<pre><code>2000
+32
+HASH.hexdigest() takes no arguments (1 given)</code></pre>
+<p><strong>Measured:</strong> <code>shake_128</code> happily produced a 1000-byte (2000 hex character) digest from a 5-byte input -- there's no upper bound built into the algorithm. <code>sha256</code>, by contrast, is capped at its fixed 32-byte <code>digest_size</code> and doesn't accept a length argument at all. If code expects to call <code>.hexdigest()</code> the same way across any hashlib algorithm (a common pattern when the algorithm name is a config value), SHAKE variants will raise immediately with no digest produced, rather than silently returning the "wrong" length.</p>
+<aside class="cta"><strong>Hashing a value and need a specific output length? Check which hashlib algorithm you&#x27;re actually using:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does hashlib.shake_128().hexdigest() raise TypeError?</summary><p>Because shake_128 and shake_256 are extendable-output functions (XOFs), not fixed-size hashes -- we measured hexdigest() requiring an explicit length argument, unlike every other hashlib algorithm which takes none.</p></details>
+<details><summary>Is a short SHAKE digest related to a longer one from the same input?</summary><p>Yes -- we measured this directly: requesting 4 bytes and 1000 bytes from the same shake_128 object and input produces outputs where the 4-byte result is an exact prefix of the 1000-byte one.</p></details>
+<details><summary>What&#x27;s the maximum output length for hashlib.shake_128 or shake_256?</summary><p>There isn&#x27;t a fixed one -- we measured generating a 1000-byte digest from a 5-byte input with no error, unlike sha256, which is capped at its fixed 32-byte digest_size and rejects a length argument entirely.</p></details>
+<details><summary>Can I swap hashlib.sha256 for hashlib.shake_128 without changing my code?</summary><p>Not without changes -- we measured code calling .hexdigest() with no arguments working fine for sha256 but raising TypeError for shake_128, since SHAKE variants require a length argument every call.</p></details>
+<details><summary>What&#x27;s the difference between hashlib.shake_128 and shake_256?</summary><p>Both are SHA-3 extendable-output functions; shake_256 offers a higher security level at the same requested output length. We confirmed both share the same length-argument requirement and prefix-consistency behavior in this testing.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in hashlib module: called hexdigest() on shake_128 with no argument, then with several different length arguments on the same hash object and input, and compared against sha256&#x27;s fixed, no-argument hexdigest(). PlainHeaders is our extension; Python&#x27;s hashlib module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

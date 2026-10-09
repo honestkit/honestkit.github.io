@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BufferedReader.peek() Silently Moves .raw Ahead (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: peek() doesn&#x27;t advance the buffered position, but it silently advances the raw stream -- reading .raw directly afterward skips data.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-io-bufferedreader-peek-raw-attribute-position-mismatch/">
+<meta property="og:title" content="BufferedReader.peek() Silently Moves .raw Ahead (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: peek() doesn&#x27;t advance the buffered position, but it silently advances the raw stream -- reading .raw directly afterward skips data.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-io-bufferedreader-peek-raw-attribute-position-mismatch/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does peek() itself lie about the stream position?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured that BufferedReader.tell() stays correct and read() after peek() returns the right bytes. The mismatch is specifically between the wrapper's own bookkeeping (correct) and the raw stream's actual position (already advanced), which only becomes visible if you bypass the wrapper and touch .raw directly."}}, {"@type": "Question", "name": "Is this the same bug as TextIOWrapper's detach() position mismatch?", "acceptedAnswer": {"@type": "Answer", "text": "Same root cause -- read-ahead buffering -- but a different trigger and a sharper version of it: TextIOWrapper requires an explicit detach() call before its raw stream is reachable, while BufferedReader exposes .raw as an always-present attribute, so there's no explicit step warning you that you're about to touch a stream with buffered-ahead state."}}, {"@type": "Question", "name": "How much does a single peek() call actually read ahead?", "acceptedAnswer": {"@type": "Answer", "text": "We measured exactly buffer_size bytes (the BufferedReader's configured internal buffer size, 64 in this repro) consumed from the raw stream on the very first peek(), regardless of how many bytes were requested from peek() itself."}}, {"@type": "Question", "name": "Is there a safe way to get back to the raw stream after using a BufferedReader?", "acceptedAnswer": {"@type": "Answer", "text": "Not directly -- we measured no API that reports how many bytes are sitting unread in the internal buffer versus consumed from raw. The safe pattern is to keep reading through the BufferedReader itself for the whole stream, rather than switching to .raw partway through."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>io.BufferedReader.peek() Leaves .raw Mid-Read-Ahead (tested)</h1>
+<p class="lead"><code>io.BufferedReader.peek(size)</code> is documented to "return bytes from the stream without advancing the position" -- and through the <code>BufferedReader</code> itself, that's exactly what happens: calling <code>peek()</code> then <code>read()</code> returns the same bytes you peeked. But <code>BufferedReader</code> implements <code>peek()</code> by reading a full internal buffer's worth of data ahead from the underlying raw stream, not just the bytes requested. Unlike <code>TextIOWrapper</code>, which needs an explicit <code>detach()</code> call to expose its raw stream, <code>BufferedReader</code> exposes its raw stream directly as the <code>.raw</code> attribute, no call needed -- so reaching for <code>br.raw.read()</code> right after a <code>peek()</code>, which looks like a harmless way to drop down to binary access, silently skips over everything the read-ahead already consumed.</p>
+<h2 id="repro1">1. peek() through the BufferedReader itself behaves exactly as documented</h2>
+<pre><code>import io
+
+raw = io.BytesIO(b"0123456789" * 1000)   # 10000 bytes
+br = io.BufferedReader(raw, buffer_size=64)
+peeked = br.peek(5)
+print("peeked:", peeked[:5])
+print("read(5) right after peek:", br.read(5))</code></pre>
+<pre><code>peeked: b'01234'
+read(5) right after peek: b'01234'</code></pre>
+<p><strong>Measured:</strong> going through <code>br</code> consistently, <code>peek()</code> does not advance anything -- the subsequent <code>read(5)</code> returns the exact same bytes that were peeked, matching the documentation.</p>
+
+<h2 id="repro2">2. The raw stream underneath has already moved</h2>
+<pre><code>raw2 = io.BytesIO(b"0123456789" * 1000)
+br2 = io.BufferedReader(raw2, buffer_size=64)
+br2.peek(5)
+print("raw2.tell() after a single peek(5):", raw2.tell())</code></pre>
+<pre><code>raw2.tell() after a single peek(5): 64</code></pre>
+<p><strong>Measured:</strong> a single <code>peek(5)</code> call reads a full <code>buffer_size</code> (64 bytes here) ahead from the raw stream to fill <code>BufferedReader</code>'s internal buffer, even though only 5 bytes were requested and returned. <code>br2</code> itself hides this -- <code>.tell()</code> on <code>br2</code> still correctly reports position 0 -- but the raw stream's own position has moved to 64.</p>
+
+<h2 id="repro3">3. Reading br.raw directly afterward silently skips data</h2>
+<pre><code>raw3 = io.BytesIO(b"0123456789" * 1000)
+br3 = io.BufferedReader(raw3, buffer_size=64)
+br3.peek(5)
+print("br3.raw.read(5) right after peek:", br3.raw.read(5))</code></pre>
+<pre><code>br3.raw.read(5) right after peek: b'45678'</code></pre>
+<p><strong>Measured:</strong> <code>.raw</code> is a plain attribute on every <code>BufferedReader</code>, accessible with no <code>detach()</code> call at all. Reading 5 bytes from it right after a <code>peek(5)</code> returns <code>b'45678'</code>, not the next unread bytes a caller would reasonably expect -- the first 64 bytes are already gone from the raw stream's perspective, 59 of which <code>peek()</code> never showed anyone.</p>
+
+<h2 id="repro4">4. The fix: never touch .raw after calling peek() (or any read) on the wrapper</h2>
+<pre><code>raw4 = io.BytesIO(b"0123456789" * 1000)
+br4 = io.BufferedReader(raw4, buffer_size=64)
+br4.peek(5)
+print("stay on the wrapper:", br4.read(10))   # correct: still goes through br4's buffer</code></pre>
+<pre><code>stay on the wrapper: b'0123456789'</code></pre>
+<p><strong>Measured:</strong> continuing to read through <code>br4</code> itself returns the correct, expected bytes, because the wrapper's buffer (already holding the read-ahead data) is what actually gets consulted. Once any <code>peek()</code> or <code>read()</code> has happened on a <code>BufferedReader</code>, treat its <code>.raw</code> attribute as off-limits for direct reads -- there's no supported way to know how far ahead the buffer has already consumed.</p>
+<aside class="cta"><strong>Calling BufferedReader.peek() and then reading from .raw directly? peek() is documented as not advancing the position -- but it already silently moved the raw stream ahead:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does peek() itself lie about the stream position?</summary><p>No -- we measured that BufferedReader.tell() stays correct and read() after peek() returns the right bytes. The mismatch is specifically between the wrapper&#x27;s own bookkeeping (correct) and the raw stream&#x27;s actual position (already advanced), which only becomes visible if you bypass the wrapper and touch .raw directly.</p></details>
+<details><summary>Is this the same bug as TextIOWrapper&#x27;s detach() position mismatch?</summary><p>Same root cause -- read-ahead buffering -- but a different trigger and a sharper version of it: TextIOWrapper requires an explicit detach() call before its raw stream is reachable, while BufferedReader exposes .raw as an always-present attribute, so there&#x27;s no explicit step warning you that you&#x27;re about to touch a stream with buffered-ahead state.</p></details>
+<details><summary>How much does a single peek() call actually read ahead?</summary><p>We measured exactly buffer_size bytes (the BufferedReader&#x27;s configured internal buffer size, 64 in this repro) consumed from the raw stream on the very first peek(), regardless of how many bytes were requested from peek() itself.</p></details>
+<details><summary>Is there a safe way to get back to the raw stream after using a BufferedReader?</summary><p>Not directly -- we measured no API that reports how many bytes are sitting unread in the internal buffer versus consumed from raw. The safe pattern is to keep reading through the BufferedReader itself for the whole stream, rather than switching to .raw partway through.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in io.BufferedReader wrapping a io.BytesIO raw stream, comparing what peek() returns against what reading br.raw directly returns immediately afterward. PlainHeaders is our extension; Python&#x27;s io module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

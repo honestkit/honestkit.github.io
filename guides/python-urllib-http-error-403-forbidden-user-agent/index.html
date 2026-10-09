@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python urllib HTTP Error 403: Forbidden - User-Agent Fix</title>
+<meta name="description" content="urlopen() sends User-Agent: Python-urllib/3.13 and requests sends python-requests/2.32.3, which many sites block. Measured fix and what a 403 after that means.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-urllib-http-error-403-forbidden-user-agent/">
+<meta property="og:title" content="Python urllib HTTP Error 403: Forbidden - User-Agent Fix">
+<meta property="og:description" content="urlopen() sends User-Agent: Python-urllib/3.13 and requests sends python-requests/2.32.3, which many sites block. Measured fix and what a 403 after that means.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-urllib-http-error-403-forbidden-user-agent/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What User-Agent does Python's urllib send?", "acceptedAnswer": {"@type": "Answer", "text": "We measured Python-urllib/3.13 on Python 3.13.5 (the version number tracks your Python), with only Accept-Encoding: identity, Host and Connection: close besides it. requests 2.32.3 sends python-requests/2.32.3."}}, {"@type": "Question", "name": "Why does the page work in my browser but return 403 in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Your browser sends a browser User-Agent plus cookies and other headers; your script sends a library User-Agent that the site filters. Set a descriptive User-Agent first."}}, {"@type": "Question", "name": "Should I copy my browser's User-Agent?", "acceptedAnswer": {"@type": "Answer", "text": "We recommend a truthful one naming your script and a contact URL. Spoofing a browser can violate the site's terms and often fails anyway against bot protection that checks more than one header."}}, {"@type": "Question", "name": "How do I see why the server refused me?", "acceptedAnswer": {"@type": "Answer", "text": "Catch urllib.error.HTTPError as e and print e.read()[:500] (or r.text with requests). Error pages often name the reason: rate limit, missing key, region, or a bot challenge."}}, {"@type": "Question", "name": "Is a 403 the same as a 401?", "acceptedAnswer": {"@type": "Answer", "text": "No. 401 means authentication is missing or failed; 403 means the server understood who you are (or doesn't care) and refuses anyway. See our 401 vs 403 guide."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python urllib HTTP Error 403: Forbidden (User-Agent, tested)</h1>
+<p class="lead"><code>urllib.error.HTTPError: HTTP Error 403: Forbidden</code> on a page that opens fine in your browser usually means the server rejected your script's User-Agent. We captured what Python sends: <code>urlopen()</code> identifies itself as <code>Python-urllib/3.13</code> and requests as <code>python-requests/2.32.3</code> -- strings many CDNs and firewalls refuse. A specific, honest User-Agent fixed it in our test; if it doesn't, the 403 body tells you what else is wrong.</p>
+<h2 id="repro">1. What urllib and requests send, and a server that filters it</h2>
+<p>The server below stands in for the many CDNs and web application firewalls that refuse default library User-Agents. It records the request headers and returns 403 for <code>Python-urllib</code> and <code>python-requests</code>:</p>
+<pre><code>import socket, threading, time, urllib.request, urllib.error, requests
+
+PORT = 8963
+seen = []
+def serve():
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", PORT))
+    srv.listen()
+    while True:
+        conn, _ = srv.accept()
+        req = conn.recv(65536).decode()
+        headers = dict(l.split(": ", 1) for l in req.split("\r\n")[1:] if ": " in l)
+        ua = headers.get("User-Agent", "")
+        seen.append(headers)
+        # like many CDNs/WAFs: refuse the default library User-Agents
+        if ua.startswith(("Python-urllib", "python-requests")):
+            conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden")
+        else:
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+time.sleep(0.2)
+url = f"http://127.0.0.1:{PORT}/page"
+
+try:
+    urllib.request.urlopen(url)
+except urllib.error.HTTPError as e:
+    print("urlopen          -&gt;", e, "| sent User-Agent:", seen[-1].get("User-Agent"))
+try:
+    requests.get(url).raise_for_status()
+except requests.HTTPError as e:
+    print("requests.get     -&gt;", e.response.status_code, "| sent User-Agent:", seen[-1].get("User-Agent"))
+
+UA = "my-report-script/1.0 (+https://example.com/contact)"
+req = urllib.request.Request(url, headers={"User-Agent": UA})
+print("urlopen + UA     -&gt;", urllib.request.urlopen(req).status)
+print("requests + UA    -&gt;", requests.get(url, headers={"User-Agent": UA}).status_code)
+print("all headers urlopen sent by default:", {k: v for k, v in seen[0].items()})</code></pre>
+<pre><code>urlopen          -&gt; HTTP Error 403: Forbidden | sent User-Agent: Python-urllib/3.13
+requests.get     -&gt; 403 | sent User-Agent: python-requests/2.32.3
+urlopen + UA     -&gt; 200
+requests + UA    -&gt; 200
+all headers urlopen sent by default: {'Accept-Encoding': 'identity', 'Host': '127.0.0.1:8963', 'User-Agent': 'Python-urllib/3.13', 'Connection': 'close'}</code></pre>
+<p><strong>Measured:</strong> Python 3.13.5's <code>urlopen()</code> sends <code>User-Agent: Python-urllib/3.13</code> and requests 2.32.3 sends <code>python-requests/2.32.3</code>. Those strings are easy to filter, and urllib's whole default request is just four headers (no <code>Accept</code>, no <code>Accept-Language</code>). Sending a real, descriptive User-Agent changed the same request from 403 to 200 for both libraries.</p>
+
+<h2 id="fix">2. The fix: send an honest, specific User-Agent</h2>
+<pre><code>import urllib.request
+
+UA = "my-report-script/1.0 (+https://example.com/contact)"
+req = urllib.request.Request(url, headers={"User-Agent": UA})
+with urllib.request.urlopen(req) as resp:
+    data = resp.read()
+
+# requests: once per session
+import requests
+s = requests.Session()
+s.headers["User-Agent"] = UA</code></pre>
+<p>Name your script and give a contact URL or email -- many sites' policies (Wikipedia's, for example) ask for exactly that, and it lets an operator reach you instead of blocking you. Pretending to be a browser is not a fix: it can break the site's terms of service, and bot protection that checks more than the User-Agent will block it anyway.</p>
+
+<h2 id="still">3. Still 403 with a proper User-Agent?</h2>
+<ul>
+<li><strong>Read the body:</strong> <code>e.read()</code> on the <code>HTTPError</code> (or <code>r.text</code>) often says why -- missing API key, region block, rate limit, or a bot-challenge page.</li>
+<li><strong>Authentication:</strong> 403 can mean "you are logged in but not allowed"; see <a href="/guides/401-vs-403-unauthorized-forbidden/">401 vs 403</a>.</li>
+<li><strong>A JavaScript challenge page</strong> (Cloudflare and similar) means the site does not want automated access to that page. Use the site's official API or feed, or ask the operator; don't try to get around it.</li>
+<li><strong>Check <code>robots.txt</code></strong> and the terms before automating requests to a site you don't own.</li>
+</ul>
+<aside class="cta"><strong>Compare the headers your script sends with what your browser sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What User-Agent does Python&#x27;s urllib send?</summary><p>We measured Python-urllib/3.13 on Python 3.13.5 (the version number tracks your Python), with only Accept-Encoding: identity, Host and Connection: close besides it. requests 2.32.3 sends python-requests/2.32.3.</p></details>
+<details><summary>Why does the page work in my browser but return 403 in Python?</summary><p>Your browser sends a browser User-Agent plus cookies and other headers; your script sends a library User-Agent that the site filters. Set a descriptive User-Agent first.</p></details>
+<details><summary>Should I copy my browser&#x27;s User-Agent?</summary><p>We recommend a truthful one naming your script and a contact URL. Spoofing a browser can violate the site&#x27;s terms and often fails anyway against bot protection that checks more than one header.</p></details>
+<details><summary>How do I see why the server refused me?</summary><p>Catch urllib.error.HTTPError as e and print e.read()[:500] (or r.text with requests). Error pages often name the reason: rate limit, missing key, region, or a bot challenge.</p></details>
+<details><summary>Is a 403 the same as a 401?</summary><p>No. 401 means authentication is missing or failed; 403 means the server understood who you are (or doesn&#x27;t care) and refuses anyway. See our 401 vs 403 guide.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s urllib.request and requests 2.32.3 against a local socket server that records request headers and refuses the default library User-Agents. PlainHeaders is our extension; Python and requests are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

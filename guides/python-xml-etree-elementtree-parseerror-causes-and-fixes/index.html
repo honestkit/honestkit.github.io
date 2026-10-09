@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python XML ParseError (ElementTree): Causes and Fixes, Tested</title>
+<meta name="description" content="Measured in Python 3.13.5: what not well-formed, undefined entity, junk after document element and no element found mean, with tested fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-xml-etree-elementtree-parseerror-causes-and-fixes/">
+<meta property="og:title" content="Python XML ParseError (ElementTree): Causes and Fixes, Tested">
+<meta property="og:description" content="Measured in Python 3.13.5: what not well-formed, undefined entity, junk after document element and no element found mean, with tested fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-xml-etree-elementtree-parseerror-causes-and-fixes/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does xml.etree.ElementTree.ParseError: not well-formed (invalid token) mean?", "acceptedAnswer": {"@type": "Answer", "text": "A character the XML parser can't accept at that position. We measured it for a bare &, a control character, an unquoted attribute, and Latin-1 bytes without an encoding declaration."}}, {"@type": "Question", "name": "How do I fix ParseError: undefined entity?", "acceptedAnswer": {"@type": "Answer", "text": "The document uses an HTML entity like &nbsp; that XML doesn't define. We measured that converting named entities to numeric references (&#160;) before parsing works; XMLParser().entity alone did not without an external DOCTYPE."}}, {"@type": "Question", "name": "What does ParseError: junk after document element mean?", "acceptedAnswer": {"@type": "Answer", "text": "There is more than one root element. We measured it for <a>1</a><a>2</a>; wrapping the fragment in a single root element fixes it."}}, {"@type": "Question", "name": "What does ParseError: no element found mean?", "acceptedAnswer": {"@type": "Answer", "text": "The input is empty or ends before the root element closes. We measured an empty string giving 'no element found: line 1, column 0'."}}, {"@type": "Question", "name": "How do I get the line and column of an XML parse error?", "acceptedAnswer": {"@type": "Answer", "text": "Use e.position, a (line, column) tuple with a 0-based column, and e.code for the expat error number. We used it to print the text around the error."}}, {"@type": "Question", "name": "Why does except ValueError not catch ET.ParseError?", "acceptedAnswer": {"@type": "Answer", "text": "ParseError subclasses SyntaxError. Catch ET.ParseError directly."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>xml.etree ParseError in Python: every message explained (tested)</h1>
+<p class="lead"><code>xml.etree.ElementTree.ParseError</code> tells you the line and column, but not what to do. We ran ten broken inputs and seven encoding cases through ElementTree to map each message to its cause, then tested fixes, including one common fix that doesn't work.</p>
+<h2 id="messages">1. What each ParseError message means</h2>
+<pre><code>import xml.etree.ElementTree as ET
+
+cases = {
+    &quot;empty string&quot;:           &quot;&quot;,
+    &quot;unclosed tag&quot;:           &quot;&lt;a&gt;&lt;b&gt;text&lt;/a&gt;&quot;,
+    &quot;bare ampersand&quot;:         &quot;&lt;a&gt;Tom &amp; Jerry&lt;/a&gt;&quot;,
+    &quot;HTML entity &amp;nbsp;&quot;:     &quot;&lt;a&gt;1&amp;nbsp;000&lt;/a&gt;&quot;,
+    &quot;two root elements&quot;:      &quot;&lt;a&gt;1&lt;/a&gt;&lt;a&gt;2&lt;/a&gt;&quot;,
+    &quot;text before the root&quot;:   &quot;Error 502&lt;a/&gt;&quot;,
+    &quot;whitespace before &lt;?xml&quot;: &quot;\n&lt;?xml version=&#x27;1.0&#x27;?&gt;&lt;a/&gt;&quot;,
+    &quot;control character&quot;:      &quot;&lt;a&gt;bell\x07&lt;/a&gt;&quot;,
+    &quot;unquoted attribute&quot;:     &quot;&lt;a id=1/&gt;&quot;,
+    &quot;HTML page&quot;:              &quot;&lt;!DOCTYPE html&gt;&lt;html&gt;&lt;body&gt;&lt;br&gt;&lt;/body&gt;&lt;/html&gt;&quot;,
+}
+for label, text in cases.items():
+    try:
+        ET.fromstring(text)
+        print(f&quot;{label:24} OK&quot;)
+    except ET.ParseError as e:
+        print(f&quot;{label:24} ParseError: {e}  | code={e.code} position={e.position}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>empty string             ParseError: no element found: line 1, column 0  | code=3 position=(1, 0)
+unclosed tag             ParseError: mismatched tag: line 1, column 12  | code=7 position=(1, 12)
+bare ampersand           ParseError: not well-formed (invalid token): line 1, column 8  | code=4 position=(1, 8)
+HTML entity &amp;nbsp;       ParseError: undefined entity: line 1, column 4  | code=11 position=(1, 4)
+two root elements        ParseError: junk after document element: line 1, column 8  | code=9 position=(1, 8)
+text before the root     ParseError: syntax error: line 1, column 0  | code=2 position=(1, 0)
+whitespace before &lt;?xml  ParseError: XML or text declaration not at start of entity: line 2, column 0  | code=17 position=(2, 0)
+control character        ParseError: not well-formed (invalid token): line 1, column 7  | code=4 position=(1, 7)
+unquoted attribute       ParseError: not well-formed (invalid token): line 1, column 6  | code=4 position=(1, 6)
+HTML page                ParseError: mismatched tag: line 1, column 33  | code=7 position=(1, 33)</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> the message names the problem and <code>e.position</code> gives <code>(line, column)</code>, with the column counted from 0. Quick lookup:</p>
+<ul>
+<li><code>no element found</code>: empty input (a failed download, or a file read twice). Also a document cut off before its end.</li>
+<li><code>not well-formed (invalid token)</code>: a bare <code>&amp;</code>, a control character, an unquoted attribute, or bytes in the wrong encoding (section 2). For the bare <code>&amp;</code> the column pointed just past it.</li>
+<li><code>undefined entity</code>: an HTML entity such as <code>&amp;nbsp;</code>. XML only knows <code>&amp;amp; &amp;lt; &amp;gt; &amp;quot; &amp;apos;</code>.</li>
+<li><code>mismatched tag</code>: an unclosed element, or HTML (whose <code>&lt;br&gt;</code> has no closing tag). ElementTree is not an HTML parser.</li>
+<li><code>junk after document element</code>: more than one root element.</li>
+<li><code>syntax error</code> at column 0: the input doesn't start with XML at all, e.g. a plain-text error from a server.</li>
+<li><code>XML or text declaration not at start of entity</code>: whitespace or a blank line before <code>&lt;?xml</code>.</li>
+</ul>
+
+<h2 id="encoding">2. Encoding: pass bytes, not a mis-decoded string</h2>
+<pre><code>import codecs, xml.etree.ElementTree as ET
+
+cases = {
+    &quot;str with encoding decl&quot;:       &quot;&lt;?xml version=&#x27;1.0&#x27; encoding=&#x27;utf-8&#x27;?&gt;&lt;a&gt;é&lt;/a&gt;&quot;,
+    &quot;utf-8 bytes, no decl&quot;:         &quot;&lt;a&gt;é&lt;/a&gt;&quot;.encode(&quot;utf-8&quot;),
+    &quot;latin-1 bytes, no decl&quot;:       &quot;&lt;a&gt;é&lt;/a&gt;&quot;.encode(&quot;latin-1&quot;),
+    &quot;latin-1 bytes, correct decl&quot;:  &quot;&lt;?xml version=&#x27;1.0&#x27; encoding=&#x27;iso-8859-1&#x27;?&gt;&lt;a&gt;é&lt;/a&gt;&quot;.encode(&quot;latin-1&quot;),
+    &quot;utf-8 bytes with BOM&quot;:         codecs.BOM_UTF8 + &quot;&lt;a&gt;é&lt;/a&gt;&quot;.encode(&quot;utf-8&quot;),
+    &quot;BOM decoded into a str&quot;:       (codecs.BOM_UTF8 + b&quot;&lt;a/&gt;&quot;).decode(&quot;latin-1&quot;),
+    &quot;utf-16 bytes&quot;:                 &quot;&lt;a&gt;é&lt;/a&gt;&quot;.encode(&quot;utf-16&quot;),
+}
+for label, data in cases.items():
+    try:
+        print(f&quot;{label:28} OK text={ET.fromstring(data).text!r}&quot;)
+    except ET.ParseError as e:
+        print(f&quot;{label:28} ParseError: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>str with encoding decl       OK text=&#x27;é&#x27;
+utf-8 bytes, no decl         OK text=&#x27;é&#x27;
+latin-1 bytes, no decl       ParseError: not well-formed (invalid token): line 1, column 3
+latin-1 bytes, correct decl  OK text=&#x27;é&#x27;
+utf-8 bytes with BOM         OK text=&#x27;é&#x27;
+BOM decoded into a str       ParseError: not well-formed (invalid token): line 1, column 1
+utf-16 bytes                 OK text=&#x27;é&#x27;</code></pre>
+<p><strong>Measured:</strong> the parser decodes bytes itself using the BOM or the <code>encoding=</code> declaration, so UTF-8, UTF-16 and correctly declared Latin-1 all worked. Latin-1 bytes <em>without</em> a declaration fail with <code>not well-formed (invalid token)</code>, and so does a BOM that was decoded into the string as text. A <code>str</code> with an <code>encoding=</code> declaration is accepted by ElementTree. With requests, pass <code>r.content</code> (bytes) rather than <code>r.text</code>, whose encoding requests guesses from the headers.</p>
+
+<h2 id="fix">3. Fixes: find the spot, escape, entities, fragments</h2>
+<pre><code>import html, re, xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
+
+def parse_or_explain(text):
+    try:
+        return ET.fromstring(text)
+    except ET.ParseError as e:
+        line, col = e.position
+        bad = text.splitlines()[line - 1] if text else &quot;&quot;
+        print(f&quot;ParseError: {e}&quot;)
+        print(&quot;   &quot; + bad[max(0, col - 20):col + 20])
+        print(&quot;   &quot; + &quot; &quot; * min(col, 20) + &quot;^&quot;)
+
+# 1) show where it broke
+parse_or_explain(&quot;&lt;order&gt;&lt;item&gt;Fish &amp; Chips&lt;/item&gt;&lt;/order&gt;&quot;)
+
+# 2) escape text when you BUILD the XML (ElementTree does it for you)
+name = &quot;Fish &amp; Chips &lt;large&gt;&quot;
+print(&quot;escape():&quot;, f&quot;&lt;item&gt;{escape(name)}&lt;/item&gt;&quot;)
+el = ET.Element(&quot;item&quot;); el.text = name
+print(&quot;ET.tostring():&quot;, ET.tostring(el, encoding=&quot;unicode&quot;))
+
+# 3) HTML entities like &amp;nbsp; &amp;eacute;
+parser = ET.XMLParser()
+parser.entity.update({&quot;nbsp&quot;: &quot;\u00a0&quot;, &quot;eacute&quot;: &quot;\u00e9&quot;})
+try:
+    ET.fromstring(&quot;&lt;a&gt;caf&amp;eacute;&amp;nbsp;1&lt;/a&gt;&quot;, parser=parser)
+except ET.ParseError as e:
+    print(&quot;parser.entity alone:&quot;, e)
+
+from html.entities import name2codepoint
+XML_OWN = {&quot;amp&quot;, &quot;lt&quot;, &quot;gt&quot;, &quot;quot&quot;, &quot;apos&quot;}
+def html_entities_to_numeric(text):
+    return re.sub(r&quot;&amp;([A-Za-z][A-Za-z0-9]*);&quot;,
+                  lambda m: f&quot;&amp;#{name2codepoint[m[1]]};&quot;
+                  if m[1] in name2codepoint and m[1] not in XML_OWN else m[0],
+                  text)
+fixed = html_entities_to_numeric(&quot;&lt;a&gt;caf&amp;eacute;&amp;nbsp;1 &amp;amp; 2&lt;/a&gt;&quot;)
+print(&quot;numeric refs:&quot;, fixed, &quot;-&gt;&quot;, repr(ET.fromstring(fixed).text))
+print(&quot;html.unescape breaks &amp;amp;:&quot;, html.unescape(&quot;&lt;a&gt;A &amp;amp; B&lt;/a&gt;&quot;))
+
+# 4) several root elements (a fragment / XML stream): wrap them
+frag = &quot;&lt;a&gt;1&lt;/a&gt;&lt;a&gt;2&lt;/a&gt;&quot;
+print(&quot;wrapped:&quot;, [x.text for x in ET.fromstring(f&quot;&lt;root&gt;{frag}&lt;/root&gt;&quot;)])</code></pre>
+<p>Output:</p>
+<pre><code>ParseError: not well-formed (invalid token): line 1, column 19
+   &lt;order&gt;&lt;item&gt;Fish &amp; Chips&lt;/item&gt;&lt;/order
+                      ^
+escape(): &lt;item&gt;Fish &amp;amp; Chips &amp;lt;large&amp;gt;&lt;/item&gt;
+ET.tostring(): &lt;item&gt;Fish &amp;amp; Chips &amp;lt;large&amp;gt;&lt;/item&gt;
+parser.entity alone: undefined entity: line 1, column 6
+numeric refs: &lt;a&gt;caf&amp;#233;&amp;#160;1 &amp;amp; 2&lt;/a&gt; -&gt; &#x27;café\xa01 &amp; 2&#x27;
+html.unescape breaks &amp;amp;: &lt;a&gt;A &amp; B&lt;/a&gt;
+wrapped: [&#x27;1&#x27;, &#x27;2&#x27;]</code></pre>
+<p><strong>Measured:</strong></p>
+<ul>
+<li><code>e.position</code> lets you print the surrounding text, which is faster than counting columns by hand.</li>
+<li>If you generate the XML, never paste text into tags with f-strings. <code>xml.sax.saxutils.escape()</code> or setting <code>el.text</code> and calling <code>ET.tostring()</code> both produced <code>Fish &amp;amp; Chips &amp;lt;large&amp;gt;</code>.</li>
+<li>Filling <code>XMLParser().entity</code> did <strong>not</strong> fix <code>undefined entity</code> for a document without a DOCTYPE; we still got the error. (In a separate one-liner it worked only once we added an external <code>&lt;!DOCTYPE a PUBLIC "x" "y"&gt;</code>.) Converting named HTML entities to numeric references before parsing worked and kept <code>&amp;amp;</code> intact. <code>html.unescape()</code> on the whole document is wrong: it turns <code>&amp;amp;</code> into a bare <code>&amp;</code>, which is the next ParseError.</li>
+<li>For several top-level elements (a log of XML records), wrap them in one root before parsing.</li>
+</ul>
+<p><code>ET.ParseError</code> subclasses <code>SyntaxError</code>, not <code>ValueError</code>, so <code>except ValueError</code> doesn't catch it. For real-world HTML use an HTML parser (<code>html.parser</code> or BeautifulSoup) instead of ElementTree. For files that are empty because a call returned <code>None</code>, see our <a href="/guides/python-xml-etree-parse-none-parseerror-no-element-found/">no element found guide</a>.</p>
+
+<aside class="cta"><strong>Getting HTML or an error page where you expected XML? Check the Content-Type the server actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does xml.etree.ElementTree.ParseError: not well-formed (invalid token) mean?</summary><p>A character the XML parser can&#x27;t accept at that position. We measured it for a bare &amp;, a control character, an unquoted attribute, and Latin-1 bytes without an encoding declaration.</p></details>
+<details><summary>How do I fix ParseError: undefined entity?</summary><p>The document uses an HTML entity like &amp;nbsp; that XML doesn&#x27;t define. We measured that converting named entities to numeric references (&amp;#160;) before parsing works; XMLParser().entity alone did not without an external DOCTYPE.</p></details>
+<details><summary>What does ParseError: junk after document element mean?</summary><p>There is more than one root element. We measured it for &lt;a&gt;1&lt;/a&gt;&lt;a&gt;2&lt;/a&gt;; wrapping the fragment in a single root element fixes it.</p></details>
+<details><summary>What does ParseError: no element found mean?</summary><p>The input is empty or ends before the root element closes. We measured an empty string giving &#x27;no element found: line 1, column 0&#x27;.</p></details>
+<details><summary>How do I get the line and column of an XML parse error?</summary><p>Use e.position, a (line, column) tuple with a 0-based column, and e.code for the expat error number. We used it to print the text around the error.</p></details>
+<details><summary>Why does except ValueError not catch ET.ParseError?</summary><p>ParseError subclasses SyntaxError. Catch ET.ParseError directly.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 on Debian with Python 3.13.5&#x27;s xml.etree.ElementTree: ten malformed inputs with their message, code and position, seven encoding variants, escaping, entity handling and fragment wrapping. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; Python&#x27;s ElementTree is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

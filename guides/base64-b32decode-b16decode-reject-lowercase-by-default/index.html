@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>base64.b32decode()/b16decode() Reject Lowercase Input by Default</title>
+<meta name="description" content="We measured Python 3.13.5: b32decode() and b16decode() raise binascii.Error on lowercase input unless you pass casefold=True.">
+<link rel="canonical" href="https://honestkit.github.io/guides/base64-b32decode-b16decode-reject-lowercase-by-default/">
+<meta property="og:title" content="base64.b32decode()/b16decode() Reject Lowercase Input by Default">
+<meta property="og:description" content="We measured Python 3.13.5: b32decode() and b16decode() raise binascii.Error on lowercase input unless you pass casefold=True.">
+<meta property="og:url" content="https://honestkit.github.io/guides/base64-b32decode-b16decode-reject-lowercase-by-default/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does base64.b32decode() accept lowercase input?", "acceptedAnswer": {"@type": "Answer", "text": "No, not by default -- we measured it raising binascii.Error('Non-base32 digit found') on a lowercased valid Base32 string. Passing casefold=True fixes it."}}, {"@type": "Question", "name": "Does base64.b16decode() accept lowercase hex digits?", "acceptedAnswer": {"@type": "Answer", "text": "No, not by default -- we measured binascii.Error('Non-base16 digit found') on lowercase hex. This differs from bytes.fromhex() and binascii.a2b_hex(), which both accept lowercase hex with no extra argument."}}, {"@type": "Question", "name": "How do I make base64.b32decode() or b16decode() accept lowercase input?", "acceptedAnswer": {"@type": "Answer", "text": "Pass casefold=True. We confirmed the identical lowercase input that previously raised binascii.Error decodes correctly once casefold=True is set."}}, {"@type": "Question", "name": "Why does base64.b16decode() reject lowercase hex when bytes.fromhex() accepts it?", "acceptedAnswer": {"@type": "Answer", "text": "They're separate implementations with different defaults. We measured both on the same lowercase hex string: bytes.fromhex() and binascii.a2b_hex() both succeeded, while base64.b16decode() raised unless casefold=True was passed."}}, {"@type": "Question", "name": "Is lowercase Base32 or hex actually ambiguous to decode?", "acceptedAnswer": {"@type": "Answer", "text": "No -- both alphabets only define uppercase letters, so a lowercase letter can only mean one thing. We measured that casefold=True resolves it correctly every time; the rejection is a strictness choice, not a real ambiguity."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>base64.b32decode() and b16decode() Reject Lowercase by Default (tested)</h1>
+<p class="lead">Base32 and hex encodings only use uppercase letters, so lowercase input is never actually ambiguous -- there's only one letter it could mean. We measured that Python's <code>base64.b32decode()</code> and <code>base64.b16decode()</code> raise an error on lowercase input anyway, by default, which is easy to miss if you're used to <code>bytes.fromhex()</code> accepting lowercase without complaint.</p>
+<h2 id="repro1">1. Lowercase input raises, even though it's unambiguous</h2>
+<pre><code>import base64
+
+encoded = base64.b32encode(b"hello world")
+print(encoded)
+print(base64.b32decode(encoded.lower()))</code></pre>
+<pre><code>b'NBSWY3DPEB3W64TMMQ======'
+Traceback (most recent call last):
+  ...
+binascii.Error: Non-base32 digit found</code></pre>
+<p><strong>Measured:</strong> lowercasing a valid Base32 string and decoding it raises <code>binascii.Error: Non-base32 digit found</code>. <code>base64.b16decode()</code> does the exact same thing on lowercased hex-like output -- <code>binascii.Error: Non-base16 digit found</code>. Neither function silently tolerates case the way <code>base64.b64decode()</code> tolerates extra characters (see our other base64 guide) -- here it's strict, not lenient, and the strictness is the surprise.</p>
+
+<h2 id="repro2">2. casefold=True is the fix, and it's off by default</h2>
+<pre><code>import base64
+
+encoded = base64.b32encode(b"hello world")
+print(base64.b32decode(encoded.lower(), casefold=True))
+
+hexed = base64.b16encode(b"hello world")
+print(base64.b16decode(hexed.lower(), casefold=True))</code></pre>
+<pre><code>b'hello world'
+b'hello world'</code></pre>
+<p><strong>Measured:</strong> passing <code>casefold=True</code> to either function makes the identical lowercase input decode correctly. Both <code>b32decode()</code> and <code>b16decode()</code> accept this keyword, and both default it to <code>False</code> -- so any code that normalizes case before storing or transmitting a Base32/hex value (or receives it from a source that happens to lowercase it) will crash on decode unless the caller remembers this argument.</p>
+
+<h2 id="repro3">3. bytes.fromhex() has no such restriction</h2>
+<pre><code>import base64, binascii
+
+print(bytes.fromhex("68656c6c6f"))
+print(binascii.a2b_hex(b"68656c6c6f"))
+print(base64.b16decode(b"68656c6c6f"))</code></pre>
+<pre><code>b'hello'
+b'hello'
+Traceback (most recent call last):
+  ...
+binascii.Error: Non-base16 digit found</code></pre>
+<p><strong>Measured:</strong> both <code>bytes.fromhex()</code> and <code>binascii.a2b_hex()</code> accept lowercase hex digits with no special argument at all. <code>base64.b16decode()</code> is the odd one out among Python's own hex-handling functions -- it's easy to reach for it (since it lives in the same module as <code>b64decode</code>) and get bitten by a case-sensitivity rule none of the equivalent stdlib functions share.</p>
+<aside class="cta"><strong>Decoding a Base32 or hex value from a header or token? Watch the case:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does base64.b32decode() accept lowercase input?</summary><p>No, not by default -- we measured it raising binascii.Error(&#x27;Non-base32 digit found&#x27;) on a lowercased valid Base32 string. Passing casefold=True fixes it.</p></details>
+<details><summary>Does base64.b16decode() accept lowercase hex digits?</summary><p>No, not by default -- we measured binascii.Error(&#x27;Non-base16 digit found&#x27;) on lowercase hex. This differs from bytes.fromhex() and binascii.a2b_hex(), which both accept lowercase hex with no extra argument.</p></details>
+<details><summary>How do I make base64.b32decode() or b16decode() accept lowercase input?</summary><p>Pass casefold=True. We confirmed the identical lowercase input that previously raised binascii.Error decodes correctly once casefold=True is set.</p></details>
+<details><summary>Why does base64.b16decode() reject lowercase hex when bytes.fromhex() accepts it?</summary><p>They&#x27;re separate implementations with different defaults. We measured both on the same lowercase hex string: bytes.fromhex() and binascii.a2b_hex() both succeeded, while base64.b16decode() raised unless casefold=True was passed.</p></details>
+<details><summary>Is lowercase Base32 or hex actually ambiguous to decode?</summary><p>No -- both alphabets only define uppercase letters, so a lowercase letter can only mean one thing. We measured that casefold=True resolves it correctly every time; the rejection is a strictness choice, not a real ambiguity.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in base64 module: encoded a known string with base32encode() and base16encode(), lowercased the result, and decoded it with and without casefold=True. Contrasted with bytes.fromhex() and binascii.a2b_hex() on equivalent lowercase hex input. PlainHeaders is our extension; Python&#x27;s base64 module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

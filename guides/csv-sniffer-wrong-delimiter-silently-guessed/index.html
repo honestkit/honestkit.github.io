@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>csv.Sniffer() Can Silently Guess the Wrong Delimiter (Tested)</title>
+<meta name="description" content="We measured csv.Sniffer() pick the letter &#x27;m&#x27; as delimiter for plain prose, zero error — it favors the most consistent per-line count, not the sensible char.">
+<link rel="canonical" href="https://honestkit.github.io/guides/csv-sniffer-wrong-delimiter-silently-guessed/">
+<meta property="og:title" content="csv.Sniffer() Can Silently Guess the Wrong Delimiter (Tested)">
+<meta property="og:description" content="We measured csv.Sniffer() pick the letter &#x27;m&#x27; as delimiter for plain prose, zero error — it favors the most consistent per-line count, not the sensible char.">
+<meta property="og:url" content="https://honestkit.github.io/guides/csv-sniffer-wrong-delimiter-silently-guessed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can csv.Sniffer() pick a letter as the delimiter?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we measured it returning the letter 'm' as the detected delimiter for two sentences of plain English prose, with no error and no low-confidence warning of any kind."}}, {"@type": "Question", "name": "Why would csv.Sniffer() pick a letter over an obvious comma?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed the cause: Sniffer's heuristic picks whichever character has the most consistent per-line occurrence count, and by default considers every character in the sample a candidate, not just typical delimiter punctuation. In our test, 'm' appeared exactly twice in both lines while ',' appeared twice then once \u2014 more consistent wins, regardless of plausibility."}}, {"@type": "Question", "name": "Does csv.Sniffer(delimiters=...) fix the wrong-guess problem?", "acceptedAnswer": {"@type": "Answer", "text": "Partially \u2014 we measured that restricting to delimiters=\\\",;\\\\t|\\\" on the same non-CSV input doesn't produce a correct guess; it raises _csv.Error: Could not determine delimiter instead, because none of the allowed characters meet the consistency threshold. It turns a silent wrong answer into a loud, catchable failure, which is the main practical benefit."}}, {"@type": "Question", "name": "Does csv.Sniffer() ever warn that its guess might be wrong?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we found no low-confidence signal in the returned Dialect object. The sniff() call either returns a dialect object (right or wrong, with no way to tell which from the return value alone) or raises Could not determine delimiter; there's no middle state."}}, {"@type": "Question", "name": "How should I validate a dialect that Sniffer detected?", "acceptedAnswer": {"@type": "Answer", "text": "We'd parse a handful of rows with it and check that every row produces the same, sane field count before trusting it on a whole file \u2014 Sniffer's result is a starting guess, not a verified fact, especially on data from an unknown or untrusted source."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>csv.Sniffer() Silently Guesses a Wrong Delimiter (tested)</h1>
+<p class="lead"><code>csv.Sniffer().sniff(text)</code> is meant to auto-detect a CSV's delimiter, but we fed it two sentences of ordinary English prose and it confidently returned the letter <code>m</code> as the delimiter &mdash; no exception, no warning, just a wrong answer that looks like a right one if you don't check it.</p>
+<h2 id="repro1">1. Plain English text, sniffed with no restrictions</h2>
+<pre><code>import csv
+
+sample = ("This is a sentence, with a comma, but not real csv.\n"
+          "Another line, also with commas.\n")
+csv.Sniffer().sniff(sample).delimiter
+'m'</code></pre>
+<p><strong>Measured:</strong> this isn't CSV data at all, just two sentences that each happen to contain a comma &mdash; yet <code>sniff()</code> returned successfully with <code>'m'</code> as the detected delimiter, not <code>','</code>, and not an error. There is nothing in the API that flags this result as low-confidence or wrong.</p>
+
+<h2 id="repro2">2. Why 'm': consistency beats plausibility</h2>
+<pre><code>sample.split("\n")[0].count("m"), sample.split("\n")[1].count("m")
+(2, 2)
+sample.split("\n")[0].count(","), sample.split("\n")[1].count(",")
+(2, 1)</code></pre>
+<p><strong>Measured:</strong> the letter <code>m</code> appears exactly twice in both lines &mdash; a perfectly consistent count &mdash; while <code>,</code> appears twice in the first line but only once in the second. <code>Sniffer</code>'s heuristic picks whichever candidate character has the most consistent occurrence count across lines, and by default every character in the sample is a candidate, including ordinary letters. A comma that looks obviously right to a human loses to a letter that's merely more consistent, because the algorithm has no concept of which characters are typically delimiters.</p>
+
+<h2 id="repro3">3. Restricting candidates with delimiters= changes failure mode entirely</h2>
+<pre><code>csv.Sniffer().sniff(sample, delimiters=",;\t|")
+_csv.Error: Could not determine delimiter</code></pre>
+<p><strong>Measured:</strong> passing <code>delimiters=",;\t|"</code> to only consider the common CSV delimiter characters doesn't make it fall back to the best among those &mdash; it raises a clean exception instead, because none of the allowed characters hit the consistency threshold the algorithm requires. This is the opposite failure mode from the unrestricted call: unrestricted, <code>sniff()</code> never raises and silently returns a wrong answer; restricted, it can raise on exactly the same input instead of guessing. Neither behavior is "detect that this isn't really CSV" &mdash; one guesses wrong silently, the other refuses.</p>
+
+<h2 id="fix">4. What to actually do</h2>
+<p>Always pass an explicit <code>delimiters=</code> argument scoped to the characters you'd actually accept (e.g. <code>",;\t|"</code>) &mdash; this won't make <code>Sniffer</code> correct, but it turns a silent wrong guess into a loud, catchable exception when the input isn't recognizable CSV. Beyond that, treat <code>Sniffer</code>'s output as a starting guess to validate, not a verified fact: parse a few rows with the detected dialect and check the resulting field count is consistent and sane before trusting it on a whole file, especially for data from an untrusted or unknown source.</p>
+
+<aside class="cta"><strong>Debugging a CSV an API claims to send but doesn&#x27;t parse right? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can csv.Sniffer() pick a letter as the delimiter?</summary><p>Yes — we measured it returning the letter &#x27;m&#x27; as the detected delimiter for two sentences of plain English prose, with no error and no low-confidence warning of any kind.</p></details>
+<details><summary>Why would csv.Sniffer() pick a letter over an obvious comma?</summary><p>We confirmed the cause: Sniffer&#x27;s heuristic picks whichever character has the most consistent per-line occurrence count, and by default considers every character in the sample a candidate, not just typical delimiter punctuation. In our test, &#x27;m&#x27; appeared exactly twice in both lines while &#x27;,&#x27; appeared twice then once — more consistent wins, regardless of plausibility.</p></details>
+<details><summary>Does csv.Sniffer(delimiters=...) fix the wrong-guess problem?</summary><p>Partially — we measured that restricting to delimiters=\&quot;,;\\t|\&quot; on the same non-CSV input doesn&#x27;t produce a correct guess; it raises _csv.Error: Could not determine delimiter instead, because none of the allowed characters meet the consistency threshold. It turns a silent wrong answer into a loud, catchable failure, which is the main practical benefit.</p></details>
+<details><summary>Does csv.Sniffer() ever warn that its guess might be wrong?</summary><p>No — we found no low-confidence signal in the returned Dialect object. The sniff() call either returns a dialect object (right or wrong, with no way to tell which from the return value alone) or raises Could not determine delimiter; there&#x27;s no middle state.</p></details>
+<details><summary>How should I validate a dialect that Sniffer detected?</summary><p>We&#x27;d parse a handful of rows with it and check that every row produces the same, sane field count before trusting it on a whole file — Sniffer&#x27;s result is a starting guess, not a verified fact, especially on data from an unknown or untrusted source.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in csv module, calling csv.Sniffer().sniff() on plain-English prose that happens to contain a comma per line, recording the exact delimiter character chosen, and comparing against the same call restricted to a candidate delimiters= set. PlainHeaders is our extension; Python&#x27;s csv module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

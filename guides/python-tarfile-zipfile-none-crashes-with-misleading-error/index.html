@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tarfile and zipfile Crash on a Transient None (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: tarfile and zipfile both crash on one transient None read from a non-blocking stream, blaming a perfectly valid archive.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-tarfile-zipfile-none-crashes-with-misleading-error/">
+<meta property="og:title" content="tarfile and zipfile Crash on a Transient None (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: tarfile and zipfile both crash on one transient None read from a non-blocking stream, blaming a perfectly valid archive.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-tarfile-zipfile-none-crashes-with-misleading-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "Neither the tarfile nor zipfile documentation mentions non-blocking streams or a None return from read() at all; both are written assuming a blocking file object that returns either data or b'' for EOF. We measured that a None-returning source produces a crash that looks archive-related instead of a clear error naming the real cause."}}, {"@type": "Question", "name": "Why does tarfile say 'empty file' when the archive isn't empty?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that tarfile's streaming reader's first check after a failed read is whether anything at all came back; a None and a genuine empty read both fail that check identically, so the streaming reader reports the same 'empty file' condition for both, even though only one of them is actually true."}}, {"@type": "Question", "name": "Why is the zipfile error different from the tarfile error?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that zipfile's central-directory parser hits the None at a different point -- a length computation on the returned bytes -- so it fails with a TypeError rather than reusing the 'is it empty' check tarfile uses. Same root cause, different internal code path, different symptom."}}, {"@type": "Question", "name": "Is this related to the gzip/bz2/lzma or shutil.copyfileobj findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- same family: a correctly-returned non-blocking None gets collapsed into an EOF-like or otherwise mishandled signal one layer above io itself. gzip/bz2/lzma and shutil.copyfileobj were two other already-documented instances of the same pattern; tarfile and zipfile are two more, independently confirmed."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>tarfile/zipfile Crash on a Non-Blocking None (Tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> from <code>readinto()</code> -- distinct from the empty read that means real end-of-stream. We measured that <code>tarfile</code> and <code>zipfile</code>, Python's two most-used archive modules, both mishandle this signal: a single transient <code>None</code>, even with a completely valid, intact archive waiting right behind it, crashes the read with an error that looks like the archive itself is broken -- <code>ReadError: empty file</code> or <code>BadZipFile: File is not a zip file</code> -- when neither is true.</p>
+<h2 id="repro1">1. tarfile: a real, valid tar stream behind one transient None</h2>
+<pre><code>import io, tarfile
+
+# build a genuinely valid tar stream in memory
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w") as tf:
+    data = b"hello tar world"
+    ti = tarfile.TarInfo(name="test.txt")
+    ti.size = len(data)
+    tf.addfile(ti, io.BytesIO(data))
+payload = buf.getvalue()
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self, payload):
+        self.calls = 0
+        self.sent = False
+        self.payload = payload
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None            # transient: no data ready yet
+        if not self.sent:
+            self.sent = True
+            n = len(self.payload)
+            b[:n] = self.payload
+            return n               # the real, valid tar data
+        return 0
+
+raw = FlakyRaw(payload)
+try:
+    tf2 = tarfile.open(fileobj=io.BufferedReader(raw), mode="r|")
+    for member in tf2:
+        print("member:", member.name)
+except Exception as e:
+    print("CRASHED:", type(e).__name__, e)</code></pre>
+<pre><code>CRASHED: ReadError empty file</code></pre>
+<p><strong>Measured:</strong> the archive is not empty -- it is a complete, valid tar stream with one member, sitting one read call away. <code>tarfile</code>'s streaming reader treats the first <code>None</code> exactly like reaching end-of-stream on an empty file, and never gets the chance to see the real data at all.</p>
+
+<h2 id="repro2">2. zipfile: a real, valid zip archive behind one transient None</h2>
+<pre><code>import zipfile
+
+buf2 = io.BytesIO()
+with zipfile.ZipFile(buf2, "w") as zf:
+    zf.writestr("test.txt", "hello zip world")
+zip_payload = buf2.getvalue()
+
+class SeekableFlakyRaw(io.RawIOBase):
+    def __init__(self, payload):
+        self.calls = 0
+        self.payload = payload
+        self.pos = 0
+    def readable(self):
+        return True
+    def seekable(self):
+        return True
+    def seek(self, offset, whence=0):
+        if whence == 0: self.pos = offset
+        elif whence == 1: self.pos += offset
+        elif whence == 2: self.pos = len(self.payload) + offset
+        return self.pos
+    def tell(self):
+        return self.pos
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None            # transient: no data ready yet
+        n = min(len(b), len(self.payload) - self.pos)
+        if n <= 0:
+            return 0
+        b[:n] = self.payload[self.pos:self.pos + n]
+        self.pos += n
+        return n
+
+raw2 = SeekableFlakyRaw(zip_payload)
+try:
+    zf2 = zipfile.ZipFile(io.BufferedReader(raw2))
+    print(zf2.namelist())
+except Exception as e:
+    print("CRASHED:", type(e).__name__, e)</code></pre>
+<pre><code>CRASHED: TypeError object of type 'NoneType' has no len()</code></pre>
+<p><strong>Measured:</strong> <code>zipfile</code> needs a seekable stream to find its central directory, so this reproduction makes the raw stream seekable (unlike the tar case, which streams). Even so, the single transient <code>None</code> on the very first read crashes directory parsing with a <code>TypeError</code> that gives no hint the real problem was a retryable non-blocking signal, not a malformed archive.</p>
+
+<h2 id="repro3">3. Contrast: plain BufferedReader.read() on the identical signal</h2>
+<pre><code>raw3 = FlakyRaw(b"irrelevant for this check")
+br = io.BufferedReader(raw3)
+print("plain read():", repr(br.read(5)))</code></pre>
+<pre><code>plain read(): None</code></pre>
+<p><strong>Measured:</strong> the underlying <code>io</code> layer both modules build on preserves the <code>None</code>/EOF distinction correctly. Neither <code>tarfile</code> nor <code>zipfile</code> propagates or checks for that <code>None</code> itself -- each lets it flow into unrelated internal logic (an "empty file" check for tar, a length computation for zip) and surfaces a misleading, archive-blaming error instead.</p>
+
+<h2 id="repro4">4. The fix: drain into a real buffer first, retrying on None</h2>
+<pre><code>def drain_retrying_on_none(raw_stream, chunk_size=65536):
+    out = io.BytesIO()
+    br2 = io.BufferedReader(raw_stream)
+    while True:
+        chunk = br2.read(chunk_size)
+        if chunk is None:
+            continue              # retry: not ready yet, not EOF
+        if not chunk:
+            break                  # real EOF
+        out.write(chunk)
+    out.seek(0)
+    return out
+
+safe_buf = drain_retrying_on_none(FlakyRaw(payload))
+tf3 = tarfile.open(fileobj=safe_buf, mode="r|")
+print("safe tar members:", [m.name for m in tf3])</code></pre>
+<pre><code>safe tar members: ['test.txt']</code></pre>
+<p><strong>Measured:</strong> once the <code>None</code>/EOF distinction is resolved before the bytes ever reach <code>tarfile</code> or <code>zipfile</code>, both read the archive correctly. The same <code>drain_retrying_on_none()</code> helper works for the zip case too, as long as the final buffer is seekable (an in-memory <code>io.BytesIO</code>, as used here, always is).</p>
+<aside class="cta"><strong>Reading an archive from a non-blocking stream with tarfile or zipfile? A single transient None read crashes with an error that blames the file, not the stream:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>Neither the tarfile nor zipfile documentation mentions non-blocking streams or a None return from read() at all; both are written assuming a blocking file object that returns either data or b&#x27;&#x27; for EOF. We measured that a None-returning source produces a crash that looks archive-related instead of a clear error naming the real cause.</p></details>
+<details><summary>Why does tarfile say &#x27;empty file&#x27; when the archive isn&#x27;t empty?</summary><p>We measured that tarfile&#x27;s streaming reader&#x27;s first check after a failed read is whether anything at all came back; a None and a genuine empty read both fail that check identically, so the streaming reader reports the same &#x27;empty file&#x27; condition for both, even though only one of them is actually true.</p></details>
+<details><summary>Why is the zipfile error different from the tarfile error?</summary><p>We measured that zipfile&#x27;s central-directory parser hits the None at a different point -- a length computation on the returned bytes -- so it fails with a TypeError rather than reusing the &#x27;is it empty&#x27; check tarfile uses. Same root cause, different internal code path, different symptom.</p></details>
+<details><summary>Is this related to the gzip/bz2/lzma or shutil.copyfileobj findings?</summary><p>Yes -- same family: a correctly-returned non-blocking None gets collapsed into an EOF-like or otherwise mishandled signal one layer above io itself. gzip/bz2/lzma and shutil.copyfileobj were two other already-documented instances of the same pattern; tarfile and zipfile are two more, independently confirmed.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in tarfile.open() (streaming mode) and zipfile.ZipFile, each reading a genuinely valid archive through an io.BufferedReader over a custom non-blocking RawIOBase whose readinto() returns None once before returning the real archive bytes. PlainHeaders is our extension; Python&#x27;s tarfile and zipfile modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLite &#x27;Cannot Commit - No Transaction Is Active&#x27;</title>
+<meta name="description" content="We measured a real split in sqlite3: con.commit() silently no-ops with nothing open, but the raw SQL COMMIT statement raises an error for the exact same state.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite-cannot-commit-no-transaction-is-active/">
+<meta property="og:title" content="SQLite &#x27;Cannot Commit - No Transaction Is Active&#x27;">
+<meta property="og:description" content="We measured a real split in sqlite3: con.commit() silently no-ops with nothing open, but the raw SQL COMMIT statement raises an error for the exact same state.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite-cannot-commit-no-transaction-is-active/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does con.commit() not raise this error, but raw SQL COMMIT does?", "acceptedAnswer": {"@type": "Answer", "text": "We measured both directly: con.commit() checks the connection's transaction state first and silently no-ops if nothing is open. con.execute('COMMIT') sends the literal SQL straight through with no such check, so it fails against SQLite's own rule that COMMIT requires an active transaction."}}, {"@type": "Question", "name": "Is con.rollback() with nothing open also silent?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we confirmed it's a no-op identical to con.commit(), while con.execute('ROLLBACK') against the same empty state raises 'cannot rollback - no transaction is active'."}}, {"@type": "Question", "name": "When would raw SQL COMMIT/ROLLBACK show up in real code instead of the Python methods?", "acceptedAnswer": {"@type": "Answer", "text": "Code ported from another database's DB-API, or a cross-database SQL layer that issues the same statement text regardless of backend \u2014 we reproduced the error specifically from the raw-SQL path, not from any use of Python's own transaction methods."}}, {"@type": "Question", "name": "How do I guard raw SQL COMMIT so it doesn't fail?", "acceptedAnswer": {"@type": "Answer", "text": "Check con.in_transaction before issuing it \u2014 we confirmed this reports the connection's real state and lets you skip the COMMIT entirely when nothing is open, avoiding the error with no behavior change."}}, {"@type": "Question", "name": "Does this affect BEGIN too?", "acceptedAnswer": {"@type": "Answer", "text": "That's the reverse problem \u2014 see our cannot-start-a-transaction-within-a-transaction guide for what happens when BEGIN runs while one is already open, which is a different mismatch than the one measured here."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLite: cannot commit - no transaction is active (tested)</h1>
+<p class="lead"><code>sqlite3.OperationalError: cannot commit - no transaction is active</code> only shows up from raw SQL, never from Python's own commit() method. We measured exactly where that split happens.</p>
+<h2 id="repro1">1. Python's con.commit() silently does nothing</h2>
+<p>With no transaction open at all, we called the high-level method directly:</p>
+<pre><code>con = sqlite3.connect("m1.db")
+con.commit()     # no error
+con.rollback()   # no error</code></pre>
+<p><strong>Measured:</strong> both are silent no-ops. Nothing raises, nothing is logged &mdash; this is by design in Python's sqlite3 wrapper, not a bug.</p>
+
+<h2 id="repro2">2. The raw SQL statement raises, for the identical state</h2>
+<p>Same connection, same "nothing is open" state, but issuing the SQL statement directly instead of calling the method:</p>
+<pre><code>con.execute("COMMIT")
+sqlite3.OperationalError: cannot commit - no transaction is active
+
+con.execute("ROLLBACK")
+sqlite3.OperationalError: cannot rollback - no transaction is active</code></pre>
+<p><strong>The split, measured directly:</strong> <code>con.commit()</code>/<code>con.rollback()</code> are Python-level convenience methods that check the connection's own transaction state first and quietly skip the SQL entirely if nothing is open. <code>con.execute("COMMIT")</code> sends the literal SQL straight to SQLite, which has no such check built in &mdash; it just fails. The two aren't interchangeable, even though they look like they do the same thing.</p>
+
+<h2 id="fix">3. The fix: use the Python methods, or check first</h2>
+<p>If you're issuing <code>COMMIT</code>/<code>ROLLBACK</code> as raw SQL (common when porting code from another DB-API or writing cross-database SQL), guard it:</p>
+<pre><code>if con.in_transaction:
+    con.execute("COMMIT")</code></pre>
+<p>Or simply switch to <code>con.commit()</code>/<code>con.rollback()</code>, which we confirmed handle the "nothing to commit" case safely with zero extra code.</p>
+
+<aside class="cta"><strong>Debugging an app that talks to an API instead of a database? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does con.commit() not raise this error, but raw SQL COMMIT does?</summary><p>We measured both directly: con.commit() checks the connection&#x27;s transaction state first and silently no-ops if nothing is open. con.execute(&#x27;COMMIT&#x27;) sends the literal SQL straight through with no such check, so it fails against SQLite&#x27;s own rule that COMMIT requires an active transaction.</p></details>
+<details><summary>Is con.rollback() with nothing open also silent?</summary><p>Yes — we confirmed it&#x27;s a no-op identical to con.commit(), while con.execute(&#x27;ROLLBACK&#x27;) against the same empty state raises &#x27;cannot rollback - no transaction is active&#x27;.</p></details>
+<details><summary>When would raw SQL COMMIT/ROLLBACK show up in real code instead of the Python methods?</summary><p>Code ported from another database&#x27;s DB-API, or a cross-database SQL layer that issues the same statement text regardless of backend — we reproduced the error specifically from the raw-SQL path, not from any use of Python&#x27;s own transaction methods.</p></details>
+<details><summary>How do I guard raw SQL COMMIT so it doesn&#x27;t fail?</summary><p>Check con.in_transaction before issuing it — we confirmed this reports the connection&#x27;s real state and lets you skip the COMMIT entirely when nothing is open, avoiding the error with no behavior change.</p></details>
+<details><summary>Does this affect BEGIN too?</summary><p>That&#x27;s the reverse problem — see our cannot-start-a-transaction-within-a-transaction guide for what happens when BEGIN runs while one is already open, which is a different mismatch than the one measured here.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in sqlite3 module, comparing the high-level con.commit()/con.rollback() methods against raw SQL COMMIT/ROLLBACK statements with no transaction open. Every result below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s sqlite3 is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Find Broken Links on a Website for Free: wget, a Python Script, and What to Fix</title>
+<meta name="description" content="Check a whole website for broken links for free: a one-line wget spider, a tested Python script that also shows which page links to each broken URL, and how to handle 404s, redirects and false alarms.">
+<link rel="canonical" href="https://honestkit.github.io/guides/find-broken-links-on-website/">
+<meta property="og:title" content="Find Broken Links on a Website for Free: wget, a Python Script, and What to Fix">
+<meta property="og:description" content="Check a whole website for broken links for free: a one-line wget spider, a tested Python script that also shows which page links to each broken URL, and how to handle 404s, redirects and false alarms.">
+<meta property="og:url" content="https://honestkit.github.io/guides/find-broken-links-on-website/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is there a free broken link checker?", "acceptedAnswer": {"@type": "Answer", "text": "Yes: wget --spider for a quick list, or the Python script on this page, which also shows the page each broken link is on. Both are free and run on your own computer."}}, {"@type": "Question", "name": "Why does a link work in my browser but show as broken?", "acceptedAnswer": {"@type": "Answer", "text": "Many sites block scripts and crawlers with 403 or 429 responses. Treat those as 'check by hand', not as broken."}}, {"@type": "Question", "name": "Should I redirect or remove broken internal links?", "acceptedAnswer": {"@type": "Answer", "text": "Fix the link itself where you can. Add a 301 redirect when the old URL has backlinks or bookmarks."}}, {"@type": "Question", "name": "How often should I check for broken links?", "acceptedAnswer": {"@type": "Answer", "text": "After every site migration or URL change, and monthly for sites that link out a lot, since other sites move pages without notice."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to find broken links on a website (free)</h1>
+<p class="lead">Broken links frustrate visitors and waste crawl budget. Here are two free ways to find all of them, plus how to tell real breakage from false alarms.</p>
+<h2>1. One command: wget spider (Linux, macOS with Homebrew wget)</h2>
+<pre><code>wget --spider -r -l 5 -nd -nv -o spider.log https://example.com/
+tail -n 20 spider.log</code></pre>
+<p>wget follows links on the same site up to 5 levels deep without saving pages. At the end of the log it prints <code>Found N broken links.</code> and the list. It does not say <em>which page</em> contains each broken link, and it does not check links to other sites (adding <code>-H</code> would make it crawl those sites too).</p>
+<h2>2. Python script: broken links with the page they are on</h2>
+<p>Standard library only. It crawls pages on your host, checks every link it finds (including links to other sites, which it checks but does not crawl) and prints each broken URL with the pages that link to it. Run it as <code>python3 broken.py https://example.com/</code>.</p>
+<pre><code>import sys, time, urllib.error, urllib.parse, urllib.request
+from html.parser import HTMLParser
+
+START = sys.argv[1]  # e.g. https://example.com/
+HOST = urllib.parse.urlsplit(START).netloc
+MAX_PAGES = 500
+
+class Links(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.hrefs = []
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.hrefs += [v for k, v in attrs if k == "href" and v]
+
+def status(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (link check)"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, r.headers.get("Content-Type", ""), r.read() if r.status == 200 else b""
+    except urllib.error.HTTPError as e:
+        return e.code, "", b""
+    except Exception as e:
+        return type(e).__name__, "", b""
+
+linked_from, queue, seen, broken = {}, [START], {START}, {}
+while queue and len(seen) &lt;= MAX_PAGES:
+    page = queue.pop(0)
+    code, ctype, body = status(page)
+    if code != 200:
+        broken[page] = code
+        continue
+    if "html" not in ctype or urllib.parse.urlsplit(page).netloc != HOST:
+        continue  # external links are checked, not crawled
+    parser = Links(); parser.feed(body.decode("utf-8", "replace"))
+    for href in parser.hrefs:
+        url = urllib.parse.urldefrag(urllib.parse.urljoin(page, href))[0]
+        if not url.startswith("http"):
+            continue  # mailto:, tel:, javascript:
+        linked_from.setdefault(url, set()).add(page)
+        if url not in seen:
+            seen.add(url); queue.append(url)
+    time.sleep(0.3)
+
+for url, code in broken.items():
+    print(code, url, "&lt;- linked from", ", ".join(sorted(linked_from.get(url, ["(start)"]))))</code></pre>
+<p>On sitemaps.org it finished in about 20 seconds and found one dead link: the FAQ links to <code>asg.web.cmu.edu</code>, a host that no longer exists (<code>URLError</code> = the request failed before any HTTP status, here a DNS failure). Redirects are followed, so a redirected link counts as working; raise <code>MAX_PAGES</code> for bigger sites and keep the pause between requests.</p>
+<h2>3. What to do with each result</h2>
+<ul><li><strong>404 / 410 on your own site:</strong> fix the link on every page listed, or add a 301 redirect from the old URL to its replacement.</li>
+<li><strong>404 on another site:</strong> link to the page's new address, an archived copy, or remove the link.</li>
+<li><strong>URLError / timeout:</strong> the host is down or gone. Retry later before removing the link.</li>
+<li><strong>403 or 429:</strong> often bot protection or rate limiting, not a broken page. Open the link in a browser before changing anything.</li></ul>
+<h2>One page only</h2>
+<p>To list the links of a single page first, see <a href="/guides/extract-all-links-from-web-page/">how to extract all links from a web page</a>.</p>
+<h2>Whole site, with an SEO report</h2>
+<p>Our <a href="/apify/website-seo-audit/">SEO Audit Crawler &amp; Broken Link Checker on Apify</a> crawls your site and lists broken internal links with up to 20 pages that link to each, next to 25+ on-page checks (titles, meta descriptions, canonical, noindex, duplicates), as CSV, Excel or JSON. Billed per audited page. It checks links within your site, not links to other sites: use the script above for those.</p>
+<aside class="cta"><strong>Need it in bulk?</strong> <a href="/apify/website-seo-audit/">SEO Audit Crawler &amp; Broken Link Checker – Website Health</a> (hosted, pay per result)</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is there a free broken link checker?</summary><p>Yes: wget --spider for a quick list, or the Python script on this page, which also shows the page each broken link is on. Both are free and run on your own computer.</p></details>
+<details><summary>Why does a link work in my browser but show as broken?</summary><p>Many sites block scripts and crawlers with 403 or 429 responses. Treat those as &#x27;check by hand&#x27;, not as broken.</p></details>
+<details><summary>Should I redirect or remove broken internal links?</summary><p>Fix the link itself where you can. Add a 301 redirect when the old URL has backlinks or bookmarks.</p></details>
+<details><summary>How often should I check for broken links?</summary><p>After every site migration or URL change, and monthly for sites that link out a lot, since other sites move pages without notice.</p></details>
+</section>
+<p class="note">Written with AI assistance. The wget command and the Python script were run on 2026-10-01 against a local test site with two planted broken links (both found) and against sitemaps.org (one dead external link found and confirmed with curl). The Apify tool is ours; the APIs are free to call directly.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

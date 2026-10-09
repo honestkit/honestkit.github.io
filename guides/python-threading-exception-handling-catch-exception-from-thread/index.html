@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python Threading Exception Handling: Catch Errors, Tested</title>
+<meta name="description" content="We measured Python thread exceptions: join() doesn&#x27;t raise and the exit code stays 0, threading.excepthook, future.result(), and map() losing results.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-threading-exception-handling-catch-exception-from-thread/">
+<meta property="og:title" content="Python Threading Exception Handling: Catch Errors, Tested">
+<meta property="og:description" content="We measured Python thread exceptions: join() doesn&#x27;t raise and the exit code stays 0, threading.excepthook, future.result(), and map() losing results.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-threading-exception-handling-catch-exception-from-thread/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I catch an exception from a thread in Python?", "acceptedAnswer": {"@type": "Answer", "text": "You can't with try/except around join(): we measured join() returning normally after the thread raised. Use threading.excepthook, or ThreadPoolExecutor and future.result(), which re-raises it."}}, {"@type": "Question", "name": "Why does my script exit with code 0 when a thread crashed?", "acceptedAnswer": {"@type": "Answer", "text": "An uncaught exception in a thread only prints a traceback. We measured exit status 0 after a thread raised ValueError on Python 3.13.5."}}, {"@type": "Question", "name": "What is threading.excepthook?", "acceptedAnswer": {"@type": "Answer", "text": "A function Python calls for every uncaught exception in a thread, with the thread, type and value. We measured a custom hook collecting the error from one of four threads."}}, {"@type": "Question", "name": "Does ThreadPoolExecutor swallow exceptions?", "acceptedAnswer": {"@type": "Answer", "text": "Only if you never call result(). We measured result() re-raising the worker's ValueError, and an unchecked future's exception producing no output at all."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python threading exception handling (tested)</h1>
+<p class="lead">An exception inside a Python thread doesn't propagate to the code that started it. We measured what actually happens on Python 3.13.5 and the three ways to get the error back: <code>threading.excepthook</code>, <code>future.result()</code> and <code>map()</code>.</p>
+<h2 id="join">1. An exception in a Thread doesn't reach the main thread</h2>
+<pre><code>import threading
+def work():
+    raise ValueError(&quot;bad row 42&quot;)
+t = threading.Thread(target=work)
+try:
+    t.start()
+    t.join()
+    print(&quot;join() returned normally; the main thread never saw the error&quot;)
+except ValueError:
+    print(&quot;caught in main&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>Exception in thread Thread-1 (work):
+Traceback (most recent call last):
+  File &quot;/usr/lib/python3.13/threading.py&quot;, line 1043, in _bootstrap_inner
+    self.run()
+    ~~~~~~~~^^
+  File &quot;/usr/lib/python3.13/threading.py&quot;, line 994, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File &quot;/tmp/th/b1.py&quot;, line 3, in work
+    raise ValueError(&quot;bad row 42&quot;)
+ValueError: bad row 42
+join() returned normally; the main thread never saw the error</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> the thread prints its traceback to stderr and dies, but <code>join()</code> returns normally and the <code>except</code> around it never runs. The script then exited with status 0, so a cron job or CI step would report success.</p>
+
+<h2 id="excepthook">2. threading.excepthook: collect errors from every thread</h2>
+<pre><code>import threading
+errors = []
+def hook(args):
+    errors.append((args.thread.name, args.exc_type.__name__, str(args.exc_value)))
+threading.excepthook = hook
+def work(n):
+    if n == 2:
+        raise ValueError(f&quot;bad row {n}&quot;)
+threads = [threading.Thread(target=work, args=(n,), name=f&quot;w{n}&quot;) for n in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(&quot;errors collected:&quot;, errors)</code></pre>
+<p>Output:</p>
+<pre><code>errors collected: [(&#x27;w2&#x27;, &#x27;ValueError&#x27;, &#x27;bad row 2&#x27;)]</code></pre>
+<p><strong>Measured:</strong> <code>threading.excepthook</code> (Python 3.8+) is called with the thread, exception type and value for every uncaught exception in a thread. Replacing it lets you log the errors or record them and fail the program at the end. It replaces the default traceback printing, so log the traceback yourself if you want it.</p>
+
+<h2 id="futures">3. ThreadPoolExecutor: result() re-raises, but only if you call it</h2>
+<pre><code>from concurrent.futures import ThreadPoolExecutor
+def work(n):
+    if n == 2:
+        raise ValueError(f&quot;bad row {n}&quot;)
+    return n * 10
+with ThreadPoolExecutor(4) as pool:
+    futures = [pool.submit(work, n) for n in range(4)]
+    for n, f in enumerate(futures):
+        try:
+            print(n, &quot;-&gt;&quot;, f.result())        # re-raises the worker&#x27;s exception here
+        except ValueError as e:
+            print(n, &quot;-&gt; ValueError:&quot;, e)
+with ThreadPoolExecutor(4) as pool:
+    pool.submit(work, 2)                       # result() never called
+print(&quot;an unchecked future&#x27;s exception is silently dropped&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>0 -&gt; 0
+1 -&gt; 10
+2 -&gt; ValueError: bad row 2
+3 -&gt; 30
+an unchecked future&#x27;s exception is silently dropped</code></pre>
+<p><strong>Measured:</strong> with <code>concurrent.futures</code>, the worker's exception is stored in the future and re-raised by <code>f.result()</code>, so you can catch it in the calling thread like a normal exception. If nobody calls <code>result()</code>, the exception is dropped without any output at all, which is worse than plain threads.</p>
+
+<h2 id="map">4. pool.map() stops at the first error</h2>
+<pre><code>from concurrent.futures import ThreadPoolExecutor
+def work(n):
+    if n == 2:
+        raise ValueError(f&quot;bad row {n}&quot;)
+    return n * 10
+with ThreadPoolExecutor(4) as pool:
+    try:
+        print(list(pool.map(work, range(4))))
+    except ValueError as e:
+        print(&quot;map() raised:&quot;, e, &quot;- and the results for 0 and 1 are lost&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>map() raised: bad row 2 - and the results for 0 and 1 are lost</code></pre>
+<p><strong>Measured:</strong> <code>map()</code> re-raises the first exception as you iterate, and the successful results collected so far are lost with it. If you need every result plus every error, use <code>submit()</code> and check each future as in section 3. For handling Ctrl+C with threads, see our <a href="/guides/python-keyboardinterrupt-not-working-ctrl-c/">KeyboardInterrupt guide</a>.</p>
+
+<aside class="cta"><strong>Threads fetching URLs and failing quietly? Check the status and headers each server really returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I catch an exception from a thread in Python?</summary><p>You can&#x27;t with try/except around join(): we measured join() returning normally after the thread raised. Use threading.excepthook, or ThreadPoolExecutor and future.result(), which re-raises it.</p></details>
+<details><summary>Why does my script exit with code 0 when a thread crashed?</summary><p>An uncaught exception in a thread only prints a traceback. We measured exit status 0 after a thread raised ValueError on Python 3.13.5.</p></details>
+<details><summary>What is threading.excepthook?</summary><p>A function Python calls for every uncaught exception in a thread, with the thread, type and value. We measured a custom hook collecting the error from one of four threads.</p></details>
+<details><summary>Does ThreadPoolExecutor swallow exceptions?</summary><p>Only if you never call result(). We measured result() re-raising the worker&#x27;s ValueError, and an unchecked future&#x27;s exception producing no output at all.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5: a raising Thread with join() and its exit status, a custom threading.excepthook, ThreadPoolExecutor submit/result with and without result(), and pool.map with one failing item. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

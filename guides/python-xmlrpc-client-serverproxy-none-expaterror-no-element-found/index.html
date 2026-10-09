@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xmlrpc.client ExpatError: no element found on a Valid Reply</title>
+<meta name="description" content="We measured Python 3.13.5: one transient None mid-body makes ServerProxy raise ExpatError &quot;no element found: line 1, column 0&quot; on a valid XML-RPC reply.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-xmlrpc-client-serverproxy-none-expaterror-no-element-found/">
+<meta property="og:title" content="xmlrpc.client ExpatError: no element found on a Valid Reply">
+<meta property="og:description" content="We measured Python 3.13.5: one transient None mid-body makes ServerProxy raise ExpatError &quot;no element found: line 1, column 0&quot; on a valid XML-RPC reply.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-xmlrpc-client-serverproxy-none-expaterror-no-element-found/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does a normal ServerProxy over a real TCP socket hit this?", "acceptedAnswer": {"@type": "Answer", "text": "Not with the default setup: Transport opens ordinary blocking sockets, and a blocking socket never returns None. You hit it when the socket or the stream that makefile() returns is non-blocking -- for example a custom Transport, an event-loop integration, or a wrapper socket that reports 'no data yet' as None."}}, {"@type": "Question", "name": "Is the server sending bad XML?", "acceptedAnswer": {"@type": "Answer", "text": "No. In this repro the server reply is a complete, valid methodResponse with a correct Content-Length. 'no element found: line 1, column 0' means the parser received zero bytes, which here comes from the client loop stopping early, not from the server."}}, {"@type": "Question", "name": "Can I catch ExpatError and retry the parse?", "acceptedAnswer": {"@type": "Answer", "text": "No. By the time ExpatError is raised, HTTPResponse.read() has already closed the connection and the body is lost. You can only retry the whole request, or fix the stream so it never hands None to http.client."}}, {"@type": "Question", "name": "Does gzip-encoded XML-RPC behave differently?", "acceptedAnswer": {"@type": "Answer", "text": "With Content-Encoding: gzip, parse_response wraps the response in GzipDecodedResponse before the same while loop; we only measured the uncompressed path shown here, so test the gzip path yourself before relying on it."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- same family as json.load(), configparser.read_file(), http.server and others: a correctly-returned non-blocking None is treated as end-of-data one layer above io. This one surfaces as an XML parse error, which points debugging at the server instead of the client's socket."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>xmlrpc.client ExpatError &quot;no element found&quot; on a Valid Response (tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> -- distinct from the empty read that means real end-of-stream. We measured that <code>xmlrpc.client.Transport.parse_response()</code> reads the body with <code>while data := stream.read(1024):</code>, and the underlying <code>http.client.HTTPResponse.read(1024)</code> returns that <code>None</code> (and closes the connection). <code>None</code> is falsy, so the loop ends before feeding a single byte to the XML parser, and <code>p.close()</code> raises <code>ExpatError: no element found: line 1, column 0</code>. The error blames the server's XML, but the server sent a complete, valid reply. Nothing in it mentions sockets, reads, or retries.</p>
+<h2 id="repro1">1. A valid XML-RPC reply behind one transient None</h2>
+<pre><code>import http.client, io, xmlrpc.client
+
+class FlakyRaw(io.RawIOBase):
+    """Sends headers cleanly, then one transient None mid-body, then the body."""
+    def __init__(self, header_bytes, body_bytes):
+        self.header_bytes, self.body_bytes, self.stage = header_bytes, body_bytes, 0
+    def readable(self):
+        return True
+    def readinto(self, b):
+        if self.stage == 0:
+            n = len(self.header_bytes)
+            b[:n] = self.header_bytes
+            self.stage = 1
+            return n
+        if self.stage == 1:
+            self.stage = 2
+            return None            # transient: no data ready yet
+        if self.stage == 2:
+            n = len(self.body_bytes)
+            b[:n] = self.body_bytes
+            self.stage = 3
+            return n               # the real, complete XML body
+        return 0                   # real EOF after that
+
+class FakeSocket:
+    def __init__(self, raw):
+        self.raw = raw
+    def makefile(self, mode, *a, **kw):
+        return io.BufferedReader(self.raw)
+    def close(self):
+        pass
+    def sendall(self, data):
+        pass
+
+body = xmlrpc.client.dumps((42,), methodresponse=True).encode()
+headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: %d\r\n\r\n" % len(body)
+
+class FlakyTransport(xmlrpc.client.Transport):
+    def make_connection(self, host):
+        c = http.client.HTTPConnection(host)
+        c.sock = FakeSocket(FlakyRaw(headers, body))
+        self._connection = host, c
+        return c
+
+proxy = xmlrpc.client.ServerProxy("http://example.com/RPC2", transport=FlakyTransport())
+try:
+    print(proxy.add(40, 2))
+except Exception as e:
+    print(type(e).__module__, type(e).__name__, e)</code></pre>
+<pre><code>xml.parsers.expat ExpatError no element found: line 1, column 0</code></pre>
+<p><strong>Measured:</strong> the reply is a valid <code>methodResponse</code> carrying <code>42</code>, with a correct <code>Content-Length</code>, one read away. <code>ServerProxy</code> raised <code>ExpatError: no element found: line 1, column 0</code> -- the message you would get if the server had sent an empty body. Line 1, column 0 means the parser was never fed anything.</p>
+
+<h2 id="why">2. Why: a truthy while loop over a read that can return None</h2>
+<p>The relevant part of the printed source:</p>
+<pre><code>import inspect, xmlrpc.client
+print(inspect.getsource(xmlrpc.client.Transport.parse_response))</code></pre>
+<pre><code>        p, u = self.getparser()
+
+        while data := stream.read(1024):
+            if self.verbose:
+                print("body:", repr(data))
+            p.feed(data)
+
+        if stream is not response:
+            stream.close()
+        p.close()
+
+        return u.close()</code></pre>
+<p><code>stream</code> is the <code>http.client.HTTPResponse</code>. Its <code>read(1024)</code> returns <code>None</code> on the transient read and closes the connection as a side effect (see the linked <code>HTTPResponse.read()</code> guide). <code>while data := ...</code> treats <code>None</code> exactly like end-of-body, so the parser is closed with zero bytes fed. The real body is gone by then, so catching <code>ExpatError</code> and retrying the parse cannot recover it -- only a fresh request can.</p>
+
+<h2 id="fix">3. The fix: stop the None below http.client</h2>
+<pre><code>class RetryOnNone(io.RawIOBase):
+    """Wraps a non-blocking raw stream; turns None into 'wait and retry'."""
+    def __init__(self, raw):
+        self.raw = raw
+    def readable(self):
+        return True
+    def readinto(self, b):
+        while True:
+            n = self.raw.readinto(b)
+            if n is not None:
+                return n
+            # real code: wait for readability here (e.g. selectors) instead of spinning
+
+class FixedSocket(FakeSocket):
+    def makefile(self, mode, *a, **kw):
+        return io.BufferedReader(RetryOnNone(self.raw))
+
+class FixedTransport(xmlrpc.client.Transport):
+    def make_connection(self, host):
+        c = http.client.HTTPConnection(host)
+        c.sock = FixedSocket(FlakyRaw(headers, body))
+        self._connection = host, c
+        return c
+
+proxy = xmlrpc.client.ServerProxy("http://example.com/RPC2", transport=FixedTransport())
+print("fixed:", proxy.add(40, 2))</code></pre>
+<pre><code>fixed: 42</code></pre>
+<p><strong>Measured:</strong> same flaky stream, same reply, and the call returns <code>42</code>. The retry has to live in the raw stream that <code>makefile()</code> hands to <code>http.client</code>, because once a <code>None</code> reaches <code>HTTPResponse.read()</code> the connection is already closed. Simpler still: if you control the socket, keep it in blocking mode (or use <code>settimeout()</code>) for XML-RPC, since a blocking socket never returns <code>None</code>.</p>
+<p>Related: <a href="/guides/python-http-client-httpresponse-read-none-unrecoverable-close/">http.client.HTTPResponse.read() permanently closes the connection on None</a>.</p>
+<aside class="cta"><strong>Calling an XML-RPC server with xmlrpc.client.ServerProxy over a non-blocking socket? A transient None makes a perfectly valid response fail as malformed XML:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does a normal ServerProxy over a real TCP socket hit this?</summary><p>Not with the default setup: Transport opens ordinary blocking sockets, and a blocking socket never returns None. You hit it when the socket or the stream that makefile() returns is non-blocking -- for example a custom Transport, an event-loop integration, or a wrapper socket that reports &#x27;no data yet&#x27; as None.</p></details>
+<details><summary>Is the server sending bad XML?</summary><p>No. In this repro the server reply is a complete, valid methodResponse with a correct Content-Length. &#x27;no element found: line 1, column 0&#x27; means the parser received zero bytes, which here comes from the client loop stopping early, not from the server.</p></details>
+<details><summary>Can I catch ExpatError and retry the parse?</summary><p>No. By the time ExpatError is raised, HTTPResponse.read() has already closed the connection and the body is lost. You can only retry the whole request, or fix the stream so it never hands None to http.client.</p></details>
+<details><summary>Does gzip-encoded XML-RPC behave differently?</summary><p>With Content-Encoding: gzip, parse_response wraps the response in GzipDecodedResponse before the same while loop; we only measured the uncompressed path shown here, so test the gzip path yourself before relying on it.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>Yes -- same family as json.load(), configparser.read_file(), http.server and others: a correctly-returned non-blocking None is treated as end-of-data one layer above io. This one surfaces as an XML parse error, which points debugging at the server instead of the client&#x27;s socket.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in xmlrpc.client.ServerProxy and Transport, calling a method whose server reply is a complete, valid XML-RPC methodResponse with a correct Content-Length, through a custom non-blocking socket whose underlying stream returns None once, mid-body, before the real bytes. PlainHeaders is our extension; Python&#x27;s xmlrpc.client, http.client and io modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

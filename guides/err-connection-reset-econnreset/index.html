@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ERR_CONNECTION_RESET and ECONNRESET: What Each Client Says (Tested)</title>
+<meta name="description" content="We made a server reset the connection and recorded the exact error from Chrome, curl, Node.js fetch and Python. RST vs FIN, reset before and after headers, and the usual causes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-connection-reset-econnreset/">
+<meta property="og:title" content="ERR_CONNECTION_RESET and ECONNRESET: What Each Client Says (Tested)">
+<meta property="og:description" content="We made a server reset the connection and recorded the exact error from Chrome, curl, Node.js fetch and Python. RST vs FIN, reset before and after headers, and the usual causes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-connection-reset-econnreset/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between ERR_CONNECTION_RESET and ERR_EMPTY_RESPONSE?", "acceptedAnswer": {"@type": "Answer", "text": "In our test, Chromium showed ERR_CONNECTION_RESET when the server sent a TCP RST, and ERR_EMPTY_RESPONSE when the server closed normally (FIN) without sending anything. curl showed exit 56 and exit 52 for the same two cases."}}, {"@type": "Question", "name": "Why does Node.js fetch just say 'fetch failed'?", "acceptedAnswer": {"@type": "Answer", "text": "The real reason is in err.cause. For a reset we saw cause code ECONNRESET with message 'read ECONNRESET'. For a clean close it was UND_ERR_SOCKET with 'other side closed'. Log err.cause.code."}}, {"@type": "Question", "name": "Can I get a 200 status and still get ECONNRESET?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. When the server reset after sending headers, Node.js fetch and Python urllib both returned status 200. The error came only when reading the body: 'TypeError: terminated' (cause ECONNRESET) in Node.js and ConnectionResetError in Python."}}, {"@type": "Question", "name": "What is the most common cause of ECONNRESET in Node.js servers?", "acceptedAnswer": {"@type": "Answer", "text": "A keep-alive race: the server closes an idle connection just as the client reuses it. Make the server's keepAliveTimeout longer than the client's or load balancer's idle timeout. See our Keep-Alive guide."}}, {"@type": "Question", "name": "Does netsh winsock reset fix ERR_CONNECTION_RESET?", "acceptedAnswer": {"@type": "Answer", "text": "Sometimes, on Windows, when other software has changed network settings. We did not test it. Try it after ruling out antivirus, VPN and proxy, and after checking the site works from another device."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ERR_CONNECTION_RESET / ECONNRESET (tested)</h1>
+<p class="lead"><code>ERR_CONNECTION_RESET</code> (Chrome) and <code>ECONNRESET</code> (Node.js) both mean the other side sent a TCP RST: it killed the connection instead of closing it politely. We triggered resets on purpose and wrote down what every client printed.</p>
+<h2>1. What a reset is</h2>
+<p>A TCP connection can end two ways. A FIN is a normal close: "I am done sending." A RST is an abort: "this connection is gone, drop everything." Clients report the two very differently. A reset can come from the server, or from anything in the middle: a proxy, a load balancer, a firewall, antivirus, or a VPN.</p>
+<h2>2. Our test server</h2>
+<p>We ran three tiny Node.js 24 servers on localhost. Each waits for the request bytes, then misbehaves:</p>
+<pre><code>const net = require('net');
+function mk(port, fn) {
+  net.createServer(s =&gt; { s.once('data', () =&gt; fn(s)); s.on('error', () =&gt; {}); })
+     .listen(port, '127.0.0.1');
+}
+// A: RST before any response
+mk(8993, s =&gt; s.resetAndDestroy());
+// B: FIN before any response
+mk(8994, s =&gt; s.destroy());
+// C: headers + 1000 of 100000 body bytes, then RST
+mk(8995, s =&gt; {
+  s.write('HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n' + 'x'.repeat(1000));
+  setTimeout(() =&gt; s.resetAndDestroy(), 200);
+});</code></pre>
+<p><code>socket.resetAndDestroy()</code> sends a RST. <code>socket.destroy()</code> sends a FIN.</p>
+<h2>3. RST vs FIN before any response</h2>
+<table>
+<tr><th>Client</th><th>RST (resetAndDestroy)</th><th>FIN (destroy)</th></tr>
+<tr><td>Chromium 153 (page.goto)</td><td><code>net::ERR_CONNECTION_RESET</code></td><td><code>net::ERR_EMPTY_RESPONSE</code></td></tr>
+<tr><td>curl 8.14.1</td><td><code>curl: (56) Recv failure: Connection reset by peer</code></td><td><code>curl: (52) Empty reply from server</code></td></tr>
+<tr><td>Node.js 24 fetch</td><td><code>TypeError: fetch failed</code>, cause <code>ECONNRESET</code> (<code>read ECONNRESET</code>)</td><td><code>TypeError: fetch failed</code>, cause <code>UND_ERR_SOCKET</code> (<code>other side closed</code>)</td></tr>
+<tr><td>Python 3.13 urllib</td><td><code>ConnectionResetError: [Errno 104] Connection reset by peer</code></td><td><code>RemoteDisconnected: Remote end closed connection without response</code></td></tr>
+</table>
+<p>So the word "reset" only shows up for a real RST. If you see "empty reply" or "other side closed", the server closed cleanly without answering. That is a different bug, often a crash or a timeout in the app.</p>
+<p>In Node.js, the useful part is in <code>err.cause</code>. The top-level message is just <code>fetch failed</code> in both cases. Log <code>err.cause.code</code>.</p>
+<h2>4. RST in the middle of the body</h2>
+<p>Server C sent a 200 status and headers, then 1000 of the promised 100000 bytes, then a RST.</p>
+<table>
+<tr><th>Client</th><th>What happened</th></tr>
+<tr><td>Chromium 153</td><td>Request failed with <code>net::ERR_CONNECTION_RESET</code>. page.goto did not return a response: once it said <code>Navigation ... is interrupted by another navigation to "chrome-error://chromewebdata/"</code>, once it timed out.</td></tr>
+<tr><td>curl 8.14.1</td><td><code>curl: (56) Recv failure: Connection reset by peer</code> (same code as before headers)</td></tr>
+<tr><td>Node.js 24 fetch</td><td><code>fetch()</code> resolved with status 200. Reading the body threw <code>TypeError: terminated</code>, cause <code>ECONNRESET</code>.</td></tr>
+<tr><td>Python 3.13 urllib</td><td><code>urlopen()</code> returned status 200. <code>read()</code> raised <code>ConnectionResetError: [Errno 104] Connection reset by peer</code>.</td></tr>
+</table>
+<p>The trap: in Node.js and Python, the status check passes. The error only appears when you read the body. Wrap the body read in your error handling and retry logic, not just the request.</p>
+<h2>5. The classic Node.js cause: keep-alive race</h2>
+<p>A very common ECONNRESET in Node.js services comes from connection reuse. The server closes an idle keep-alive connection at the same moment the client sends a new request on it. The client gets a reset or a closed socket. The fix is to make the server's idle timeout longer than the client's (or the load balancer's). We measured this in the <a href="/guides/keep-alive-header-connection/">Keep-Alive and Connection header guide</a>. If a proxy sits between them, the same race shows up as a <a href="/guides/502-bad-gateway/">502 Bad Gateway</a>.</p>
+<h2>6. Server closing on a too-large request</h2>
+<p>Some servers and proxies give up on a request that is too big and close the connection instead of sending a full error response. Then the client sees a reset where you expected a status code. Check request size limits: see <a href="/guides/431-request-header-fields-too-large/">431 Request Header Fields Too Large</a> for big headers or cookies, and <a href="/guides/413-request-entity-too-large/">413 Request Entity Too Large</a> for big uploads.</p>
+<h2>7. Causes outside your code (not tested)</h2>
+<p>These come from vendor docs and common troubleshooting, not from our run:</p>
+<ul>
+<li><strong>Antivirus or firewall</strong> with HTTPS or web scanning can reset connections it does not like. Try disabling it for one test.</li>
+<li><strong>VPN or corporate proxy</strong> can reset connections to blocked hosts. Try without it, or from another network.</li>
+<li><strong>Windows network stack</strong>: Microsoft documents <code>netsh winsock reset</code> (run as admin, then reboot) to reset Winsock settings that third-party software may have changed.</li>
+<li><strong>MTU problems</strong>: small requests work, large ones hang or reset, often on VPNs or PPPoE links.</li>
+<li><strong>ISP or national filtering</strong> can inject resets for certain sites. Changing network is the quick test.</li>
+</ul>
+<h2>8. How to narrow it down</h2>
+<ol>
+<li>Run <code>curl -v</code> against the same URL. Exit 56 means reset; exit 52 means clean close with no reply.</li>
+<li>Try from another network. If the error goes away, look at the network path, not the server.</li>
+<li>Hit the server directly, skipping the proxy or CDN. If that works, the proxy is the one resetting.</li>
+<li>Check server logs at the exact time. A crash, a timeout, or a size limit usually shows up there.</li>
+</ol>
+<aside class="cta"><strong>Check the response headers your server actually sends before it drops the connection:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between ERR_CONNECTION_RESET and ERR_EMPTY_RESPONSE?</summary><p>In our test, Chromium showed ERR_CONNECTION_RESET when the server sent a TCP RST, and ERR_EMPTY_RESPONSE when the server closed normally (FIN) without sending anything. curl showed exit 56 and exit 52 for the same two cases.</p></details>
+<details><summary>Why does Node.js fetch just say &#x27;fetch failed&#x27;?</summary><p>The real reason is in err.cause. For a reset we saw cause code ECONNRESET with message &#x27;read ECONNRESET&#x27;. For a clean close it was UND_ERR_SOCKET with &#x27;other side closed&#x27;. Log err.cause.code.</p></details>
+<details><summary>Can I get a 200 status and still get ECONNRESET?</summary><p>Yes. When the server reset after sending headers, Node.js fetch and Python urllib both returned status 200. The error came only when reading the body: &#x27;TypeError: terminated&#x27; (cause ECONNRESET) in Node.js and ConnectionResetError in Python.</p></details>
+<details><summary>What is the most common cause of ECONNRESET in Node.js servers?</summary><p>A keep-alive race: the server closes an idle connection just as the client reuses it. Make the server&#x27;s keepAliveTimeout longer than the client&#x27;s or load balancer&#x27;s idle timeout. See our Keep-Alive guide.</p></details>
+<details><summary>Does netsh winsock reset fix ERR_CONNECTION_RESET?</summary><p>Sometimes, on Windows, when other software has changed network settings. We did not test it. Try it after ruling out antivirus, VPN and proxy, and after checking the site works from another device.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153 (Playwright 1.63), curl 8.14.1, Node.js 24.21.0 fetch and Python 3.13.5 urllib against a tiny Node.js server that sent a TCP RST (socket.resetAndDestroy()) or a plain FIN (socket.destroy()). PlainHeaders is our extension; Chromium, curl, Node.js and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

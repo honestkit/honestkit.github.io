@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ValueError: math domain error in Python &amp;mdash; Causes, Tested</title>
+<meta name="description" content="We measured which math calls raise math domain error (sqrt, log, acos, pow), the float rounding case that hits acos at 1.0000000000000002, and fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-valueerror-math-domain-error/">
+<meta property="og:title" content="ValueError: math domain error in Python &amp;mdash; Causes, Tested">
+<meta property="og:description" content="We measured which math calls raise math domain error (sqrt, log, acos, pow), the float rounding case that hits acos at 1.0000000000000002, and fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-valueerror-math-domain-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes ValueError: math domain error?", "acceptedAnswer": {"@type": "Answer", "text": "A math function got an input where no real result exists. We measured it from math.sqrt(-1), math.log(0), math.log(-5), math.log10(0), math.acos(1.0000000000000002), math.asin(-1.5), math.pow(-8, 1/3) and math.atanh(1)."}}, {"@type": "Question", "name": "Why does math.acos fail when the value should be 1?", "acceptedAnswer": {"@type": "Answer", "text": "Float rounding. We measured the cosine of a vector with itself coming out as 1.0000000000000002, which acos rejects. Clamp with max(-1.0, min(1.0, x)) before calling it."}}, {"@type": "Question", "name": "How do I take the square root of a negative number in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Use cmath.sqrt(), which returns a complex number; we measured cmath.sqrt(-1) giving 1j."}}, {"@type": "Question", "name": "Why does (-8) ** (1/3) not return -2?", "acceptedAnswer": {"@type": "Answer", "text": "With a negative base and fractional exponent, ** returns a complex number instead of raising; we measured 1.0000000000000002+1.7320508075688772j. Use math.cbrt(-8) on Python 3.11+, which returned -2.0."}}, {"@type": "Question", "name": "Does math.log(0) return -inf?", "acceptedAnswer": {"@type": "Answer", "text": "No, math.log(0) raises ValueError: math domain error. Check for zero before the call."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ValueError: math domain error (tested)</h1>
+<p class="lead"><code>ValueError: math domain error</code> means a <code>math</code> function got an input with no real-number answer. We ran every common trigger on Python 3.13.5, including the one that catches careful code: a value that should be exactly 1 but rounds to just above it.</p>
+<h2 id="which">1. Which calls raise it</h2>
+<pre><code>import math
+
+for expr in [&quot;math.sqrt(-1)&quot;, &quot;math.log(0)&quot;, &quot;math.log(-5)&quot;, &quot;math.log10(0)&quot;,
+             &quot;math.acos(1.0000000000000002)&quot;, &quot;math.asin(-1.5)&quot;,
+             &quot;math.pow(-8, 1/3)&quot;, &quot;math.atanh(1)&quot;, &quot;math.sqrt(-0.0)&quot;]:
+    try:
+        print(f&quot;{expr} = {eval(expr)!r}&quot;)
+    except ValueError as e:
+        print(f&quot;{expr}: {e}&quot;)</code></pre>
+<pre><code>math.sqrt(-1): math domain error
+math.log(0): math domain error
+math.log(-5): math domain error
+math.log10(0): math domain error
+math.acos(1.0000000000000002): math domain error
+math.asin(-1.5): math domain error
+math.pow(-8, 1/3): math domain error
+math.atanh(1): math domain error
+math.sqrt(-0.0) = -0.0</code></pre>
+<p><strong>Measured:</strong> every one of these gives the identical message, <code>math domain error</code>, with no hint of which argument was bad, so in a long formula add a check or print before each call. The rule is the same in each case: the real-number result doesn't exist. <code>sqrt</code> of a negative, <code>log</code>/<code>log10</code> of zero or a negative, <code>acos</code>/<code>asin</code> outside [-1, 1], <code>atanh</code> at &plusmn;1, and <code>math.pow</code> of a negative base with a fractional exponent. <code>math.sqrt(-0.0)</code> is fine and returns <code>-0.0</code>.</p>
+
+<h2 id="rounding">2. The one that surprises people: float rounding just past 1</h2>
+<pre><code>import math
+
+a = [0.1, 0.2, 1.1]
+b = [0.1, 0.2, 1.1]   # same vector: the angle should be 0
+dot = sum(x * y for x, y in zip(a, b))
+norm = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
+cos = dot / norm
+print(repr(cos))
+try:
+    print(math.acos(cos))
+except ValueError as e:
+    print(&quot;acos:&quot;, e)
+print(math.acos(max(-1.0, min(1.0, cos))))</code></pre>
+<pre><code>1.0000000000000002
+acos: math domain error
+0.0</code></pre>
+<p><strong>Measured:</strong> the cosine of a vector with itself should be exactly 1.0, but floating-point rounding produced <code>1.0000000000000002</code> and <code>acos</code> refused it. This is the usual cause in cosine similarity, angle between vectors, and great-circle distance (haversine) code: inputs that are mathematically fine but numerically a hair outside the domain. Clamp to [-1, 1] right before the call, as in the last line. Only clamp where rounding is the explanation; a value like 1.5 is a real bug and clamping hides it.</p>
+
+<h2 id="complex">3. When you actually want the answer for a negative</h2>
+<pre><code>import cmath, math
+
+print(cmath.sqrt(-1))
+print((-8) ** (1/3))
+print(-(8 ** (1/3)))
+print(math.cbrt(-8))
+print(-8 ** 2, (-8) ** 2)</code></pre>
+<pre><code>1j
+(1.0000000000000002+1.7320508075688772j)
+-2.0
+-2.0
+-64 64</code></pre>
+<p><strong>Measured:</strong> <code>cmath.sqrt(-1)</code> returns <code>1j</code> if you need complex results. The <code>**</code> operator doesn't raise for a negative base with a fractional exponent; it silently returns a complex number (<code>(-8) ** (1/3)</code> gave <code>1.0000000000000002+1.7320508075688772j</code>, not -2), which then breaks later in your code instead. For a real cube root use <code>math.cbrt(-8)</code> (Python 3.11+) or <code>-(8 ** (1/3))</code>. Also watch precedence: <code>-8 ** 2</code> is <code>-64</code>, because <code>**</code> binds tighter than the minus sign.</p>
+
+<h2 id="fix">4. Fix checklist</h2>
+<ul>
+<li>Find the call: the traceback line tells you which function; print its argument just before it.</li>
+<li>Negative into <code>sqrt</code>/<code>log</code>: usually a sign bug or a subtraction in the wrong order upstream. Fix the cause; use <code>abs()</code> only if a negative really means the same thing.</li>
+<li><code>log(0)</code>: guard empty or zero inputs (<code>if x &gt; 0</code>), or add a small offset only if your formula is defined that way (for example <code>log1p</code>).</li>
+<li><code>acos</code>/<code>asin</code> on computed values: clamp with <code>max(-1.0, min(1.0, x))</code>.</li>
+</ul>
+
+<aside class="cta"><strong>Crunching numbers pulled from an API? Check the raw response headers and status first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes ValueError: math domain error?</summary><p>A math function got an input where no real result exists. We measured it from math.sqrt(-1), math.log(0), math.log(-5), math.log10(0), math.acos(1.0000000000000002), math.asin(-1.5), math.pow(-8, 1/3) and math.atanh(1).</p></details>
+<details><summary>Why does math.acos fail when the value should be 1?</summary><p>Float rounding. We measured the cosine of a vector with itself coming out as 1.0000000000000002, which acos rejects. Clamp with max(-1.0, min(1.0, x)) before calling it.</p></details>
+<details><summary>How do I take the square root of a negative number in Python?</summary><p>Use cmath.sqrt(), which returns a complex number; we measured cmath.sqrt(-1) giving 1j.</p></details>
+<details><summary>Why does (-8) ** (1/3) not return -2?</summary><p>With a negative base and fractional exponent, ** returns a complex number instead of raising; we measured 1.0000000000000002+1.7320508075688772j. Use math.cbrt(-8) on Python 3.11+, which returned -2.0.</p></details>
+<details><summary>Does math.log(0) return -inf?</summary><p>No, math.log(0) raises ValueError: math domain error. Check for zero before the call.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s math and cmath modules: sqrt, log, log10, acos, asin, atanh and pow at and past their domain edges, a cosine-similarity calculation that rounds to 1.0000000000000002, and the ** operator and math.cbrt with negative bases. Every code block was run verbatim and its output pasted from that run. PlainHeaders is our extension; math and cmath are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

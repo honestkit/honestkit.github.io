@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Git &quot;error: cannot lock ref&quot;: Exact Causes and Fixes (Tested)</title>
+<meta name="description" content="We reproduced git&#x27;s cannot-lock-ref error two real ways: a stale .lock file and a branch name collision, with exact output and fixes for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/git-error-cannot-lock-ref/">
+<meta property="og:title" content="Git &quot;error: cannot lock ref&quot;: Exact Causes and Fixes (Tested)">
+<meta property="og:description" content="We reproduced git&#x27;s cannot-lock-ref error two real ways: a stale .lock file and a branch name collision, with exact output and fixes for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/git-error-cannot-lock-ref/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does \"error: cannot lock ref\" mean in git?", "acceptedAnswer": {"@type": "Answer", "text": "Git could not write a ref file (usually a branch pointer under .git/refs/) because something was already blocking it: either a leftover .lock file from a previous git process, or another ref whose name collides with the one being created."}}, {"@type": "Question", "name": "How do I know if it's a stale lock file or a name collision?", "acceptedAnswer": {"@type": "Answer", "text": "Read the exact text. A stale lock file error mentions \"Unable to create '...lock': File exists\" and \"Another git process seems to be running\". A name collision error instead says \"'refs/heads/X' exists; cannot create 'refs/heads/Y'\", naming two different ref paths, with no mention of another process."}}, {"@type": "Question", "name": "Is it safe to just delete the .lock file?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, as long as no git process is genuinely running against that repo right now. We confirmed deleting a hand-created stale .lock file immediately let git write the ref again with no side effects. If a real git process is mid-operation, deleting its active lock can corrupt the ref, so check for running git processes first if you're unsure."}}, {"@type": "Question", "name": "Why can't I have a branch called foo and a branch called foo/bar at the same time?", "acceptedAnswer": {"@type": "Answer", "text": "Git stores each branch as a file at .git/refs/heads/<name>, using the OS filesystem, where / is a real directory separator. refs/heads/foo as a file and refs/heads/foo/bar needing refs/heads/foo as a directory are mutually exclusive on disk, so git refuses to create whichever one comes second."}}, {"@type": "Question", "name": "Does this happen with tags too, not just branches?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Tags live under .git/refs/tags/ using the same file-per-ref layout, so a tag named foo and a tag named foo/bar collide the same way a branch pair does, with the same cannot lock ref error."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Git cannot lock ref (tested)</h1>
+<p class="lead"><code>error: cannot lock ref '...'</code> means git could not safely write a ref file (a branch pointer) because something is already in its way. We reproduced the two most common real causes in a throwaway repo: a stale <code>.lock</code> file left over from a crashed git process, and a ref name collision where one branch name is a path prefix of another. The exact wording differs between the two, which is the easiest way to tell them apart.</p>
+<h2>1. Cause A: a stale .lock file</h2>
+<p>Git never writes a ref file directly. It writes <code>refs/heads/&lt;branch&gt;.lock</code>, then renames it into place. If git crashes or is killed mid-operation, that <code>.lock</code> file can be left behind, and every future write to that ref fails because the lock file already exists. We reproduced this by creating one by hand:</p>
+<pre><code>$ touch .git/refs/heads/master.lock
+$ git commit -am "second"
+fatal: cannot lock ref 'HEAD': Unable to create '/tmp/gitlockref/.git/refs/heads/master.lock': File exists.
+
+Another git process seems to be running in this repository, e.g.
+an editor opened by 'git commit'. Please make sure all processes
+are terminated then try again. If it still fails, a git process
+may have crashed in this repository earlier:
+remove the file manually to continue.</code></pre>
+<p>Exit code <code>128</code>. Any command that needs to update that specific ref fails the same way. We confirmed it for <code>git branch -d master</code> and <code>git update-ref refs/heads/master HEAD</code> too, both producing the same "cannot lock ref 'refs/heads/master'" message and the same hint text. Commands that don't touch that ref, like <code>git checkout -b newbranch</code> or plain <code>git checkout master</code> (which only moves HEAD, not the master ref itself), succeeded normally even with the stale lock file present.</p>
+
+<h2>2. Fix for cause A: delete the lock file</h2>
+<p>Git's own hint is correct and is the actual fix: find and remove the leftover <code>.lock</code> file, then retry.</p>
+<pre><code>$ rm .git/refs/heads/master.lock
+$ git commit -am "second"
+[master 9b3b911] second
+ 1 file changed, 1 insertion(+)</code></pre>
+<p>Exit code <code>0</code>. If you aren't sure which ref is affected, search for every stale lock at once: <code>find .git -name '*.lock'</code>. Only delete one if you're sure no other git process is actually running against that repo right now &mdash; deleting a lock held by a <em>currently running</em> git process can corrupt the ref.</p>
+
+<h2>3. Cause B: a ref name collision</h2>
+<p>Git stores branches as files under <code>.git/refs/heads/</code>, using <code>/</code> in the branch name as a real directory separator. That means a branch named <code>foo</code> and a branch named <code>foo/bar</code> cannot coexist: one needs <code>refs/heads/foo</code> to be a file, the other needs it to be a directory. We reproduced both directions:</p>
+<pre><code>$ git branch foo
+$ git branch foo/bar
+fatal: cannot lock ref 'refs/heads/foo/bar': 'refs/heads/foo' exists; cannot create 'refs/heads/foo/bar'</code></pre>
+<pre><code>$ git branch baz/qux
+$ git branch baz
+fatal: cannot lock ref 'refs/heads/baz': 'refs/heads/baz/qux' exists; cannot create 'refs/heads/baz'</code></pre>
+<p>Both fail with exit code <code>128</code>, and in both cases <code>git checkout -b</code> fails with the identical message instead of creating the branch. Note the wording: it names the <em>other</em> ref as the blocker, not the one you're trying to create, which is the fastest way to tell this apart from the stale-lock case in section 1 &mdash; there's no "Another git process seems to be running" hint here at all.</p>
+
+<h2>4. Fix for cause B: remove or rename the conflicting ref</h2>
+<p>There is no way to have both names at once. Delete the one you don't need, or pick a non-conflicting name.</p>
+<pre><code>$ git branch -d baz/qux
+Deleted branch baz/qux (was 9b3b911).
+$ git branch baz
+$ echo $?
+0</code></pre>
+<p>If both branches have commits you need, rename instead of deleting: <code>git branch -m foo foo-old</code> frees up <code>foo</code> for use as a prefix. The same collision rule applies to tags and any other ref under <code>.git/refs/</code>, not just branches.</p>
+
+<h2>5. Telling the two causes apart at a glance</h2>
+<table>
+<tr><th>Error text contains</th><th>Cause</th><th>Fix</th></tr>
+<tr><td>"Unable to create '...lock': File exists" plus "Another git process seems to be running"</td><td>Stale <code>.lock</code> file (section 1)</td><td>Delete the <code>.lock</code> file (section 2)</td></tr>
+<tr><td>"'refs/heads/X' exists; cannot create 'refs/heads/Y'"</td><td>Ref name collision (section 3)</td><td>Delete or rename the conflicting ref (section 4)</td></tr>
+</table>
+<p>Both are reported as <code>cannot lock ref</code> because both fail at the same point internally &mdash; git's ref-locking code refuses to write &mdash; but the two root causes and fixes are unrelated. If you hit this while rebasing or merging, the same detection rule applies; also see <a href="/guides/git-detached-head/">git detached HEAD</a> if the branch you expected to update doesn't exist at all.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &quot;error: cannot lock ref&quot; mean in git?</summary><p>Git could not write a ref file (usually a branch pointer under .git/refs/) because something was already blocking it: either a leftover .lock file from a previous git process, or another ref whose name collides with the one being created.</p></details>
+<details><summary>How do I know if it&#x27;s a stale lock file or a name collision?</summary><p>Read the exact text. A stale lock file error mentions &quot;Unable to create &#x27;...lock&#x27;: File exists&quot; and &quot;Another git process seems to be running&quot;. A name collision error instead says &quot;&#x27;refs/heads/X&#x27; exists; cannot create &#x27;refs/heads/Y&#x27;&quot;, naming two different ref paths, with no mention of another process.</p></details>
+<details><summary>Is it safe to just delete the .lock file?</summary><p>Yes, as long as no git process is genuinely running against that repo right now. We confirmed deleting a hand-created stale .lock file immediately let git write the ref again with no side effects. If a real git process is mid-operation, deleting its active lock can corrupt the ref, so check for running git processes first if you&#x27;re unsure.</p></details>
+<details><summary>Why can&#x27;t I have a branch called foo and a branch called foo/bar at the same time?</summary><p>Git stores each branch as a file at .git/refs/heads/&lt;name&gt;, using the OS filesystem, where / is a real directory separator. refs/heads/foo as a file and refs/heads/foo/bar needing refs/heads/foo as a directory are mutually exclusive on disk, so git refuses to create whichever one comes second.</p></details>
+<details><summary>Does this happen with tags too, not just branches?</summary><p>Yes. Tags live under .git/refs/tags/ using the same file-per-ref layout, so a tag named foo and a tag named foo/bar collide the same way a branch pair does, with the same cannot lock ref error.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with git 2.47.3 on Linux, in a throwaway /tmp repo. Both causes below were reproduced directly: a hand-created stale .lock file, and a real ref-name collision between a branch and a nested branch path. Git is free and open source.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

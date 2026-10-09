@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>collections.abc.Set: &amp;/|/- Break On a Multi-Arg __init__ (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: Set&#x27;s &amp;, |, -, ^ build results via cls(iterable) -- an __init__ needing a 2nd arg makes all of them raise TypeError.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-collections-abc-set-operators-from-iterable-typeerror/">
+<meta property="og:title" content="collections.abc.Set: &amp;/|/- Break On a Multi-Arg __init__ (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: Set&#x27;s &amp;, |, -, ^ build results via cls(iterable) -- an __init__ needing a 2nd arg makes all of them raise TypeError.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-collections-abc-set-operators-from-iterable-typeerror/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does collections.abc.Set's & operator raise TypeError on my subclass?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that Set's &, |, -, and ^ operators build their result via self._from_iterable(iterable), whose default implementation calls cls(iterable) with a single positional argument. If your __init__ requires more than just an iterable, that call fails with a missing-argument TypeError."}}, {"@type": "Question", "name": "How do I fix a collections.abc.Set subclass that needs extra constructor arguments?", "acceptedAnswer": {"@type": "Answer", "text": "Override the _from_iterable classmethod to call your constructor correctly, e.g. return cls(your_extra_args, it). We measured this fixing &, |, -, and ^ all at once, since every Set mixin operator routes through it."}}, {"@type": "Question", "name": "Why didn't testing __contains__/__iter__/__len__ catch this bug?", "acceptedAnswer": {"@type": "Answer", "text": "Those are the three required abstract methods and work independently of _from_iterable -- we measured them succeeding normally. _from_iterable is only invoked by the derived set operators (&, |, -, ^, and the comparison-adjacent copy operations), so a class can look fully functional under basic testing and still break the moment an operator is used."}}, {"@type": "Question", "name": "Does this affect frozenset or set directly?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we only measured this for custom collections.abc.Set subclasses with a non-trivial __init__. Built-in set and frozenset already have constructors that accept a single iterable argument, so their inherited _from_iterable default works without any override."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>collections.abc.Set operators raise TypeError without _from_iterable override (tested)</h1>
+<p class="lead"><code>collections.abc.Set</code> only requires <code>__contains__</code>, <code>__iter__</code>, and <code>__len__</code> -- in exchange you get <code>&amp;</code>, <code>|</code>, <code>-</code>, <code>^</code>, and comparison operators for free. Those operators build their result by calling <code>self._from_iterable(iterable)</code>, and the <em>default</em> implementation of <code>_from_iterable</code> is just <code>cls(iterable)</code> -- it calls your class's constructor with exactly one positional argument. If your subclass's <code>__init__</code> needs anything more than that single iterable (a label, a name, a config object, anything), every operator that constructs a new set breaks, even though plain membership tests, iteration, and <code>len()</code> all work perfectly on the same object.</p>
+<h2 id="repro1">1. A Set subclass with an extra required __init__ argument</h2>
+<pre><code>from collections.abc import Set
+
+class LabeledSet(Set):
+    def __init__(self, label, items):
+        self.label = label
+        self._items = frozenset(items)
+    def __contains__(self, x):
+        return x in self._items
+    def __iter__(self):
+        return iter(self._items)
+    def __len__(self):
+        return len(self._items)
+
+a = LabeledSet("a", [1, 2, 3])
+b = LabeledSet("b", [2, 3, 4])
+print(len(a), list(a), 2 in a)   # the required abstract methods -- all fine</code></pre>
+<pre><code>3 [1, 2, 3] True</code></pre>
+<p><strong>Measured:</strong> the three required abstract methods work correctly. Nothing about basic usage suggests a problem -- this is exactly the kind of class that looks finished after a quick smoke test.</p>
+
+<h2 id="repro2">2. Every set operator raises TypeError</h2>
+<pre><code>try:
+    c = a &amp; b
+except TypeError as e:
+    print("a &amp; b ->", e)
+try:
+    c = a | b
+except TypeError as e:
+    print("a | b ->", e)</code></pre>
+<pre><code>a & b -> LabeledSet.__init__() missing 1 required positional argument: 'items'
+a | b -> LabeledSet.__init__() missing 1 required positional argument: 'items'</code></pre>
+<p><strong>Measured:</strong> <code>&amp;</code>, <code>|</code>, <code>-</code>, and <code>^</code> all fail the same way. <code>Set</code>'s mixin implementations build their result by calling <code>type(self)._from_iterable(result_items)</code>, and the inherited <code>_from_iterable</code> classmethod is just <code>return cls(iterable)</code> -- a single positional argument. <code>LabeledSet.__init__</code> requires a <code>label</code> first, so the call fails every time, regardless of which operator triggered it.</p>
+
+<h2 id="repro3">3. The fix: override _from_iterable</h2>
+<pre><code>class LabeledSet(Set):
+    def __init__(self, label, items):
+        self.label = label
+        self._items = frozenset(items)
+    def __contains__(self, x):
+        return x in self._items
+    def __iter__(self):
+        return iter(self._items)
+    def __len__(self):
+        return len(self._items)
+    @classmethod
+    def _from_iterable(cls, it):
+        return cls("derived", it)
+
+a = LabeledSet("a", [1, 2, 3])
+b = LabeledSet("b", [2, 3, 4])
+print(list(a &amp; b))
+print(sorted(a | b))
+print(list(a - b))
+print(sorted(a ^ b))</code></pre>
+<pre><code>[2, 3]
+[1, 2, 3, 4]
+[1]
+[1, 4]</code></pre>
+<p><strong>Measured:</strong> overriding the <code>_from_iterable</code> classmethod to supply whatever extra arguments the constructor needs fixes every operator at once, since they all route through it. This is documented behavior (<code>collections.abc.Set</code> specifically calls out <code>_from_iterable</code> as an overridable hook), but it is easy to miss because the three <em>required</em> abstract methods give no hint that a fourth, optional method needs attention until an operator is actually used.</p>
+<aside class="cta"><strong>Subclassing collections.abc.Set with an __init__ that takes more than just an iterable? The &amp;, |, -, ^ operators will break unless you override _from_iterable:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does collections.abc.Set&#x27;s &amp; operator raise TypeError on my subclass?</summary><p>We measured that Set&#x27;s &amp;, |, -, and ^ operators build their result via self._from_iterable(iterable), whose default implementation calls cls(iterable) with a single positional argument. If your __init__ requires more than just an iterable, that call fails with a missing-argument TypeError.</p></details>
+<details><summary>How do I fix a collections.abc.Set subclass that needs extra constructor arguments?</summary><p>Override the _from_iterable classmethod to call your constructor correctly, e.g. return cls(your_extra_args, it). We measured this fixing &amp;, |, -, and ^ all at once, since every Set mixin operator routes through it.</p></details>
+<details><summary>Why didn&#x27;t testing __contains__/__iter__/__len__ catch this bug?</summary><p>Those are the three required abstract methods and work independently of _from_iterable -- we measured them succeeding normally. _from_iterable is only invoked by the derived set operators (&amp;, |, -, ^, and the comparison-adjacent copy operations), so a class can look fully functional under basic testing and still break the moment an operator is used.</p></details>
+<details><summary>Does this affect frozenset or set directly?</summary><p>No -- we only measured this for custom collections.abc.Set subclasses with a non-trivial __init__. Built-in set and frozenset already have constructors that accept a single iterable argument, so their inherited _from_iterable default works without any override.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in collections.abc.Set: subclassed it with an __init__ requiring a second argument beyond the iterable, implemented only the three required abstract methods (__contains__, __iter__, __len__), and called the inherited operators &amp;, |, -, and ^. PlainHeaders is our extension; Python&#x27;s collections.abc module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

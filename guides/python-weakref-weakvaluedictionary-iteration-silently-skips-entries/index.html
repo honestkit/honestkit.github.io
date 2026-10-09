@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>weakref.WeakValueDictionary Skips Entries Mid-Loop, No Error</title>
+<meta name="description" content="We measured Python 3.13.5: dropping the last strong ref during iteration silently removes it from a WeakValueDictionary, no RuntimeError, unlike a plain dict.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-weakref-weakvaluedictionary-iteration-silently-skips-entries/">
+<meta property="og:title" content="weakref.WeakValueDictionary Skips Entries Mid-Loop, No Error">
+<meta property="og:description" content="We measured Python 3.13.5: dropping the last strong ref during iteration silently removes it from a WeakValueDictionary, no RuntimeError, unlike a plain dict.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-weakref-weakvaluedictionary-iteration-silently-skips-entries/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does iterating a WeakValueDictionary raise RuntimeError if its size changes mid-loop, like a plain dict does?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured dropping the last strong reference to a not-yet-visited value during iteration: the key silently never appears in the loop, and nothing is raised, across repeated deterministic runs."}}, {"@type": "Question", "name": "Does a WeakValueDictionary have to be mutated directly (like del wd[key]) to shrink during iteration?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it shrinking because a completely separate variable (objs[3]) dropped the last strong reference to the value, with no call to del on the dictionary itself and no code in the loop touching that key."}}, {"@type": "Question", "name": "Does len() reveal that an entry vanished during iteration?", "acceptedAnswer": {"@type": "Answer", "text": "It reflects it correctly (5 before, 4 after in our measurement) but gives no signal that it happened mid-loop or which key was affected -- there's no exception and no inconsistent count to flag the event."}}, {"@type": "Question", "name": "How is this different from the documented caution about WeakValueDictionary and GC?", "acceptedAnswer": {"@type": "Answer", "text": "The docs note that entries can vanish due to garbage collection during iteration; what we measured and confirmed concretely is that this specific case -- a plain, deterministic drop of the last reference, not even requiring a GC cycle -- produces silent skipping with zero exception, in contrast to the RuntimeError a plain dict gives for the equivalent direct mutation."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>weakref: WeakValueDictionary Iteration Silently Skips GC&#x27;d Entries (tested)</h1>
+<p class="lead">Mutating a plain <code>dict</code>'s size while iterating over it is a well-known mistake that Python catches for you -- it raises <code>RuntimeError: dictionary changed size during iteration</code>. A <code>weakref.WeakValueDictionary</code> can shrink mid-iteration too, but not because your code called <code>del</code> on it directly -- it shrinks because something else in the program dropped the last reference to one of its values. We measured whether that gets the same protection.</p>
+<h2 id="repro1">1. A plain dict catches you. A WeakValueDictionary doesn't.</h2>
+<pre><code>d = {0: "a", 1: "b", 2: "c", 3: "d", 4: "e"}
+try:
+    for k in d:
+        if k == 1:
+            del d[3]   # mutate size during iteration
+except RuntimeError as e:
+    print("plain dict:", type(e).__name__, e)</code></pre>
+<pre><code>plain dict: RuntimeError dictionary changed size during iteration</code></pre>
+<pre><code>import weakref
+
+class Obj:
+    def __init__(self, n): self.n = n
+
+wd = weakref.WeakValueDictionary()
+objs = {i: Obj(i) for i in range(5)}
+for i, o in objs.items():
+    wd[i] = o
+
+seen = []
+for k in wd:          # no try/except -- nothing is raised
+    seen.append(k)
+    if k == 1:
+        del objs[3]   # drop the last strong ref to value 3, NOT a dict mutation
+
+print("keys visited:", seen)
+print("final keys:  ", list(wd.keys()))</code></pre>
+<pre><code>keys visited: [0, 1, 2, 4]
+final keys:   [0, 1, 2, 4]</code></pre>
+<p><strong>Measured:</strong> key <code>3</code> silently never appears in the iteration, and the loop never raises anything -- across repeated runs, deterministically. We never called <code>del wd[3]</code>; we only dropped the last strong reference to the <em>value</em> stored at that key, from a completely different variable (<code>objs</code>), and the dictionary shrank anyway, invisibly, in the middle of a loop that had no idea anything outside it could do that.</p>
+
+<h2 id="repro2">2. len() stays internally consistent -- which makes the vanish harder to notice</h2>
+<pre><code>import weakref
+
+class Obj:
+    def __init__(self, n): self.n = n
+
+wd = weakref.WeakValueDictionary()
+objs = {i: Obj(i) for i in range(5)}
+for i, o in objs.items():
+    wd[i] = o
+
+print("before:", len(wd))
+for k in wd:
+    if k == 1:
+        del objs[3]
+print("after: ", len(wd))</code></pre>
+<pre><code>before: 5
+after:  4</code></pre>
+<p><strong>Measured:</strong> <code>len(wd)</code> correctly drops from 5 to 4 -- the dictionary isn't corrupted or left in some inconsistent state, and nothing crashes later either. That's actually what makes this easy to miss in a real program: there's no exception to catch, no wrong count to notice, just one fewer iteration than you expected, with the cause living in unrelated code that happened to drop a reference at the wrong moment.</p>
+<aside class="cta"><strong>Iterating over a weakref.WeakValueDictionary while other code might drop the last reference to one of its values? Check for RuntimeError protection first -- there isn&#x27;t any:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does iterating a WeakValueDictionary raise RuntimeError if its size changes mid-loop, like a plain dict does?</summary><p>No -- we measured dropping the last strong reference to a not-yet-visited value during iteration: the key silently never appears in the loop, and nothing is raised, across repeated deterministic runs.</p></details>
+<details><summary>Does a WeakValueDictionary have to be mutated directly (like del wd[key]) to shrink during iteration?</summary><p>No -- we measured it shrinking because a completely separate variable (objs[3]) dropped the last strong reference to the value, with no call to del on the dictionary itself and no code in the loop touching that key.</p></details>
+<details><summary>Does len() reveal that an entry vanished during iteration?</summary><p>It reflects it correctly (5 before, 4 after in our measurement) but gives no signal that it happened mid-loop or which key was affected -- there&#x27;s no exception and no inconsistent count to flag the event.</p></details>
+<details><summary>How is this different from the documented caution about WeakValueDictionary and GC?</summary><p>The docs note that entries can vanish due to garbage collection during iteration; what we measured and confirmed concretely is that this specific case -- a plain, deterministic drop of the last reference, not even requiring a GC cycle -- produces silent skipping with zero exception, in contrast to the RuntimeError a plain dict gives for the equivalent direct mutation.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in weakref module: iterated a WeakValueDictionary, dropped the last strong reference to one of its not-yet-visited values mid-loop, and compared the result (and any exception) against doing the equivalent size-changing mutation to a plain dict during iteration. PlainHeaders is our extension; Python&#x27;s weakref module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

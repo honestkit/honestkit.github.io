@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JSONDecodeError: Extra Data — What It Means and the Fix</title>
+<meta name="description" content="We measured why json.loads() throws Extra Data on concatenated JSON and JSON Lines files, and the exact raw_decode() fix for both, in Python 3.13.">
+<link rel="canonical" href="https://honestkit.github.io/guides/json-decode-error-extra-data/">
+<meta property="og:title" content="JSONDecodeError: Extra Data — What It Means and the Fix">
+<meta property="og:description" content="We measured why json.loads() throws Extra Data on concatenated JSON and JSON Lines files, and the exact raw_decode() fix for both, in Python 3.13.">
+<meta property="og:url" content="https://honestkit.github.io/guides/json-decode-error-extra-data/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does \"Extra data\" actually mean in a JSONDecodeError?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed it means json.loads() successfully parsed one complete JSON value and then found more content after it \u2014 the position reported (e.pos) is where that first value ended, not where anything is malformed."}}, {"@type": "Question", "name": "Why do I get \"Extra data\" when loading a .jsonl (JSON Lines) file?", "acceptedAnswer": {"@type": "Answer", "text": "Because we measured that Python's json module has no built-in support for JSON Lines \u2014 calling json.loads() on a whole multi-line file parses only the first line's object, then raises Extra data at the start of line 2."}}, {"@type": "Question", "name": "How is \"Extra data\" different from \"Illegal trailing comma\"?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed these are two distinctly worded errors: Extra data means the document doesn't end where a complete JSON value ends, while Illegal trailing comma means punctuation inside one value (like {\"a\": 1,}) is itself invalid \u2014 the wording alone tells you which problem you have."}}, {"@type": "Question", "name": "What's the fix for parsing multiple concatenated JSON objects in one string?", "acceptedAnswer": {"@type": "Answer", "text": "We tested json.JSONDecoder().raw_decode(s, idx), which parses exactly one value starting at a given index and returns where it ended \u2014 looping it with that end index lets you pull out every value without json.loads() raising on what follows."}}, {"@type": "Question", "name": "What's the simplest way to parse an actual JSON Lines file?", "acceptedAnswer": {"@type": "Answer", "text": "We'd split on newlines first and call json.loads() on each non-blank line individually \u2014 simpler than raw_decode() and the standard approach for the common one-object-per-line wire format used by streaming APIs and log exports."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>json.decoder.JSONDecodeError: Extra Data (tested)</h1>
+<p class="lead"><code>json.loads()</code> expects the entire string to be exactly one JSON value. The moment anything else follows &mdash; a second object, a trailing comment, a newline-delimited second line &mdash; it raises <code>json.decoder.JSONDecodeError: Extra data</code>. We measured exactly where it stops and how to parse past it.</p>
+<h2 id="repro1">1. The error, with two JSON objects back to back</h2>
+<pre><code>import json
+
+json.loads('{"a": 1}{"b": 2}')
+json.decoder.JSONDecodeError: Extra data: line 1 column 9 (char 8)</code></pre>
+<p><strong>Measured:</strong> <code>json.loads()</code> parsed the first complete object, <code>{"a": 1}</code> (8 characters), successfully &mdash; then found the second <code>{</code> starting at character 8 and raised, because a valid JSON document is supposed to end there. The position it reports is exactly where the <em>first</em> valid value ended, not where anything is actually malformed.</p>
+
+<h2 id="repro2">2. The most common real trigger: a JSON Lines file</h2>
+<pre><code>json.loads('{"a": 1}\n{"b": 2}\n')
+json.decoder.JSONDecodeError: Extra data: line 2 column 1 (char 9)
+
+json.loads('{"a": 1} // comment')
+json.decoder.JSONDecodeError: Extra data: line 1 column 10 (char 9)</code></pre>
+<p><strong>Measured:</strong> a newline-delimited JSON Lines (<code>.jsonl</code>) file produces this exact error if you call <code>json.loads()</code> on the whole file &mdash; Python's <code>json</code> module has no built-in JSON Lines support. The same error also fires for a trailing <code>//</code> comment, since JSON has no comment syntax at all; <code>json.loads()</code> stops at the first complete value and anything after is "extra" regardless of what it looks like.</p>
+
+<h2 id="repro3">3. This is a different error from a trailing comma</h2>
+<pre><code>json.loads('{"a": 1,}')
+json.decoder.JSONDecodeError: Illegal trailing comma before end of object: line 1 column 8 (char 7)</code></pre>
+<p><strong>Measured:</strong> a trailing comma inside the same object raises a distinctly worded error, not "Extra data" &mdash; useful for telling the two apart from the message alone: "Extra data" means the document doesn't end where it should; "Illegal trailing comma" means punctuation inside one value is wrong.</p>
+
+<h2 id="repro4">4. The fix: parse one value at a time with raw_decode()</h2>
+<pre><code>def parse_concatenated(s):
+    dec = json.JSONDecoder()
+    results = []
+    idx = 0
+    s = s.strip()
+    while idx < len(s):
+        obj, end = dec.raw_decode(s, idx)
+        results.append(obj)
+        idx = end
+        while idx < len(s) and s[idx].isspace():
+            idx += 1
+    return results
+
+parse_concatenated('{"a": 1}  {"b": 2}  {"c": 3}')
+[{'a': 1}, {'b': 2}, {'c': 3}]</code></pre>
+<p><strong>Measured:</strong> <code>JSONDecoder().raw_decode(s, idx)</code> parses exactly one JSON value starting at <code>idx</code> and returns <code>(value, end_index)</code> instead of raising on whatever comes after &mdash; it's the building block both <code>json.loads()</code> uses internally and what you need to pull multiple back-to-back values out of one string.</p>
+
+<h2 id="repro5">5. For an actual JSON Lines file, split first</h2>
+<pre><code>lines = open("data.jsonl").read().splitlines()
+records = [json.loads(line) for line in lines if line.strip()]</code></pre>
+<p><strong>Measured:</strong> for a real <code>.jsonl</code> file (one JSON value per line, which is the common wire format for streaming APIs and log files), splitting on newlines first and calling <code>json.loads()</code> per line is simpler than <code>raw_decode()</code> and handles blank lines correctly with the <code>if line.strip()</code> guard. Use <code>raw_decode()</code> instead when values are concatenated without a reliable line-based separator.</p>
+
+<h2 id="fix">6. How to tell what you're actually looking at</h2>
+<p>If <code>json.loads()</code> raises "Extra data" and <code>e.pos</code> lands right after what looks like one complete object, you don't have a single JSON document &mdash; you have several, either concatenated or one per line. Check the source: an API that streams multiple objects per response, or a log/export file, is almost always JSON Lines. Fix the parsing strategy (split-and-loads, or <code>raw_decode()</code> in a loop) rather than trying to make <code>json.loads()</code> accept it directly &mdash; it never will, by design.</p>
+
+<aside class="cta"><strong>Debugging a stream of JSON objects from an API instead of one response body? Check the real headers and status behind it:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &quot;Extra data&quot; actually mean in a JSONDecodeError?</summary><p>We confirmed it means json.loads() successfully parsed one complete JSON value and then found more content after it — the position reported (e.pos) is where that first value ended, not where anything is malformed.</p></details>
+<details><summary>Why do I get &quot;Extra data&quot; when loading a .jsonl (JSON Lines) file?</summary><p>Because we measured that Python&#x27;s json module has no built-in support for JSON Lines — calling json.loads() on a whole multi-line file parses only the first line&#x27;s object, then raises Extra data at the start of line 2.</p></details>
+<details><summary>How is &quot;Extra data&quot; different from &quot;Illegal trailing comma&quot;?</summary><p>We confirmed these are two distinctly worded errors: Extra data means the document doesn&#x27;t end where a complete JSON value ends, while Illegal trailing comma means punctuation inside one value (like {&quot;a&quot;: 1,}) is itself invalid — the wording alone tells you which problem you have.</p></details>
+<details><summary>What&#x27;s the fix for parsing multiple concatenated JSON objects in one string?</summary><p>We tested json.JSONDecoder().raw_decode(s, idx), which parses exactly one value starting at a given index and returns where it ended — looping it with that end index lets you pull out every value without json.loads() raising on what follows.</p></details>
+<details><summary>What&#x27;s the simplest way to parse an actual JSON Lines file?</summary><p>We&#x27;d split on newlines first and call json.loads() on each non-blank line individually — simpler than raw_decode() and the standard approach for the common one-object-per-line wire format used by streaming APIs and log exports.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in json module, calling json.loads() and json.JSONDecoder().raw_decode() directly and printing the exact exception text. Every message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s json module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

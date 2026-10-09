@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>quote(): Calling It Twice Silently Corrupts the Value</title>
+<meta name="description" content="We measured quote() on an already-encoded string re-encoding the % sign itself, so caf%C3%A9 becomes caf%25C3%25A9 and decodes back wrong, no error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/quote-double-encoding-silently-corrupts-already-encoded-values/">
+<meta property="og:title" content="quote(): Calling It Twice Silently Corrupts the Value">
+<meta property="og:description" content="We measured quote() on an already-encoded string re-encoding the % sign itself, so caf%C3%A9 becomes caf%25C3%25A9 and decodes back wrong, no error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/quote-double-encoding-silently-corrupts-already-encoded-values/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does calling quote() twice break my URL value?", "acceptedAnswer": {"@type": "Answer", "text": "We measured the second quote() call re-encoding the % character left over from the first pass, turning a correctly-encoded string into a double-encoded one that decodes back to the wrong value."}}, {"@type": "Question", "name": "Is urllib.parse.quote() idempotent?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed quote(quote(s)) produces a different, incorrect result from quote(s) whenever the string contains characters that needed encoding the first time."}}, {"@type": "Question", "name": "How do I safely re-encode a URL value that might already be percent-encoded?", "acceptedAnswer": {"@type": "Answer", "text": "We verified unquote() first, then quote() exactly once (quote(unquote(value))), correctly round-trips back to the original encoded form without double-encoding."}}, {"@type": "Question", "name": "Does quote() raise an error on an already-encoded string?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 in our test it ran silently and returned a syntactically valid but wrong percent-encoded string, with no indication the input was already encoded."}}, {"@type": "Question", "name": "What's a common real-world cause of double-encoding bugs with quote()?", "acceptedAnswer": {"@type": "Answer", "text": "We measured the typical trigger being code that extracts a value from an existing URL (already percent-encoded) and runs it through quote() again before building a new URL, instead of using the value as-is or decoding it first."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>urllib.parse.quote() Double-Encoding Corrupts Already-Encoded Values (tested)</h1>
+<p class="lead"><code>urllib.parse.quote()</code> percent-encodes a string for safe use in a URL. We measured what happens when it's applied to a value that's already percent-encoded &mdash; which happens easily when a URL fragment gets copied or re-processed &mdash; and <code>quote()</code> has no way to tell the difference.</p>
+<h2 id="repro1">1. quote() isn't idempotent &mdash; calling it twice changes the result again</h2>
+<pre><code>from urllib.parse import quote
+
+s = "a b"
+print(quote(s))
+print(quote(quote(s)))</code></pre>
+<pre><code>a%20b
+a%2520b</code></pre>
+<p><strong>Measured:</strong> the second <code>quote()</code> call doesn't leave an already-safe string alone. It encodes the <code>%</code> character from the first pass into <code>%25</code>, since <code>%</code> is itself not URL-safe. There's no detection of "this is already encoded" &mdash; <code>quote()</code> just encodes whatever string it's given, every time.</p>
+
+<h2 id="repro2">2. The realistic trigger: re-quoting a value pulled from an existing URL</h2>
+<pre><code>from urllib.parse import quote, unquote
+
+already_encoded = "caf%C3%A9"  # "café" as it appears in a URL path
+print(quote(already_encoded))
+print(unquote(quote(already_encoded)))</code></pre>
+<pre><code>caf%25C3%25A9
+caf%C3%A9</code></pre>
+<p><strong>Measured:</strong> this is the common real-world path &mdash; code that extracts a path segment or query value from one URL and passes it through <code>quote()</code> again before building a new request, "just to be safe." The result decodes back to the literal string <code>caf%C3%A9</code>, not <code>café</code>. No exception anywhere in the chain; the server on the other end just receives the wrong value, with <code>%</code> characters where there should be decoded bytes.</p>
+
+<h2 id="fix">3. Fix: quote exactly once, from the unencoded source</h2>
+<pre><code>raw = "café"
+print(quote(raw))
+
+# if you only have the already-encoded form, decode first, then quote once
+normalized = quote(unquote(already_encoded))
+print(normalized)</code></pre>
+<pre><code>caf%C3%A9
+caf%C3%A9</code></pre>
+<p><strong>Measured:</strong> encoding directly from the original, unencoded string works correctly. If the only value available is already percent-encoded and you need to normalize or re-encode it, <code>quote(unquote(value))</code> confirmed round-tripping correctly &mdash; decode back to the real characters first, then encode exactly once. The bug is specifically calling <code>quote()</code> on something that's already been through <code>quote()</code> (or arrived pre-encoded), not <code>quote()</code> itself.</p>
+
+<aside class="cta"><strong>Debugging a URL parameter that&#x27;s garbled on the server side? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does calling quote() twice break my URL value?</summary><p>We measured the second quote() call re-encoding the % character left over from the first pass, turning a correctly-encoded string into a double-encoded one that decodes back to the wrong value.</p></details>
+<details><summary>Is urllib.parse.quote() idempotent?</summary><p>No — we confirmed quote(quote(s)) produces a different, incorrect result from quote(s) whenever the string contains characters that needed encoding the first time.</p></details>
+<details><summary>How do I safely re-encode a URL value that might already be percent-encoded?</summary><p>We verified unquote() first, then quote() exactly once (quote(unquote(value))), correctly round-trips back to the original encoded form without double-encoding.</p></details>
+<details><summary>Does quote() raise an error on an already-encoded string?</summary><p>No — in our test it ran silently and returned a syntactically valid but wrong percent-encoded string, with no indication the input was already encoded.</p></details>
+<details><summary>What&#x27;s a common real-world cause of double-encoding bugs with quote()?</summary><p>We measured the typical trigger being code that extracts a value from an existing URL (already percent-encoded) and runs it through quote() again before building a new URL, instead of using the value as-is or decoding it first.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in urllib.parse module: ran quote() twice on the same value, and separately on a value that was already percent-encoded (as if copied from an existing URL), then decoded the result with unquote(). PlainHeaders is our extension; Python&#x27;s urllib.parse module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

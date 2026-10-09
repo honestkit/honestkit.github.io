@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLite &#x27;Unable to Open Database File&#x27; — Tested</title>
+<meta name="description" content="We reproduced sqlite3&#x27;s &#x27;unable to open database file&#x27; two ways: a missing parent directory, and a read-only directory for a brand-new file.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite-unable-to-open-database-file/">
+<meta property="og:title" content="SQLite &#x27;Unable to Open Database File&#x27; — Tested">
+<meta property="og:description" content="We reproduced sqlite3&#x27;s &#x27;unable to open database file&#x27; two ways: a missing parent directory, and a read-only directory for a brand-new file.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite-unable-to-open-database-file/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What's the difference between 'unable to open database file' and 'attempt to write a readonly database'?", "acceptedAnswer": {"@type": "Answer", "text": "We measured both: 'unable to open' fires when SQLite can't create or open the file handle at all (missing parent directory, or no permission to create a new file there). 'Readonly database' fires later, when the file already exists and opens fine but can't be written to."}}, {"@type": "Question", "name": "Does sqlite3.connect() create missing parent directories for me?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed it creates a missing database file, but not a missing parent directory. Pointing at a path inside a directory that doesn't exist yet fails immediately with 'unable to open database file' on the first real operation."}}, {"@type": "Question", "name": "How do I tell which of the two causes I'm hitting?", "acceptedAnswer": {"@type": "Answer", "text": "The error text is identical for both in our test, so check directly: os.path.isdir() on the parent directory tells you if it's missing, and os.access(dir, os.W_OK) tells you if it exists but isn't writable."}}, {"@type": "Question", "name": "Does this happen with in-memory databases (:memory:)?", "acceptedAnswer": {"@type": "Answer", "text": "Not applicable \u2014 :memory: databases have no file path at all, so this error, which we reproduced specifically against real file paths with missing or unwritable parent directories, doesn't apply to them."}}, {"@type": "Question", "name": "Is this the same error as a locked database?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured 'database is locked' separately: that happens when the file opens fine but another connection already holds a write lock. 'Unable to open' happens before any lock is ever involved, at the file-handle-creation step."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLite: unable to open database file (tested)</h1>
+<p class="lead"><code>sqlite3.OperationalError: unable to open database file</code> fires when sqlite3 can't even create or open the file handle itself &mdash; a step earlier than a permission problem on an existing file. We reproduced two distinct causes and measured where the error actually happens.</p>
+<h2 id="repro1">1. The parent directory doesn't exist</h2>
+<p>We pointed <code>connect()</code> at a path inside a directory that was never created:</p>
+<pre><code>con = sqlite3.connect("/tmp/sq_uo/nonexistentdir/x.db")
+con.execute("CREATE TABLE t(id INTEGER)")
+sqlite3.OperationalError: unable to open database file</code></pre>
+<p>Unlike a missing database <em>file</em> (which <code>connect()</code> creates silently &mdash; see our <a href="/guides/sqlite-no-such-table/">no such table</a> guide), a missing parent <strong>directory</strong> is not created for you, and fails immediately on the first real operation.</p>
+
+<h2 id="repro2">2. The parent directory exists but can't be written to</h2>
+<p>We made a directory and removed its write permission, then pointed at a new (not-yet-existing) file inside it:</p>
+<pre><code>$ chmod 555 /tmp/sq_uo/rodir</code></pre>
+<pre><code>con = sqlite3.connect("/tmp/sq_uo/rodir/new.db")
+con.execute("CREATE TABLE t(id INTEGER)")
+sqlite3.OperationalError: unable to open database file</code></pre>
+<p><strong>Measured:</strong> this gives the identical error text to the missing-directory case &mdash; the message doesn't tell you which of the two it is. It's also a different error from <a href="/guides/sqlite-attempt-to-write-a-readonly-database/">attempt to write a readonly database</a>: that one fires when the file already exists and SQLite can open it but not write to it; this one fires earlier, when SQLite can't even create the file handle in the first place.</p>
+
+<h2 id="fix">3. The fix: check the directory, not just the path string</h2>
+<p>Since the error text is identical for both causes, check the parent directory directly instead of guessing from the message:</p>
+<pre><code>import os
+d = os.path.dirname(os.path.abspath(db_path))
+print(os.path.isdir(d), os.access(d, os.W_OK))</code></pre>
+<p><code>False</code> for the first means create the directory; <code>False</code> for the second means fix its permissions (<code>chmod u+w</code>). We confirmed both independently resolve the error with no other change.</p>
+
+<aside class="cta"><strong>Debugging an app that talks to an API instead of a database? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What&#x27;s the difference between &#x27;unable to open database file&#x27; and &#x27;attempt to write a readonly database&#x27;?</summary><p>We measured both: &#x27;unable to open&#x27; fires when SQLite can&#x27;t create or open the file handle at all (missing parent directory, or no permission to create a new file there). &#x27;Readonly database&#x27; fires later, when the file already exists and opens fine but can&#x27;t be written to.</p></details>
+<details><summary>Does sqlite3.connect() create missing parent directories for me?</summary><p>No — we confirmed it creates a missing database file, but not a missing parent directory. Pointing at a path inside a directory that doesn&#x27;t exist yet fails immediately with &#x27;unable to open database file&#x27; on the first real operation.</p></details>
+<details><summary>How do I tell which of the two causes I&#x27;m hitting?</summary><p>The error text is identical for both in our test, so check directly: os.path.isdir() on the parent directory tells you if it&#x27;s missing, and os.access(dir, os.W_OK) tells you if it exists but isn&#x27;t writable.</p></details>
+<details><summary>Does this happen with in-memory databases (:memory:)?</summary><p>Not applicable — :memory: databases have no file path at all, so this error, which we reproduced specifically against real file paths with missing or unwritable parent directories, doesn&#x27;t apply to them.</p></details>
+<details><summary>Is this the same error as a locked database?</summary><p>No — we measured &#x27;database is locked&#x27; separately: that happens when the file opens fine but another connection already holds a write lock. &#x27;Unable to open&#x27; happens before any lock is ever involved, at the file-handle-creation step.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in sqlite3 module, connecting to a path whose parent directory doesn&#x27;t exist and, separately, a new file inside a read-only directory. Every error string below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s sqlite3 is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

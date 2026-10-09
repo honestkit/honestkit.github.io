@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python requests ReadTimeout: Read Timed Out (Tested Fixes)</title>
+<meta name="description" content="We measured requests ReadTimeout: per-read vs total timeout, (connect, read) tuples, and why Retry turns ReadTimeout into ConnectionError for GET.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-requests-readtimeout-read-timed-out/">
+<meta property="og:title" content="Python requests ReadTimeout: Read Timed Out (Tested Fixes)">
+<meta property="og:description" content="We measured requests ReadTimeout: per-read vs total timeout, (connect, read) tuples, and why Retry turns ReadTimeout into ConnectionError for GET.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-requests-readtimeout-read-timed-out/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I fix requests ReadTimeout?", "acceptedAnswer": {"@type": "Answer", "text": "The server connected but sent nothing within the read timeout. Raise the read part with timeout=(connect, read), add retries for idempotent requests, or fix the slow endpoint. We measured each case with requests 2.32.3."}}, {"@type": "Question", "name": "Is requests timeout a total timeout?", "acceptedAnswer": {"@type": "Answer", "text": "No. It's the maximum gap between bytes. We measured a response that dripped one byte every 0.5 s finishing after 4.5 s with timeout=1. Use stream=True and check elapsed time for a total deadline."}}, {"@type": "Question", "name": "Why doesn't except ReadTimeout catch my timeout?", "acceptedAnswer": {"@type": "Answer", "text": "With an HTTPAdapter Retry mounted, the final error is ConnectionError (Max retries exceeded, Caused by ReadTimeoutError). We measured that for GET. Catch requests.RequestException."}}, {"@type": "Question", "name": "Does except ConnectionError catch ReadTimeout?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured ReadTimeout is a Timeout but not a ConnectionError; ConnectTimeout is both."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>requests ReadTimeout: Read timed out (tested)</h1>
+<p class="lead"><code>requests.exceptions.ReadTimeout: HTTPConnectionPool(...): Read timed out. (read timeout=N)</code> means the server accepted the connection but went quiet. We measured what the timeout actually limits, and how retries change the exception you have to catch.</p>
+<h2 id="harness">Test server</h2>
+<p>Every block uses this local server: <code>/slow</code> waits 3 s before answering, <code>/drip</code> sends one byte every 0.5 s.</p>
+<pre><code># helper: tiny local server on port 8963 with a slow endpoint and a drip endpoint
+import http.server, threading, time
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path == &quot;/slow&quot;:            # waits 3s before answering
+            time.sleep(3)
+        self.send_response(200); self.send_header(&quot;Content-Length&quot;, &quot;10&quot;); self.end_headers()
+        for ch in b&quot;0123456789&quot;:
+            self.wfile.write(bytes([ch])); self.wfile.flush()
+            if self.path == &quot;/drip&quot;: time.sleep(0.5)   # one byte every 0.5s
+    do_POST = do_GET
+def start():
+    s = http.server.ThreadingHTTPServer((&quot;127.0.0.1&quot;, 8963), H)
+    s.handle_error = lambda *a: None       # client hung up on /slow: ignore
+    threading.Thread(target=s.serve_forever, daemon=True).start()</code></pre>
+
+<h2 id="what">1. The exact ReadTimeout</h2>
+<pre><code>import requests, srv
+srv.start()
+try:
+    requests.get(&quot;http://127.0.0.1:8963/slow&quot;, timeout=1)
+except requests.exceptions.ReadTimeout as e:
+    print(&quot;ReadTimeout:&quot;, e)
+print(issubclass(requests.exceptions.ReadTimeout, requests.exceptions.Timeout),
+      issubclass(requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError))</code></pre>
+<p>Output:</p>
+<pre><code>ReadTimeout: HTTPConnectionPool(host=&#x27;127.0.0.1&#x27;, port=8963): Read timed out. (read timeout=1)
+True False</code></pre>
+<p><strong>Measured with requests 2.32.3 / urllib3 2.3.0:</strong> the server accepted the connection but sent nothing for longer than <code>timeout</code>. <code>ReadTimeout</code> is a <code>Timeout</code> but <em>not</em> a <code>ConnectionError</code>, so <code>except requests.ConnectionError</code> does not catch it. Catch <code>requests.Timeout</code> (or <code>RequestException</code>).</p>
+
+<h2 id="per-read">2. timeout is per read, not a total limit</h2>
+<pre><code>import requests, srv, time
+srv.start()
+t0 = time.monotonic()
+r = requests.get(&quot;http://127.0.0.1:8963/drip&quot;, timeout=1)   # each byte arrives within 1s
+print(r.status_code, r.text, f&quot;took {time.monotonic()-t0:.1f}s with timeout=1&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>200 0123456789 took 4.5s with timeout=1</code></pre>
+<p><strong>Measured:</strong> with <code>timeout=1</code>, a response that trickles in one byte every 0.5 s never times out; it took 4.5 s. The read timeout is the longest gap between bytes, not the time for the whole request. A slow-drip server can hold a request open far past your timeout. See section 5 for a total deadline.</p>
+
+<h2 id="connect">3. Connect vs read: use a tuple</h2>
+<pre><code>import requests, time
+t0 = time.monotonic()
+try:   # 10.255.255.1: non-routable, the connect attempt just hangs
+    requests.get(&quot;http://10.255.255.1/&quot;, timeout=(0.5, 30))
+except requests.exceptions.ConnectTimeout as e:
+    print(&quot;ConnectTimeout after&quot;, f&quot;{time.monotonic()-t0:.1f}s&quot;)
+    print(issubclass(requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError))</code></pre>
+<p>Output:</p>
+<pre><code>ConnectTimeout after 0.5s
+True</code></pre>
+<p><strong>Measured:</strong> <code>timeout=(0.5, 30)</code> means 0.5 s to connect, 30 s per read, and a non-routable address failed with <code>ConnectTimeout</code> after 0.5 s. Unlike <code>ReadTimeout</code>, <code>ConnectTimeout</code> <em>is</em> a subclass of <code>ConnectionError</code>. Use a short connect timeout and a read timeout sized to how slow the server legitimately is.</p>
+
+<h2 id="retry">4. With Retry, a GET ReadTimeout turns into ConnectionError</h2>
+<pre><code>import requests, srv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+srv.start()
+s = requests.Session()
+s.mount(&quot;http://&quot;, HTTPAdapter(max_retries=Retry(total=2, read=2, backoff_factor=0)))
+import time
+for method in (&quot;GET&quot;, &quot;POST&quot;):
+    t0 = time.monotonic()
+    try:
+        s.request(method, &quot;http://127.0.0.1:8963/slow&quot;, timeout=1)
+    except requests.exceptions.RequestException as e:
+        print(method, type(e).__name__, f&quot;after {time.monotonic()-t0:.1f}s,&quot;,
+              &quot;is ReadTimeout:&quot;, isinstance(e, requests.exceptions.ReadTimeout))
+        if method == &quot;GET&quot;: print(&quot;   &quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>GET ConnectionError after 3.0s, is ReadTimeout: False
+    HTTPConnectionPool(host=&#x27;127.0.0.1&#x27;, port=8963): Max retries exceeded with url: /slow (Caused by ReadTimeoutError(&quot;HTTPConnectionPool(host=&#x27;127.0.0.1&#x27;, port=8963): Read timed out. (read timeout=1)&quot;))
+POST ReadTimeout after 1.0s, is ReadTimeout: True</code></pre>
+<p><strong>Measured:</strong> after mounting <code>Retry(total=2, read=2)</code>, the GET retried (3 tries, 3.0 s) and then raised <code>ConnectionError: Max retries exceeded ... (Caused by ReadTimeoutError(...))</code>, which is <em>not</em> a <code>ReadTimeout</code>, so an <code>except ReadTimeout</code> handler silently stops matching once you add retries. The POST was not retried at all (Retry's default <code>allowed_methods</code> leaves out POST) and raised a plain <code>ReadTimeout</code> after 1.0 s. Catch both, or catch <code>RequestException</code>.</p>
+
+<h2 id="deadline">5. A real total deadline</h2>
+<pre><code>import requests, srv, time
+srv.start()
+def get_with_deadline(url, deadline=2.0, timeout=1):
+    t0 = time.monotonic(); body = b&quot;&quot;
+    with requests.get(url, timeout=timeout, stream=True) as r:
+        for chunk in r.iter_content(1):
+            body += chunk
+            if time.monotonic() - t0 &gt; deadline:
+                raise TimeoutError(f&quot;total deadline {deadline}s exceeded after {len(body)} bytes&quot;)
+    return body
+try:
+    get_with_deadline(&quot;http://127.0.0.1:8963/drip&quot;)
+except TimeoutError as e:
+    print(&quot;TimeoutError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>TimeoutError: total deadline 2.0s exceeded after 5 bytes</code></pre>
+<p>With <code>stream=True</code> and <code>iter_content()</code> you can check the elapsed time yourself and give up on a slow-drip response. <strong>Measured:</strong> it stopped after 2 s with 5 of 10 bytes. More on raising timeouts: <a href="/guides/python-requests-connectionerror-max-retries/">requests Max retries exceeded</a>.</p>
+
+<aside class="cta"><strong>Is the server slow or the network? Check its real status and headers:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I fix requests ReadTimeout?</summary><p>The server connected but sent nothing within the read timeout. Raise the read part with timeout=(connect, read), add retries for idempotent requests, or fix the slow endpoint. We measured each case with requests 2.32.3.</p></details>
+<details><summary>Is requests timeout a total timeout?</summary><p>No. It&#x27;s the maximum gap between bytes. We measured a response that dripped one byte every 0.5 s finishing after 4.5 s with timeout=1. Use stream=True and check elapsed time for a total deadline.</p></details>
+<details><summary>Why doesn&#x27;t except ReadTimeout catch my timeout?</summary><p>With an HTTPAdapter Retry mounted, the final error is ConnectionError (Max retries exceeded, Caused by ReadTimeoutError). We measured that for GET. Catch requests.RequestException.</p></details>
+<details><summary>Does except ConnectionError catch ReadTimeout?</summary><p>No. We measured ReadTimeout is a Timeout but not a ConnectionError; ConnectTimeout is both.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5, requests 2.32.3 and urllib3 2.3.0 against a local test server (included above): ReadTimeout and its class hierarchy, a slow-drip response vs timeout=1, a connect/read tuple against a non-routable address, Retry with GET and POST, and a stream=True total deadline. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; requests, urllib3 and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

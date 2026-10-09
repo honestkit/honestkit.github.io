@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>csv.reader() Blames Text Mode for a None Line (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: csv.reader() crashes blaming text mode when its iterable yields a single None, even with valid CSV rows right behind it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-csv-reader-none-error-wrong-text-mode-message/">
+<meta property="og:title" content="csv.reader() Blames Text Mode for a None Line (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: csv.reader() crashes blaming text mode when its iterable yields a single None, even with valid CSV rows right behind it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-csv-reader-none-error-wrong-text-mode-message/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "The csv module's documentation for reader() says the argument can be any object which supports the iterator protocol and returns a string each time its __next__() method is called; it does not mention None or what happens if that contract is violated. We measured the resulting error message, which misleadingly suggests a file text-mode problem."}}, {"@type": "Question", "name": "Why does the error mention text mode when there's no file?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that csv's C implementation uses the same internal check it uses to catch the genuine mistake of iterating a file opened in binary mode (where lines come back as bytes, not str); None fails that same type check and triggers the identical message, which was written assuming the only way to get a non-str value is a file-mode mistake."}}, {"@type": "Question", "name": "Is this likely to come up in real code?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- any code that reads CSV lines from a non-blocking source (a socket, a message queue, a custom line-buffering generator) and uses the common while chunk := source.get_line(): pattern where None means 'not ready yet' is at risk if that None ever reaches csv.reader() directly instead of being filtered out first."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- same family already confirmed in shutil.copyfileobj, gzip/bz2/lzma, tarfile/zipfile, TextIOWrapper.readline(), ElementTree.parse(), tomllib.load(), email.message_from_binary_file(), plistlib.load(), wave.open(), json.load(), http.client.HTTPResponse, smtplib.getreply(), poplib._getline(), and base64.encode()/decode(): a None meant as a retry signal gets mishandled one layer above where it originated. This is the first case triggered by a plain custom iterable rather than anything built on io.BufferedReader."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>csv.reader() Crashes with a Wrong Text-Mode Error on None (tested)</h1>
+<p class="lead">Code that reads lines from a non-blocking source (a socket, a queue, a custom generator) often has a moment where there's "nothing ready yet" and yields <code>None</code> to signal a retry. We measured that feeding such an iterable directly to <code>csv.reader()</code> is not safe: a single <code>None</code> value crashes with <code>_csv.Error: iterator should return strings, not NoneType (the file should be opened in text mode)</code> -- an error that looks like a file-mode mistake, even though no file is involved and valid CSV rows are sitting right behind the <code>None</code> in the same iterable.</p>
+<h2 id="repro1">1. A real, valid CSV row behind one None from the source iterable</h2>
+<pre><code>import csv
+
+class FlakyLines:
+    def __init__(self, lines):
+        self.lines = lines
+        self.i = 0
+    def __iter__(self):
+        return self
+    def __next__(self):
+        if self.i == 0:
+            self.i += 1
+            return None          # transient: no line ready yet
+        if self.i - 1 < len(self.lines):
+            line = self.lines[self.i - 1]
+            self.i += 1
+            return line
+        raise StopIteration
+
+try:
+    for row in csv.reader(FlakyLines(["a,b,c", "1,2,3"])):
+        print("row:", row)
+except Exception as e:
+    print("CRASHED:", type(e).__name__, e)</code></pre>
+<pre><code>CRASHED: Error iterator should return strings, not NoneType (the file should be opened in text mode)</code></pre>
+<p><strong>Measured:</strong> the real rows (<code>"a,b,c"</code>, <code>"1,2,3"</code>) are valid and waiting, but <code>csv.reader()</code> crashes on the very first <code>None</code> it sees. The error message talks about text mode and file objects -- there is no file here at all, just a plain iterable.</p>
+
+<h2 id="repro2">2. The fix: filter None out of your own iterable before csv.reader sees it</h2>
+<pre><code>def retrying_lines(raw_lines):
+    for line in raw_lines:
+        if line is None:
+            continue              # retry: not ready yet, skip it
+        yield line
+
+raw_lines = [None, "a,b,c", "1,2,3"]
+for row in csv.reader(retrying_lines(raw_lines)):
+    print("row:", row)</code></pre>
+<pre><code>row: ['a', 'b', 'c']
+row: ['1', '2', '3']</code></pre>
+<p><strong>Measured:</strong> filtering out the retry signal before it reaches <code>csv.reader()</code> parses both rows correctly.</p>
+<aside class="cta"><strong>Feeding csv.reader() a generator over a non-blocking line source? A single None from your generator crashes with an error blaming text mode -- not your generator:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>The csv module&#x27;s documentation for reader() says the argument can be any object which supports the iterator protocol and returns a string each time its __next__() method is called; it does not mention None or what happens if that contract is violated. We measured the resulting error message, which misleadingly suggests a file text-mode problem.</p></details>
+<details><summary>Why does the error mention text mode when there&#x27;s no file?</summary><p>We measured that csv&#x27;s C implementation uses the same internal check it uses to catch the genuine mistake of iterating a file opened in binary mode (where lines come back as bytes, not str); None fails that same type check and triggers the identical message, which was written assuming the only way to get a non-str value is a file-mode mistake.</p></details>
+<details><summary>Is this likely to come up in real code?</summary><p>Yes -- any code that reads CSV lines from a non-blocking source (a socket, a message queue, a custom line-buffering generator) and uses the common while chunk := source.get_line(): pattern where None means &#x27;not ready yet&#x27; is at risk if that None ever reaches csv.reader() directly instead of being filtered out first.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>Yes -- same family already confirmed in shutil.copyfileobj, gzip/bz2/lzma, tarfile/zipfile, TextIOWrapper.readline(), ElementTree.parse(), tomllib.load(), email.message_from_binary_file(), plistlib.load(), wave.open(), json.load(), http.client.HTTPResponse, smtplib.getreply(), poplib._getline(), and base64.encode()/decode(): a None meant as a retry signal gets mishandled one layer above where it originated. This is the first case triggered by a plain custom iterable rather than anything built on io.BufferedReader.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in csv.reader(), iterating a plain Python generator whose first yielded value is None (simulating a retry signal from a non-blocking line source) before yielding real, valid CSV lines. PlainHeaders is our extension; Python&#x27;s csv module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

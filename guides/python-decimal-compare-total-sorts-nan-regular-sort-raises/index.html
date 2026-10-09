@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>decimal: compare_total() Sorts NaN, sorted() Raises</title>
+<meta name="description" content="We measured Python 3.13.5: sorted() on a list containing Decimal(&#x27;NaN&#x27;) raises InvalidOperation, but compare_total() orders it without error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-decimal-compare-total-sorts-nan-regular-sort-raises/">
+<meta property="og:title" content="decimal: compare_total() Sorts NaN, sorted() Raises">
+<meta property="og:description" content="We measured Python 3.13.5: sorted() on a list containing Decimal(&#x27;NaN&#x27;) raises InvalidOperation, but compare_total() orders it without error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-decimal-compare-total-sorts-nan-regular-sort-raises/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I sort a list of Decimal values that might contain NaN?", "acceptedAnswer": {"@type": "Answer", "text": "Use Decimal.compare_total() as the comparator, e.g. sorted(vals, key=functools.cmp_to_key(lambda a, b: a.compare_total(b))) -- we measured this succeeding where a plain sorted() call raises InvalidOperation the moment it needs to compare a NaN."}}, {"@type": "Question", "name": "Why does sorted() raise InvalidOperation on a list of Decimals?", "acceptedAnswer": {"@type": "Answer", "text": "Because regular comparison operators are undefined for NaN per IEEE 754, and we confirmed Python's decimal module raises decimal.InvalidOperation rather than silently picking an order when a NaN needs to be compared during a sort."}}, {"@type": "Question", "name": "Does Decimal.compare_total() give the same ordering as == and sorted()?", "acceptedAnswer": {"@type": "Answer", "text": "Not exactly -- we measured Decimal('1').compare_total(Decimal('1.0')) returning 1 (not equal) even though Decimal('1') == Decimal('1.0') is True. compare_total() implements IEEE 754 total ordering, which also considers a value's stored representation (exponent/coefficient), not just its numeric value."}}, {"@type": "Question", "name": "Can compare_total() sort NaN relative to regular numbers?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured a list containing Decimal('3'), Decimal('NaN'), and Decimal('1') sorting successfully with compare_total() as the comparator, placing NaN in a defined position (last, in our test) with no exception."}}, {"@type": "Question", "name": "Is compare_total() a drop-in replacement for sorted() on Decimal lists?", "acceptedAnswer": {"@type": "Answer", "text": "Only if you also expect its secondary effect: it distinguishes equal-value Decimals with different representations (like Decimal('1') vs Decimal('1.0')) as non-equal, which == and ordinary sorted() do not. Switching to it purely to tolerate NaN changes that unrelated behavior too."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>decimal: compare_total() Sorts NaN, Regular sorted() Raises (tested)</h1>
+<p class="lead">Earlier we measured that Decimal's regular comparison operators raise <code>InvalidOperation</code> the moment a <code>NaN</code> is involved, which means <code>sorted()</code> can't be used at all on data that might contain one. We measured whether <code>Decimal.compare_total()</code> -- a method most people never reach for -- actually solves that, and what else it does differently from regular comparison.</p>
+<h2 id="repro1">1. Regular sorted() raises the instant a NaN is in the list</h2>
+<pre><code>from decimal import Decimal
+
+vals = [Decimal("3"), Decimal("NaN"), Decimal("1")]
+sorted(vals)</code></pre>
+<pre><code>Traceback (most recent call last):
+  ...
+decimal.InvalidOperation: [&lt;class 'decimal.InvalidOperation'&gt;]</code></pre>
+<p><strong>Measured:</strong> <code>sorted()</code> on a list that includes a <code>NaN</code> raises <code>InvalidOperation</code> -- regular comparison operators (<code>&lt;</code>, <code>&gt;</code>) are undefined for NaN by design, per IEEE 754, so any sort that needs to compare it fails rather than silently placing it somewhere.</p>
+
+<h2 id="repro2">2. compare_total() gives every value a defined position, NaN included</h2>
+<pre><code>from decimal import Decimal
+import functools
+
+vals = [Decimal("3"), Decimal("NaN"), Decimal("1")]
+print(sorted(vals, key=functools.cmp_to_key(lambda a, b: a.compare_total(b))))</code></pre>
+<pre><code>[Decimal('1'), Decimal('3'), Decimal('NaN')]</code></pre>
+<p><strong>Measured:</strong> using <code>compare_total()</code> (via <code>functools.cmp_to_key</code>, since it's a three-way comparator, not an operator) sorts the same list successfully, placing <code>NaN</code> at the end with no error. <code>compare_total()</code> implements the IEEE 754 <em>total ordering</em> predicate, which guarantees every two values have a defined order -- including NaN vs. a number, and (though not shown here) NaN vs. another NaN by payload.</p>
+
+<h2 id="repro3">3. compare_total() also distinguishes equal-valued Decimals that == treats as the same</h2>
+<pre><code>from decimal import Decimal
+
+a = Decimal("1")
+b = Decimal("1.0")
+print("a == b:", a == b)
+print("a.compare_total(b):", a.compare_total(b))</code></pre>
+<pre><code>a == b: True
+a.compare_total(b): 1</code></pre>
+<p><strong>Measured:</strong> <code>Decimal('1') == Decimal('1.0')</code> is <code>True</code> -- they represent the same numeric value. But <code>compare_total()</code> returns <code>1</code> (not <code>0</code>), because total ordering also accounts for representation (coefficient/exponent), not just numeric value -- two Decimals that are mathematically equal but stored with different exponents are NOT total-order-equal. If code switches from <code>==</code>/<code>sorted()</code> to <code>compare_total()</code> purely to handle NaN, it should expect this second, unrelated behavior change too: values that used to compare equal may now sort into a defined but non-zero relative order.</p>
+<aside class="cta"><strong>Sorting Decimal values that might include NaN? Check compare_total() before reaching for sorted():</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I sort a list of Decimal values that might contain NaN?</summary><p>Use Decimal.compare_total() as the comparator, e.g. sorted(vals, key=functools.cmp_to_key(lambda a, b: a.compare_total(b))) -- we measured this succeeding where a plain sorted() call raises InvalidOperation the moment it needs to compare a NaN.</p></details>
+<details><summary>Why does sorted() raise InvalidOperation on a list of Decimals?</summary><p>Because regular comparison operators are undefined for NaN per IEEE 754, and we confirmed Python&#x27;s decimal module raises decimal.InvalidOperation rather than silently picking an order when a NaN needs to be compared during a sort.</p></details>
+<details><summary>Does Decimal.compare_total() give the same ordering as == and sorted()?</summary><p>Not exactly -- we measured Decimal(&#x27;1&#x27;).compare_total(Decimal(&#x27;1.0&#x27;)) returning 1 (not equal) even though Decimal(&#x27;1&#x27;) == Decimal(&#x27;1.0&#x27;) is True. compare_total() implements IEEE 754 total ordering, which also considers a value&#x27;s stored representation (exponent/coefficient), not just its numeric value.</p></details>
+<details><summary>Can compare_total() sort NaN relative to regular numbers?</summary><p>Yes -- we measured a list containing Decimal(&#x27;3&#x27;), Decimal(&#x27;NaN&#x27;), and Decimal(&#x27;1&#x27;) sorting successfully with compare_total() as the comparator, placing NaN in a defined position (last, in our test) with no exception.</p></details>
+<details><summary>Is compare_total() a drop-in replacement for sorted() on Decimal lists?</summary><p>Only if you also expect its secondary effect: it distinguishes equal-value Decimals with different representations (like Decimal(&#x27;1&#x27;) vs Decimal(&#x27;1.0&#x27;)) as non-equal, which == and ordinary sorted() do not. Switching to it purely to tolerate NaN changes that unrelated behavior too.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in decimal module: sorted a list of Decimal values containing a NaN with the regular sorted() builtin, then repeated it using Decimal.compare_total() as the sort key, and compared Decimal(&#x27;1&#x27;).compare_total(Decimal(&#x27;1.0&#x27;)) against the regular == result for the same pair. PlainHeaders is our extension; Python&#x27;s decimal module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

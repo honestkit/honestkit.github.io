@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Accept-Language Header: Format, q Values, Examples and How to Parse It (Tested)</title>
+<meta name="description" content="What the Accept-Language header looks like in a real Chrome request, how q values rank languages, what headless browsers send, and a tested Python parser that picks the best supported language.">
+<link rel="canonical" href="https://honestkit.github.io/guides/accept-language-header/">
+<meta property="og:title" content="Accept-Language Header: Format, q Values, Examples and How to Parse It (Tested)">
+<meta property="og:description" content="What the Accept-Language header looks like in a real Chrome request, how q values rank languages, what headless browsers send, and a tested Python parser that picks the best supported language.">
+<meta property="og:url" content="https://honestkit.github.io/guides/accept-language-header/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does q mean in Accept-Language?", "acceptedAnswer": {"@type": "Answer", "text": "Quality, 0 to 1: how much the user wants that language. No q means 1. q=0 means not acceptable, so our parser drops it."}}, {"@type": "Question", "name": "What does Chrome send in Accept-Language?", "acceptedAnswer": {"@type": "Answer", "text": "In our test, full Chromium on an English (UK) system sent en-GB,en-US;q=0.9,en;q=0.8. Playwright's default headless shell sent no Accept-Language header at all."}}, {"@type": "Question", "name": "Is the first language in the header always the preferred one?", "acceptedAnswer": {"@type": "Answer", "text": "No, q decides. In 'fr;q=0.5, en;q=0.8, de' the preferred language is de (implicit q=1)."}}, {"@type": "Question", "name": "How do I test my site with a different Accept-Language?", "acceptedAnswer": {"@type": "Answer", "text": "Start Chromium with --accept-lang=de-DE (that changed the header in our test; --lang did not), change the browser's language settings, or set the header with an extension such as PlainHeaders."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Accept-Language header: format, q values, real examples and a parser</h1>
+<p class="lead">Accept-Language is the browser's ranked list of preferred languages. Here is what Chromium really sent, and a small parser tested on it.</p>
+<h2>1. Real values</h2>
+<table><thead><tr><th>Browser setup</th><th>Accept-Language sent</th></tr></thead><tbody>
+<tr><td>Chromium 153, English (UK) system</td><td><code>en-GB,en-US;q=0.9,en;q=0.8</code></td></tr>
+<tr><td>Chromium with <code>--accept-lang=de-DE,fr</code></td><td><code>de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7</code></td></tr>
+<tr><td>Playwright default headless shell</td><td><strong>no header at all</strong></td></tr>
+</tbody></table>
+<p>Format: comma-separated language tags, each optionally followed by <code>;q=</code> (0 to 1, default 1). Chromium wrote the q values itself, stepping down 0.1 per entry, and added the base language <code>de</code> after <code>de-DE</code>. In our run it also left out <code>fr</code> and added English, so don't assume the header mirrors a setting one-to-one. <code>--lang=de-DE</code> did not change the header on this Linux build; only <code>--accept-lang</code> did. A missing header (as from the headless shell) is common for scripts and bots: always have a default.</p>
+<h2>2. Parsing it (Python, tested)</h2>
+<pre><code>def parse_accept_language(header):
+    # language tags sorted by q (highest first); q=0 means 'not acceptable'
+    langs = []
+    for i, part in enumerate((header or "").split(",")):
+        tag, _, params = part.strip().partition(";")
+        tag = tag.strip()
+        if not tag:
+            continue
+        q = 1.0
+        for p in params.split(";"):
+            k, _, v = p.strip().partition("=")
+            if k.strip().lower() == "q":
+                try:
+                    q = float(v)
+                except ValueError:
+                    q = 0.0
+        if q &gt; 0:
+            langs.append((-q, i, tag))
+    return [tag for _, _, tag in sorted(langs)]
+
+def pick(header, supported, default="en"):
+    sup = {s.lower(): s for s in supported}
+    for tag in parse_accept_language(header):
+        t = tag.lower()
+        if t in sup: return sup[t]
+        if t.split("-")[0] in sup: return sup[t.split("-")[0]]
+        if t == "*": return default
+    return default
+
+print(pick("de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7", ["en", "de", "fr"]))  # de</code></pre>
+<table><thead><tr><th>Header</th><th>Ranked</th><th>pick(en, de, fr)</th></tr></thead><tbody>
+<tr><td><code>fr;q=0.5, en;q=0.8 ,de</code></td><td>de, en, fr</td><td>de</td></tr>
+<tr><td><code>fr-CA;q=0, fr;q=0.9, *;q=0.1</code></td><td>fr, * (fr-CA dropped: q=0 = "not acceptable")</td><td>fr</td></tr>
+<tr><td><code>en;q=abc,de;q=0.4</code></td><td>de (invalid q ignored)</td><td>de</td></tr>
+<tr><td>(empty or missing)</td><td>[]</td><td>en (default)</td></tr>
+</tbody></table>
+<p>Order in the header is not the ranking: <code>de</code> came first in the third row because it has the implicit q=1. Ties keep header order.</p>
+<h2>3. Using it well</h2>
+<ul><li>Treat it as a hint for the first visit. Let users switch language and remember the choice (cookie or URL like <code>/de/</code>): someone abroad or on a shared computer gets the wrong language otherwise.</li>
+<li>If the same URL returns different languages depending on this header, send <code>Vary: Accept-Language</code> so caches don't mix them up (<a href="/guides/vary-origin-header-cors-cache/">what happens without Vary, measured</a>). Separate URLs per language are better for search engines, which mostly crawl without the header.</li>
+<li>Server-side frameworks have this built in (Spring's <code>AcceptHeaderLocaleResolver</code>, Django's <code>LocaleMiddleware</code>, PHP's <code>Locale::acceptFromHttp</code>); the parser above is for when you need the logic yourself.</li></ul>
+<aside class="cta"><strong>Test your site in another language by setting Accept-Language:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does q mean in Accept-Language?</summary><p>Quality, 0 to 1: how much the user wants that language. No q means 1. q=0 means not acceptable, so our parser drops it.</p></details>
+<details><summary>What does Chrome send in Accept-Language?</summary><p>In our test, full Chromium on an English (UK) system sent en-GB,en-US;q=0.9,en;q=0.8. Playwright&#x27;s default headless shell sent no Accept-Language header at all.</p></details>
+<details><summary>Is the first language in the header always the preferred one?</summary><p>No, q decides. In &#x27;fr;q=0.5, en;q=0.8, de&#x27; the preferred language is de (implicit q=1).</p></details>
+<details><summary>How do I test my site with a different Accept-Language?</summary><p>Start Chromium with --accept-lang=de-DE (that changed the header in our test; --lang did not), change the browser&#x27;s language settings, or set the header with an extension such as PlainHeaders.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01: a local server logged the Accept-Language header from Chromium 153 (full build, new headless, and Playwright&#x27;s chrome-headless-shell) with default settings, --lang and --accept-lang. The Python parser below was run on those real headers plus edge cases. PlainHeaders is our extension; the other methods are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

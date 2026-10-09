@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python: Send an Email on Error with logging SMTPHandler (Tested)</title>
+<meta name="description" content="Measured in Python 3.13.5: email errors with tracebacks using SMTPHandler, what happens when the mail server is down, and mailing uncaught exceptions.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-send-email-on-error-logging-smtphandler/">
+<meta property="og:title" content="Python: Send an Email on Error with logging SMTPHandler (Tested)">
+<meta property="og:description" content="Measured in Python 3.13.5: email errors with tracebacks using SMTPHandler, what happens when the mail server is down, and mailing uncaught exceptions.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-send-email-on-error-logging-smtphandler/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I send an email when my Python script fails?", "acceptedAnswer": {"@type": "Answer", "text": "Add logging.handlers.SMTPHandler to your logger with level ERROR and call log.exception() in your except block. We measured one email containing the message and full traceback."}}, {"@type": "Question", "name": "Does SMTPHandler raise if the mail server is down?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured log.error() returning normally while logging printed '--- Logging error ---' with ConnectionRefusedError to stderr."}}, {"@type": "Question", "name": "How do I email uncaught exceptions?", "acceptedAnswer": {"@type": "Answer", "text": "Set sys.excepthook to a function that logs at CRITICAL with exc_info, then calls sys.__excepthook__. We measured it sending the email and still printing the traceback."}}, {"@type": "Question", "name": "Does SMTPHandler slow down my program?", "acceptedAnswer": {"@type": "Answer", "text": "It sends synchronously inside the logging call, with a default timeout of 5.0 seconds. Use a QueueHandler/QueueListener if that's a problem."}}, {"@type": "Question", "name": "How do I use Gmail or STARTTLS with SMTPHandler?", "acceptedAnswer": {"@type": "Answer", "text": "Pass credentials=(user, app_password) and secure=() with port 587. secure is ignored without credentials."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Send an email on error in Python with SMTPHandler (tested)</h1>
+<p class="lead">Python can email you when a script fails, using only the standard library's <code>logging.handlers.SMTPHandler</code>. We ran it against a scripted SMTP server to measure what gets sent, what happens when the mail server is down, and how to also catch exceptions nobody handled.</p>
+<p>The examples use a scripted SMTP server on localhost, so no real mail account is needed. It's the <code>fake_smtp.py</code> from our <a href="/guides/python-smtplib-exceptions-list-and-error-handling/">smtplib exceptions guide</a>, with one addition: it saves each message it receives into a <code>SENT</code> list. Point <code>mailhost</code> at your real server (e.g. <code>("smtp.example.com", 587)</code>) in production.</p>
+
+<h2 id="basic">1. Mail errors (with the traceback) using SMTPHandler</h2>
+<pre><code>import logging, logging.handlers
+from fake_smtp import serve, SENT
+
+serve(8964, {})
+log = logging.getLogger(&quot;app&quot;)
+mail = logging.handlers.SMTPHandler(
+    mailhost=(&quot;127.0.0.1&quot;, 8964), fromaddr=&quot;app@example.com&quot;,
+    toaddrs=[&quot;me@example.com&quot;], subject=&quot;app error&quot;, timeout=5)
+mail.setLevel(logging.ERROR)             # only errors get mailed
+log.addHandler(mail)
+
+log.warning(&quot;disk 85% full&quot;)             # not mailed
+try:
+    1 / 0
+except ZeroDivisionError:
+    log.exception(&quot;nightly job failed&quot;)  # mailed, with traceback
+
+print(&quot;emails sent:&quot;, len(SENT))
+print(SENT[0].split(&quot;\r\n\r\n&quot;, 1)[0])  # headers
+print(&quot;--- body ---&quot;)
+print(SENT[0].split(&quot;\r\n\r\n&quot;, 1)[1].strip())</code></pre>
+<p>Output:</p>
+<pre><code>emails sent: 1
+From: app@example.com
+To: me@example.com
+Subject: app error
+Date: Fri, 09 Oct 2026 15:18:08 +0100
+Content-Type: text/plain; charset=&quot;utf-8&quot;
+Content-Transfer-Encoding: 7bit
+MIME-Version: 1.0
+--- body ---
+nightly job failed
+Traceback (most recent call last):
+  File &quot;/tmp/sh/b1.py&quot;, line 14, in &lt;module&gt;
+    1 / 0
+    ~~^~~
+ZeroDivisionError: division by zero</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> with the handler's level set to <code>ERROR</code>, the warning was not mailed and the <code>log.exception()</code> call sent exactly one email. Its body contained the message and the full traceback, and its headers had the From/To/Subject we configured. <code>SMTPHandler</code> is in the standard library (<code>logging.handlers</code>), so you don't need any package.</p>
+
+<h2 id="down">2. If the mail server is down, your program keeps going</h2>
+<pre><code>import logging, logging.handlers, sys, time
+
+log = logging.getLogger(&quot;app&quot;)
+log.addHandler(logging.handlers.SMTPHandler(
+    (&quot;127.0.0.1&quot;, 8967), &quot;app@example.com&quot;, [&quot;me@example.com&quot;], &quot;app error&quot;))
+# port 8967: nothing listening, like a mail server that&#x27;s down
+
+t0 = time.monotonic()
+log.error(&quot;payment import failed&quot;)
+print(f&quot;log.error() returned after {time.monotonic() - t0:.2f}s, no exception raised&quot;,
+      file=sys.stderr)
+print(&quot;program keeps running&quot;, file=sys.stderr)</code></pre>
+<p>Output:</p>
+<pre><code>--- Logging error ---
+Traceback (most recent call last):
+  File &quot;/usr/lib/python3.13/logging/handlers.py&quot;, line 1088, in emit
+    smtp = smtplib.SMTP(self.mailhost, port, timeout=self.timeout)
+  File &quot;/usr/lib/python3.13/smtplib.py&quot;, line 255, in __init__
+    (code, msg) = self.connect(host, port)
+                  ~~~~~~~~~~~~^^^^^^^^^^^^
+  File &quot;/usr/lib/python3.13/smtplib.py&quot;, line 341, in connect
+    self.sock = self._get_socket(host, port, self.timeout)
+                ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File &quot;/usr/lib/python3.13/smtplib.py&quot;, line 312, in _get_socket
+    return socket.create_connection((host, port), timeout,
+           ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+                                    self.source_address)
+                                    ^^^^^^^^^^^^^^^^^^^^
+  File &quot;/usr/lib/python3.13/socket.py&quot;, line 864, in create_connection
+    raise exceptions[0]
+  File &quot;/usr/lib/python3.13/socket.py&quot;, line 849, in create_connection
+    sock.connect(sa)
+    ~~~~~~~~~~~~^^^^
+ConnectionRefusedError: [Errno 111] Connection refused
+Call stack:
+  File &quot;/tmp/sh/b2.py&quot;, line 9, in &lt;module&gt;
+    log.error(&quot;payment import failed&quot;)
+Message: &#x27;payment import failed&#x27;
+Arguments: ()
+log.error() returned after 0.03s, no exception raised
+program keeps running</code></pre>
+<p><strong>Measured:</strong> with nothing listening on the mail port, <code>log.error()</code> did <strong>not</strong> raise. Logging printed <code>--- Logging error ---</code> with the <code>ConnectionRefusedError</code> to stderr and the program carried on. So a broken alert setup fails quietly unless someone reads stderr. Test it once on purpose after deploying. Each email is sent synchronously inside the logging call: refused took 0.03s here, but an unreachable server blocks for up to <code>timeout</code>, which defaults to 5.0 seconds. If that matters, put a <code>QueueHandler</code> in front of it.</p>
+
+<h2 id="uncaught">3. Email on uncaught exceptions too</h2>
+<pre><code>import logging, logging.handlers, sys
+from fake_smtp import serve, SENT
+
+serve(8964, {})
+log = logging.getLogger(&quot;app&quot;)
+mail = logging.handlers.SMTPHandler((&quot;127.0.0.1&quot;, 8964), &quot;app@example.com&quot;,
+                                    [&quot;me@example.com&quot;], &quot;app crashed&quot;)
+mail.setLevel(logging.ERROR)
+log.addHandler(mail)
+
+def mail_uncaught(exc_type, exc, tb):
+    log.critical(&quot;uncaught exception&quot;, exc_info=(exc_type, exc, tb))
+    sys.__excepthook__(exc_type, exc, tb)   # still print it as usual
+
+sys.excepthook = mail_uncaught
+import atexit
+atexit.register(lambda: print(&quot;emails sent before exit:&quot;, len(SENT),
+                              &quot;| subject line:&quot;, [l for l in SENT[0].splitlines()
+                                                  if l.startswith(&quot;Subject&quot;)]))
+{}[&quot;missing_key&quot;]                           # nobody catches this</code></pre>
+<p>Output:</p>
+<pre><code>Traceback (most recent call last):
+  File &quot;/tmp/sh/b3.py&quot;, line 20, in &lt;module&gt;
+    {}[&quot;missing_key&quot;]                           # nobody catches this
+    ~~^^^^^^^^^^^^^^^
+KeyError: &#x27;missing_key&#x27;
+emails sent before exit: 1 | subject line: [&#x27;Subject: app crashed&#x27;]</code></pre>
+<p><strong>Measured:</strong> an exception nobody catches never reaches your logger on its own. Setting <code>sys.excepthook</code> to a function that logs at <code>CRITICAL</code> with <code>exc_info</code> sent the email (subject <code>app crashed</code>) and still printed the normal traceback through <code>sys.__excepthook__</code>. This covers the main thread only; threads use <code>threading.excepthook</code> (see our <a href="/guides/python-threading-exception-handling-catch-exception-from-thread/">thread exceptions guide</a>).</p>
+
+<h2 id="auth">4. Login and TLS</h2>
+<p>For a real provider pass <code>credentials=("user", "app-password")</code> and <code>secure=()</code> for STARTTLS on port 587. In the 3.13 source, <code>secure</code> is only used when <code>credentials</code> are set, so <code>secure=()</code> on its own sends the email without TLS. Use an app password or a transactional mail service rather than your main account password, and keep it in an environment variable. If the server rejects the login you get the same <code>--- Logging error ---</code> output as in section 2, this time with <code>SMTPAuthenticationError</code>.</p>
+
+<aside class="cta"><strong>Monitoring a web app? Check the real status and headers its endpoints return:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I send an email when my Python script fails?</summary><p>Add logging.handlers.SMTPHandler to your logger with level ERROR and call log.exception() in your except block. We measured one email containing the message and full traceback.</p></details>
+<details><summary>Does SMTPHandler raise if the mail server is down?</summary><p>No. We measured log.error() returning normally while logging printed &#x27;--- Logging error ---&#x27; with ConnectionRefusedError to stderr.</p></details>
+<details><summary>How do I email uncaught exceptions?</summary><p>Set sys.excepthook to a function that logs at CRITICAL with exc_info, then calls sys.__excepthook__. We measured it sending the email and still printing the traceback.</p></details>
+<details><summary>Does SMTPHandler slow down my program?</summary><p>It sends synchronously inside the logging call, with a default timeout of 5.0 seconds. Use a QueueHandler/QueueListener if that&#x27;s a problem.</p></details>
+<details><summary>How do I use Gmail or STARTTLS with SMTPHandler?</summary><p>Pass credentials=(user, app_password) and secure=() with port 587. secure is ignored without credentials.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 on Debian with Python 3.13.5&#x27;s logging.handlers.SMTPHandler against a scripted SMTP server on localhost: level filtering, the email body with the traceback, a mail server that is down, and sys.excepthook for uncaught exceptions. Every block was run verbatim and its output pasted from that run. No real mail server was contacted; the credentials/secure behaviour is from the 3.13 source. PlainHeaders is our extension; Python&#x27;s logging module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

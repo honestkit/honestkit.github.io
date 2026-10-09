@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JSONDecodeError: Expecting value: line 1 column 1 (char 0)</title>
+<meta name="description" content="Every cause measured in Python 3.13.5 and requests 2.32.3: empty body, HTML error page, JSONP, file already read. How to find which one and fix it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-jsondecodeerror-expecting-value-line-1-column-1-char-0/">
+<meta property="og:title" content="JSONDecodeError: Expecting value: line 1 column 1 (char 0)">
+<meta property="og:description" content="Every cause measured in Python 3.13.5 and requests 2.32.3: empty body, HTML error page, JSONP, file already read. How to find which one and fix it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-jsondecodeerror-expecting-value-line-1-column-1-char-0/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does 'Expecting value: line 1 column 1 (char 0)' mean?", "acceptedAnswer": {"@type": "Answer", "text": "The decoder found no JSON value at the very first character. We measured it for '', an HTML page, plain text like 'Internal Server Error', a JSONP callback(...) wrapper, and json.load() on a file that was already read."}}, {"@type": "Question", "name": "Why does r.json() fail when the API works in my browser?", "acceptedAnswer": {"@type": "Answer", "text": "Your script's request gets a different response: often a 401/403 login page, a rate-limit page, or a proxy error in HTML. Print r.status_code, r.headers.get('Content-Type') and r.text[:200] to see it."}}, {"@type": "Question", "name": "How do I catch it with requests?", "acceptedAnswer": {"@type": "Answer", "text": "except requests.exceptions.JSONDecodeError -- we measured it is also a json.JSONDecodeError and a ValueError. Better: call r.raise_for_status() first so HTTP errors surface as HTTPError instead."}}, {"@type": "Question", "name": "Why does json.load(f) fail on a valid file?", "acceptedAnswer": {"@type": "Answer", "text": "If anything read the file object first, its position is at the end and json.load() sees an empty string. We measured it failing at char 0 and succeeding after f.seek(0)."}}, {"@type": "Question", "name": "What about 'Expecting property name enclosed in double quotes'?", "acceptedAnswer": {"@type": "Answer", "text": "That one means the input started like JSON but used single quotes, as Python's str(dict) produces. JSON needs double quotes; write it with json.dumps()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>JSONDecodeError: Expecting value: line 1 column 1 (char 0) in Python (tested)</h1>
+<p class="lead"><code>json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)</code> means the first character of the input is not JSON at all. We reproduced every common cause: almost always the input is <strong>empty</strong> or is <strong>an HTML/text page</strong> -- with <code>requests</code>, typically an error, login or proxy page returned with a 4xx/5xx status -- or a file object that was already read to the end.</p>
+<h2 id="repro">1. What produces "Expecting value: line 1 column 1 (char 0)"</h2>
+<pre><code>import io, json
+
+cases = {
+    "empty string": "",
+    "whitespace / newline only": "\n",
+    "HTML error page": "&lt;!DOCTYPE html&gt;&lt;html&gt;&lt;body&gt;502 Bad Gateway&lt;/body&gt;&lt;/html&gt;",
+    "plain-text error": "Internal Server Error",
+    "Python dict repr (single quotes)": "{'a': 1}",
+    "Python True/None": '{"ok": True, "v": None}',
+    "JSONP wrapper": 'callback({"a": 1})',
+    "UTF-8 BOM (decoded as utf-8)": "﻿{\"a\": 1}",
+    "two JSON objects (JSON Lines)": '{"a": 1}\n{"a": 2}',
+}
+for label, text in cases.items():
+    try:
+        json.loads(text)
+        print(f"{label:34} OK")
+    except json.JSONDecodeError as e:
+        print(f"{label:34} {e}")
+
+f = io.StringIO('{"a": 1}')
+f.read()                                   # something already consumed the stream
+try:
+    json.load(f)
+except json.JSONDecodeError as e:
+    print(f"{'json.load(file already read)':34} {e}")
+f.seek(0)
+print(f"{'json.load(after seek(0))':34}", json.load(f))</code></pre>
+<pre><code>empty string                       Expecting value: line 1 column 1 (char 0)
+whitespace / newline only          Expecting value: line 2 column 1 (char 1)
+HTML error page                    Expecting value: line 1 column 1 (char 0)
+plain-text error                   Expecting value: line 1 column 1 (char 0)
+Python dict repr (single quotes)   Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+Python True/None                   Expecting value: line 1 column 8 (char 7)
+JSONP wrapper                      Expecting value: line 1 column 1 (char 0)
+UTF-8 BOM (decoded as utf-8)       Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)
+two JSON objects (JSON Lines)      Extra data: line 2 column 1 (char 9)
+json.load(file already read)       Expecting value: line 1 column 1 (char 0)
+json.load(after seek(0))           {'a': 1}</code></pre>
+<p><strong>Measured:</strong> <code>char 0</code> means the very first character is not the start of a JSON value. In practice that is one of: <strong>an empty string</strong>, <strong>an HTML or plain-text page</strong> (an error page, a login page, a proxy's 502), <strong>a JSONP wrapper</strong>, or <strong>a file object that was already read</strong> -- <code>json.load()</code> then sees an empty remainder. A later position points inside the document: <code>True</code>/<code>None</code> instead of <code>true</code>/<code>null</code> fail at their own column, single-quoted keys give "Expecting property name enclosed in double quotes", a BOM has its own message, and JSON Lines gives "Extra data".</p>
+
+<h2 id="requests">2. With requests: r.json() on an error page</h2>
+<pre><code>import json, socket, threading, time, requests
+
+PORT = 8963
+def serve():
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", PORT))
+    srv.listen()
+    while True:
+        conn, _ = srv.accept()
+        conn.recv(65536)
+        page = b"&lt;html&gt;&lt;body&gt;502 Bad Gateway&lt;/body&gt;&lt;/html&gt;"
+        conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\n"
+                     b"Content-Length: %d\r\n\r\n%s" % (len(page), page))
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+time.sleep(0.2)
+
+r = requests.get(f"http://127.0.0.1:{PORT}/api")
+try:
+    r.json()
+except requests.exceptions.JSONDecodeError as e:
+    print("r.json() -&gt;", type(e).__name__ + ":", e)
+    print("also a json.JSONDecodeError?", isinstance(e, json.JSONDecodeError))
+    print("status:", r.status_code, "| Content-Type:", r.headers.get("Content-Type"))
+    print("body starts:", r.text[:60])
+
+# Safer pattern: check before decoding
+def get_json(url, **kw):
+    r = requests.get(url, **kw)
+    r.raise_for_status()                               # 4xx/5xx -&gt; HTTPError, not JSONDecodeError
+    if "json" not in r.headers.get("Content-Type", ""):
+        raise ValueError(f"expected JSON, got {r.headers.get('Content-Type')!r}: {r.text[:200]!r}")
+    return r.json()
+try:
+    get_json(f"http://127.0.0.1:{PORT}/api")
+except requests.HTTPError as e:
+    print("get_json -&gt;", type(e).__name__ + ":", e)</code></pre>
+<pre><code>r.json() -&gt; JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+also a json.JSONDecodeError? True
+status: 502 | Content-Type: text/html
+body starts: &lt;html&gt;&lt;body&gt;502 Bad Gateway&lt;/body&gt;&lt;/html&gt;
+get_json -&gt; HTTPError: 502 Server Error: Bad Gateway for url: http://127.0.0.1:8963/api</code></pre>
+<p><strong>Measured:</strong> the server returned a 502 HTML page and <code>r.json()</code> reported it as a JSON problem. <code>requests.exceptions.JSONDecodeError</code> is also a <code>json.JSONDecodeError</code> (and a <code>ValueError</code>), so either <code>except</code> catches it. Checking <code>raise_for_status()</code> and the <code>Content-Type</code> before decoding turns the misleading JSON error into the real one: <code>502 Server Error: Bad Gateway</code>.</p>
+
+<h2 id="fix">3. Fixes, by cause</h2>
+<ul>
+<li><strong>Error/login/HTML page:</strong> print <code>r.status_code</code>, <code>r.headers.get("Content-Type")</code> and <code>r.text[:200]</code> -- the body usually says what went wrong (wrong URL, expired token, rate limit, proxy error). Use the <code>get_json()</code> pattern above.</li>
+<li><strong>Empty body:</strong> a <code>204 No Content</code> or an endpoint that returns nothing. Check <code>if r.content:</code> before <code>r.json()</code>.</li>
+<li><strong>File already read:</strong> <code>f.seek(0)</code> before <code>json.load(f)</code>, or read once into a string and use <code>json.loads()</code>.</li>
+<li><strong>Python literals or single quotes:</strong> the data was written with <code>str(dict)</code>/<code>print()</code> instead of <code>json.dumps()</code>. Fix the writer; for existing data, <code>ast.literal_eval()</code> reads Python-literal syntax safely.</li>
+<li><strong>BOM:</strong> open the file with <code>encoding="utf-8-sig"</code>. <strong>JSON Lines:</strong> parse line by line: <code>[json.loads(l) for l in f if l.strip()]</code>.</li>
+</ul>
+<p>Related: <a href="/guides/json-decode-error-extra-data/">JSONDecodeError: Extra data</a>, <a href="/guides/json-decode-error-invalid-control-character/">Invalid control character</a> and <a href="/guides/unexpected-end-of-json-input/">Unexpected end of JSON input (JavaScript)</a>.</p>
+<aside class="cta"><strong>r.json() failing? Check the status and Content-Type the API actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &#x27;Expecting value: line 1 column 1 (char 0)&#x27; mean?</summary><p>The decoder found no JSON value at the very first character. We measured it for &#x27;&#x27;, an HTML page, plain text like &#x27;Internal Server Error&#x27;, a JSONP callback(...) wrapper, and json.load() on a file that was already read.</p></details>
+<details><summary>Why does r.json() fail when the API works in my browser?</summary><p>Your script&#x27;s request gets a different response: often a 401/403 login page, a rate-limit page, or a proxy error in HTML. Print r.status_code, r.headers.get(&#x27;Content-Type&#x27;) and r.text[:200] to see it.</p></details>
+<details><summary>How do I catch it with requests?</summary><p>except requests.exceptions.JSONDecodeError -- we measured it is also a json.JSONDecodeError and a ValueError. Better: call r.raise_for_status() first so HTTP errors surface as HTTPError instead.</p></details>
+<details><summary>Why does json.load(f) fail on a valid file?</summary><p>If anything read the file object first, its position is at the end and json.load() sees an empty string. We measured it failing at char 0 and succeeding after f.seek(0).</p></details>
+<details><summary>What about &#x27;Expecting property name enclosed in double quotes&#x27;?</summary><p>That one means the input started like JSON but used single quotes, as Python&#x27;s str(dict) produces. JSON needs double quotes; write it with json.dumps().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in json module and requests 2.32.3, decoding empty, HTML, plain-text, JSONP, Python-literal, BOM-prefixed and JSON Lines input, plus a local server returning a 502 HTML page. PlainHeaders is our extension; Python and requests are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

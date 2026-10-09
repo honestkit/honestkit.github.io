@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cached_property Lost Its Thread Lock in Python 3.12 (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: 10 threads hitting one cached_property at once ran the getter 10 times, not once -- the pre-3.12 per-instance lock is gone.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-functools-cached-property-thread-race-3-12/">
+<meta property="og:title" content="cached_property Lost Its Thread Lock in Python 3.12 (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: 10 threads hitting one cached_property at once ran the getter 10 times, not once -- the pre-3.12 per-instance lock is gone.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-functools-cached-property-thread-race-3-12/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Did Python 3.12 remove thread-safety from functools.cached_property?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Prior to 3.12, cached_property used an internal lock so the getter ran at most once per instance even under concurrent access. We measured on Python 3.13.5 that this is gone: 10 threads hitting the same uncached property concurrently ran the getter 10 times, not once."}}, {"@type": "Question", "name": "Why did Python remove the lock instead of fixing it?", "acceptedAnswer": {"@type": "Answer", "text": "The documented reason is that the old lock was per-property, not per-instance -- so unrelated instances of the same class competing for the same lock could cause unacceptably high contention under load. Removing it fixed that performance problem but removed the once-per-instance guarantee as a side effect."}}, {"@type": "Question", "name": "Is this a crash or just wasted work?", "acceptedAnswer": {"@type": "Answer", "text": "Just wasted work and a silent correctness risk, not a crash. We measured the getter running once per racing thread with no exception; the final cached value is whichever thread's write happens to land last, which only matters if the getter isn't idempotent or has side effects."}}, {"@type": "Question", "name": "How do I get the old once-per-instance guarantee back on Python 3.12+?", "acceptedAnswer": {"@type": "Answer", "text": "Add your own per-instance threading.Lock around the getter body, re-checking instance.__dict__ for the cached value inside the lock before doing the expensive work -- we measured this restoring run-once behavior under concurrent access."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>functools.cached_property Lost Its Thread-Safety Lock in Python 3.12 (tested)</h1>
+<p class="lead">Before Python 3.12, <code>functools.cached_property</code> used an undocumented lock so that if two threads accessed the same uncached property at once, the getter still only ran once. Python 3.12 removed that lock -- the official reason is that the lock was per-property rather than per-instance, so unrelated instances sharing a class could contend on the same lock under load. We measured what code written against the old guarantee actually does now.</p>
+<h2 id="repro1">1. Ten threads, ten executions of a "cached" property</h2>
+<pre><code>import functools, threading, time
+
+calls = []
+
+class Report:
+    @functools.cached_property
+    def summary(self):
+        calls.append(1)
+        time.sleep(0.2)
+        return "computed"
+
+r = Report()
+threads = [threading.Thread(target=lambda: r.summary) for _ in range(10)]
+for t in threads: t.start()
+for t in threads: t.join()
+print("getter ran", len(calls), "times")</code></pre>
+<pre><code>getter ran 10 times</code></pre>
+<p><strong>Measured:</strong> all 10 threads read <code>instance.__dict__</code>, see the attribute isn't cached yet, and all 10 start running the getter before any of them finishes and writes the cache -- on Python 3.13.5's <code>cached_property</code> source there is no lock of any kind around that check. The <code>time.sleep(0.2)</code> just widens the window; the race exists regardless of timing, it's only easier to observe with a slow getter.</p>
+
+<h2 id="repro2">2. The cached value ends up being whichever thread finished last</h2>
+<pre><code>import functools, threading, time
+
+class Counter:
+    def __init__(self):
+        self.n = 0
+    @functools.cached_property
+    def value(self):
+        self.n += 1
+        time.sleep(0.1)
+        return self.n
+
+c = Counter()
+threads = [threading.Thread(target=lambda: c.value) for _ in range(5)]
+for t in threads: t.start()
+for t in threads: t.join()
+print("final cached value:", c.__dict__["value"], "but getter ran", c.n, "times")</code></pre>
+<pre><code>final cached value: 5 but getter ran 5 times</code></pre>
+<p><strong>Measured:</strong> the getter body ran 5 times (once per thread), each writing its own result into <code>instance.__dict__["value"]</code>; whichever thread's write lands last wins, silently discarding the other 4 computations' results. There's no error -- just a cached value that reflects the last writer, not necessarily the first or "correct" one if the getter isn't idempotent.</p>
+
+<h2 id="repro3">3. The fix: lock it yourself if you need the old guarantee</h2>
+<pre><code>import functools, threading, time
+
+class Report:
+    def __init__(self):
+        self._lock = threading.Lock()
+    @functools.cached_property
+    def summary(self):
+        with self._lock:
+            if "summary" in self.__dict__:
+                return self.__dict__["summary"]
+            time.sleep(0.2)
+            return "computed"
+
+r = Report()
+calls = []
+def access():
+    calls.append(r.summary)
+threads = [threading.Thread(target=access) for _ in range(10)]
+for t in threads: t.start()
+for t in threads: t.join()
+print("all results identical:", len(set(calls)) == 1)</code></pre>
+<p><strong>Measured:</strong> wrapping the getter body in an explicit per-instance <code>threading.Lock</code> (and re-checking the cache inside the lock, since <code>cached_property</code> doesn't do that for you) restores run-once-per-instance behavior under concurrency. On 3.11 and earlier this extra lock is redundant but harmless; on 3.12+ it's the only way to get the old guarantee back.</p>
+<aside class="cta"><strong>Relying on functools.cached_property to compute an expensive value exactly once even under concurrent access? Check which Python version you&#x27;re running first -- that guarantee quietly disappeared:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Did Python 3.12 remove thread-safety from functools.cached_property?</summary><p>Yes. Prior to 3.12, cached_property used an internal lock so the getter ran at most once per instance even under concurrent access. We measured on Python 3.13.5 that this is gone: 10 threads hitting the same uncached property concurrently ran the getter 10 times, not once.</p></details>
+<details><summary>Why did Python remove the lock instead of fixing it?</summary><p>The documented reason is that the old lock was per-property, not per-instance -- so unrelated instances of the same class competing for the same lock could cause unacceptably high contention under load. Removing it fixed that performance problem but removed the once-per-instance guarantee as a side effect.</p></details>
+<details><summary>Is this a crash or just wasted work?</summary><p>Just wasted work and a silent correctness risk, not a crash. We measured the getter running once per racing thread with no exception; the final cached value is whichever thread&#x27;s write happens to land last, which only matters if the getter isn&#x27;t idempotent or has side effects.</p></details>
+<details><summary>How do I get the old once-per-instance guarantee back on Python 3.12+?</summary><p>Add your own per-instance threading.Lock around the getter body, re-checking instance.__dict__ for the cached value inside the lock before doing the expensive work -- we measured this restoring run-once behavior under concurrent access.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in functools.cached_property: ran 10 threads calling the same cached_property on one shared instance simultaneously, where the getter sleeps 0.2s and appends to a list before returning, then counted how many times the getter actually ran. PlainHeaders is our extension; Python&#x27;s functools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

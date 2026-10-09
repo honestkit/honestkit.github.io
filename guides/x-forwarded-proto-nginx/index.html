@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>X-Forwarded-Proto in nginx: $scheme vs $http_x_forwarded_proto, Redirect Loops and Spoofing (Tested)</title>
+<meta name="description" content="What a backend behind nginx actually received as X-Forwarded-Proto with no setting, with $scheme and with $http_x_forwarded_proto, how that produced http:// redirects and an endless https redirect, and which config fixed it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/x-forwarded-proto-nginx/">
+<meta property="og:title" content="X-Forwarded-Proto in nginx: $scheme vs $http_x_forwarded_proto, Redirect Loops and Spoofing (Tested)">
+<meta property="og:description" content="What a backend behind nginx actually received as X-Forwarded-Proto with no setting, with $scheme and with $http_x_forwarded_proto, how that produced http:// redirects and an endless https redirect, and which config fixed it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/x-forwarded-proto-nginx/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does nginx send X-Forwarded-Proto by default?", "acceptedAnswer": {"@type": "Answer", "text": "No. In our test the backend got no X-Forwarded-Proto unless the config set one, but a header sent by the client was forwarded unchanged."}}, {"@type": "Question", "name": "Should I use $scheme or $http_x_forwarded_proto?", "acceptedAnswer": {"@type": "Answer", "text": "$scheme if nginx terminates TLS itself. Behind a load balancer that terminates TLS, $scheme was always http in our test, so pass $http_x_forwarded_proto through (with a $scheme fallback via map) and only accept traffic from the load balancer."}}, {"@type": "Question", "name": "Why do I get ERR_TOO_MANY_REDIRECTS behind a load balancer?", "acceptedAnswer": {"@type": "Answer", "text": "Typically the app thinks the request is http and redirects to https forever. We reproduced it with proxy_set_header X-Forwarded-Proto $scheme behind a simulated TLS load balancer: every https request got a 301 to itself."}}, {"@type": "Question", "name": "Why are my redirects going to http:// instead of https://?", "acceptedAnswer": {"@type": "Answer", "text": "The app builds the URL from X-Forwarded-Proto (or the connection) and it says http. In our test that happened with $scheme behind a TLS-terminating proxy; passing the load balancer's header fixed it."}}, {"@type": "Question", "name": "Can a client spoof X-Forwarded-Proto?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. With no setting or with passthrough, a client-sent https reached the backend unchanged. With $scheme nginx replaced it. Only trust the header when the request came through your own proxy."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>X-Forwarded-Proto in nginx: $scheme vs passing it through (tested)</h1>
+<p class="lead">Your app sits behind nginx, nginx talks plain HTTP to it, and the app needs to know whether the visitor used https. X-Forwarded-Proto is how it finds out. We checked what the backend really got under three common configs.</p>
+<h2>1. What the backend received</h2>
+<table><thead><tr><th>nginx config</th><th>Client sends nothing</th><th>Client sends <code>X-Forwarded-Proto: https</code></th></tr></thead><tbody>
+<tr><td>no <code>proxy_set_header X-Forwarded-Proto</code></td><td>(header absent)</td><td><code>https</code> (client value passed through)</td></tr>
+<tr><td><code>proxy_set_header X-Forwarded-Proto $scheme;</code></td><td><code>http</code></td><td><code>http</code> (client value replaced)</td></tr>
+<tr><td><code>proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;</code></td><td>(header absent)</td><td><code>https</code></td></tr>
+</tbody></table>
+<ul><li>With no setting, nginx does not add the header, but it does forward one the client sent. So "I never set it" does not mean the backend never sees it.</li>
+<li><code>$scheme</code> is the scheme of the connection to <em>this</em> nginx. Our listener was plain HTTP, so it was always <code>http</code>, and it overwrote the client's <code>https</code>. That is correct when nginx itself terminates TLS, and wrong when a load balancer in front of it does.</li>
+<li><code>$http_x_forwarded_proto</code> is just the incoming request header. It carried the load balancer's <code>https</code> through, and when nothing was sent, nginx omitted the header entirely (an empty value is not sent).</li></ul>
+<h2>2. The redirect bugs</h2>
+<p>Our backend did two common things: after login it redirected to <code>{proto}://{host}/dashboard</code>, and on <code>/secure</code> it redirected to https unless <code>X-Forwarded-Proto</code> was <code>https</code>. With the request arriving as https from a load balancer (simulated by sending <code>X-Forwarded-Proto: https</code>):</p>
+<pre><code>$ curl -sD- -o/dev/null -H 'X-Forwarded-Proto: https' http://localhost:8961/scheme/login
+HTTP/1.1 302 Found
+Location: http://localhost/dashboard          # downgraded to http
+
+$ curl -sD- -o/dev/null -H 'X-Forwarded-Proto: https' http://localhost:8961/scheme/secure
+HTTP/1.1 301 Moved Permanently
+Location: https://localhost/secure            # same URL, every time
+
+$ curl -sD- -o/dev/null -H 'X-Forwarded-Proto: https' http://localhost:8961/pass/secure
+HTTP/1.1 200 OK</code></pre>
+<p>With <code>$scheme</code> behind a TLS-terminating load balancer, the app always believed the request was http: login redirects pointed to <code>http://</code>, and the "force https" check answered every request, already https, with a 301 to itself. In a browser that is the <code>ERR_TOO_MANY_REDIRECTS</code> loop. Passing the header through fixed both. (Side note: <code>proxy_set_header Host $host</code> dropped our <code>:8961</code> port from the redirect; use <code>$http_host</code> if the public port is not the default.)</p>
+<h2>3. Spoofing</h2>
+<p>The passthrough config trusts whatever the client sends. If anyone can reach nginx directly, not only through your load balancer, they can claim <code>https</code> on a plain-http request, and our <code>/secure</code> check returned <code>200 ok</code> for it. Same for the no-setting config. With <code>$scheme</code> the client value was always replaced. The header is not a secret, so the risk is wrong security decisions (skipped https redirects, cookies marked or not marked Secure), not data theft by itself. Same trust problem as <a href="/guides/x-forwarded-for-real-ip-nginx/">X-Forwarded-For</a>.</p>
+<h2>4. Config that worked</h2>
+<pre><code># nginx terminates TLS itself:
+proxy_set_header X-Forwarded-Proto $scheme;
+
+# behind a TLS-terminating load balancer (nginx reachable only from it):
+map $http_x_forwarded_proto $fwd_proto {
+    default $http_x_forwarded_proto;
+    ""      $scheme;
+}
+proxy_set_header X-Forwarded-Proto $fwd_proto;</code></pre>
+<p>We tested the <code>map</code>: no client header gave <code>http</code> (from <code>$scheme</code>), and <code>https</code> from the "load balancer" was passed through, so <code>/secure</code> returned 200. Lock the port down (firewall or <code>allow</code>/<code>deny</code> to the load balancer's addresses) so only the load balancer can set it.</p>
+<h2>5. Telling the framework to trust it (doc-based)</h2>
+<ul><li><strong>Express:</strong> <code>app.set('trust proxy', ...)</code> makes <code>req.protocol</code> and <code>req.secure</code> use X-Forwarded-Proto.</li>
+<li><strong>Django:</strong> <code>SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")</code>; Django's docs warn to set it only if your proxy strips or overwrites the client's value.</li>
+<li><strong>Rails:</strong> Rack reads X-Forwarded-Proto for <code>request.ssl?</code>; with <code>config.force_ssl</code> the same $scheme mistake causes the redirect loop.</li></ul>
+<p>We did not run these frameworks; check their current docs. Related: <a href="/guides/change-referer-user-agent-x-forwarded-for-chrome/">sending X-Forwarded-For and other headers from Chrome</a>.</p>
+<aside class="cta"><strong>Send your own X-Forwarded-Proto to your app and see what it does:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does nginx send X-Forwarded-Proto by default?</summary><p>No. In our test the backend got no X-Forwarded-Proto unless the config set one, but a header sent by the client was forwarded unchanged.</p></details>
+<details><summary>Should I use $scheme or $http_x_forwarded_proto?</summary><p>$scheme if nginx terminates TLS itself. Behind a load balancer that terminates TLS, $scheme was always http in our test, so pass $http_x_forwarded_proto through (with a $scheme fallback via map) and only accept traffic from the load balancer.</p></details>
+<details><summary>Why do I get ERR_TOO_MANY_REDIRECTS behind a load balancer?</summary><p>Typically the app thinks the request is http and redirects to https forever. We reproduced it with proxy_set_header X-Forwarded-Proto $scheme behind a simulated TLS load balancer: every https request got a 301 to itself.</p></details>
+<details><summary>Why are my redirects going to http:// instead of https://?</summary><p>The app builds the URL from X-Forwarded-Proto (or the connection) and it says http. In our test that happened with $scheme behind a TLS-terminating proxy; passing the load balancer&#x27;s header fixed it.</p></details>
+<details><summary>Can a client spoof X-Forwarded-Proto?</summary><p>Yes. With no setting or with passthrough, a client-sent https reached the backend unchanged. With $scheme nginx replaced it. Only trust the header when the request came through your own proxy.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 with a throwaway nginx 1.31.6 container (nginx:alpine, plain HTTP listener) proxying to a small Node.js server that echoed the X-Forwarded-Proto it received and built redirects from it; requests made with curl -sD-, with and without a client-sent X-Forwarded-Proto: https to stand in for a TLS-terminating load balancer. Removed afterwards. Express, Django and Rails settings are doc-based, not tested. PlainHeaders is our extension; the other methods are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

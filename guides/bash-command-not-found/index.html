@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bash Command Not Found Error: Cause and Fix, Tested</title>
+<meta name="description" content="We reproduced 6 real causes of bash: command not found, from typos to a stale PATH hash cache, and tested the exact fix for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/bash-command-not-found/">
+<meta property="og:title" content="Bash Command Not Found Error: Cause and Fix, Tested">
+<meta property="og:description" content="We reproduced 6 real causes of bash: command not found, from typos to a stale PATH hash cache, and tested the exact fix for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/bash-command-not-found/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What exit code means command not found?", "acceptedAnswer": {"@type": "Answer", "text": "127. We confirmed it across every command-not-found case we tested: a plain typo, a case mismatch, a script run without ./ or a PATH entry, and an unsourced function. A permission problem (file exists but isn't executable) gives exit 126 instead, with the message 'Permission denied' rather than 'command not found' \u2014 that distinction tells you immediately which kind of fix to look for."}}, {"@type": "Question", "name": "The file is right there and executable \u2014 why does bash still say command not found?", "acceptedAnswer": {"@type": "Answer", "text": "Because bash only runs bare command names by searching $PATH, and the current directory isn't on $PATH by default. We reproduced this exactly: an executable script in the working directory failed as 'myscript.sh' but ran fine as './myscript.sh'. Use an explicit path, or add the directory to $PATH."}}, {"@type": "Question", "name": "Why did a command stop working right after I reinstalled or moved it?", "acceptedAnswer": {"@type": "Answer", "text": "bash caches the resolved path of commands you've already run, in its hash table. We reproduced this: moving a binary to a different (still-valid) PATH directory made bash report 'No such file or directory' at the stale old path, with exit 127, until we ran hash -r to clear the cache and force a fresh PATH search."}}, {"@type": "Question", "name": "Why does my function work in my terminal but say command not found in a script?", "acceptedAnswer": {"@type": "Answer", "text": "Functions and aliases only exist in the shell that defined them. We confirmed that a function defined in one file was invisible in a fresh bash -c subshell until we explicitly sourced that file first. A script or cron job needs its own source line \u2014 it doesn't inherit functions from your interactive shell."}}, {"@type": "Question", "name": "Is command not found the same as Permission denied?", "acceptedAnswer": {"@type": "Answer", "text": "No, and we confirmed they're distinguishable by exit code alone: command not found is exit 127 and means bash found nothing executable by that name anywhere on $PATH. Permission denied is exit 126 and means bash found the file but it lacks the execute bit \u2014 the fix there is chmod +x, not touching $PATH at all."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Bash: Command Not Found (tested)</h1>
+<p class="lead"><code>bash: command not found</code> (exit code 127) means bash looked through every directory in <code>$PATH</code> for an executable with that exact name and found none. It is not one bug &mdash; we reproduced six different real-world ways to trigger it, and they don't all have the same fix.</p>
+<h2>1. Reproduced: the plain case &mdash; a typo</h2>
+<pre><code>$ lss
+/bin/bash: line 14: lss: command not found
+$ echo $?
+127</code></pre>
+<p>Exit code <strong>127</strong> is the signal: bash didn't find anything to run at all. Keep that number in mind, because the next two sections show errors that look similar but are <em>not</em> 127, and that difference tells you what's actually wrong.</p>
+
+<h2>2. Not the same thing: "Permission denied"</h2>
+<p>We made a script and removed its execute bit, then ran it:</p>
+<pre><code>$ chmod -x noexec.sh
+$ ./noexec.sh
+/bin/bash: line 18: ./noexec.sh: Permission denied
+$ echo $?
+126</code></pre>
+<p>Exit code <strong>126</strong>, different message. bash found the file &mdash; it exists, bash can see it &mdash; but can't execute it. The fix is <code>chmod +x</code>, not anything PATH-related. If you see 126, stop looking for a missing command; look for a missing execute bit instead.</p>
+
+<h2>3. Reproduced: a script that exists, is executable, and still "isn't found"</h2>
+<pre><code>$ chmod +x myscript.sh
+$ ls myscript.sh
+myscript.sh
+$ myscript.sh
+/bin/bash: line 22: myscript.sh: command not found
+$ echo $?
+127</code></pre>
+<p>The file is right there and executable, yet bash reports exit 127. That's because bash only searches the directories listed in <code>$PATH</code> &mdash; and by design, the current directory is not one of them unless you put it there. The fix is either an explicit path:</p>
+<pre><code>$ ./myscript.sh
+hi</code></pre>
+<p>or adding the script's directory to <code>$PATH</code> if you'll run it by name repeatedly.</p>
+
+<h2>4. Reproduced: moving a binary breaks bash's cached location (a confusing variant)</h2>
+<p>bash remembers where it last found a command, in a per-shell cache (<code>hash</code>), so it doesn't re-search <code>$PATH</code> every time. We put a script in one directory, ran it once, then moved it to a second directory that's also on <code>$PATH</code>:</p>
+<pre><code>$ export PATH="/tmp/bashguides/dirA:/tmp/bashguides/dirB:$PATH"
+$ movable
+fake-tool ran
+$ mv dirA/movable dirB/movable
+$ movable
+/bin/bash: line 24: /tmp/bashguides/dirA/movable: No such file or directory
+$ echo $?
+127</code></pre>
+<p>Note the message: <strong>"No such file or directory"</strong>, not "command not found" &mdash; but still exit 127, and the practical symptom is identical: your command stops running. bash is still trying the old, cached path. The fix is to clear the cache:</p>
+<pre><code>$ hash -r
+$ movable
+fake-tool ran</code></pre>
+<p><code>hash -r</code> forces bash to re-search <code>$PATH</code> from scratch. This is the variant to suspect when a command "was working five minutes ago" and the only thing that changed is that a tool got reinstalled, upgraded, or moved.</p>
+
+<h2>5. Reproduced: it's case-sensitive</h2>
+<pre><code>$ Python3 --version
+/bin/bash: line 18: Python3: command not found
+$ python3 --version
+Python 3.13.1</code></pre>
+<p>Unlike Windows, Linux filenames (and so command names) are case-sensitive. A capitalization typo produces the exact same "command not found" as a real typo.</p>
+
+<h2>6. Reproduced: a function from another file, not sourced</h2>
+<pre><code>$ cat funcs.sh
+greet() { echo "hello $1"; }
+$ bash -c 'greet world'
+bash: line 1: greet: command not found</code></pre>
+<p>The function is real and correctly written &mdash; it's just not loaded into this shell. Functions and aliases only exist in the shell session (or script) that defined or sourced them. A subshell, a fresh script, or a cron job that doesn't <code>source funcs.sh</code> first will not see <code>greet</code>, and bash reports it exactly like a typo.</p>
+<pre><code>$ bash -c 'source /tmp/bashguides/funcs.sh; greet world'
+hello world</code></pre>
+
+<h2>7. Checklist</h2>
+<ul>
+<li><strong>Exit 127, "command not found":</strong> check spelling and case first (<code>type -a &lt;name&gt;</code> or <code>command -v &lt;name&gt;</code> tells you instantly if bash can see it anywhere).</li>
+<li><strong>File exists but still 127:</strong> run it with an explicit path (<code>./script.sh</code>) or check <code>echo $PATH</code> includes the right directory.</li>
+<li><strong>Exit 126 instead of 127:</strong> it's a permissions problem, not a PATH problem &mdash; <code>chmod +x</code>.</li>
+<li><strong>"No such file or directory" where you expected "command not found":</strong> the binary moved or was reinstalled; run <code>hash -r</code> to clear bash's stale cache.</li>
+<li><strong>A function or alias "stopped working" in a script or subshell:</strong> it was never sourced there in the first place &mdash; add the <code>source</code> line.</li>
+<li>If the command genuinely isn't installed, that's a package-manager problem, not a shell one &mdash; install it, then confirm with <code>command -v</code>.</li>
+</ul>
+<p>If your script dies with an unset-variable error instead, see <a href="/guides/bash-unbound-variable/">Bash: Unbound Variable</a>. If chmod itself refuses to run, see <a href="/guides/chmod-operation-not-permitted/">chmod: Operation Not Permitted</a>.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What exit code means command not found?</summary><p>127. We confirmed it across every command-not-found case we tested: a plain typo, a case mismatch, a script run without ./ or a PATH entry, and an unsourced function. A permission problem (file exists but isn&#x27;t executable) gives exit 126 instead, with the message &#x27;Permission denied&#x27; rather than &#x27;command not found&#x27; — that distinction tells you immediately which kind of fix to look for.</p></details>
+<details><summary>The file is right there and executable — why does bash still say command not found?</summary><p>Because bash only runs bare command names by searching $PATH, and the current directory isn&#x27;t on $PATH by default. We reproduced this exactly: an executable script in the working directory failed as &#x27;myscript.sh&#x27; but ran fine as &#x27;./myscript.sh&#x27;. Use an explicit path, or add the directory to $PATH.</p></details>
+<details><summary>Why did a command stop working right after I reinstalled or moved it?</summary><p>bash caches the resolved path of commands you&#x27;ve already run, in its hash table. We reproduced this: moving a binary to a different (still-valid) PATH directory made bash report &#x27;No such file or directory&#x27; at the stale old path, with exit 127, until we ran hash -r to clear the cache and force a fresh PATH search.</p></details>
+<details><summary>Why does my function work in my terminal but say command not found in a script?</summary><p>Functions and aliases only exist in the shell that defined them. We confirmed that a function defined in one file was invisible in a fresh bash -c subshell until we explicitly sourced that file first. A script or cron job needs its own source line — it doesn&#x27;t inherit functions from your interactive shell.</p></details>
+<details><summary>Is command not found the same as Permission denied?</summary><p>No, and we confirmed they&#x27;re distinguishable by exit code alone: command not found is exit 127 and means bash found nothing executable by that name anywhere on $PATH. Permission denied is exit 126 and means bash found the file but it lacks the execute bit — the fix there is chmod +x, not touching $PATH at all.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with GNU bash (Debian) on a real Linux box. Every error message and exit code below is copy-pasted output, not paraphrased. PlainHeaders is our extension; bash is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

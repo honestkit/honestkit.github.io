@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ERR_CONNECTION_TIMED_OUT and ETIMEDOUT: Causes and Fixes (Tested)</title>
+<meta name="description" content="We connected Chromium, curl, Node and Python to a blackholed IP and timed each error. Linux gave up at 134.7 s, Node fetch at 10 s. Exact errors and fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-connection-timed-out-etimedout/">
+<meta property="og:title" content="ERR_CONNECTION_TIMED_OUT and ETIMEDOUT: Causes and Fixes (Tested)">
+<meta property="og:description" content="We connected Chromium, curl, Node and Python to a blackholed IP and timed each error. Linux gave up at 134.7 s, Node fetch at 10 s. Exact errors and fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-connection-timed-out-etimedout/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How long does Chrome wait before ERR_CONNECTION_TIMED_OUT?", "acceptedAnswer": {"@type": "Answer", "text": "On our Linux box, 134.7 s. That is the kernel's default SYN retry limit, not a Chrome setting. curl, Node net.connect and Python with no timeout failed at the same moment."}}, {"@type": "Question", "name": "Why does Node fetch fail after 10 seconds?", "acceptedAnswer": {"@type": "Answer", "text": "Node's built-in fetch (undici) has its own 10 s connect timeout. We measured 10.5 s and the cause code UND_ERR_CONNECT_TIMEOUT. Plain net.connect has no such limit and waited 134.7 s for the kernel's ETIMEDOUT."}}, {"@type": "Question", "name": "What is the difference between ETIMEDOUT and ECONNREFUSED?", "acceptedAnswer": {"@type": "Answer", "text": "ETIMEDOUT: no reply at all, usually a firewall drop, wrong IP or down host. ECONNREFUSED: the host replied that nothing listens on the port. Refused fails at once; timed out takes seconds to minutes."}}, {"@type": "Question", "name": "Does curl --connect-timeout stop a server that never answers?", "acceptedAnswer": {"@type": "Answer", "text": "No. It only covers setting up the connection. Against our server that accepted but never replied, curl --connect-timeout 2 -m 5 ran the full 5 s and failed with Operation timed out, 0 bytes received. Use -m (--max-time)."}}, {"@type": "Question", "name": "Does ERR_TIMED_OUT appear when the server hangs?", "acceptedAnswer": {"@type": "Answer", "text": "Not in our test. Chromium 153 waited over 7 minutes on a server that accepted but never replied, without any error. The connection succeeded, so ERR_CONNECTION_TIMED_OUT does not apply there either."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ERR_CONNECTION_TIMED_OUT / ETIMEDOUT (tested)</h1>
+<p class="lead"><code>ERR_CONNECTION_TIMED_OUT</code> (Chrome) and <code>ETIMEDOUT</code> (Node, Linux) mean the TCP connection was never set up. Packets went out and nothing came back. We pointed four clients at an address that drops every packet and timed exactly how long each waited and what it said.</p>
+<h2>1. What the error means</h2>
+<p>To open a connection, the client sends a SYN packet and waits for a SYN-ACK. If nothing at all comes back, the client resends the SYN a few times and then gives up. That is a connection timeout.</p>
+<p>It is different from a refused connection (ECONNREFUSED; see <a href="/guides/err-connection-refused-econnrefused/">ERR_CONNECTION_REFUSED / ECONNREFUSED</a>). Refused means the host answered with a reset because nothing listens on the port. That fails at once. A timeout means silence: the packets are dropped by a firewall, a wrong route, a down host or a wrong IP.</p>
+<p>It is also different from a server that accepts the connection and then never answers. That gives other errors, or none at all (section 4).</p>
+
+<h2>2. Our test setup</h2>
+<p>We connected to <code>http://10.255.255.1/</code>. It is a private address that nothing on our network answers, so every SYN is silently dropped. <code>192.0.2.1</code> (TEST-NET-1, reserved for documentation) did the same. No firewall rules were changed. Each client ran with its defaults, then with an explicit timeout.</p>
+
+<h2>3. Results: blackholed address</h2>
+<table>
+<tr><th>Client</th><th>Error</th><th>Time to error</th></tr>
+<tr><td>Chromium 153, page navigation</td><td><code>net::ERR_CONNECTION_TIMED_OUT</code></td><td>134.7 s</td></tr>
+<tr><td>Chromium 153, <code>fetch()</code> in a page</td><td><code>TypeError: Failed to fetch</code></td><td>135.1 s</td></tr>
+<tr><td>curl, no options</td><td>exit 28, "Failed to connect to 10.255.255.1 port 80 after 134745 ms: Could not connect to server"</td><td>134.7 s</td></tr>
+<tr><td>curl <code>--connect-timeout 5</code></td><td>exit 28, "Connection timed out after 5002 milliseconds"</td><td>5.0 s</td></tr>
+<tr><td>Node 24 <code>net.connect()</code></td><td><code>connect ETIMEDOUT 10.255.255.1:80</code>, code <code>ETIMEDOUT</code>, errno -110</td><td>134.7 s</td></tr>
+<tr><td>Node 24 <code>fetch()</code></td><td><code>TypeError: fetch failed</code>, cause <code>ConnectTimeoutError</code>, code <code>UND_ERR_CONNECT_TIMEOUT</code>, "Connect Timeout Error (attempted address: 10.255.255.1:80, timeout: 10000ms)"</td><td>10.5 s</td></tr>
+<tr><td>Python urllib, no timeout</td><td><code>URLError(TimeoutError(110, 'Connection timed out'))</code></td><td>134.7 s</td></tr>
+<tr><td>Python urllib <code>timeout=5</code></td><td><code>URLError(TimeoutError('timed out'))</code></td><td>5.0 s</td></tr>
+</table>
+<p>The 134.7 s is not a browser or library setting. It is the Linux kernel giving up after its default SYN retries. Chromium, curl, Node <code>net</code> and Python all hit the same wall within a few milliseconds of each other. curl's own default connect timeout is 300 s (per the curl docs, not measured), so on Linux the kernel always wins.</p>
+<p>Node's built-in <code>fetch</code> is the exception. Its undici connect timeout of 10 s fired first. Catch it like this:</p>
+<pre><code>try {
+  await fetch(url);
+} catch (e) {
+  if (e.cause?.code === 'UND_ERR_CONNECT_TIMEOUT') { /* host unreachable */ }
+  if (e.cause?.code === 'ETIMEDOUT') { /* kernel timeout */ }
+}</code></pre>
+<p>Note that Chromium's <code>fetch()</code> only says "Failed to fetch". Page code cannot see the reason. The DevTools console and network panel show the <code>net::</code> code.</p>
+
+<h2>4. Contrast: the server accepts but never answers</h2>
+<p>Next we ran a Node server on 127.0.0.1 that accepts connections and never sends a byte. One version was a raw TCP server, one an HTTP server whose handler never calls <code>res.end()</code>. Both gave the same client results.</p>
+<table>
+<tr><th>Client</th><th>Result</th><th>Time</th></tr>
+<tr><td>curl <code>-m 3</code></td><td>exit 28, "Operation timed out after 3003 milliseconds with 0 bytes received", status 000</td><td>3.0 s</td></tr>
+<tr><td>curl <code>--connect-timeout 2 -m 5</code></td><td>exit 28, "Operation timed out after 5002 milliseconds with 0 bytes received"</td><td>5.0 s (connect timeout never fired)</td></tr>
+<tr><td>Python urllib <code>timeout=3</code></td><td><code>TimeoutError('timed out')</code> (not wrapped in URLError)</td><td>3.0 s</td></tr>
+<tr><td>Node 24 <code>fetch()</code>, defaults</td><td><code>fetch failed</code>, cause <code>HeadersTimeoutError</code>, code <code>UND_ERR_HEADERS_TIMEOUT</code></td><td>300.8 s</td></tr>
+<tr><td>Chromium 153 navigation</td><td>No error from the browser. Playwright's own 420 s limit fired first.</td><td>&gt; 420 s</td></tr>
+</table>
+<p>So <code>ERR_CONNECTION_TIMED_OUT</code> and <code>ETIMEDOUT</code> never appear here. The connection worked. curl's <code>--connect-timeout</code> does not help either; only <code>-m</code>/<code>--max-time</code> caps the whole request. We did not see Chromium's <code>net::ERR_TIMED_OUT</code> in this test. Chromium simply kept waiting for at least 7 minutes.</p>
+<p>On the server side, Node's <code>headersTimeout</code> (60 s) and <code>requestTimeout</code> (300 s) only cover receiving the <em>request</em>. They did nothing to stop our handler hanging. When a client connected and sent nothing, or only half the headers, Node replied <code>HTTP/1.1 408 Request Timeout</code> and closed after 77 s (60 s plus the 30 s check interval). See <a href="/guides/408-request-timeout/">408 Request Timeout</a>.</p>
+<p>Behind a proxy, a hanging upstream turns into <a href="/guides/504-gateway-timeout/">504 Gateway Timeout</a>. If the client gives up first, nginx logs <a href="/guides/499-client-closed-request/">499</a>.</p>
+
+<h2>5. Common causes</h2>
+<ul>
+<li><strong>Firewall drops the port.</strong> A cloud security group, host firewall or ISP filter with a DROP rule. A REJECT rule usually gives "refused" instead (not measured here).</li>
+<li><strong>Wrong IP.</strong> Stale DNS, an old A record, or a hosts file entry pointing at a machine that is gone.</li>
+<li><strong>Server is down or the port is not exposed.</strong> A container port not published, a VM stopped, a load balancer with no healthy targets.</li>
+<li><strong>Private address from outside.</strong> Connecting to 10.x, 172.16-31.x or 192.168.x from another network, like our test.</li>
+<li><strong>IPv6 route broken.</strong> The name resolves to an AAAA record but IPv6 traffic goes nowhere.</li>
+</ul>
+
+<h2>6. How to fix it</h2>
+<ul>
+<li>Check what the name resolves to: <code>dig +short example.com</code>. Is that the right IP?</li>
+<li>Test the port with a short limit: <code>curl -v --connect-timeout 5 http://HOST:PORT/</code>. Exit 28 with "Connection timed out" means silence. Exit 7 after 0 ms (we measured "Failed to connect to 127.0.0.1 port 8987 after 0 ms: Could not connect to server" on a closed port) means refused. Without <code>--connect-timeout</code>, a timeout prints the same "Could not connect to server" text, so check the exit code: 28 vs 7.</li>
+<li>Test from the server itself: <code>curl http://127.0.0.1:PORT/</code>. If that works, the problem is a firewall or routing between you and it.</li>
+<li>Open the port in every layer: cloud security group, host firewall, container port mapping.</li>
+<li>In code, always set your own timeouts so a dead host fails in seconds, not 135 s: curl <code>--connect-timeout</code> plus <code>-m</code>, Python <code>timeout=</code>, Node <code>AbortSignal.timeout()</code>.</li>
+</ul>
+<p>If connections open and then drop, read <a href="/guides/err-connection-reset-econnreset/">ERR_CONNECTION_RESET / ECONNRESET</a>.</p>
+<aside class="cta"><strong>Once the connection works, check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How long does Chrome wait before ERR_CONNECTION_TIMED_OUT?</summary><p>On our Linux box, 134.7 s. That is the kernel&#x27;s default SYN retry limit, not a Chrome setting. curl, Node net.connect and Python with no timeout failed at the same moment.</p></details>
+<details><summary>Why does Node fetch fail after 10 seconds?</summary><p>Node&#x27;s built-in fetch (undici) has its own 10 s connect timeout. We measured 10.5 s and the cause code UND_ERR_CONNECT_TIMEOUT. Plain net.connect has no such limit and waited 134.7 s for the kernel&#x27;s ETIMEDOUT.</p></details>
+<details><summary>What is the difference between ETIMEDOUT and ECONNREFUSED?</summary><p>ETIMEDOUT: no reply at all, usually a firewall drop, wrong IP or down host. ECONNREFUSED: the host replied that nothing listens on the port. Refused fails at once; timed out takes seconds to minutes.</p></details>
+<details><summary>Does curl --connect-timeout stop a server that never answers?</summary><p>No. It only covers setting up the connection. Against our server that accepted but never replied, curl --connect-timeout 2 -m 5 ran the full 5 s and failed with Operation timed out, 0 bytes received. Use -m (--max-time).</p></details>
+<details><summary>Does ERR_TIMED_OUT appear when the server hangs?</summary><p>Not in our test. Chromium 153 waited over 7 minutes on a server that accepted but never replied, without any error. The connection succeeded, so ERR_CONNECTION_TIMED_OUT does not apply there either.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 on Linux 6.12 with headless Chromium 153.0.8010.12 (Playwright), Node.js 24.21.0, curl 8.14.1 and Python 3.13.5 urllib. Blackholed target: 10.255.255.1:80 (no reply to SYN; 192.0.2.1 behaved the same). Hanging-server tests used a local Node server that accepts but never answers. Kernel and firewall settings were left at their defaults. PlainHeaders is our extension; curl, Python, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

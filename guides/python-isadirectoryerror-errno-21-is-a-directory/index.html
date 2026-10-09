@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IsADirectoryError: [Errno 21] Is a directory (Tested Fix)</title>
+<meta name="description" content="We measured Python IsADirectoryError [Errno 21]: open() on a folder, an empty filename in os.path.join, listdir subfolders, and os.remove on directories.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-isadirectoryerror-errno-21-is-a-directory/">
+<meta property="og:title" content="IsADirectoryError: [Errno 21] Is a directory (Tested Fix)">
+<meta property="og:description" content="We measured Python IsADirectoryError [Errno 21]: open() on a folder, an empty filename in os.path.join, listdir subfolders, and os.remove on directories.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-isadirectoryerror-errno-21-is-a-directory/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does IsADirectoryError: [Errno 21] Is a directory mean?", "acceptedAnswer": {"@type": "Answer", "text": "You passed a folder path to something that needs a file: open(), Path.read_text(), os.remove() or shutil.copy(). We measured each on Python 3.13.5."}}, {"@type": "Question", "name": "Why do I get Is a directory when writing a file?", "acceptedAnswer": {"@type": "Answer", "text": "The path ends at a folder, often because the filename part was empty: we measured os.path.join('reports', '') returning 'reports/'. Check the filename before opening."}}, {"@type": "Question", "name": "How do I skip directories when reading all files in a folder?", "acceptedAnswer": {"@type": "Answer", "text": "Filter with os.path.isfile() or Path.is_file(), or glob a specific extension. We measured os.listdir returning a subfolder that then failed to open."}}, {"@type": "Question", "name": "How do I delete a directory in Python?", "acceptedAnswer": {"@type": "Answer", "text": "os.rmdir for an empty directory, shutil.rmtree for one with contents. We measured os.remove on a directory raising IsADirectoryError."}}, {"@type": "Question", "name": "Is it IsADirectoryError or PermissionError on Windows?", "acceptedAnswer": {"@type": "Answer", "text": "On Windows, opening a directory typically raises PermissionError [Errno 13] instead. We only measured Linux, which raises IsADirectoryError [Errno 21]."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>IsADirectoryError: [Errno 21] Is a directory (tested)</h1>
+<p class="lead"><code>IsADirectoryError: [Errno 21] Is a directory</code> means a function that works on files was given a directory path. We measured the four ways that usually happens on Python 3.13.5, with the fix for each.</p>
+<h2 id="open">1. open() on a directory, in any mode</h2>
+<pre><code>import os
+os.makedirs(&quot;reports&quot;, exist_ok=True)
+for mode in [&quot;r&quot;, &quot;w&quot;, &quot;a&quot;]:
+    try:
+        open(&quot;reports&quot;, mode)
+    except IsADirectoryError as e:
+        print(f&quot;open(dir, {mode!r}):&quot;, e)
+from pathlib import Path
+try:
+    Path(&quot;reports&quot;).read_text()
+except IsADirectoryError as e:
+    print(&quot;read_text:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>open(dir, &#x27;r&#x27;): [Errno 21] Is a directory: &#x27;reports&#x27;
+open(dir, &#x27;w&#x27;): [Errno 21] Is a directory: &#x27;reports&#x27;
+open(dir, &#x27;a&#x27;): [Errno 21] Is a directory: &#x27;reports&#x27;
+read_text: [Errno 21] Is a directory: &#x27;reports&#x27;</code></pre>
+<p><strong>Measured on Python 3.13.5 (Linux):</strong> reading, writing and appending all raise <code>IsADirectoryError: [Errno 21] Is a directory</code>, as does <code>Path.read_text()</code>. The path you passed points at a folder, not a file inside it. On Windows the same mistake usually shows up as <a href="/guides/python-permissionerror-errno-13-permission-denied/">PermissionError: [Errno 13] Permission denied</a> instead (not tested here).</p>
+
+<h2 id="join">2. An empty filename in os.path.join</h2>
+<pre><code>import os
+folder = &quot;reports&quot;
+name = &quot;&quot;                                   # e.g. empty from a form/config
+path = os.path.join(folder, name)
+print(repr(path))
+try:
+    open(path, &quot;w&quot;)
+except IsADirectoryError as e:
+    print(e)
+# fix: make sure there is a filename
+name = name or &quot;report.txt&quot;
+with open(os.path.join(folder, name), &quot;w&quot;) as f:
+    f.write(&quot;ok&quot;)
+print(&quot;wrote&quot;, os.path.join(folder, name))</code></pre>
+<p>Output:</p>
+<pre><code>&#x27;reports/&#x27;
+[Errno 21] Is a directory: &#x27;reports/&#x27;
+wrote reports/report.txt</code></pre>
+<p><strong>Measured:</strong> <code>os.path.join("reports", "")</code> gives <code>'reports/'</code>, the folder itself. This is the usual cause when the filename comes from a form field, config value, URL path or <code>split()</code> result that turned out empty. Validate the name (or fall back to a default) before opening.</p>
+
+<h2 id="listdir">3. Looping over a folder that contains subfolders</h2>
+<pre><code>import os, glob
+os.makedirs(&quot;data/sub&quot;, exist_ok=True)
+open(&quot;data/a.csv&quot;, &quot;w&quot;).write(&quot;1\n&quot;)
+for name in sorted(os.listdir(&quot;data&quot;)):     # includes the subdirectory
+    try:
+        open(os.path.join(&quot;data&quot;, name)).read()
+        print(&quot;read&quot;, name)
+    except IsADirectoryError as e:
+        print(&quot;failed:&quot;, e)
+for p in sorted(glob.glob(&quot;data/*&quot;)):
+    if os.path.isfile(p):                   # fix: skip directories
+        print(&quot;file:&quot;, p)</code></pre>
+<p>Output:</p>
+<pre><code>read a.csv
+failed: [Errno 21] Is a directory: &#x27;data/sub&#x27;
+file: data/a.csv</code></pre>
+<p><strong>Measured:</strong> <code>os.listdir</code> and <code>glob("*")</code> return subdirectories along with files. Filter with <code>os.path.isfile()</code>, use <code>glob("*.csv")</code> with an extension, or <code>Path.glob(...)</code> plus <code>p.is_file()</code>.</p>
+
+<h2 id="remove">4. Deleting or copying a directory with file functions</h2>
+<pre><code>import shutil, os
+os.makedirs(&quot;src&quot;, exist_ok=True)
+try:
+    os.remove(&quot;src&quot;)
+except IsADirectoryError as e:
+    print(&quot;os.remove(dir):&quot;, e)
+try:
+    shutil.copy(&quot;src&quot;, &quot;dst&quot;)
+except IsADirectoryError as e:
+    print(&quot;shutil.copy(dir):&quot;, e)
+os.rmdir(&quot;src&quot;)                              # empty dir; shutil.rmtree for non-empty
+print(&quot;os.rmdir: removed&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>os.remove(dir): [Errno 21] Is a directory: &#x27;src&#x27;
+shutil.copy(dir): [Errno 21] Is a directory: &#x27;src&#x27;
+os.rmdir: removed</code></pre>
+<p><strong>Measured:</strong> <code>os.remove</code> and <code>shutil.copy</code> only handle files. Use <code>os.rmdir</code> (empty directory), <code>shutil.rmtree</code> (with contents) or <code>shutil.copytree</code> for folders.</p>
+
+<aside class="cta"><strong>Debugging a Python HTTP script? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does IsADirectoryError: [Errno 21] Is a directory mean?</summary><p>You passed a folder path to something that needs a file: open(), Path.read_text(), os.remove() or shutil.copy(). We measured each on Python 3.13.5.</p></details>
+<details><summary>Why do I get Is a directory when writing a file?</summary><p>The path ends at a folder, often because the filename part was empty: we measured os.path.join(&#x27;reports&#x27;, &#x27;&#x27;) returning &#x27;reports/&#x27;. Check the filename before opening.</p></details>
+<details><summary>How do I skip directories when reading all files in a folder?</summary><p>Filter with os.path.isfile() or Path.is_file(), or glob a specific extension. We measured os.listdir returning a subfolder that then failed to open.</p></details>
+<details><summary>How do I delete a directory in Python?</summary><p>os.rmdir for an empty directory, shutil.rmtree for one with contents. We measured os.remove on a directory raising IsADirectoryError.</p></details>
+<details><summary>Is it IsADirectoryError or PermissionError on Windows?</summary><p>On Windows, opening a directory typically raises PermissionError [Errno 13] instead. We only measured Linux, which raises IsADirectoryError [Errno 21].</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: open() on a directory in r/w/a modes, Path.read_text, os.path.join with an empty name, os.listdir with a subfolder, os.remove and shutil.copy on a directory. Every block was run verbatim and its output pasted from that run. Windows was not tested. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

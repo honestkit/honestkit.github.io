@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python Import From Another Directory: No module named (Tested)</title>
+<meta name="description" content="Why Python can&#x27;t import from another directory: we measured sys.path[0] for scripts vs -m, PYTHONPATH, a __file__ path fix, and the -m sibling trap.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-import-from-another-directory-modulenotfounderror/">
+<meta property="og:title" content="Python Import From Another Directory: No module named (Tested)">
+<meta property="og:description" content="Why Python can&#x27;t import from another directory: we measured sys.path[0] for scripts vs -m, PYTHONPATH, a __file__ path fix, and the -m sibling trap.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-import-from-another-directory-modulenotfounderror/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why can't Python import a module from another directory?", "acceptedAnswer": {"@type": "Answer", "text": "When you run python3 path/to/script.py, sys.path[0] is the script's folder, not your current directory. We measured sys.path[0] = proj/scripts and No module named 'lib' for a lib/ folder next to scripts/."}}, {"@type": "Question", "name": "How do I import from a parent or sibling directory in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Run from the project root with python3 -m scripts.run, set PYTHONPATH to the root, or insert the root (built from __file__) into sys.path. We measured all three working."}}, {"@type": "Question", "name": "Why does my import work in VS Code or PyCharm but not in the terminal?", "acceptedAnswer": {"@type": "Answer", "text": "IDEs usually add the project root to PYTHONPATH. We measured PYTHONPATH=. making the failing script work, and failing again when run from a different directory."}}, {"@type": "Question", "name": "Is the current working directory on sys.path?", "acceptedAnswer": {"@type": "Answer", "text": "Not when running a script file: we measured sys.path[0] being the script's folder. With python3 -m it is: we measured sys.path[0] being the directory we ran it from."}}, {"@type": "Question", "name": "Why does python -m break my imports?", "acceptedAnswer": {"@type": "Answer", "text": "With -m, sibling files are no longer on sys.path. We measured from helpers import helper working when run directly and failing with -m."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python import from another directory: No module named (tested)</h1>
+<p class="lead"><code>ModuleNotFoundError: No module named 'lib'</code> for a folder that's right there in your project almost always comes down to one thing: which directory is first on <code>sys.path</code>. We measured it for every common way of running a script on Python 3.13.5.</p>
+<h2 id="why">1. Why it fails: Python searches the script's folder, not your project</h2>
+<pre><code>mkdir -p proj/lib proj/scripts &amp;&amp; cd proj
+echo &#x27;def greet(): return &quot;hello from lib&quot;&#x27; &gt; lib/tools.py
+cat &gt; scripts/run.py &lt;&lt;&#x27;PY&#x27;
+import sys
+print(&quot;sys.path[0] =&quot;, sys.path[0])
+from lib.tools import greet
+print(greet())
+PY
+python3 scripts/run.py 2&gt;&amp;1 | grep -E &quot;^(sys.path|ModuleNotFound|hello)&quot;</code></pre>
+<p>Output:</p>
+<pre><code>sys.path[0] = /tmp/ad/proj/scripts
+ModuleNotFoundError: No module named &#x27;lib&#x27;</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> when you run <code>python3 scripts/run.py</code>, the first entry on <code>sys.path</code> is the folder <em>containing the script</em> (<code>proj/scripts</code>), not the directory you ran it from. <code>lib/</code> sits next to <code>scripts/</code>, not inside it, so <code>from lib.tools import greet</code> raises <code>ModuleNotFoundError: No module named 'lib'</code>, even though you're standing in <code>proj/</code>.</p>
+
+<h2 id="dash-m">2. Fix: run it as a module from the project root</h2>
+<pre><code>cd proj
+python3 -m scripts.run</code></pre>
+<p>Output:</p>
+<pre><code>sys.path[0] = /tmp/ad/proj
+hello from lib</code></pre>
+<p><strong>Measured:</strong> <code>python3 -m scripts.run</code> (dots, no <code>.py</code>) puts the current directory first on <code>sys.path</code>, so <code>lib</code> is found. No code changes and no <code>__init__.py</code> needed on 3.13. You have to run it from <code>proj/</code>.</p>
+
+<h2 id="pythonpath">3. Fix: PYTHONPATH (and why "it works in my IDE")</h2>
+<pre><code>cd proj
+PYTHONPATH=. python3 scripts/run.py
+cd scripts &amp;&amp; python3 run.py 2&gt;&amp;1 | tail -1</code></pre>
+<p>Output:</p>
+<pre><code>sys.path[0] = /tmp/ad/proj/scripts
+hello from lib
+ModuleNotFoundError: No module named &#x27;lib&#x27;</code></pre>
+<p><strong>Measured:</strong> <code>PYTHONPATH=.</code> adds the project root, so the plain script works. It's tied to where you run it from: in <code>scripts/</code>, <code>.</code> isn't the root and it fails again. Most IDEs (VS Code, PyCharm) quietly add the project root to <code>PYTHONPATH</code> for their Run button, which is why the same file can work there and fail in a terminal or cron.</p>
+
+<h2 id="syspath">4. Fix: put the path in the script (works from anywhere)</h2>
+<pre><code>cd proj
+cat &gt; scripts/run2.py &lt;&lt;&#x27;PY&#x27;
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from lib.tools import greet
+print(greet())
+PY
+python3 scripts/run2.py
+cd /tmp &amp;&amp; python3 /tmp/ad/proj/scripts/run2.py</code></pre>
+<p>Output:</p>
+<pre><code>hello from lib
+hello from lib</code></pre>
+<p><strong>Measured:</strong> building the path from <code>__file__</code> works from any working directory, including <code>/tmp</code>. It's the most robust option for a one-off script. For a real project, make <code>lib</code> an installable package (<code>pip install -e .</code> in a venv) so no path code is needed at all; we didn't measure that one here.</p>
+
+<h2 id="sibling">5. The reverse trap: sibling imports break under -m</h2>
+<pre><code>cd proj
+echo &#x27;def helper(): return &quot;sibling ok&quot;&#x27; &gt; scripts/helpers.py
+echo &#x27;from helpers import helper; print(helper())&#x27; &gt; scripts/job.py
+python3 scripts/job.py
+python3 -m scripts.job 2&gt;&amp;1 | tail -1</code></pre>
+<p>Output:</p>
+<pre><code>sibling ok
+ModuleNotFoundError: No module named &#x27;helpers&#x27;</code></pre>
+<p><strong>Measured:</strong> <code>from helpers import helper</code> works when you run <code>scripts/job.py</code> directly, because <code>scripts/</code> is <code>sys.path[0]</code>, but fails with <code>python3 -m scripts.job</code>, because now the project root is. Pick one way to run your code and write imports for it: from the root, use <code>from scripts.helpers import helper</code> and always use <code>-m</code>. Don't fix it with a relative import (<code>from .helpers</code>): that breaks the direct-run way instead (see our <a href="/guides/python-importerror-attempted-relative-import-with-no-known-parent-package/">relative import guide</a>).</p>
+
+<aside class="cta"><strong>Imports sorted and now calling an API? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why can&#x27;t Python import a module from another directory?</summary><p>When you run python3 path/to/script.py, sys.path[0] is the script&#x27;s folder, not your current directory. We measured sys.path[0] = proj/scripts and No module named &#x27;lib&#x27; for a lib/ folder next to scripts/.</p></details>
+<details><summary>How do I import from a parent or sibling directory in Python?</summary><p>Run from the project root with python3 -m scripts.run, set PYTHONPATH to the root, or insert the root (built from __file__) into sys.path. We measured all three working.</p></details>
+<details><summary>Why does my import work in VS Code or PyCharm but not in the terminal?</summary><p>IDEs usually add the project root to PYTHONPATH. We measured PYTHONPATH=. making the failing script work, and failing again when run from a different directory.</p></details>
+<details><summary>Is the current working directory on sys.path?</summary><p>Not when running a script file: we measured sys.path[0] being the script&#x27;s folder. With python3 -m it is: we measured sys.path[0] being the directory we ran it from.</p></details>
+<details><summary>Why does python -m break my imports?</summary><p>With -m, sibling files are no longer on sys.path. We measured from helpers import helper working when run directly and failing with -m.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5: a script importing from a sibling folder run directly, with python3 -m, with PYTHONPATH from two directories, with a __file__-based sys.path insert from two directories, and a sibling import under both run styles. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

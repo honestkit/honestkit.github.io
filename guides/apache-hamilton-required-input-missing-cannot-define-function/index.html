@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Apache Hamilton: &#x27;Required Input Missing&#x27; — Fixed (Tested)</title>
+<meta name="description" content="We reproduced 3 real Hamilton dataflow errors — missing input, duplicate function, and a cyclic dependency — and measured the exact fix for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/apache-hamilton-required-input-missing-cannot-define-function/">
+<meta property="og:title" content="Apache Hamilton: &#x27;Required Input Missing&#x27; — Fixed (Tested)">
+<meta property="og:description" content="We reproduced 3 real Hamilton dataflow errors — missing input, duplicate function, and a cyclic dependency — and measured the exact fix for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/apache-hamilton-required-input-missing-cannot-define-function/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Hamilton say an input is 'required' when I never declared it as one?", "acceptedAnswer": {"@type": "Answer", "text": "Hamilton infers the entire dependency graph from function parameter names \u2014 any parameter that doesn't match another function's name in your modules is automatically treated as an external input you must supply via the inputs dict at execute() time. We confirmed the fix is simply adding that name to inputs; if that wasn't the intent, the real bug is usually a typo in a parameter name that was meant to match another function."}}, {"@type": "Question", "name": "Can two Hamilton functions have the same name in different modules?", "acceptedAnswer": {"@type": "Answer", "text": "Not by default \u2014 we confirmed Builder().with_modules() raises ValueError: Cannot define function X more than once the moment two loaded modules define the same function name. If you want a later module to intentionally replace an earlier node with the same name (e.g. swapping an implementation per environment), call .allow_module_overrides() on the Builder first \u2014 the error message names this method directly."}}, {"@type": "Question", "name": "Does Hamilton detect cyclic dependencies between functions?", "acceptedAnswer": {"@type": "Answer", "text": "Not with a dedicated error \u2014 we measured that a two-function cycle (x depends on y, y depends on x) raises Python's generic RecursionError: maximum recursion depth exceeded instead of any Hamilton-specific cycle message. If you see a RecursionError from a Hamilton driver.build()/execute() call and your code isn't deeply recursive on its own, suspect a naming cycle first."}}, {"@type": "Question", "name": "Is 'sf-hamilton' the same project as 'apache-hamilton'?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we installed via pip install sf-hamilton on 2026-10-03 and it pulled in apache-hamilton 1.90.0 as a dependency; the project (formerly developed by DAGWorks) is now distributed under the Apache Software Foundation. The sf-hamilton package name is kept for backward compatibility with existing installs/imports."}}, {"@type": "Question", "name": "What's the actual mechanism that causes these errors \u2014 is it a config file or something else?", "acceptedAnswer": {"@type": "Answer", "text": "Neither \u2014 Hamilton has no separate config or wiring file for the graph. It reads your Python module(s) directly: each function becomes a graph node, and each parameter name is matched against other functions' names in the same set of modules. All three errors here (missing input, duplicate name, cycle) are direct consequences of that name-matching happening purely at the Python-identifier level."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Hamilton: Required input missing / Cannot define function twice (tested)</h1>
+<p class="lead"><a href="https://hamilton.apache.org/">Hamilton</a> (formerly Sf-Hamilton/DAGWorks, now an Apache Software Foundation project) turns plain Python functions into a dataflow graph by matching parameter names to other functions' names. That name-matching is powerful but produces a few distinctive errors when the graph doesn't line up. We reproduced three of them on Hamilton 1.90.0 and measured the exact fix for each.</p>
+<h2 id="missing-input">1. ValueError: Required input X not provided for nodes</h2>
+<p>Hamilton builds a dependency graph purely from function parameter names. A function parameter that doesn't match the name of any other function in your module is treated as an external input you must supply at execution time. We defined two functions where <code>c</code> depends on a parameter with no matching function, then called <code>execute()</code> without supplying it:</p>
+<pre><code>def a(b: int) -> int:
+    return b + 1
+
+def c(a: int, missing_input: int) -> int:
+    return a + missing_input
+
+dr = driver.Builder().with_modules(dataflow).build()
+dr.execute(["c"], inputs={"b": 1})</code></pre>
+<pre><code>ValueError: 1 errors encountered:
+  Error: Required input missing_input not provided for nodes: [&#39;c&#39;].</code></pre>
+<p><strong>The fix</strong> we confirmed: add the missing name to the <code>inputs</code> dict passed to <code>execute()</code> &mdash; <code>dr.execute(["c"], inputs={"b": 1, "missing_input": 5})</code> runs cleanly. If the parameter was meant to reference another function rather than be a runtime input, the real bug is usually a typo in the parameter name not matching the intended function's name exactly.</p>
+
+<h2 id="duplicate">2. ValueError: Cannot define function X more than once</h2>
+<p>Hamilton builds its graph from every function across all modules passed to <code>with_modules()</code>. Two functions with the <strong>same name</strong> in different modules collide:</p>
+<pre><code># mod_a.py
+def shared(b: int) -> int:
+    return b + 1
+
+# mod_b.py
+def shared(b: int) -> int:
+    return b * 2
+
+dr = driver.Builder().with_modules(mod_a, mod_b).build()</code></pre>
+<pre><code>ValueError: Cannot define function shared more than once. Already defined by
+function &lt;function shared at 0x...&gt; In case you want to override the
+previous functions check out .allow_module_overrides() at:
+https://hamilton.apache.org/reference/drivers/Driver/</code></pre>
+<p><strong>The fix</strong> depends on intent. If the collision is accidental (two unrelated functions happen to share a name), rename one. If you deliberately want a later module to override an earlier one's node with the same name (a common pattern for swapping an implementation per environment), the error message names the exact method to call: <code>.allow_module_overrides()</code> on the <code>Builder</code>, before <code>.with_modules(...)</code>.</p>
+
+<h2 id="cyclic">3. A cyclic dependency does NOT give a friendly "cycle detected" error</h2>
+<p>We expected a clear cycle-detection message. Instead, two functions depending on each other by name produced Python's own generic recursion error, with Hamilton's own Slack-invite error banner on top but no cycle-specific wording underneath:</p>
+<pre><code>def x(y: int) -> int:
+    return y + 1
+
+def y(x: int) -> int:
+    return x + 1
+
+dr = driver.Builder().with_modules(cyclic).build()
+dr.execute(["x"])</code></pre>
+<pre><code>RecursionError: maximum recursion depth exceeded</code></pre>
+<p>This is worth knowing specifically because the error gives no hint that the real problem is a naming cycle, not actually-deep recursion in your own code. If you hit <code>RecursionError</code> from a Hamilton driver build/execute call with no deep call stack of your own, check for two function parameter names that resolve back to each other before assuming anything else &mdash; draw the dependency graph on paper if it's not obvious from reading the module.</p>
+
+<aside class="cta"><strong>Debugging a dataflow pipeline that calls an API? Check the real headers and status it sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Hamilton say an input is &#x27;required&#x27; when I never declared it as one?</summary><p>Hamilton infers the entire dependency graph from function parameter names — any parameter that doesn&#x27;t match another function&#x27;s name in your modules is automatically treated as an external input you must supply via the inputs dict at execute() time. We confirmed the fix is simply adding that name to inputs; if that wasn&#x27;t the intent, the real bug is usually a typo in a parameter name that was meant to match another function.</p></details>
+<details><summary>Can two Hamilton functions have the same name in different modules?</summary><p>Not by default — we confirmed Builder().with_modules() raises ValueError: Cannot define function X more than once the moment two loaded modules define the same function name. If you want a later module to intentionally replace an earlier node with the same name (e.g. swapping an implementation per environment), call .allow_module_overrides() on the Builder first — the error message names this method directly.</p></details>
+<details><summary>Does Hamilton detect cyclic dependencies between functions?</summary><p>Not with a dedicated error — we measured that a two-function cycle (x depends on y, y depends on x) raises Python&#x27;s generic RecursionError: maximum recursion depth exceeded instead of any Hamilton-specific cycle message. If you see a RecursionError from a Hamilton driver.build()/execute() call and your code isn&#x27;t deeply recursive on its own, suspect a naming cycle first.</p></details>
+<details><summary>Is &#x27;sf-hamilton&#x27; the same project as &#x27;apache-hamilton&#x27;?</summary><p>Yes — we installed via pip install sf-hamilton on 2026-10-03 and it pulled in apache-hamilton 1.90.0 as a dependency; the project (formerly developed by DAGWorks) is now distributed under the Apache Software Foundation. The sf-hamilton package name is kept for backward compatibility with existing installs/imports.</p></details>
+<details><summary>What&#x27;s the actual mechanism that causes these errors — is it a config file or something else?</summary><p>Neither — Hamilton has no separate config or wiring file for the graph. It reads your Python module(s) directly: each function becomes a graph node, and each parameter name is matched against other functions&#x27; names in the same set of modules. All three errors here (missing input, duplicate name, cycle) are direct consequences of that name-matching happening purely at the Python-identifier level.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with apache-hamilton 1.90.0 (pip package sf-hamilton, now distributed under the Apache Software Foundation), Python 3.13, calling driver.Builder().with_modules(...).build().execute(...) directly. Every message and exception type below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Hamilton is free/open-source.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

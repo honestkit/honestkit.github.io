@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python UnicodeDecodeError: Causes Reproduced, With Fixes</title>
+<meta name="description" content="We reproduced UnicodeDecodeError 4 ways on Python 3.13.5: Latin-1 bytes, truncated UTF-8, ASCII decoding, UTF-16 read as UTF-8. Exact messages and fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-unicodedecodeerror/">
+<meta property="og:title" content="Python UnicodeDecodeError: Causes Reproduced, With Fixes">
+<meta property="og:description" content="We reproduced UnicodeDecodeError 4 ways on Python 3.13.5: Latin-1 bytes, truncated UTF-8, ASCII decoding, UTF-16 read as UTF-8. Exact messages and fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-unicodedecodeerror/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does UnicodeDecodeError actually mean?", "acceptedAnswer": {"@type": "Answer", "text": "It means Python tried to interpret a sequence of raw bytes as text using a specific codec (most often UTF-8, the default for open()), and those bytes don't form valid data under that codec. The bytes themselves aren't corrupt - they're just encoded differently than the code assumed."}}, {"@type": "Question", "name": "What does 'invalid continuation byte' mean specifically?", "acceptedAnswer": {"@type": "Answer", "text": "UTF-8 multi-byte characters have a strict structure: a start byte followed by one or more continuation bytes in a specific range. This error means a byte that should have been a valid continuation byte wasn't - usually because the file isn't UTF-8 at all (often Latin-1/cp1252 instead)."}}, {"@type": "Question", "name": "How do I fix UnicodeDecodeError when reading a file?", "acceptedAnswer": {"@type": "Answer", "text": "Determine the file's actual encoding and pass it explicitly: open(path, encoding='latin-1') or whatever the source really uses. If the encoding is unknown or inconsistent, use a detection library, or fall back to errors='replace' only if losing unrecognizable characters is acceptable."}}, {"@type": "Question", "name": "What's the difference between errors='ignore' and errors='replace'?", "acceptedAnswer": {"@type": "Answer", "text": "Both suppress the exception instead of raising it. errors='ignore' silently drops the bad bytes entirely. errors='replace' substitutes a placeholder character (U+FFFD) for each bad byte. Both lose information - prefer finding the correct encoding over either when the data matters."}}, {"@type": "Question", "name": "Why does a file starting with 0xff or 0xfe fail to decode as UTF-8?", "acceptedAnswer": {"@type": "Answer", "text": "Those bytes are typically a byte-order mark (BOM) indicating UTF-16 encoding, not UTF-8. UTF-8 never starts a file with those byte values in a BOM position the same way. Try opening with encoding='utf-16' instead, which auto-detects the byte order from the BOM."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python UnicodeDecodeError (tested)</h1>
+<p class="lead"><code>UnicodeDecodeError</code> means Python tried to interpret a sequence of bytes as text using a specific encoding (usually UTF-8, Python's default), and those bytes aren't valid under that encoding. The byte data itself is fine &mdash; it's just encoded differently than the code assumed. We wrote real byte files on disk and reproduced four distinct causes.</p>
+<h2>1. Four reproduced causes</h2>
+<table>
+<tr><th>Situation</th><th>Exact error (Python 3.13.5)</th></tr>
+<tr><td>A Latin-1 ("é" = <code>0xe9</code>) file read as UTF-8</td><td><code>UnicodeDecodeError: 'utf-8' codec can't decode byte 0xe9 in position 3: invalid continuation byte</code></td></tr>
+<tr><td>A UTF-8 file with its last byte cut off mid-character</td><td><code>UnicodeDecodeError: 'utf-8' codec can't decode byte 0xc3 in position 3: unexpected end of data</code></td></tr>
+<tr><td>A non-ASCII byte decoded with the <code>ascii</code> codec</td><td><code>UnicodeDecodeError: 'ascii' codec can't decode byte 0xe9 in position 3: ordinal not in range(128)</code></td></tr>
+<tr><td>A UTF-16 file read as UTF-8</td><td><code>UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte</code></td></tr>
+</table>
+<p>Each message names the specific codec that failed, the exact byte value, its position in the data, and a short reason (<code>invalid continuation byte</code>, <code>unexpected end of data</code>, <code>invalid start byte</code>) &mdash; which, read together, usually tells you which real cause below you're hitting.</p>
+
+<h2>2. Cause 1: the file isn't UTF-8 at all</h2>
+<p>By far the most common real cause: a file was actually saved in Latin-1 (cp1252/ISO-8859-1, common on older Windows tools and some databases) or another encoding, but the code assumes UTF-8, Python's default for <code>open()</code>:</p>
+<pre><code>&gt;&gt;&gt; open("file.txt", encoding="utf-8").read()
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xe9 in position 3: invalid continuation byte</code></pre>
+<p>Fix: open with the correct encoding if you know it (<code>encoding="latin-1"</code> or <code>encoding="cp1252"</code>), or detect it with a library like <code>charset-normalizer</code> if the source is unpredictable. "invalid continuation byte" specifically means a UTF-8 multi-byte sequence started correctly but the next byte didn't match what UTF-8 requires &mdash; a strong signal the file is single-byte-encoded, not UTF-8.</p>
+
+<h2>3. Cause 2: truncated or corrupted data</h2>
+<p>"unexpected end of data" means a multi-byte UTF-8 character was cut off before it finished &mdash; the file ends (or a network read stopped) mid-character:</p>
+<pre><code>&gt;&gt;&gt; open("truncated.txt", encoding="utf-8").read()
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xc3 in position 3: unexpected end of data</code></pre>
+<p>This happens with partial file downloads, a network stream read in fixed-size chunks that happens to split a multi-byte character across two chunks, or a file genuinely truncated by a crashed write. Fix: for streaming reads, decode incrementally with <code>codecs.getincrementaldecoder("utf-8")()</code> instead of decoding each chunk independently, so a split character is buffered until the next chunk completes it.</p>
+
+<h2>4. Cause 3: using the wrong codec on purpose (or by default)</h2>
+<p><code>ascii</code> only accepts byte values 0-127. Anything outside that &mdash; including any accented letter, emoji, or non-Latin script &mdash; fails:</p>
+<pre><code>&gt;&gt;&gt; b'Caf\xe9'.decode('ascii')
+UnicodeDecodeError: 'ascii' codec can't decode byte 0xe9 in position 3: ordinal not in range(128)</code></pre>
+<p>This can show up unexpectedly in older code, or in environments where Python 2-era <code>str.decode()</code> calls or a <code>locale</code>-based default encoding silently picked <code>ascii</code>. Fix: decode with <code>utf-8</code> explicitly rather than relying on an implicit default, especially when deploying to a different machine with a different system locale.</p>
+
+<h2>5. Cause 4: the data is a different Unicode encoding entirely (UTF-16, UTF-32)</h2>
+<p>"invalid start byte", especially right at position 0, often means the file is a different multi-byte Unicode encoding, not a single-byte one:</p>
+<pre><code>&gt;&gt;&gt; open("utf16file.txt", encoding="utf-8").read()
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte</code></pre>
+<p><code>0xff 0xfe</code> (or <code>0xfe 0xff</code>) at the very start of a file is a byte-order mark (BOM) that signals UTF-16. Fix: try <code>encoding="utf-16"</code> (Python auto-detects byte order from the BOM), or check the first 2-4 bytes of the file yourself before choosing a codec.</p>
+
+<h2>6. Fix checklist</h2>
+<ul>
+<li>Know your data's actual encoding before choosing one in code &mdash; don't assume UTF-8 for files from Windows tools, legacy databases, or unknown external sources.</li>
+<li>Use <code>errors="replace"</code> or <code>errors="ignore"</code> in <code>open()</code>/<code>.decode()</code> only when losing or mangling the bad bytes is genuinely acceptable &mdash; it silently discards information otherwise.</li>
+<li>For a quick, honest fallback that doesn't lose data: <code>errors="surrogateescape"</code> round-trips unknown bytes losslessly if you'll re-encode with the same setting later.</li>
+<li>For streamed/chunked reads, use an incremental decoder instead of decoding each chunk on its own.</li>
+<li>Check the first few bytes for a BOM (<code>\xff\xfe</code>, <code>\xfe\xff</code>, <code>\xef\xbb\xbf</code> for UTF-8-with-BOM) before assuming a plain encoding.</li>
+</ul>
+<p>This is purely about byte-level text decoding, unrelated to <a href="/guides/python-valueerror/">ValueError</a>'s type-conversion failures like <code>int("abc")</code> &mdash; though both report "this specific value isn't valid here" rather than a wrong Python type.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does UnicodeDecodeError actually mean?</summary><p>It means Python tried to interpret a sequence of raw bytes as text using a specific codec (most often UTF-8, the default for open()), and those bytes don&#x27;t form valid data under that codec. The bytes themselves aren&#x27;t corrupt - they&#x27;re just encoded differently than the code assumed.</p></details>
+<details><summary>What does &#x27;invalid continuation byte&#x27; mean specifically?</summary><p>UTF-8 multi-byte characters have a strict structure: a start byte followed by one or more continuation bytes in a specific range. This error means a byte that should have been a valid continuation byte wasn&#x27;t - usually because the file isn&#x27;t UTF-8 at all (often Latin-1/cp1252 instead).</p></details>
+<details><summary>How do I fix UnicodeDecodeError when reading a file?</summary><p>Determine the file&#x27;s actual encoding and pass it explicitly: open(path, encoding=&#x27;latin-1&#x27;) or whatever the source really uses. If the encoding is unknown or inconsistent, use a detection library, or fall back to errors=&#x27;replace&#x27; only if losing unrecognizable characters is acceptable.</p></details>
+<details><summary>What&#x27;s the difference between errors=&#x27;ignore&#x27; and errors=&#x27;replace&#x27;?</summary><p>Both suppress the exception instead of raising it. errors=&#x27;ignore&#x27; silently drops the bad bytes entirely. errors=&#x27;replace&#x27; substitutes a placeholder character (U+FFFD) for each bad byte. Both lose information - prefer finding the correct encoding over either when the data matters.</p></details>
+<details><summary>Why does a file starting with 0xff or 0xfe fail to decode as UTF-8?</summary><p>Those bytes are typically a byte-order mark (BOM) indicating UTF-16 encoding, not UTF-8. UTF-8 never starts a file with those byte values in a BOM position the same way. Try opening with encoding=&#x27;utf-16&#x27; instead, which auto-detects the byte order from the BOM.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5 on Linux, reading real byte files written under /tmp. Every error below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

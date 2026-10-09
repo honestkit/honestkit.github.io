@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>http.client Mistakes None for RemoteDisconnected (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: HTTPResponse.begin() raises RemoteDisconnected on a transient non-blocking None read, not an actual closed connection.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-http-client-httpresponse-none-remotedisconnected/">
+<meta property="og:title" content="http.client Mistakes None for RemoteDisconnected (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: HTTPResponse.begin() raises RemoteDisconnected on a transient non-blocking None read, not an actual closed connection.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-http-client-httpresponse-none-remotedisconnected/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "The http.client documentation for HTTPResponse does not mention non-blocking sockets or a None read result; RemoteDisconnected is documented as meaning the server closed the connection before sending a response. We measured that a None-returning source triggers the identical exception with no actual disconnection involved."}}, {"@type": "Question", "name": "Does this affect urllib.request.urlopen(), not just raw http.client?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured it directly: urlopen() builds its request on top of the same http.client.HTTPConnection and HTTPResponse, and a non-blocking socket wrapped incorrectly at that layer surfaces the identical RemoteDisconnected exception through urlopen() too, with the same misleading message. We did not test requests or urllib3 directly, but both are also built on http.client's HTTPResponse for the underlying socket read, so the same failure is plausible through them as well (possibly surfaced as a subclass like requests' ConnectionError)."}}, {"@type": "Question", "name": "Why does this look like a real network problem?", "acceptedAnswer": {"@type": "Answer", "text": "Because RemoteDisconnected is also the genuine exception for an actually-closed connection, there is no way to distinguish the two causes from the exception alone. If you see this on a socket you know is still open (e.g. a non-blocking socket you're polling), suspect a transient None read instead of a real disconnection."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- same family already confirmed in shutil.copyfileobj, gzip/bz2/lzma, tarfile/zipfile, TextIOWrapper.readline(), ElementTree.parse(), tomllib.load(), email.message_from_binary_file(), and plistlib.load(): a correctly-returned non-blocking None gets mishandled one layer above io itself. This is the first case in the family traced all the way down to io.BufferedReader.readline() itself doing the collapsing, rather than a higher-level module's own loop."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>http.client.HTTPResponse Mistakes None for RemoteDisconnected (tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> from <code>readinto()</code> -- distinct from the empty read that means real end-of-stream. We measured that <code>http.client.HTTPResponse.begin()</code> reads its status line with <code>self.fp.readline()</code>, and <code>io.BufferedReader.readline()</code> itself collapses that transient <code>None</code> into <code>b''</code> -- indistinguishable from a socket that closed before sending anything. <code>begin()</code> sees the empty line and raises <code>http.client.RemoteDisconnected: Remote end closed connection without response</code>, even though a complete, valid <code>200 OK</code> response is sitting one read call away and the connection was never actually closed.</p>
+<h2 id="repro1">1. A real, complete response behind one transient None</h2>
+<pre><code>import io, http.client
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self, payload):
+        self.calls = 0
+        self.sent = False
+        self.payload = payload
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None            # transient: no data ready yet
+        if not self.sent:
+            self.sent = True
+            n = len(self.payload)
+            b[:n] = self.payload
+            return n               # the real, complete response
+        return 0                   # real EOF after that
+
+class FakeSocket:
+    def __init__(self, payload):
+        self.raw = FlakyRaw(payload)
+        self.br = io.BufferedReader(self.raw)
+    def makefile(self, mode, *a, **kw):
+        return self.br
+
+payload = (b"HTTP/1.1 200 OK\r\n"
+           b"Content-Type: text/plain\r\n"
+           b"Content-Length: 5\r\n"
+           b"\r\n"
+           b"hello")
+
+sock = FakeSocket(payload)
+resp = http.client.HTTPResponse(sock)
+try:
+    resp.begin()
+    print("status:", resp.status)
+except Exception as e:
+    print("CRASHED:", type(e).__name__, e)
+print("raw calls made:", sock.raw.calls)</code></pre>
+<pre><code>CRASHED: RemoteDisconnected Remote end closed connection without response
+raw calls made: 1</code></pre>
+<p><strong>Measured:</strong> the response is valid and complete, one read call away. <code>HTTPResponse.begin()</code> made exactly one read call, got back an empty status line, and concluded the server closed the connection -- a conclusion that looks like a real network failure but is actually just an unhandled non-blocking retry signal.</p>
+
+<h2 id="repro2">2. The root cause: BufferedReader.readline() collapses None into b'', unlike read()</h2>
+<pre><code>raw1 = FlakyRaw(b"HTTP/1.1 200 OK\r\n")
+br1 = io.BufferedReader(raw1)
+print("readline():", repr(br1.readline()))
+
+raw2 = FlakyRaw(b"HTTP/1.1 200 OK\r\n")
+br2 = io.BufferedReader(raw2)
+print("read(5):", repr(br2.read(5)))</code></pre>
+<pre><code>readline(): b''
+read(5): None</code></pre>
+<p><strong>Measured:</strong> the same class handles the identical transient <code>None</code> two different ways depending on which method is called. <code>read()</code> propagates it correctly so a caller can retry; <code>readline()</code> -- what <code>http.client</code> actually uses to read the status line -- silently turns it into <code>b''</code>, the same value a genuinely closed connection would produce.</p>
+
+<h2 id="repro3">3. The fix: drain into a real buffer first, retrying on None</h2>
+<pre><code>def drain_retrying_on_none(raw_stream, chunk_size=65536):
+    out = io.BytesIO()
+    br = io.BufferedReader(raw_stream)
+    while True:
+        chunk = br.read(chunk_size)
+        if chunk is None:
+            continue              # retry: not ready yet, not EOF
+        if not chunk:
+            break                  # real EOF
+        out.write(chunk)
+    out.seek(0)
+    return out
+
+class FakeSocket2:
+    def __init__(self, fileobj):
+        self.fileobj = fileobj
+    def makefile(self, mode, *a, **kw):
+        return self.fileobj
+
+raw3 = FlakyRaw(payload)
+safe_buf = drain_retrying_on_none(raw3)
+sock2 = FakeSocket2(safe_buf)
+resp2 = http.client.HTTPResponse(sock2)
+resp2.begin()
+print("status:", resp2.status)
+print("body:", resp2.read())</code></pre>
+<pre><code>status: 200
+body: b'hello'</code></pre>
+<p><strong>Measured:</strong> resolving the <code>None</code>/EOF distinction before the bytes reach <code>HTTPResponse.begin()</code> parses the status line and body correctly, with no spurious disconnection.</p>
+<aside class="cta"><strong>Reading an HTTP response from a non-blocking socket with http.client.HTTPResponse? A transient None read crashes with RemoteDisconnected -- even though the server never closed the connection:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>The http.client documentation for HTTPResponse does not mention non-blocking sockets or a None read result; RemoteDisconnected is documented as meaning the server closed the connection before sending a response. We measured that a None-returning source triggers the identical exception with no actual disconnection involved.</p></details>
+<details><summary>Does this affect urllib.request.urlopen(), not just raw http.client?</summary><p>Yes -- we measured it directly: urlopen() builds its request on top of the same http.client.HTTPConnection and HTTPResponse, and a non-blocking socket wrapped incorrectly at that layer surfaces the identical RemoteDisconnected exception through urlopen() too, with the same misleading message. We did not test requests or urllib3 directly, but both are also built on http.client&#x27;s HTTPResponse for the underlying socket read, so the same failure is plausible through them as well (possibly surfaced as a subclass like requests&#x27; ConnectionError).</p></details>
+<details><summary>Why does this look like a real network problem?</summary><p>Because RemoteDisconnected is also the genuine exception for an actually-closed connection, there is no way to distinguish the two causes from the exception alone. If you see this on a socket you know is still open (e.g. a non-blocking socket you&#x27;re polling), suspect a transient None read instead of a real disconnection.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>Yes -- same family already confirmed in shutil.copyfileobj, gzip/bz2/lzma, tarfile/zipfile, TextIOWrapper.readline(), ElementTree.parse(), tomllib.load(), email.message_from_binary_file(), and plistlib.load(): a correctly-returned non-blocking None gets mishandled one layer above io itself. This is the first case in the family traced all the way down to io.BufferedReader.readline() itself doing the collapsing, rather than a higher-level module&#x27;s own loop.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in http.client.HTTPResponse, reading a genuinely complete, valid HTTP response through a fake socket whose makefile() returns an io.BufferedReader over a custom non-blocking RawIOBase whose readinto() returns None once before returning the real response bytes. PlainHeaders is our extension; Python&#x27;s http.client and io modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cannot Connect to the Docker Daemon: Causes and Fixes (Tested)</title>
+<meta name="description" content="We pointed docker at a missing socket and dead TCP ports and recorded the exact errors. Unix-socket and TCP wording differ; compose copies the CLI&#x27;s error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/docker-cannot-connect-to-the-docker-daemon/">
+<meta property="og:title" content="Cannot Connect to the Docker Daemon: Causes and Fixes (Tested)">
+<meta property="og:description" content="We pointed docker at a missing socket and dead TCP ports and recorded the exact errors. Unix-socket and TCP wording differ; compose copies the CLI&#x27;s error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/docker-cannot-connect-to-the-docker-daemon/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does the error say unix:///var/run/docker.sock even though I didn't type that?", "acceptedAnswer": {"@type": "Answer", "text": "That's the default address the docker CLI tries when you haven't set DOCKER_HOST or a different context. If you see that exact path in the error, you're using default settings and the daemon isn't reachable there."}}, {"@type": "Question", "name": "Is \"cannot connect\" the same as \"permission denied\"?", "acceptedAnswer": {"@type": "Answer", "text": "No. In our tests a missing socket or dead port gave \"failed to connect to the docker API...\" or \"Cannot connect to the Docker daemon...\". Permission denied (per the Docker docs, section 5) is a different message: the socket exists and the daemon is running, but your user can't read or write it."}}, {"@type": "Question", "name": "Does docker compose give a different error than docker ps?", "acceptedAnswer": {"@type": "Answer", "text": "We measured no difference. docker compose -p <project> ps against the same wrong DOCKER_HOST printed the identical error text as plain docker ps, both for a missing unix socket and for a dead TCP port."}}, {"@type": "Question", "name": "Why did docker version print some output before the error?", "acceptedAnswer": {"@type": "Answer", "text": "docker version and docker info print a Client block first using only local CLI data, then try to reach the daemon for the Server block. In our test the Client block always printed fine; only the Server lookup failed with the connection error."}}, {"@type": "Question", "name": "I'm on macOS with Docker Desktop and get this error. Is it the same fix?", "acceptedAnswer": {"@type": "Answer", "text": "The error shape is the same, but per Docker's docs the default socket path differs (Desktop uses a proxy socket under ~/.docker/run, not /var/run/docker.sock). We didn't measure Desktop; check Desktop is actually running and that nothing hard-codes the Linux socket path."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Cannot Connect to the Docker Daemon (tested)</h1>
+<p class="lead"><code>Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?</code> means the <code>docker</code> CLI could not reach <code>dockerd</code> at the address it tried. It is a client-side connection failure, not a daemon crash report. We reproduced it safely by pointing the CLI at a socket path and ports that do not exist, without touching the real daemon.</p>
+<h2>1. What this error means</h2>
+<p>The <code>docker</code> command is a thin client. Every command, including <code>docker ps</code>, opens a connection to <code>dockerd</code> at whatever address is configured: by default the unix socket <code>/var/run/docker.sock</code>, or a <code>DOCKER_HOST</code> you set, or a <code>docker context</code>. If nothing answers at that address, the CLI prints a "cannot connect" error and exits 1. It says nothing about why the daemon isn't there &mdash; stopped, not installed, wrong socket, wrong permissions, or wrong host are all the same symptom from the client's point of view.</p>
+
+<h2>2. Our test setup</h2>
+<p>We did not stop or touch the real Docker daemon on our box (it has live containers). Instead we made the CLI look in the wrong place by overriding <code>DOCKER_HOST</code> for single commands, which only affects that command, not the daemon:</p>
+<pre><code>DOCKER_HOST=unix:///tmp/guide-dockerdaemon/nonexistent.sock docker ps
+DOCKER_HOST=tcp://127.0.0.1:1 docker ps
+DOCKER_HOST=tcp://127.0.0.1:19999 docker ps</code></pre>
+<p>We ran this with Docker Engine 29.8.1 and Docker Compose v5.5.1. A plain <code>docker ps</code> with no override, run right after, still listed our real containers normally &mdash; confirming the daemon itself was never affected.</p>
+
+<h2>3. Results: the exact errors, side by side</h2>
+<table>
+<tr><th>Command</th><th>Address tried</th><th>Output</th><th>Exit code</th></tr>
+<tr><td>docker ps</td><td>unix:///tmp/&hellip;/nonexistent.sock</td><td>failed to connect to the docker API at unix:///tmp/&hellip;/nonexistent.sock; check if the path is correct and if the daemon is running: dial unix /tmp/&hellip;/nonexistent.sock: connect: no such file or directory</td><td>1</td></tr>
+<tr><td>docker ps</td><td>tcp://127.0.0.1:1</td><td>Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?</td><td>1</td></tr>
+<tr><td>docker ps</td><td>tcp://127.0.0.1:19999</td><td>Cannot connect to the Docker daemon at tcp://127.0.0.1:19999. Is the docker daemon running?</td><td>1</td></tr>
+<tr><td>docker -H tcp://127.0.0.1:19999 ps</td><td>tcp://127.0.0.1:19999</td><td>identical wording to the DOCKER_HOST env var case above</td><td>1</td></tr>
+<tr><td>docker info</td><td>unix:///tmp/&hellip;/nonexistent.sock</td><td>prints the Client block (version, plugins) fine, then under "Server:" the same "failed to connect to the docker API&hellip;" line as docker ps</td><td>1</td></tr>
+<tr><td>docker version</td><td>unix:///tmp/&hellip;/nonexistent.sock</td><td>prints the Client block fine, then the same "failed to connect to the docker API&hellip;" line, no Server block at all</td><td>1</td></tr>
+<tr><td>docker compose -p forever-test ps</td><td>unix:///tmp/&hellip;/nonexistent.sock</td><td>byte-for-byte the same "failed to connect to the docker API&hellip;" line as docker ps</td><td>1</td></tr>
+<tr><td>docker compose -p forever-test ps</td><td>tcp://127.0.0.1:19999</td><td>byte-for-byte the same "Cannot connect to the Docker daemon at tcp://&hellip;" line as docker ps</td><td>1</td></tr>
+</table>
+<p>Two things stand out. First, on this CLI version the unix-socket failure and the TCP failure use <strong>different wording</strong>: the socket case says "failed to connect to the docker API at&hellip;", the TCP case says the older, shorter "Cannot connect to the Docker daemon at&hellip;". If your search brought you here for the classic "Cannot connect to the Docker daemon at unix:///var/run/docker.sock" phrasing specifically, note that a current Docker CLI (29.8.1) only prints that exact classic shape for TCP addresses; for a missing unix socket it now prints the longer "failed to connect to the docker API" message with the underlying <code>dial unix &hellip;: connect: no such file or directory</code> reason attached. Older CLI versions used the classic wording for both; expect either shape depending on your installed version.</p>
+<p>Second, port 1 (a privileged port nothing was listening on) and port 19999 (an ordinary unused port) produced the identical message. The CLI does not distinguish "nothing listens here" from "you'd need privilege to bind here" &mdash; both are just a failed TCP connect from the client's side, so you cannot tell port-privilege issues apart from plain "nothing running" by the wording alone.</p>
+
+<h2>4. docker compose behaves exactly like docker</h2>
+<p>We confirmed <code>docker compose ps</code> (the plugin, invoked via <code>docker compose -p &lt;project&gt; ps</code>) reports the exact same connection error, word for word, as plain <code>docker ps</code>, for both the unix-socket and the TCP case. That is expected: the compose plugin talks to the daemon through the same client library docker itself uses. There is no separate "compose can't connect" message to learn &mdash; fixing the connection fixes both.</p>
+
+<h2>5. Permission-denied (per the Docker docs, not measured here)</h2>
+<p>We could not reproduce this one safely: our test account is already in the <code>docker</code> group, and reproducing a permission failure would mean either removing that group membership or using <code>sudo</code> to break the socket's permissions, both of which we avoided. Per the Docker docs, a user who is <em>not</em> in the <code>docker</code> group and runs a plain <code>docker ps</code> against the real socket sees something like:</p>
+<pre><code>Got permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock:
+Get "http://%2Fvar%2Frun%2Fdocker.sock/v1.51/containers/json":
+dial unix /var/run/docker.sock: connect: permission denied</code></pre>
+<p>This is a different failure from "cannot connect": the socket exists and the daemon is running, but your user lacks read/write access to it. The fix is to add your user to the <code>docker</code> group (<code>sudo usermod -aG docker $USER</code>, then log out and back in) rather than prefixing every command with <code>sudo</code>.</p>
+
+<h2>6. Rootless Docker and Docker Desktop (per the docs, not measured)</h2>
+<p>This box runs standard Linux <code>dockerd</code> as a system service, so we measured only that. Per the Docker docs, other setups default to different addresses, and pointing at the wrong one gives the same class of error for a different reason:</p>
+<ul>
+<li><strong>Rootless Docker</strong> defaults to a per-user socket, typically <code>unix:///run/user/&lt;uid&gt;/docker.sock</code>, not <code>/var/run/docker.sock</code>.</li>
+<li><strong>Docker Desktop</strong> (macOS/Windows) runs the real engine inside a VM and exposes a proxy socket, typically <code>~/.docker/run/docker.sock</code> on macOS. Scripts hard-coded to <code>/var/run/docker.sock</code> can fail there even though Desktop is running.</li>
+<li><strong>Remote Docker over SSH or TCP</strong> (via <code>docker context</code> or <code>DOCKER_HOST=ssh://&hellip;</code>) means "the docker daemon running" is a question about a different machine, not yours.</li>
+</ul>
+
+<h2>7. How to fix it, in order</h2>
+<ul>
+<li><strong>Check what address the CLI is actually using.</strong> <code>echo $DOCKER_HOST</code> and <code>docker context ls</code> (the one marked <code>*</code> is active). A leftover <code>DOCKER_HOST</code> from another terminal session is a common cause.</li>
+<li><strong>If it's the default socket, check the daemon is actually running</strong> (<code>sudo systemctl status docker</code> on systemd Linux, or open Docker Desktop).</li>
+<li><strong>Check the socket file exists</strong> at the address the error names, e.g. <code>ls -la /var/run/docker.sock</code>. Missing entirely usually means the daemon never started or you're on rootless/Desktop with a different path (section 6).</li>
+<li><strong>Permission denied instead of cannot-connect</strong> (section 5) means add yourself to the <code>docker</code> group, then start a new login shell so the group takes effect.</li>
+<li><strong>docker compose erroring the same way as docker ps</strong> is normal (section 4) &mdash; don't debug them separately.</li>
+<li><strong>Remote or SSH hosts:</strong> confirm the target host's daemon is up and reachable, not your local one.</li>
+</ul>
+<p>For the specific socket-already-exists-but-wrong-owner case, or TCP connect failures in other tools, see <a href="/guides/err-connection-refused-econnrefused/">ERR_CONNECTION_REFUSED / ECONNREFUSED</a> for how "nothing is listening" looks from other clients.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does the error say unix:///var/run/docker.sock even though I didn&#x27;t type that?</summary><p>That&#x27;s the default address the docker CLI tries when you haven&#x27;t set DOCKER_HOST or a different context. If you see that exact path in the error, you&#x27;re using default settings and the daemon isn&#x27;t reachable there.</p></details>
+<details><summary>Is &quot;cannot connect&quot; the same as &quot;permission denied&quot;?</summary><p>No. In our tests a missing socket or dead port gave &quot;failed to connect to the docker API...&quot; or &quot;Cannot connect to the Docker daemon...&quot;. Permission denied (per the Docker docs, section 5) is a different message: the socket exists and the daemon is running, but your user can&#x27;t read or write it.</p></details>
+<details><summary>Does docker compose give a different error than docker ps?</summary><p>We measured no difference. docker compose -p &lt;project&gt; ps against the same wrong DOCKER_HOST printed the identical error text as plain docker ps, both for a missing unix socket and for a dead TCP port.</p></details>
+<details><summary>Why did docker version print some output before the error?</summary><p>docker version and docker info print a Client block first using only local CLI data, then try to reach the daemon for the Server block. In our test the Client block always printed fine; only the Server lookup failed with the connection error.</p></details>
+<details><summary>I&#x27;m on macOS with Docker Desktop and get this error. Is it the same fix?</summary><p>The error shape is the same, but per Docker&#x27;s docs the default socket path differs (Desktop uses a proxy socket under ~/.docker/run, not /var/run/docker.sock). We didn&#x27;t measure Desktop; check Desktop is actually running and that nothing hard-codes the Linux socket path.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Docker Engine 29.8.1 (API 1.56) and Docker Compose v5.5.1 on Linux, by pointing the docker CLI at a deliberately wrong DOCKER_HOST (a missing unix socket, and two TCP ports nothing listens on). The real daemon was never touched. The permission-denied and rootless/Docker Desktop sections are from the Docker docs, not measured, and are labelled as such. PlainHeaders is our extension; curl, Python, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

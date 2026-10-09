@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python tarfile.ReadError: file could not be opened successfully</title>
+<meta name="description" content="Measured in Python 3.13.5: empty files, HTML pages, wrong modes and zips cause it. A truncated .tar.gz raises EOFError, which except ReadError misses.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-tarfile-readerror-file-could-not-be-opened-successfully/">
+<meta property="og:title" content="Python tarfile.ReadError: file could not be opened successfully">
+<meta property="og:description" content="Measured in Python 3.13.5: empty files, HTML pages, wrong modes and zips cause it. A truncated .tar.gz raises EOFError, which except ReadError misses.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-tarfile-readerror-file-could-not-be-opened-successfully/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does tarfile.ReadError: file could not be opened successfully mean?", "acceptedAnswer": {"@type": "Answer", "text": "tarfile tried gzip, bz2, xz and plain tar and all failed. We measured the last line: 'empty file' for a 0-byte file and 'truncated header' (with 'not a gzip file') for an HTML page saved as .tar.gz."}}, {"@type": "Question", "name": "Why does except tarfile.ReadError not catch my truncated .tar.gz?", "acceptedAnswer": {"@type": "Answer", "text": "A truncated gzip stream raises the built-in EOFError ('Compressed file ended before the end-of-stream marker was reached'), which is not a TarError. We measured is_tarfile() returning True for that file and the error appearing during extraction."}}, {"@type": "Question", "name": "What is tarfile.ReadError: not a gzip file?", "acceptedAnswer": {"@type": "Answer", "text": "You opened with mode 'r:gz' and the file is not gzip-compressed: a plain tar, a zip, or an HTML page. We measured all three; mode 'r' autodetects and opened the plain tar."}}, {"@type": "Question", "name": "What does ReadError: unexpected end of data mean?", "acceptedAnswer": {"@type": "Answer", "text": "An uncompressed .tar was cut short. We measured open() and is_tarfile() succeeding and the error appearing only when reading the members, so re-download the file."}}, {"@type": "Question", "name": "Can tarfile open a zip file?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured a zip renamed .tar.gz: is_tarfile() False, is_zipfile() True. Use the zipfile module."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>tarfile.ReadError: file could not be opened successfully (tested)</h1>
+<p class="lead"><code>tarfile.ReadError: file could not be opened successfully</code> lists four failed methods and hides the actual cause. We reproduced each cause: an <strong>empty file</strong>, an <strong>HTML page</strong> saved as <code>.tar.gz</code>, a <strong>wrong mode</strong>, a <strong>zip</strong> with a tar name, and <strong>truncated downloads</strong> &mdash; where the error you get is not a <code>ReadError</code> at all.</p>
+<h2 id="error">1. The exact error: empty file vs saved HTML page</h2>
+<pre><code>import io, os, tarfile, tempfile
+
+d = tempfile.mkdtemp()
+src = os.path.join(d, &quot;a.txt&quot;)
+open(src, &quot;w&quot;).write(&quot;hello\n&quot; * 5000)
+good = os.path.join(d, &quot;good.tar.gz&quot;)
+with tarfile.open(good, &quot;w:gz&quot;) as t:
+    t.add(src, arcname=&quot;a.txt&quot;)
+data = open(good, &quot;rb&quot;).read()
+
+cases = {
+    &quot;empty file&quot;: b&quot;&quot;,
+    &quot;HTML 404 page saved as .tar.gz&quot;: b&quot;&lt;!DOCTYPE html&gt;&lt;html&gt;&lt;body&gt;404 Not Found&lt;/body&gt;&lt;/html&gt;&quot;,
+    &quot;valid archive&quot;: data,
+}
+for label, blob in cases.items():
+    p = os.path.join(d, &quot;f.tar.gz&quot;)
+    open(p, &quot;wb&quot;).write(blob)
+    try:
+        with tarfile.open(p) as t:
+            print(f&quot;{label}: OK {t.getnames()}&quot;)
+    except tarfile.ReadError as e:
+        print(f&quot;{label}: ReadError: {e}&quot;)
+    print(&quot;-&quot; * 40)</code></pre>
+<p>Output:</p>
+<pre><code>empty file: ReadError: file could not be opened successfully:
+- method gz: ReadError(&#x27;empty file&#x27;)
+- method bz2: ReadError(&#x27;not a bzip2 file&#x27;)
+- method xz: ReadError(&#x27;not an lzma file&#x27;)
+- method tar: ReadError(&#x27;empty file&#x27;)
+----------------------------------------
+HTML 404 page saved as .tar.gz: ReadError: file could not be opened successfully:
+- method gz: ReadError(&#x27;not a gzip file&#x27;)
+- method bz2: ReadError(&#x27;not a bzip2 file&#x27;)
+- method xz: ReadError(&#x27;not an lzma file&#x27;)
+- method tar: ReadError(&#x27;truncated header&#x27;)
+----------------------------------------
+valid archive: OK [&#x27;a.txt&#x27;]
+----------------------------------------</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> with the default mode (<code>"r"</code>, autodetect), <code>tarfile.open()</code> tries every compression method and, when all fail, raises one <code>ReadError</code> listing each attempt. Read the last line: <code>method tar: ReadError('empty file')</code> means a 0-byte file (a failed download, or a file still being written); <code>'truncated header'</code> together with <code>'not a gzip file'</code> means the bytes are not an archive at all &mdash; here an HTML 404 page saved under a <code>.tar.gz</code> name.</p>
+
+<h2 id="mode">2. Explicit modes give a short message (and a zip renamed .tar.gz)</h2>
+<pre><code>import os, tarfile, tempfile, zipfile
+
+d = tempfile.mkdtemp()
+src = os.path.join(d, &quot;a.txt&quot;)
+open(src, &quot;w&quot;).write(&quot;hello\n&quot; * 5000)
+gz = os.path.join(d, &quot;good.tar.gz&quot;)
+with tarfile.open(gz, &quot;w:gz&quot;) as t:
+    t.add(src, arcname=&quot;a.txt&quot;)
+
+# Explicit mode: one short message instead of the list
+for mode in (&quot;r:gz&quot;, &quot;r:bz2&quot;, &quot;r:xz&quot;):
+    try:
+        tarfile.open(gz, mode)
+        print(mode, &quot;OK&quot;)
+    except tarfile.ReadError as e:
+        print(f&quot;{mode}: ReadError: {e}&quot;)
+
+# A .zip renamed to .tar.gz
+z = os.path.join(d, &quot;really_a_zip.tar.gz&quot;)
+with zipfile.ZipFile(z, &quot;w&quot;) as zf:
+    zf.write(src, &quot;a.txt&quot;)
+print(&quot;first bytes:&quot;, open(z, &quot;rb&quot;).read(4))
+try:
+    tarfile.open(z, &quot;r:gz&quot;)
+except tarfile.ReadError as e:
+    print(&quot;zip as r:gz: ReadError:&quot;, e)
+print(&quot;is_tarfile:&quot;, tarfile.is_tarfile(z), &quot;| is_zipfile:&quot;, zipfile.is_zipfile(z))</code></pre>
+<p>Output:</p>
+<pre><code>r:gz OK
+r:bz2: ReadError: not a bzip2 file
+r:xz: ReadError: not an lzma file
+first bytes: b&#x27;PK\x03\x04&#x27;
+zip as r:gz: ReadError: not a gzip file
+is_tarfile: False | is_zipfile: True</code></pre>
+<p><strong>Measured:</strong> with an explicit mode you get one short reason instead of the list: <code>not a gzip file</code>, <code>not a bzip2 file</code>, <code>not an lzma file</code>. A wrong mode on a valid archive (<code>r:bz2</code> on a gzip file) fails the same way as a corrupt file, so prefer plain <code>"r"</code> unless you must enforce a format. A zip archive renamed to <code>.tar.gz</code> starts with <code>PK\x03\x04</code>; <code>tarfile.is_tarfile()</code> says <code>False</code> and <code>zipfile.is_zipfile()</code> says <code>True</code>, so open it with <code>zipfile</code> (see our <a href="/guides/python-badzipfile-file-is-not-a-zip-file/">BadZipFile guide</a>).</p>
+
+<h2 id="truncated">3. The trap: a truncated .tar.gz is NOT a ReadError</h2>
+<pre><code>import os, tarfile, tempfile
+
+d = tempfile.mkdtemp()
+src = os.path.join(d, &quot;a.bin&quot;)
+open(src, &quot;wb&quot;).write(os.urandom(200_000))
+gz = os.path.join(d, &quot;good.tar.gz&quot;)
+with tarfile.open(gz, &quot;w:gz&quot;) as t:
+    t.add(src, arcname=&quot;a.bin&quot;)
+data = open(gz, &quot;rb&quot;).read()
+cut = os.path.join(d, &quot;cut.tar.gz&quot;)
+open(cut, &quot;wb&quot;).write(data[: len(data) // 2])   # download stopped halfway
+
+print(&quot;is_tarfile:&quot;, tarfile.is_tarfile(cut))
+try:
+    with tarfile.open(cut) as t:
+        t.extractall(os.path.join(d, &quot;out&quot;), filter=&quot;data&quot;)
+except tarfile.ReadError as e:
+    print(&quot;caught ReadError:&quot;, e)
+except Exception as e:
+    print(f&quot;NOT a ReadError -&gt; {type(e).__module__}.{type(e).__name__}: {e}&quot;)
+    print(&quot;subclass of tarfile.TarError?&quot;, isinstance(e, tarfile.TarError))</code></pre>
+<p>Output:</p>
+<pre><code>is_tarfile: True
+NOT a ReadError -&gt; builtins.EOFError: Compressed file ended before the end-of-stream marker was reached
+subclass of tarfile.TarError? False</code></pre>
+<p><strong>Measured:</strong> a download cut off halfway still starts with a valid gzip header, so <code>tarfile.is_tarfile()</code> returns <code>True</code> and <code>open()</code> succeeds. The failure comes during extraction as a built-in <code>EOFError: Compressed file ended before the end-of-stream marker was reached</code>, and <code>EOFError</code> is <strong>not</strong> a subclass of <code>tarfile.TarError</code>. Code that only does <code>except tarfile.ReadError</code> (or <code>except tarfile.TarError</code>) lets it crash the program, possibly after writing part of the files.</p>
+
+<h2 id="plain">4. A truncated plain .tar: opens fine, fails later with 'unexpected end of data'</h2>
+<pre><code>import os, tarfile, tempfile
+
+d = tempfile.mkdtemp()
+src = os.path.join(d, &quot;a.bin&quot;)
+open(src, &quot;wb&quot;).write(os.urandom(200_000))
+tar = os.path.join(d, &quot;good.tar&quot;)              # uncompressed
+with tarfile.open(tar, &quot;w&quot;) as t:
+    t.add(src, arcname=&quot;a.bin&quot;)
+cut = os.path.join(d, &quot;cut.tar&quot;)
+open(cut, &quot;wb&quot;).write(open(tar, &quot;rb&quot;).read()[:100_000])
+
+t = tarfile.open(cut)                          # opening works...
+print(&quot;opened OK, is_tarfile:&quot;, tarfile.is_tarfile(cut))
+try:
+    print(t.getnames())                        # ...reading the members fails
+except tarfile.ReadError as e:
+    print(&quot;ReadError:&quot;, e)
+t.close()</code></pre>
+<p>Output:</p>
+<pre><code>opened OK, is_tarfile: True
+ReadError: unexpected end of data</code></pre>
+<p><strong>Measured:</strong> for an uncompressed <code>.tar</code> cut at 100 KB of 200 KB, <code>open()</code> and <code>is_tarfile()</code> both succeed; the <code>ReadError: unexpected end of data</code> only appears when tarfile walks the members (<code>getnames()</code>, <code>getmembers()</code>, <code>extractall()</code>). So wrap the whole read, not just the <code>open()</code> call.</p>
+
+<h2 id="fix">5. A robust opener: check the first bytes, catch the right exceptions</h2>
+<pre><code>import os, tarfile, tempfile
+
+def open_archive(path):
+    with open(path, &quot;rb&quot;) as f:
+        head = f.read(8)
+    if os.path.getsize(path) == 0:
+        raise ValueError(f&quot;{path} is empty (failed download?)&quot;)
+    if head.lstrip()[:1] == b&quot;&lt;&quot;:
+        raise ValueError(f&quot;{path} is HTML, not an archive: {head!r}&quot;)
+    if head[:4] == b&quot;PK\x03\x04&quot;:
+        raise ValueError(f&quot;{path} is a zip file; use zipfile&quot;)
+    return tarfile.open(path)          # mode &quot;r&quot; = autodetect
+
+def extract(path, dest):
+    try:
+        with open_archive(path) as t:
+            t.extractall(dest, filter=&quot;data&quot;)
+        return &quot;ok&quot;
+    except (tarfile.TarError, EOFError, OSError, ValueError) as e:
+        return f&quot;{type(e).__name__}: {e}&quot;
+
+d = tempfile.mkdtemp()
+src = os.path.join(d, &quot;a.bin&quot;)
+open(src, &quot;wb&quot;).write(os.urandom(200_000))
+plain = os.path.join(d, &quot;plain_named.tar.gz&quot;)      # uncompressed tar, .gz name
+with tarfile.open(plain, &quot;w&quot;) as t:
+    t.add(src, arcname=&quot;a.bin&quot;)
+gz = os.path.join(d, &quot;good.tar.gz&quot;)
+with tarfile.open(gz, &quot;w:gz&quot;) as t:
+    t.add(src, arcname=&quot;a.bin&quot;)
+cut = os.path.join(d, &quot;cut.tar.gz&quot;)
+open(cut, &quot;wb&quot;).write(open(gz, &quot;rb&quot;).read()[:60_000])
+html = os.path.join(d, &quot;page.tar.gz&quot;)
+open(html, &quot;w&quot;).write(&quot;&lt;!DOCTYPE html&gt;&lt;title&gt;404&lt;/title&gt;&quot;)
+
+for p in (gz, plain, cut, html):
+    print(f&quot;{os.path.basename(p):18} {extract(p, os.path.join(d, &#x27;out&#x27;))}&quot;)
+try:
+    tarfile.open(plain, &quot;r:gz&quot;)
+except tarfile.ReadError as e:
+    print(&quot;plain tar with mode &#x27;r:gz&#x27;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>good.tar.gz        ok
+plain_named.tar.gz ok
+cut.tar.gz         EOFError: Compressed file ended before the end-of-stream marker was reached
+page.tar.gz        ValueError: /tmp/tmpl6f1kx9j/page.tar.gz is HTML, not an archive: b&#x27;&lt;!DOCTYP&#x27;
+plain tar with mode &#x27;r:gz&#x27;: not a gzip file</code></pre>
+<p><strong>Measured:</strong> sniffing the first bytes turns the confusing multi-line message into a clear one (empty, HTML, or zip), autodetect mode opens an uncompressed tar that is misnamed <code>.tar.gz</code> (an explicit <code>"r:gz"</code> rejects it with <code>not a gzip file</code>), and catching <code>(tarfile.TarError, EOFError, OSError, ValueError)</code> covers the truncated case. <code>tarfile.ReadError</code> subclasses <code>TarError</code>, which subclasses plain <code>Exception</code>. Extract into a fresh temporary directory and move it into place only on success, so a failed run doesn't leave half the files behind. <code>filter="data"</code> is the safe extraction filter; see our <a href="/guides/tarfile-extractall-path-traversal-not-blocked-by-default/">path-traversal guide</a>.</p>
+
+<h2 id="download">6. If the file came from a download</h2>
+<ul>
+<li>Check <code>r.status_code</code> and <code>r.headers["Content-Type"]</code> before saving: <code>text/html</code> means you are about to save an error or login page as your archive.</li>
+<li>Compare the file size with the server's <code>Content-Length</code>; a shorter file is the truncated case from section 3. See our <a href="/guides/python-incompleteread-chunkedencodingerror-connection-broken/">IncompleteRead guide</a> for connections cut mid-body.</li>
+<li>For GitHub release or API tarball URLs, follow redirects (<code>requests</code> does by default; <code>curl</code> needs <code>-L</code>), or you save a tiny redirect body instead of the archive.</li>
+</ul>
+
+<aside class="cta"><strong>Downloaded archive won&#x27;t open? Check the Content-Type and Content-Length the server actually sent:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does tarfile.ReadError: file could not be opened successfully mean?</summary><p>tarfile tried gzip, bz2, xz and plain tar and all failed. We measured the last line: &#x27;empty file&#x27; for a 0-byte file and &#x27;truncated header&#x27; (with &#x27;not a gzip file&#x27;) for an HTML page saved as .tar.gz.</p></details>
+<details><summary>Why does except tarfile.ReadError not catch my truncated .tar.gz?</summary><p>A truncated gzip stream raises the built-in EOFError (&#x27;Compressed file ended before the end-of-stream marker was reached&#x27;), which is not a TarError. We measured is_tarfile() returning True for that file and the error appearing during extraction.</p></details>
+<details><summary>What is tarfile.ReadError: not a gzip file?</summary><p>You opened with mode &#x27;r:gz&#x27; and the file is not gzip-compressed: a plain tar, a zip, or an HTML page. We measured all three; mode &#x27;r&#x27; autodetects and opened the plain tar.</p></details>
+<details><summary>What does ReadError: unexpected end of data mean?</summary><p>An uncompressed .tar was cut short. We measured open() and is_tarfile() succeeding and the error appearing only when reading the members, so re-download the file.</p></details>
+<details><summary>Can tarfile open a zip file?</summary><p>No. We measured a zip renamed .tar.gz: is_tarfile() False, is_zipfile() True. Use the zipfile module.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 on Debian with Python 3.13.5&#x27;s built-in tarfile: an empty file, an HTML page saved as .tar.gz, explicit r:gz/r:bz2/r:xz modes, a zip renamed .tar.gz, a .tar.gz and a plain .tar truncated mid-file, and a byte-sniffing opener. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; Python&#x27;s tarfile is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

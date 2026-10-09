@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FileNotFoundError: [Errno 2] But the File Exists (Tested)</title>
+<meta name="description" content="We measured why Python can&#x27;t find a file that exists: working directory vs script folder, trailing spaces, and ~ not expanded. Path(__file__) fix tested.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-filenotfounderror-errno-2-no-such-file-or-directory/">
+<meta property="og:title" content="FileNotFoundError: [Errno 2] But the File Exists (Tested)">
+<meta property="og:description" content="We measured why Python can&#x27;t find a file that exists: working directory vs script folder, trailing spaces, and ~ not expanded. Path(__file__) fix tested.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-filenotfounderror-errno-2-no-such-file-or-directory/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why do I get FileNotFoundError when the file exists?", "acceptedAnswer": {"@type": "Answer", "text": "Relative paths are resolved against the current working directory, not the script's folder. We measured the same script finding data.csv when run from project/ and failing when run from project/scripts/."}}, {"@type": "Question", "name": "How do I open a file relative to the script in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Path(__file__).resolve().parent / 'data.csv'. We measured it working regardless of where the script was run from."}}, {"@type": "Question", "name": "Does Python's open() understand ~?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured open('~/data.csv') raising Errno 2; use os.path.expanduser() first."}}, {"@type": "Question", "name": "What does [Errno 2] No such file or directory mean?", "acceptedAnswer": {"@type": "Answer", "text": "Nothing exists at the exact path given, after resolving it against the current directory. Check the quoted path in the message for spaces, ~ and the working directory."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>FileNotFoundError: [Errno 2] No such file or directory (tested)</h1>
+<p class="lead"><code>FileNotFoundError: [Errno 2] No such file or directory</code> when the file is clearly there almost always means the path is being resolved from somewhere else. We ran one script from two directories on Python 3.13.5 and got opposite results.</p>
+<h2 id="cwd">1. Relative paths follow where you run from, not where the script is</h2>
+<p>Layout: <code>project/data.csv</code> and <code>project/scripts/load.py</code>:</p>
+<pre><code>import os
+from pathlib import Path
+
+print(&quot;cwd:&quot;, os.getcwd())
+for name in [&quot;data.csv&quot;, &quot;../data.csv&quot;, &quot;data.csv &quot;, &quot;~/data.csv&quot;]:
+    try:
+        open(name)
+        print(repr(name), &quot;ok&quot;)
+    except FileNotFoundError as e:
+        print(repr(name), &quot;-&gt;&quot;, e)
+
+HERE = Path(__file__).resolve().parent
+print((HERE.parent / &quot;data.csv&quot;).read_text().strip())
+print(os.path.expanduser(&quot;~/data.csv&quot;).startswith(&quot;/home/&quot;))</code></pre>
+<p>Run from <code>project/</code>:</p>
+<pre><code>cd project &amp;&amp; python3 scripts/load.py
+cwd: /tmp/fnf2/project
+&#x27;data.csv&#x27; ok
+&#x27;../data.csv&#x27; -&gt; [Errno 2] No such file or directory: &#x27;../data.csv&#x27;
+&#x27;data.csv &#x27; -&gt; [Errno 2] No such file or directory: &#x27;data.csv &#x27;
+&#x27;~/data.csv&#x27; -&gt; [Errno 2] No such file or directory: &#x27;~/data.csv&#x27;
+a,b
+True</code></pre>
+<p>Run from <code>project/scripts/</code>:</p>
+<pre><code>cd project/scripts &amp;&amp; python3 load.py
+cwd: /tmp/fnf2/project/scripts
+&#x27;data.csv&#x27; -&gt; [Errno 2] No such file or directory: &#x27;data.csv&#x27;
+&#x27;../data.csv&#x27; ok
+&#x27;data.csv &#x27; -&gt; [Errno 2] No such file or directory: &#x27;data.csv &#x27;
+&#x27;~/data.csv&#x27; -&gt; [Errno 2] No such file or directory: &#x27;~/data.csv&#x27;
+a,b
+True</code></pre>
+<p><strong>Measured:</strong> the same script, the same file on disk, opposite results: <code>open("data.csv")</code> resolves against the current working directory (<code>os.getcwd()</code>), which is wherever the command was run from, or whatever your IDE, cron or a service manager sets. That's the usual &ldquo;FileNotFoundError but the file exists&rdquo;. The path built from <code>Path(__file__).resolve().parent</code> worked in both runs.</p>
+
+<h2 id="invisible">2. Names that look right but aren't</h2>
+<p><strong>Measured</strong> in both runs above: <code>'data.csv '</code> (trailing space, common when the name comes from input or a config file) and <code>'~/data.csv'</code> both fail. <code>open()</code> does not expand <code>~</code>; that's the shell's job. Use <code>os.path.expanduser()</code> or <code>Path(...).expanduser()</code>, and <code>.strip()</code> names you read from text. The error shows the path in quotes, so look closely at it.</p>
+
+<h2 id="fix">3. Fix checklist</h2>
+<ul>
+<li>Print <code>os.getcwd()</code> and the absolute path: <code>Path(name).resolve()</code>.</li>
+<li>For files that ship with your code, build paths from <code>Path(__file__).resolve().parent</code>.</li>
+<li>For user-supplied paths: <code>Path(name.strip()).expanduser()</code>.</li>
+<li>Windows only (not tested here): use raw strings or forward slashes, because <code>"C:\new\data.csv"</code> contains a <code>\n</code> newline escape.</li>
+</ul>
+
+<aside class="cta"><strong>Loading files over HTTP instead? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why do I get FileNotFoundError when the file exists?</summary><p>Relative paths are resolved against the current working directory, not the script&#x27;s folder. We measured the same script finding data.csv when run from project/ and failing when run from project/scripts/.</p></details>
+<details><summary>How do I open a file relative to the script in Python?</summary><p>Path(__file__).resolve().parent / &#x27;data.csv&#x27;. We measured it working regardless of where the script was run from.</p></details>
+<details><summary>Does Python&#x27;s open() understand ~?</summary><p>No. We measured open(&#x27;~/data.csv&#x27;) raising Errno 2; use os.path.expanduser() first.</p></details>
+<details><summary>What does [Errno 2] No such file or directory mean?</summary><p>Nothing exists at the exact path given, after resolving it against the current directory. Check the quoted path in the message for spaces, ~ and the working directory.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: one script opening data.csv, ../data.csv, a name with a trailing space and ~/data.csv, run from two different working directories, plus the Path(__file__) fix. Every block was run verbatim and its output pasted from that run. Windows paths were not tested. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

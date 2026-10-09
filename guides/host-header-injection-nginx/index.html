@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Host Header Injection: Example With curl, and How to Fix It in nginx (Tested)</title>
+<meta name="description" content="What the HTTP Host header is and how Host header injection works, reproduced with curl against nginx: poisoned reset links and redirects to an attacker&#x27;s domain, then the default_server 444 fix, $host vs $http_host, and the missing-Host 400.">
+<link rel="canonical" href="https://honestkit.github.io/guides/host-header-injection-nginx/">
+<meta property="og:title" content="Host Header Injection: Example With curl, and How to Fix It in nginx (Tested)">
+<meta property="og:description" content="What the HTTP Host header is and how Host header injection works, reproduced with curl against nginx: poisoned reset links and redirects to an attacker&#x27;s domain, then the default_server 444 fix, $host vs $http_host, and the missing-Host 400.">
+<meta property="og:url" content="https://honestkit.github.io/guides/host-header-injection-nginx/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is Host header injection?", "acceptedAnswer": {"@type": "Answer", "text": "Sending a fake Host header so the server builds links or redirects to another domain. In our nginx test, Host: evil.example produced a reset link and a 301 pointing at evil.example."}}, {"@type": "Question", "name": "How do I prevent Host header injection in nginx?", "acceptedAnswer": {"@type": "Answer", "text": "Add a default_server that returns 444 and give real sites explicit server_names. In our test unknown hosts and the bare IP then got an empty reply."}}, {"@type": "Question", "name": "What is the difference between $host and $http_host?", "acceptedAnswer": {"@type": "Answer", "text": "$host is lower-case without the port (example.test); $http_host is the raw header (Example.TEST:8080), as measured."}}, {"@type": "Question", "name": "How do I send a custom Host header with curl?", "acceptedAnswer": {"@type": "Answer", "text": "curl -H 'Host: example.test' http://SERVER-IP/ . That's how we ran every test here; curl --resolve example.test:80:IP is the alternative that also works for HTTPS."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Host header injection: tested in nginx, and the default_server fix</h1>
+<p class="lead">The Host header tells the server which site you want. It comes from the client, so anything that copies it into links or redirects can be pointed at another domain. We reproduced that in nginx and fixed it.</p>
+<h2>1. The attack, with curl</h2>
+<p>nginx with one server block for <code>example.test</code>, building a password-reset link and an HTTPS redirect from <code>$host</code>:</p>
+<pre><code>$ curl -H 'Host: evil.example' http://SERVER/link
+reset link: http://evil.example/reset?t=123
+
+$ curl -sI -H 'Host: evil.example' http://SERVER/redir
+HTTP/1.1 301 Moved Permanently
+Location: https://evil.example/redir</code></pre>
+<p>nginx served the request although <code>evil.example</code> matched no <code>server_name</code>: with no explicit default, the first server block handles every unknown Host. If a reset email is built this way, the token goes to the attacker's domain when the victim clicks. If a cache stores the redirect, other visitors get it too.</p>
+<h2>2. The fix: a catch-all default_server</h2>
+<pre><code>server {
+    listen 80 default_server;
+    server_name _;
+    return 444;          # close the connection, send nothing
+}
+server {
+    listen 80;
+    server_name example.test;
+    ...
+}</code></pre>
+<p>After this, <code>Host: evil.example</code> and requests to the bare IP got an empty reply (curl exit 52), while <code>Host: example.test</code> worked and its redirect pointed to <code>https://example.test/redir</code>. Add the same catch-all for <code>listen 443 ssl default_server</code> (it needs a certificate; <code>ssl_reject_handshake on;</code> avoids that on nginx 1.19.4+, per nginx docs).</p>
+<h2>3. $host vs $http_host</h2>
+<p>For <code>Host: Example.TEST:8080</code> nginx gave <code>$host = example.test</code> (lower-cased, port removed) and <code>$http_host = Example.TEST:8080</code> (raw). Prefer <code>$host</code>, or better, a fixed name in redirects: <code>return 301 https://example.test$request_uri;</code>.</p>
+<h2>4. Other things we checked</h2>
+<ul><li>An HTTP/1.1 request with no Host header got <code>400 Bad Request</code>: Host is mandatory in HTTP/1.1.</li>
+<li>In the app, never build absolute URLs from the request's host; use a configured base URL. Frameworks have allow-lists for this (Django <code>ALLOWED_HOSTS</code>, Rails <code>config.hosts</code>, Laravel <code>TrustHosts</code>).</li>
+<li>Behind a proxy, <code>X-Forwarded-Host</code> is just as client-controlled unless the proxy overwrites it; the same applies to X-Forwarded-For (<a href="/guides/x-forwarded-for-real-ip-nginx/">measured here</a>).</li></ul>
+<aside class="cta"><strong>Inspect response headers in the browser:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is Host header injection?</summary><p>Sending a fake Host header so the server builds links or redirects to another domain. In our nginx test, Host: evil.example produced a reset link and a 301 pointing at evil.example.</p></details>
+<details><summary>How do I prevent Host header injection in nginx?</summary><p>Add a default_server that returns 444 and give real sites explicit server_names. In our test unknown hosts and the bare IP then got an empty reply.</p></details>
+<details><summary>What is the difference between $host and $http_host?</summary><p>$host is lower-case without the port (example.test); $http_host is the raw header (Example.TEST:8080), as measured.</p></details>
+<details><summary>How do I send a custom Host header with curl?</summary><p>curl -H &#x27;Host: example.test&#x27; http://SERVER-IP/ . That&#x27;s how we ran every test here; curl --resolve example.test:80:IP is the alternative that also works for HTTPS.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 with curl 8.14.1 and a raw socket against nginx 1.31.6 (nginx:alpine) in a throwaway container, first with a single server block, then with a default_server catch-all. Application-framework settings (Django, Rails, Laravel), ssl_reject_handshake, X-Forwarded-Host and curl --resolve are from their documentation, not this test. PlainHeaders is our extension; curl is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

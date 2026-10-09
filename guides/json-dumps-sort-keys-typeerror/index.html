@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>json.dumps(sort_keys=True) TypeError — Cause and Fix</title>
+<meta name="description" content="We measured why adding sort_keys=True can suddenly break json.dumps() on mixed-type dict keys, and which key-type mixes are actually safe.">
+<link rel="canonical" href="https://honestkit.github.io/guides/json-dumps-sort-keys-typeerror/">
+<meta property="og:title" content="json.dumps(sort_keys=True) TypeError — Cause and Fix">
+<meta property="og:description" content="We measured why adding sort_keys=True can suddenly break json.dumps() on mixed-type dict keys, and which key-type mixes are actually safe.">
+<meta property="og:url" content="https://honestkit.github.io/guides/json-dumps-sort-keys-typeerror/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does sort_keys=True make json.dumps() raise a TypeError when the same dict works without it?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed that without sort_keys, json.dumps() converts each key to a string independently with no comparison; sort_keys=True sorts the original Python key objects first using <, and Python can't order an int against a str, so it raises before any string conversion happens."}}, {"@type": "Question", "name": "Does json.dumps(sort_keys=True) fail on all dicts with non-string keys?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured that all-int or all-str dicts sort correctly; the error only occurs when a single dict mixes key types that Python's < operator can't compare directly against each other."}}, {"@type": "Question", "name": "Are int and bool keys safe to mix with sort_keys=True?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we confirmed bool and int sort together without error since bool is a subclass of int in Python (True == 1), and float mixes with int fine too since both compare numerically; it's crossing into str or None that breaks."}}, {"@type": "Question", "name": "What's the fix for a TypeError from json.dumps(sort_keys=True) on mixed keys?", "acceptedAnswer": {"@type": "Answer", "text": "We tested converting every key to str yourself before calling json.dumps() \u2014 for example {str(k): v for k, v in d.items()} \u2014 which sidesteps the comparison entirely since sort_keys then only ever compares strings to strings."}}, {"@type": "Question", "name": "When does this error typically show up in real code?", "acceptedAnswer": {"@type": "Answer", "text": "In our experience it surfaces when sort_keys=True gets added later for deterministic test output or canonical hashing, applied to a dict merged from multiple sources \u2014 say int IDs from a database plus str keys from user input \u2014 that happened to never exercise both key types in the same dict during earlier testing."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>json.dumps() sort_keys=True TypeError (tested)</h1>
+<p class="lead">A dict with mixed-type keys serializes just fine with plain <code>json.dumps()</code>. Add <code>sort_keys=True</code> for deterministic output and the exact same dict can suddenly raise a <code>TypeError</code>. We measured which key-type combinations break and why.</p>
+<h2 id="repro1">1. Works without sort_keys, breaks with it</h2>
+<pre><code>import json
+
+d = {1: "a", "b": 2}
+
+json.dumps(d)
+'{"1": "a", "b": 2}'
+
+json.dumps(d, sort_keys=True)
+TypeError: \'<\' not supported between instances of \'str\' and \'int\'</code></pre>
+<p><strong>Measured:</strong> without <code>sort_keys</code>, <code>json.dumps()</code> keeps insertion order and never needs to compare keys to each other &mdash; it just converts each key to its string form independently. <code>sort_keys=True</code> sorts the <em>original Python key objects</em> before converting them to strings, and Python can't order an <code>int</code> against a <code>str</code> with <code>&lt;</code>, so it raises before serialization even starts.</p>
+
+<h2 id="repro2">2. All-int or all-str keys sort fine &mdash; the problem is mixing types</h2>
+<pre><code>json.dumps({2: "a", 1: "b"}, sort_keys=True)
+'{"1": "b", "2": "a"}'
+
+json.dumps({"b": 1, "a": 2}, sort_keys=True)
+'{"a": 2, "b": 1}'</code></pre>
+<p><strong>Measured:</strong> both of these work correctly and sort as expected &mdash; the bug only appears once a single dict mixes key types that Python's <code>&lt;</code> operator can't compare, which makes it easy to miss in testing if your test data happens to use one key type consistently.</p>
+
+<h2 id="repro3">3. Some mixes are safe: bool and float compare fine with int</h2>
+<pre><code>json.dumps({True: "a", 2: "b"}, sort_keys=True)
+'{"true": "a", "2": "b"}'
+
+json.dumps({1.5: "a", 2: "b"}, sort_keys=True)
+'{"1.5": "a", "2": "b"}'</code></pre>
+<p><strong>Measured:</strong> <code>bool</code> is a subclass of <code>int</code> in Python (<code>True == 1</code>) and <code>float</code>/<code>int</code> compare numerically, so both of these sort without error. <code>None</code> mixed with anything else does not: <code>json.dumps({None: "a", "b": "c"}, sort_keys=True)</code> raises the same <code>'&lt;' not supported between instances of 'str' and 'NoneType'</code> style error. The safe combinations are <code>int</code>/<code>float</code>/<code>bool</code> together, or an all-<code>str</code> dict &mdash; anything crossing the numeric/string/<code>None</code> boundary breaks.</p>
+
+<h2 id="fix">4. The fix: normalize keys to one type before dumping</h2>
+<pre><code>d = {1: "a", "b": 2}
+json.dumps({str(k): v for k, v in d.items()}, sort_keys=True)
+'{"1": "a", "b": 2}'</code></pre>
+<p><strong>Measured:</strong> converting every key to <code>str</code> yourself before calling <code>json.dumps()</code> sidesteps the comparison entirely, since <code>sort_keys</code> then only ever sorts strings against strings. This is also usually the right fix conceptually &mdash; JSON object keys are always strings anyway, so a dict with genuinely mixed-type Python keys was already relying on <code>json.dumps()</code>'s automatic (unsorted) stringification, and making that explicit avoids the surprise entirely.</p>
+
+<h2 id="repro5">5. Why this bites people in practice</h2>
+<p>This almost always shows up when <code>sort_keys=True</code> is added later &mdash; for reproducible test fixtures, diff-friendly output, or canonical hashing of a JSON blob &mdash; to a dict that was built from mixed sources: some keys from a database (<code>int</code> IDs) merged with some keys from user input or config (<code>str</code> names). The call worked in every test until a dict exercised both key types in the same object at once.</p>
+
+<aside class="cta"><strong>Debugging deterministic output from an API instead of a database export? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does sort_keys=True make json.dumps() raise a TypeError when the same dict works without it?</summary><p>We confirmed that without sort_keys, json.dumps() converts each key to a string independently with no comparison; sort_keys=True sorts the original Python key objects first using &lt;, and Python can&#x27;t order an int against a str, so it raises before any string conversion happens.</p></details>
+<details><summary>Does json.dumps(sort_keys=True) fail on all dicts with non-string keys?</summary><p>No — we measured that all-int or all-str dicts sort correctly; the error only occurs when a single dict mixes key types that Python&#x27;s &lt; operator can&#x27;t compare directly against each other.</p></details>
+<details><summary>Are int and bool keys safe to mix with sort_keys=True?</summary><p>Yes — we confirmed bool and int sort together without error since bool is a subclass of int in Python (True == 1), and float mixes with int fine too since both compare numerically; it&#x27;s crossing into str or None that breaks.</p></details>
+<details><summary>What&#x27;s the fix for a TypeError from json.dumps(sort_keys=True) on mixed keys?</summary><p>We tested converting every key to str yourself before calling json.dumps() — for example {str(k): v for k, v in d.items()} — which sidesteps the comparison entirely since sort_keys then only ever compares strings to strings.</p></details>
+<details><summary>When does this error typically show up in real code?</summary><p>In our experience it surfaces when sort_keys=True gets added later for deterministic test output or canonical hashing, applied to a dict merged from multiple sources — say int IDs from a database plus str keys from user input — that happened to never exercise both key types in the same dict during earlier testing.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in json module, calling json.dumps() with sort_keys=True on dicts with mixed key types and printing the exact exception text. Every message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s json module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

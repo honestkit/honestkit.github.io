@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLite &#x27;Foreign Key Constraint Failed&#x27; — Tested</title>
+<meta name="description" content="We measured that SQLite&#x27;s foreign keys are OFF by default (a missing-parent insert succeeds silently) until PRAGMA foreign_keys=ON is set per connection.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite-foreign-key-constraint-failed/">
+<meta property="og:title" content="SQLite &#x27;Foreign Key Constraint Failed&#x27; — Tested">
+<meta property="og:description" content="We measured that SQLite&#x27;s foreign keys are OFF by default (a missing-parent insert succeeds silently) until PRAGMA foreign_keys=ON is set per connection.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite-foreign-key-constraint-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Are foreign keys enforced by default in SQLite?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured PRAGMA foreign_keys returning 0 (off) by default, and confirmed an insert referencing a nonexistent parent row succeeds with zero error in that state, even though the column is declared REFERENCES."}}, {"@type": "Question", "name": "Does the error message name the table or column involved?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed it's just the generic text 'FOREIGN KEY constraint failed' with no specifics, unlike NOT NULL/UNIQUE/CHECK errors in this series which all name the exact column."}}, {"@type": "Question", "name": "Is PRAGMA foreign_keys = ON permanent once set?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed it's per-connection and not stored in the database file; a new connection to the same file defaults back to off, so it needs to be set every time you connect if you want enforcement."}}, {"@type": "Question", "name": "What triggers this error on DELETE instead of INSERT?", "acceptedAnswer": {"@type": "Answer", "text": "Deleting a parent row that a child row still references \u2014 we reproduced this directly: with foreign_keys on, deleting the referenced parent failed identically to the missing-parent insert case."}}, {"@type": "Question", "name": "How do I delete a parent without this error?", "acceptedAnswer": {"@type": "Answer", "text": "Either delete or reassign the referencing child rows first, or declare ON DELETE CASCADE (auto-delete children) or ON DELETE SET NULL (auto-null the reference) on the foreign key definition \u2014 not directly tested here, per SQLite's own documented behavior."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLite: FOREIGN KEY constraint failed (tested)</h1>
+<p class="lead"><code>sqlite3.IntegrityError: FOREIGN KEY constraint failed</code> only happens if foreign keys are actually being enforced. We measured SQLite's biggest surprise here: they're off by default.</p>
+<h2 id="repro1">1. Off by default: a missing parent row doesn't even error</h2>
+<pre><code>con.execute("PRAGMA foreign_keys")  # (0,) &mdash; OFF by default
+con.execute("INSERT INTO child (id, parent_id) VALUES (1, 999)")  # parent 999 doesn't exist
+con.commit()
+# no error at all</code></pre>
+<p><strong>Measured:</strong> unlike Postgres and MySQL (InnoDB), where foreign keys are always enforced, SQLite leaves them off by default even if the column is declared <code>REFERENCES parent(id)</code>. The constraint exists in the schema but isn't checked.</p>
+
+<h2 id="repro2">2. Turning it on, then hitting the real error</h2>
+<pre><code>con.execute("PRAGMA foreign_keys = ON")
+con.execute("INSERT INTO child (id, parent_id) VALUES (2, 999)")
+sqlite3.IntegrityError: FOREIGN KEY constraint failed</code></pre>
+<p>Notably, the message names no table or column &mdash; a contrast with every other constraint error in this series (NOT NULL, UNIQUE, CHECK all name the specific column). With foreign keys on, deleting a parent row that still has children fails the same way:</p>
+<pre><code>con.execute("DELETE FROM parent WHERE id=1")  # child row still references it
+sqlite3.IntegrityError: FOREIGN KEY constraint failed</code></pre>
+
+<h2 id="fix">3. The fix: turn it on every connection, deliberately</h2>
+<p><code>PRAGMA foreign_keys = ON</code> is per-connection, not persisted in the database file &mdash; we confirmed a fresh connection to the same file defaults back to off. Run it right after every <code>connect()</code> call if you want enforcement. For the delete case, either remove/reassign the children first, or declare <code>ON DELETE CASCADE</code>/<code>ON DELETE SET NULL</code> on the foreign key so SQLite handles it automatically.</p>
+
+<aside class="cta"><strong>Debugging an app that talks to an API instead of a database? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Are foreign keys enforced by default in SQLite?</summary><p>No — we measured PRAGMA foreign_keys returning 0 (off) by default, and confirmed an insert referencing a nonexistent parent row succeeds with zero error in that state, even though the column is declared REFERENCES.</p></details>
+<details><summary>Does the error message name the table or column involved?</summary><p>No — we confirmed it&#x27;s just the generic text &#x27;FOREIGN KEY constraint failed&#x27; with no specifics, unlike NOT NULL/UNIQUE/CHECK errors in this series which all name the exact column.</p></details>
+<details><summary>Is PRAGMA foreign_keys = ON permanent once set?</summary><p>No — we confirmed it&#x27;s per-connection and not stored in the database file; a new connection to the same file defaults back to off, so it needs to be set every time you connect if you want enforcement.</p></details>
+<details><summary>What triggers this error on DELETE instead of INSERT?</summary><p>Deleting a parent row that a child row still references — we reproduced this directly: with foreign_keys on, deleting the referenced parent failed identically to the missing-parent insert case.</p></details>
+<details><summary>How do I delete a parent without this error?</summary><p>Either delete or reassign the referencing child rows first, or declare ON DELETE CASCADE (auto-delete children) or ON DELETE SET NULL (auto-null the reference) on the foreign key definition — not directly tested here, per SQLite&#x27;s own documented behavior.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in sqlite3 module, checking the default state of PRAGMA foreign_keys, an insert referencing a missing parent row with it on, and a delete of a parent that still has children. Every result below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s sqlite3 is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

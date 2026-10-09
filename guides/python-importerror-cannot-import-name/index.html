@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ImportError: cannot import name &amp;mdash; Circular Import, Tested</title>
+<meta name="description" content="We measured Python&#x27;s cannot import name: circular imports (where 3.13 gives a misleading &#x27;consider renaming&#x27; hint), shadowing files, typos. Fixes tested.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-importerror-cannot-import-name/">
+<meta property="og:title" content="ImportError: cannot import name &amp;mdash; Circular Import, Tested">
+<meta property="og:description" content="We measured Python&#x27;s cannot import name: circular imports (where 3.13 gives a misleading &#x27;consider renaming&#x27; hint), shadowing files, typos. Fixes tested.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-importerror-cannot-import-name/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does ImportError: cannot import name mean?", "acceptedAnswer": {"@type": "Answer", "text": "The module was found but the name wasn't in it at that moment. We measured three causes on Python 3.13.5: a circular import, a local file shadowing a library, and a typo."}}, {"@type": "Question", "name": "How do I know if it's a circular import?", "acceptedAnswer": {"@type": "Answer", "text": "The traceback shows two of your own files importing each other. On Python 3.13.5 we measured the message suggesting 'consider renaming' instead of mentioning a circular import, so trust the traceback, not the hint."}}, {"@type": "Question", "name": "How do I fix a circular import in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Import the module instead of names (import models, then models.User at call time), move shared code into a third module, or import inside the function. We measured the module-import version working for the same two files that failed."}}, {"@type": "Question", "name": "Why does my json.py or requests.py break imports?", "acceptedAnswer": {"@type": "Answer", "text": "Python imports your local file instead of the library. We measured json.py causing cannot import name 'loads', and requests.py causing module 'requests' has no attribute 'get'. Rename the file."}}, {"@type": "Question", "name": "Does ImportError suggest the right name?", "acceptedAnswer": {"@type": "Answer", "text": "For typos, yes: we measured 'Did you mean: slugify?' on Python 3.13.5."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ImportError: cannot import name (circular import, tested)</h1>
+<p class="lead"><code>ImportError: cannot import name 'X' from 'Y'</code> has three common causes. We reproduced each on Python 3.13.5 and found that for the most common one, a circular import, the new error hint points you at the wrong problem.</p>
+<h2 id="circular">1. Circular import &mdash; and a misleading hint on Python 3.13</h2>
+<pre><code>mkdir -p demo1 &amp;&amp; cd demo1
+cat &gt; models.py &lt;&lt;&#x27;PY&#x27;
+from services import save
+class User:
+    pass
+PY
+cat &gt; services.py &lt;&lt;&#x27;PY&#x27;
+from models import User
+def save(u: User):
+    return &quot;saved&quot;
+PY
+python3 -c &quot;import models&quot;</code></pre>
+<pre><code>Traceback (most recent call last):
+  File &quot;&lt;string&gt;&quot;, line 1, in &lt;module&gt;
+    import models
+  File &quot;/tmp/ci/demo1/models.py&quot;, line 1, in &lt;module&gt;
+    from services import save
+  File &quot;/tmp/ci/demo1/services.py&quot;, line 1, in &lt;module&gt;
+    from models import User
+ImportError: cannot import name &#x27;User&#x27; from &#x27;models&#x27; (consider renaming &#x27;/tmp/ci/demo1/models.py&#x27; if it has the same name as a library you intended to import)</code></pre>
+<p><strong>Measured:</strong> <code>models</code> starts running, imports <code>services</code>, which asks <code>models</code> for <code>User</code> &mdash; but <code>models</code> is only on line 1, so <code>User</code> doesn't exist yet. The hint most answers online describe is <code>(most likely due to a circular import)</code>, from earlier versions (we tested 3.13.5 only). On 3.13.5 we got <code>consider renaming '.../models.py' if it has the same name as a library you intended to import</code> instead, a hint for a different problem (section 2). Nothing here shadows a library: if the traceback shows two of <em>your</em> files importing each other, it's circular, whatever the hint says.</p>
+
+<h2 id="fix-circular">Fix: import the module, not the name (or move the shared code)</h2>
+<pre><code>mkdir -p demo2 &amp;&amp; cd demo2
+cat &gt; models.py &lt;&lt;&#x27;PY&#x27;
+import services
+class User:
+    pass
+PY
+cat &gt; services.py &lt;&lt;&#x27;PY&#x27;
+import models
+def save(u):
+    return f&quot;saved {type(u).__name__}&quot;
+PY
+python3 -c &quot;import models; print(models.services.save(models.User()))&quot;</code></pre>
+<pre><code>saved User</code></pre>
+<p><strong>Measured:</strong> with <code>import services</code> / <code>import models</code> and attribute access at call time (<code>models.services.save</code>), the same two-file cycle works, because neither file needs the other's names while it is still loading. Other fixes: move the shared class into a third module both import; move the import inside the function that uses it; for type hints only, use <code>from __future__ import annotations</code> plus <code>if typing.TYPE_CHECKING:</code> around the import.</p>
+
+<h2 id="shadow">2. Your file has the same name as a library</h2>
+<pre><code>mkdir -p demo3 &amp;&amp; cd demo3
+cat &gt; json.py &lt;&lt;&#x27;PY&#x27;
+print(&quot;this is my json.py&quot;)
+PY
+python3 -c &quot;from json import loads&quot; 2&gt;&amp;1 | tail -1
+cat &gt; requests.py &lt;&lt;&#x27;PY&#x27;
+import requests
+requests.get
+PY
+python3 requests.py 2&gt;&amp;1 | tail -1</code></pre>
+<pre><code>ImportError: cannot import name &#x27;loads&#x27; from &#x27;json&#x27; (consider renaming &#x27;/tmp/ci/demo3/json.py&#x27; since it has the same name as the standard library module named &#x27;json&#x27; and prevents importing that standard library module)
+AttributeError: module &#x27;requests&#x27; has no attribute &#x27;get&#x27; (consider renaming &#x27;/tmp/ci/demo3/requests.py&#x27; if it has the same name as a library you intended to import)</code></pre>
+<p><strong>Measured:</strong> a <code>json.py</code> in the current directory is imported instead of the standard library <code>json</code>, so <code>loads</code> isn't there. Python 3.13 names the file and says it shadows the standard library. A <code>requests.py</code> that imports <code>requests</code> imports <em>itself</em>, giving <code>AttributeError: module 'requests' has no attribute 'get'</code> with the same renaming hint. Rename the file (and delete any <code>__pycache__</code> next to it).</p>
+
+<h2 id="typo">3. The name simply isn't there</h2>
+<pre><code>mkdir -p demo4 &amp;&amp; cd demo4
+cat &gt; helpers.py &lt;&lt;&#x27;PY&#x27;
+def slugify(s):
+    return s.lower()
+PY
+python3 -c &quot;from helpers import slugfy&quot; 2&gt;&amp;1 | tail -1</code></pre>
+<pre><code>ImportError: cannot import name &#x27;slugfy&#x27; from &#x27;helpers&#x27; (/tmp/ci/demo4/helpers.py). Did you mean: &#x27;slugify&#x27;?</code></pre>
+<p><strong>Measured:</strong> a typo gets a <code>Did you mean</code> suggestion on 3.13. With no suggestion, check the library version: the name may have been renamed or removed in the version you have installed (<code>pip show package</code>), or it lives in a submodule.</p>
+
+<aside class="cta"><strong>Import fixed and now debugging the HTTP calls? Check the real response headers and status:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does ImportError: cannot import name mean?</summary><p>The module was found but the name wasn&#x27;t in it at that moment. We measured three causes on Python 3.13.5: a circular import, a local file shadowing a library, and a typo.</p></details>
+<details><summary>How do I know if it&#x27;s a circular import?</summary><p>The traceback shows two of your own files importing each other. On Python 3.13.5 we measured the message suggesting &#x27;consider renaming&#x27; instead of mentioning a circular import, so trust the traceback, not the hint.</p></details>
+<details><summary>How do I fix a circular import in Python?</summary><p>Import the module instead of names (import models, then models.User at call time), move shared code into a third module, or import inside the function. We measured the module-import version working for the same two files that failed.</p></details>
+<details><summary>Why does my json.py or requests.py break imports?</summary><p>Python imports your local file instead of the library. We measured json.py causing cannot import name &#x27;loads&#x27;, and requests.py causing module &#x27;requests&#x27; has no attribute &#x27;get&#x27;. Rename the file.</p></details>
+<details><summary>Does ImportError suggest the right name?</summary><p>For typos, yes: we measured &#x27;Did you mean: slugify?&#x27; on Python 3.13.5.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5: a two-file circular import with from-imports and with plain module imports, local json.py and requests.py files shadowing libraries, and a misspelled name. Every shell block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

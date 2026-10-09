@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Last-Modified Header: Format, Heuristic Caching and ETag (Tested)</title>
+<meta name="description" content="Chromium 153 cached a page with only Last-Modified (10 days old) and no Cache-Control: zero server hits on revisits. A 1-minute-old date went stale in seconds and revalidated with a 304. Express 5 sends Last-Modified and ETag by default.">
+<link rel="canonical" href="https://honestkit.github.io/guides/last-modified-header/">
+<meta property="og:title" content="Last-Modified Header: Format, Heuristic Caching and ETag (Tested)">
+<meta property="og:description" content="Chromium 153 cached a page with only Last-Modified (10 days old) and no Cache-Control: zero server hits on revisits. A 1-minute-old date went stale in seconds and revalidated with a 304. Express 5 sends Last-Modified and ETag by default.">
+<meta property="og:url" content="https://honestkit.github.io/guides/last-modified-header/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Will a browser cache a page that has Last-Modified but no Cache-Control?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. In our test Chromium 153 reused a page whose Last-Modified was 10 days old without contacting the server, both immediately and 8 seconds later. A page modified 1 minute earlier was reused only for a few seconds, then revalidated with If-Modified-Since and got a 304."}}, {"@type": "Question", "name": "How long is heuristic freshness?", "acceptedAnswer": {"@type": "Answer", "text": "RFC 9111 suggests about 10% of the time since Last-Modified (from the RFC, not measured as an exact figure). Our results fit that: 10 days old stayed fresh past 8 seconds, 1 minute old (about 6 seconds) did not."}}, {"@type": "Question", "name": "Does Express send Last-Modified?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Express 5.2.1 express.static sends Last-Modified from the file mtime, a weak ETag and Cache-Control: public, max-age=0, and answers If-Modified-Since with 304. Pass {lastModified: false} to drop the header."}}, {"@type": "Question", "name": "Should I use Last-Modified or ETag?", "acceptedAnswer": {"@type": "Answer", "text": "Send both if your framework does. If both conditional headers arrive, If-None-Match wins (we saw Express return 200 when the ETag did not match even though the date did). ETag can catch changes within the same second; Last-Modified cannot."}}, {"@type": "Question", "name": "Why did the page see 200 when the server sent 304?", "acceptedAnswer": {"@type": "Answer", "text": "The browser merges the 304 with its cached copy and hands the page a 200. Check DevTools Network or the server log to see the real status."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Last-Modified header explained (tested)</h1>
+<p class="lead"><code>Last-Modified</code> is the server saying "this resource last changed at this time". It does two jobs: it lets clients revalidate cheaply with <code>If-Modified-Since</code> (a 304 instead of the full body), and, when there is no <code>Cache-Control</code> or <code>Expires</code>, it lets browsers guess a freshness lifetime on their own. The second job surprises people. We measured both in Chromium 153 and Express 5.</p>
+<h2>1. Format</h2>
+<pre><code>Last-Modified: Tue, 22 Sep 2026 10:00:00 GMT</code></pre>
+<p>From the RFC, not measured: the value must be an HTTP-date in IMF-fixdate form (day name, day, month name, year, time, literally <code>GMT</code>), with one-second resolution. A server should not send a date later than its own <code>Date</code> header. In JavaScript, <code>new Date(ms).toUTCString()</code> produces the right format; in Node, <code>fs.stat().mtime</code> is the usual source.</p>
+
+<h2>2. Heuristic freshness: Last-Modified without Cache-Control (measured)</h2>
+<p>A Node.js server sent pages with a <code>Last-Modified</code> header and <em>no</em> <code>Cache-Control</code> or <code>Expires</code>. Chromium 153 navigated to each page, away, and back; then waited 8 seconds and navigated back again. The server logged every request.</p>
+<table>
+<tr><th>Last-Modified</th><th>Revisit right away</th><th>Revisit after 8 s</th></tr>
+<tr><td>10 days old</td><td>served from cache, no request</td><td>served from cache, no request</td></tr>
+<tr><td>1 minute old</td><td>served from cache, no request</td><td>request with <code>If-Modified-Since</code>, got 304</td></tr>
+<tr><td>none (no validators at all)</td><td>request, full 200</td><td>request, full 200</td></tr>
+</table>
+<p>This matches the common heuristic from RFC 9111 (from the RFC, not measured as an exact number): a cache may treat the response as fresh for about 10% of the time since <code>Last-Modified</code>. Ten days old gives roughly a day of freshness; one minute old gives roughly six seconds. That is why a file you deployed weeks ago, served with no <code>Cache-Control</code>, can keep showing the old version after you update it: the browser does not ask.</p>
+<p><strong>Takeaway:</strong> if you send <code>Last-Modified</code>, also send an explicit <code>Cache-Control</code>. <code>no-cache</code> (or <code>max-age=0</code>) forces a check every time; a real <code>max-age</code> sets the lifetime you actually want. See <a href="/guides/cache-control-no-cache-vs-no-store/">no-cache vs no-store</a>.</p>
+
+<h2>3. Reload sends If-Modified-Since (measured)</h2>
+<p>On <code>page.reload()</code> of the 10-day-old page, Chromium sent <code>If-Modified-Since</code> with the exact <code>Last-Modified</code> string it had stored, even though the cached copy was still heuristically fresh. Our server answered 304 with no body. The page itself saw status 200: the browser swaps the 304 for the cached response. To see the 304, look in DevTools Network or at the server log. The request side of this is covered in <a href="/guides/if-modified-since-header/">If-Modified-Since explained</a>.</p>
+
+<h2>4. Express 5 defaults (measured)</h2>
+<p><code>express.static</code> on a file with mtime <code>2026-09-22 10:00:00 UTC</code>:</p>
+<pre><code>$ curl -sI http://127.0.0.1:8984/a.txt
+HTTP/1.1 200 OK
+Cache-Control: public, max-age=0
+Last-Modified: Tue, 22 Sep 2026 10:00:00 GMT
+ETag: W/"6-1a0c88ed900"</code></pre>
+<table>
+<tr><th>Request</th><th>Status</th></tr>
+<tr><td><code>If-Modified-Since</code> equal to Last-Modified</td><td>304</td></tr>
+<tr><td><code>If-Modified-Since</code> later than Last-Modified</td><td>304</td></tr>
+<tr><td><code>If-Modified-Since</code> earlier than Last-Modified</td><td>200</td></tr>
+<tr><td><code>If-Modified-Since: yesterday</code> (not a date)</td><td>200</td></tr>
+<tr><td>Later <code>If-Modified-Since</code> + non-matching <code>If-None-Match</code></td><td>200 (ETag wins)</td></tr>
+<tr><td>After <code>touch a.txt</code>, old <code>If-Modified-Since</code></td><td>200, new Last-Modified</td></tr>
+</table>
+<p>Express already sends <code>max-age=0</code>, so the heuristic in section 2 does not kick in for its static files; every use revalidates. Options:</p>
+<ul>
+<li><code>express.static(dir, {lastModified: false})</code>: no Last-Modified header; a later <code>If-Modified-Since</code> then got 200. The ETag was still sent.</li>
+<li><code>express.static(dir, {etag: false})</code>: Last-Modified only; <code>If-Modified-Since</code> still got 304.</li>
+</ul>
+<p>Note that Express's static ETag (<code>W/"size-mtime"</code>) is also built from the mtime, so on a static file the two validators carry nearly the same information.</p>
+
+<h2>5. Last-Modified vs ETag</h2>
+<table>
+<tr><th></th><th>Last-Modified</th><th>ETag</th></tr>
+<tr><td>Request header</td><td><code>If-Modified-Since</code></td><td><code>If-None-Match</code></td></tr>
+<tr><td>Resolution</td><td>1 second</td><td>any change the server encodes</td></tr>
+<tr><td>Heuristic freshness without Cache-Control</td><td>yes (measured above)</td><td>no (from the RFC, not measured)</td></tr>
+<tr><td>Both sent</td><td colspan="2">If-None-Match is evaluated and If-Modified-Since ignored (RFC 9110; matched in Express above)</td></tr>
+</table>
+<p>From the RFC, not measured: two edits in the same second, or a redeploy that resets mtimes on unchanged files, break Last-Modified but not a content-hash ETag. Sending both is normal and harmless. More in <a href="/guides/etag-header-explained/">ETag explained</a>.</p>
+
+<h2>6. Non-standard dates (measured)</h2>
+<p>We sent <code>Last-Modified: 2026-09-22 10:00:00</code> (not IMF-fixdate). Chromium 153 still cached the page heuristically (no request on revisit, even after 8 s), but on revisits it never sent <code>If-Modified-Since</code> for it. Express does not validate a Last-Modified you set yourself: <code>res.set('Last-Modified','2026-09-22')</code> went out verbatim, and its freshness check parsed it leniently and returned 304 to a later <code>If-Modified-Since</code>. Lenient parsing is not something to rely on across clients and CDNs: always emit the GMT format.</p>
+
+<h2>7. Checklist</h2>
+<ul>
+<li>Format: <code>Tue, 22 Sep 2026 10:00:00 GMT</code>, never in the future.</li>
+<li>Always pair it with explicit <code>Cache-Control</code>, or browsers will pick a lifetime for you.</li>
+<li>Answer <code>If-Modified-Since</code> with 304 when unchanged (Express does this for you).</li>
+<li>For per-user responses, also read <a href="/guides/cache-control-private-vs-public/">private vs public</a>.</li>
+</ul>
+<aside class="cta"><strong>See the Last-Modified and ETag headers your pages actually return:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Will a browser cache a page that has Last-Modified but no Cache-Control?</summary><p>Yes. In our test Chromium 153 reused a page whose Last-Modified was 10 days old without contacting the server, both immediately and 8 seconds later. A page modified 1 minute earlier was reused only for a few seconds, then revalidated with If-Modified-Since and got a 304.</p></details>
+<details><summary>How long is heuristic freshness?</summary><p>RFC 9111 suggests about 10% of the time since Last-Modified (from the RFC, not measured as an exact figure). Our results fit that: 10 days old stayed fresh past 8 seconds, 1 minute old (about 6 seconds) did not.</p></details>
+<details><summary>Does Express send Last-Modified?</summary><p>Yes. Express 5.2.1 express.static sends Last-Modified from the file mtime, a weak ETag and Cache-Control: public, max-age=0, and answers If-Modified-Since with 304. Pass {lastModified: false} to drop the header.</p></details>
+<details><summary>Should I use Last-Modified or ETag?</summary><p>Send both if your framework does. If both conditional headers arrive, If-None-Match wins (we saw Express return 200 when the ETag did not match even though the date did). ETag can catch changes within the same second; Last-Modified cannot.</p></details>
+<details><summary>Why did the page see 200 when the server sent 304?</summary><p>The browser merges the 304 with its cached copy and hands the page a 200. Check DevTools Network or the server log to see the real status.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright) against a Node.js 24.21.0 http server on localhost:8983 that logged every request, and Express 5.2.1 (express.static) on localhost:8984 checked with curl 8.14.1. The 10% heuristic, the date format rules and the ETag precedence rule are quoted from RFC 9110/9111 and are labelled where not measured. PlainHeaders is our extension; Chromium, Node.js, Express and curl are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

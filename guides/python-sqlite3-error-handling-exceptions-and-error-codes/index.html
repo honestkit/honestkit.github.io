@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python sqlite3 Error Handling: Exceptions &amp; Error Codes, Tested</title>
+<meta name="description" content="Which sqlite3 exception you get for each error: IntegrityError, OperationalError, ProgrammingError, plus sqlite_errorname codes, measured on Python 3.13.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-sqlite3-error-handling-exceptions-and-error-codes/">
+<meta property="og:title" content="Python sqlite3 Error Handling: Exceptions &amp; Error Codes, Tested">
+<meta property="og:description" content="Which sqlite3 exception you get for each error: IntegrityError, OperationalError, ProgrammingError, plus sqlite_errorname codes, measured on Python 3.13.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-sqlite3-error-handling-exceptions-and-error-codes/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What exceptions does Python sqlite3 raise?", "acceptedAnswer": {"@type": "Answer", "text": "All database errors subclass sqlite3.Error: IntegrityError, OperationalError and ProgrammingError (all DatabaseError), plus InterfaceError. We measured that sqlite3.Warning is not a subclass of sqlite3.Error."}}, {"@type": "Question", "name": "What is the difference between IntegrityError and OperationalError?", "acceptedAnswer": {"@type": "Answer", "text": "IntegrityError is a constraint violation by your data (UNIQUE, NOT NULL). OperationalError is a database or SQL problem: no such table, syntax error, database is locked. We measured each."}}, {"@type": "Question", "name": "How do I get the SQLite error code in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Since Python 3.11, use e.sqlite_errorcode and e.sqlite_errorname. We measured SQLITE_CONSTRAINT_UNIQUE for a duplicate and SQLITE_BUSY (5) for a locked database."}}, {"@type": "Question", "name": "How do I catch a duplicate key error in sqlite3?", "acceptedAnswer": {"@type": "Answer", "text": "except sqlite3.IntegrityError as e: then check e.sqlite_errorname == 'SQLITE_CONSTRAINT_UNIQUE' and re-raise anything else. We measured it."}}, {"@type": "Question", "name": "Why is sqlite_errorname None?", "acceptedAnswer": {"@type": "Answer", "text": "ProgrammingError is raised by Python's sqlite3 module, not SQLite, so it carries no code. We measured that for wrong binding counts, a closed connection, and two statements in one execute()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python sqlite3 error handling: exceptions and error codes (tested)</h1>
+<p class="lead">To handle <code>sqlite3</code> errors properly you need to know which class each one raises and how to tell two errors of the same class apart. We triggered nine common errors on Python 3.13.5 and recorded the class and SQLite error code for each.</p>
+<h2 id="hierarchy">1. The exception classes</h2>
+<pre><code>import sqlite3
+for cls in (sqlite3.IntegrityError, sqlite3.OperationalError, sqlite3.ProgrammingError,
+            sqlite3.DatabaseError, sqlite3.InterfaceError, sqlite3.Warning):
+    print(cls.__name__.ljust(17), &quot;-&gt;&quot;, &quot; &gt; &quot;.join(c.__name__ for c in cls.__mro__[1:-2]))</code></pre>
+<p>Output:</p>
+<pre><code>IntegrityError    -&gt; DatabaseError &gt; Error &gt; Exception
+OperationalError  -&gt; DatabaseError &gt; Error &gt; Exception
+ProgrammingError  -&gt; DatabaseError &gt; Error &gt; Exception
+DatabaseError     -&gt; Error &gt; Exception
+InterfaceError    -&gt; Error &gt; Exception
+Warning           -&gt; Exception</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> everything the database raises is a <code>sqlite3.Error</code>, so <code>except sqlite3.Error</code> is the catch-all. <code>sqlite3.Warning</code> is the exception: it subclasses <code>Exception</code> directly and isn't caught by <code>except sqlite3.Error</code>.</p>
+
+<h2 id="which">2. Which class you get for which error, with its SQLite error code</h2>
+<pre><code>import sqlite3
+con = sqlite3.connect(&quot;:memory:&quot;)
+con.execute(&quot;CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL)&quot;)
+con.execute(&quot;INSERT INTO u (email) VALUES (&#x27;a@x&#x27;)&quot;)
+cases = {
+    &quot;duplicate&quot;:   (&quot;INSERT INTO u (email) VALUES (&#x27;a@x&#x27;)&quot;, ()),
+    &quot;null&quot;:        (&quot;INSERT INTO u (email) VALUES (NULL)&quot;, ()),
+    &quot;no table&quot;:    (&quot;SELECT * FROM users&quot;, ()),
+    &quot;no column&quot;:   (&quot;SELECT name FROM u&quot;, ()),
+    &quot;syntax&quot;:      (&quot;SELEC * FROM u&quot;, ()),
+    &quot;bind count&quot;:  (&quot;SELECT * FROM u WHERE id = ?&quot;, (1, 2)),
+    &quot;two stmts&quot;:   (&quot;SELECT 1; SELECT 2&quot;, ()),
+}
+for label, (sql, params) in cases.items():
+    try:
+        con.execute(sql, params)
+    except sqlite3.Error as e:
+        print(f&quot;{label:11} {type(e).__name__:16} {getattr(e, &#x27;sqlite_errorname&#x27;, None)!s:25} {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>duplicate   IntegrityError   SQLITE_CONSTRAINT_UNIQUE  UNIQUE constraint failed: u.email
+null        IntegrityError   SQLITE_CONSTRAINT_NOTNULL NOT NULL constraint failed: u.email
+no table    OperationalError SQLITE_ERROR              no such table: users
+no column   OperationalError SQLITE_ERROR              no such column: name
+syntax      OperationalError SQLITE_ERROR              near &quot;SELEC&quot;: syntax error
+bind count  ProgrammingError None                      Incorrect number of bindings supplied. The current statement uses 1, and there are 2 supplied.
+two stmts   ProgrammingError None                      You can only execute one statement at a time.</code></pre>
+<pre><code>import sqlite3, os
+if os.path.exists(&quot;app.db&quot;): os.remove(&quot;app.db&quot;)
+a = sqlite3.connect(&quot;app.db&quot;)
+a.execute(&quot;CREATE TABLE t (x)&quot;); a.commit()
+a.execute(&quot;INSERT INTO t VALUES (1)&quot;)          # a holds an open write transaction
+b = sqlite3.connect(&quot;app.db&quot;, timeout=0.2)
+try:
+    b.execute(&quot;INSERT INTO t VALUES (2)&quot;)
+except sqlite3.OperationalError as e:
+    print(type(e).__name__, e.sqlite_errorname, e.sqlite_errorcode, &quot;|&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>OperationalError SQLITE_BUSY 5 | database is locked</code></pre>
+<p><strong>Measured:</strong> the pattern is:</p>
+<ul>
+<li><code>IntegrityError</code>: your data broke a constraint (UNIQUE, NOT NULL, FOREIGN KEY, CHECK). Usually something to handle: tell the user, skip the row.</li>
+<li><code>OperationalError</code>: problems with the database or the SQL text: a missing table or column, a syntax error, a locked file. Usually a bug or an environment problem, not bad input.</li>
+<li><code>ProgrammingError</code>: you used the Python API wrong: wrong number of <code>?</code> parameters, two statements in one <code>execute()</code>, an unsupported parameter type, a closed connection. Raised by Python, so <code>sqlite_errorname</code> is <code>None</code>.</li>
+</ul>
+<p>Since Python 3.11, exceptions from SQLite itself carry <code>e.sqlite_errorcode</code> (an int) and <code>e.sqlite_errorname</code>. The name is the fine-grained one: <code>SQLITE_CONSTRAINT_UNIQUE</code> vs <code>SQLITE_CONSTRAINT_NOTNULL</code>, <code>SQLITE_BUSY</code> (code 5) for a locked database. Note that "no such table", "no such column" and a syntax error all share plain <code>SQLITE_ERROR</code>, so for those you can only tell them apart by the message.</p>
+
+<h2 id="handle">3. Handle one specific error, re-raise the rest</h2>
+<pre><code>import sqlite3
+con = sqlite3.connect(&quot;:memory:&quot;)
+con.execute(&quot;CREATE TABLE u (email TEXT UNIQUE)&quot;)
+con.execute(&quot;INSERT INTO u VALUES (&#x27;a@x&#x27;)&quot;)
+def add(email):
+    try:
+        with con:
+            con.execute(&quot;INSERT INTO u VALUES (?)&quot;, (email,))
+        return &quot;added&quot;
+    except sqlite3.IntegrityError as e:
+        if e.sqlite_errorname == &quot;SQLITE_CONSTRAINT_UNIQUE&quot;:
+            return &quot;already exists&quot;
+        raise
+print(add(&quot;b@x&quot;), &quot;|&quot;, add(&quot;a@x&quot;))
+print(con.execute(&quot;SELECT count(*) FROM u&quot;).fetchone()[0], &quot;rows&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>added | already exists
+2 rows</code></pre>
+<p><strong>Measured:</strong> the duplicate insert is reported as "already exists", the table still has 2 rows, and any other integrity error (e.g. NOT NULL) would still raise. <code>with con:</code> commits on success and rolls back on an exception, so a failed insert doesn't leave a half-open transaction behind. Checking <code>sqlite_errorname</code> is more reliable than matching the message text.</p>
+
+<h2 id="api">4. ProgrammingError has no error code</h2>
+<pre><code>import sqlite3
+con = sqlite3.connect(&quot;:memory:&quot;)
+con.close()
+try:
+    con.execute(&quot;SELECT 1&quot;)
+except sqlite3.Error as e:
+    print(type(e).__name__, &quot;|&quot;, e, &quot;|&quot;, hasattr(e, &quot;sqlite_errorcode&quot;), getattr(e, &quot;sqlite_errorcode&quot;, None))
+try:
+    sqlite3.connect(&quot;:memory:&quot;).execute(&quot;SELECT ?&quot;, ([1],))
+except sqlite3.Error as e:
+    print(type(e).__name__, &quot;|&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>ProgrammingError | Cannot operate on a closed database. | False None
+ProgrammingError | Error binding parameter 1: type &#x27;list&#x27; is not supported</code></pre>
+<p><strong>Measured:</strong> a closed connection and an unsupported parameter type (a list) both raise <code>ProgrammingError</code> without <code>sqlite_errorcode</code>, so use <code>getattr(e, "sqlite_errorname", None)</code> if your handler sees both kinds.</p>
+
+<h2 id="guides">Fixes for specific messages</h2>
+<p>We measured each of these separately: <a href="/guides/sqlite-database-is-locked/">database is locked</a> &middot; <a href="/guides/sqlite-unique-constraint-failed/">UNIQUE constraint failed</a> &middot; <a href="/guides/sqlite-not-null-constraint-failed/">NOT NULL constraint failed</a> &middot; <a href="/guides/sqlite-foreign-key-constraint-failed/">FOREIGN KEY constraint failed</a> &middot; <a href="/guides/sqlite-no-such-table/">no such table</a> &middot; <a href="/guides/sqlite-no-such-column/">no such column</a> &middot; <a href="/guides/sqlite3-operationalerror-near-syntax-error/">near "X": syntax error</a> &middot; <a href="/guides/sqlite-unable-to-open-database-file/">unable to open database file</a> &middot; <a href="/guides/sqlite-attempt-to-write-a-readonly-database/">attempt to write a readonly database</a> &middot; <a href="/guides/sqlite-database-disk-image-is-malformed/">database disk image is malformed</a>.</p>
+
+<aside class="cta"><strong>Building a Python web backend on SQLite? Check the real status and headers your API returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What exceptions does Python sqlite3 raise?</summary><p>All database errors subclass sqlite3.Error: IntegrityError, OperationalError and ProgrammingError (all DatabaseError), plus InterfaceError. We measured that sqlite3.Warning is not a subclass of sqlite3.Error.</p></details>
+<details><summary>What is the difference between IntegrityError and OperationalError?</summary><p>IntegrityError is a constraint violation by your data (UNIQUE, NOT NULL). OperationalError is a database or SQL problem: no such table, syntax error, database is locked. We measured each.</p></details>
+<details><summary>How do I get the SQLite error code in Python?</summary><p>Since Python 3.11, use e.sqlite_errorcode and e.sqlite_errorname. We measured SQLITE_CONSTRAINT_UNIQUE for a duplicate and SQLITE_BUSY (5) for a locked database.</p></details>
+<details><summary>How do I catch a duplicate key error in sqlite3?</summary><p>except sqlite3.IntegrityError as e: then check e.sqlite_errorname == &#x27;SQLITE_CONSTRAINT_UNIQUE&#x27; and re-raise anything else. We measured it.</p></details>
+<details><summary>Why is sqlite_errorname None?</summary><p>ProgrammingError is raised by Python&#x27;s sqlite3 module, not SQLite, so it carries no code. We measured that for wrong binding counts, a closed connection, and two statements in one execute().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 (bundled SQLite): the exception class hierarchy, the class and sqlite_errorname for duplicate, NOT NULL, missing table/column, syntax error, wrong binding count, two statements, a locked database, a closed connection and a list parameter, plus a UNIQUE-only handler. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

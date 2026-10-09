@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>contextlib.suppress(GeneratorExit) Breaks Generator close()</title>
+<meta name="description" content="We measured Python 3.13.5: suppressing GeneratorExit then reaching another yield makes a generators close() raise RuntimeError instead of closing cleanly.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-contextlib-suppress-generatorexit-breaks-close/">
+<meta property="og:title" content="contextlib.suppress(GeneratorExit) Breaks Generator close()">
+<meta property="og:description" content="We measured Python 3.13.5: suppressing GeneratorExit then reaching another yield makes a generators close() raise RuntimeError instead of closing cleanly.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-contextlib-suppress-generatorexit-breaks-close/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does contextlib.suppress() catch GeneratorExit if you pass it explicitly?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured suppress(GeneratorExit) catching the exception close() throws into a generator just like any other listed exception type, with no special-casing."}}, {"@type": "Question", "name": "What happens if a generator that caught GeneratorExit reaches another yield?", "acceptedAnswer": {"@type": "Answer", "text": "generator.close() raises RuntimeError: generator ignored GeneratorExit -- we measured this happening whether the catch was contextlib.suppress(GeneratorExit) or a plain try/except GeneratorExit: pass."}}, {"@type": "Question", "name": "Does this only happen with contextlib.suppress()?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured the identical RuntimeError from a bare try/except GeneratorExit block, confirming this is a generator-protocol rule (don't yield again after catching GeneratorExit), not something specific to suppress()."}}, {"@type": "Question", "name": "How do you run cleanup code in a generator without breaking close()?", "acceptedAnswer": {"@type": "Answer", "text": "Use try/finally around the yield instead of catching GeneratorExit -- finally runs during the close()-triggered unwind without suppressing the exception, so the generator still terminates the way close() requires."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>contextlib: suppress(GeneratorExit) Breaks Generator close() (tested)</h1>
+<p class="lead">Calling <code>generator.close()</code> works by throwing <code>GeneratorExit</code> into the generator at its current <code>yield</code> point -- the generator is expected to let that exception propagate out, not catch it. <code>contextlib.suppress(GeneratorExit)</code> will catch it like any other exception if it happens to be in scope. We measured what that does to <code>close()</code>.</p>
+<h2 id="repro1">1. Swallowing GeneratorExit with no yield left afterward looks fine</h2>
+<pre><code>import contextlib
+
+def gen():
+    with contextlib.suppress(GeneratorExit):
+        yield "first"
+        print("this never prints -- close() throws here")
+    print("after suppress block")
+
+g = gen()
+next(g)
+g.close()
+print("closed cleanly")</code></pre>
+<pre><code>after suppress block
+closed cleanly</code></pre>
+<p><strong>Measured:</strong> <code>close()</code> throws <code>GeneratorExit</code> at the <code>yield</code>, <code>suppress(GeneratorExit)</code> catches it, and the generator function then runs to completion normally (printing <code>"after suppress block"</code> and falling off the end). Because the generator terminates by returning rather than yielding again, <code>close()</code> is satisfied -- this case gives no sign anything unusual happened.</p>
+
+<h2 id="repro2">2. If anything reachable after the suppressed exit can yield again, close() breaks</h2>
+<pre><code>import contextlib
+
+def gen():
+    with contextlib.suppress(GeneratorExit):
+        yield "first"
+    yield "second"  # reached because GeneratorExit was swallowed
+
+g = gen()
+print(next(g))
+try:
+    g.close()
+    print("closed cleanly")
+except RuntimeError as e:
+    print("close error:", e)</code></pre>
+<pre><code>first
+close error: generator ignored GeneratorExit</code></pre>
+<p><strong>Measured:</strong> once <code>GeneratorExit</code> is swallowed, the generator function keeps running as if nothing happened, and reaches <code>yield "second"</code>. Python's generator protocol requires that a generator stop (return or raise) in response to <code>GeneratorExit</code>, not yield again -- <code>close()</code> enforces that by raising <code>RuntimeError: generator ignored GeneratorExit</code>. The error is raised from the <code>close()</code> call site, far from the <code>suppress(GeneratorExit)</code> that actually caused it.</p>
+
+<h2 id="repro3">3. The same thing happens with a bare try/except, so this isn't suppress-specific -- it's a trap for anything that catches GeneratorExit</h2>
+<pre><code>import contextlib
+
+def gen():
+    try:
+        yield "first"
+    except GeneratorExit:
+        pass
+    yield "second"
+
+g = gen()
+next(g)
+try:
+    g.close()
+except RuntimeError as e:
+    print("close error:", e)</code></pre>
+<pre><code>close error: generator ignored GeneratorExit</code></pre>
+<p><strong>Measured:</strong> identical outcome with plain <code>try</code>/<code>except GeneratorExit: pass</code>. <code>contextlib.suppress()</code> doesn't add any special risk here -- it's simply a one-liner that makes it easy to catch a broader set of exceptions than intended, and <code>GeneratorExit</code> is one that generator code specifically must not catch-and-continue from.</p>
+
+<h2 id="fix">Scope suppress() to real exceptions, never GeneratorExit</h2>
+<pre><code>import contextlib
+
+def gen():
+    with contextlib.suppress(ValueError, KeyError):  # not GeneratorExit
+        yield "first"</code></pre>
+<p>If a generator needs cleanup code that must run even when the caller calls <code>close()</code>, use <code>try</code>/<code>finally</code> around the <code>yield</code> instead -- <code>finally</code> runs during the <code>GeneratorExit</code> unwind without suppressing it, so the generator still stops as the protocol requires.</p>
+<aside class="cta"><strong>Using contextlib.suppress() inside a generator to catch cleanup errors? Check whether it&#x27;s broad enough to catch GeneratorExit too -- that breaks the generator&#x27;s close() contract:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does contextlib.suppress() catch GeneratorExit if you pass it explicitly?</summary><p>Yes -- we measured suppress(GeneratorExit) catching the exception close() throws into a generator just like any other listed exception type, with no special-casing.</p></details>
+<details><summary>What happens if a generator that caught GeneratorExit reaches another yield?</summary><p>generator.close() raises RuntimeError: generator ignored GeneratorExit -- we measured this happening whether the catch was contextlib.suppress(GeneratorExit) or a plain try/except GeneratorExit: pass.</p></details>
+<details><summary>Does this only happen with contextlib.suppress()?</summary><p>No -- we measured the identical RuntimeError from a bare try/except GeneratorExit block, confirming this is a generator-protocol rule (don&#x27;t yield again after catching GeneratorExit), not something specific to suppress().</p></details>
+<details><summary>How do you run cleanup code in a generator without breaking close()?</summary><p>Use try/finally around the yield instead of catching GeneratorExit -- finally runs during the close()-triggered unwind without suppressing the exception, so the generator still terminates the way close() requires.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5: wrapped a yield in a generator with contextlib.suppress(GeneratorExit), then called close() on the generator both with and without a second yield reachable afterward. PlainHeaders is our extension; Python&#x27;s contextlib module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

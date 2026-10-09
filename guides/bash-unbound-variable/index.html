@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bash Unbound Variable Error: Cause and Fix, Tested</title>
+<meta name="description" content="We reproduced set -u&#x27;s unbound variable error on a typo&#x27;d env var and a missing positional argument, then tested three real fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/bash-unbound-variable/">
+<meta property="og:title" content="Bash Unbound Variable Error: Cause and Fix, Tested">
+<meta property="og:description" content="We reproduced set -u&#x27;s unbound variable error on a typo&#x27;d env var and a missing positional argument, then tested three real fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/bash-unbound-variable/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why doesn't this error happen in my script even though I reference undefined variables?", "acceptedAnswer": {"@type": "Answer", "text": "Because set -u (or set -o nounset) isn't on by default in bash. We confirmed the identical reference to an undefined variable produces no error and exits 0 without it, versus a hard 'unbound variable' error with it enabled."}}, {"@type": "Question", "name": "What's the safest fix when a variable is only sometimes set?", "acceptedAnswer": {"@type": "Answer", "text": "${VAR:-default} for a real fallback value, or ${VAR:-} (empty default) inside an explicit -z check if you want to detect and handle the unset case yourself with a clearer error message. We tested both and confirmed each suppresses the error for that one variable while leaving set -u active for everything else."}}, {"@type": "Question", "name": "Does set -u only catch environment/global variables?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we reproduced it on a missing function argument too (myfunc() { echo \"$1\"; }; myfunc with no argument given). Any unset parameter reference triggers it, including $1/$2/etc. inside functions and scripts."}}, {"@type": "Question", "name": "Is turning off set -u entirely a good fix?", "acceptedAnswer": {"@type": "Answer", "text": "Only as a last resort, and ideally scoped narrowly (set +u ... set -u around just the problem section) rather than removed from the whole script \u2014 removing it globally reintroduces the exact silent-failure risk (e.g. a typo'd variable in a destructive command like rm -rf) that set -u exists to catch."}}, {"@type": "Question", "name": "Should every bash script use set -u?", "acceptedAnswer": {"@type": "Answer", "text": "It's widely recommended alongside set -e and set -o pipefail (often combined as set -euo pipefail) specifically because it turns typo'd/unset variable bugs into immediate, loud failures at the point of the mistake instead of silent wrong behavior later in the script."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Bash: Unbound Variable (tested)</h1>
+<p class="lead">This error only appears when a script has opted into strict mode with <code>set -u</code> (or <code>set -o nounset</code>). Without it, bash silently treats an undefined variable as an empty string; with it, referencing one is a hard error that stops the script &mdash; which is exactly the point of enabling it.</p>
+<h2>1. Reproduced: the error only fires under set -u</h2>
+<pre><code>bash -c 'set -u; echo "$UNDEFINED_VAR"'
+bash: line 1: UNDEFINED_VAR: unbound variable</code></pre>
+<p>The identical reference without <code>set -u</code> doesn't error at all &mdash; it just prints nothing and exits 0:</p>
+<pre><code>bash -c 'echo "$UNDEFINED_VAR2"; echo "exit: $?"'
+
+exit: 0</code></pre>
+<p>This is the whole reason <code>set -u</code> exists: a typo'd variable name silently becoming an empty string is a common, hard-to-notice source of bugs (e.g. <code>rm -rf "$TMPDIR/"*</code> when <code>TMPDIR</code> is unset deletes from the current directory instead). <code>set -u</code> trades that silent failure for a loud one.</p>
+
+<h2>2. Reproduced: it also catches missing function arguments</h2>
+<p>This isn't limited to environment variables &mdash; a function called without its expected positional argument triggers the same error:</p>
+<pre><code>bash -c 'set -u; myfunc() { echo "$1"; }; myfunc'
+environment: line 1: $1: unbound variable</code></pre>
+<p>This is a common real-world trigger: a function assumes a caller always passes an argument, and under <code>set -u</code> that assumption gets enforced automatically the first time it's violated.</p>
+
+<h2>3. Fix 1: provide a default with ${VAR:-default}</h2>
+<p>If the variable being unset sometimes is expected and fine, give it a fallback instead of removing <code>set -u</code> entirely:</p>
+<pre><code>bash -c 'set -u; echo "${UNDEFINED_VAR3:-fallback}"'
+fallback</code></pre>
+<p>We confirmed this suppresses the error and substitutes the default, while <code>set -u</code> stays in effect for every other variable in the script &mdash; this is almost always the better fix than disabling strict mode outright, since it stays specific to the one variable you've reasoned about.</p>
+
+<h2>4. Fix 2: check before using, with an explicit guard</h2>
+<pre><code>if [ -z "${MY_VAR:-}" ]; then
+  echo "MY_VAR is required but not set" >&2
+  exit 1
+fi</code></pre>
+<p>The <code>${MY_VAR:-}</code> form (empty default, not a real fallback value) lets you test for "is this set" without triggering the unbound-variable error during the check itself &mdash; useful when you want to fail with your own clear message rather than bash's generic one.</p>
+
+<h2>5. Fix 3 (last resort): turn off nounset for a specific section</h2>
+<p>If a specific block genuinely needs to tolerate unset variables (e.g. sourcing a third-party script you don't control), scope the exception narrowly instead of removing <code>set -u</code> from the whole script:</p>
+<pre><code>set +u
+source ./third_party_script.sh
+set -u</code></pre>
+<p>Turning it off for the whole script defeats the reason you added it in the first place; turning it off for one known block, then back on immediately after, keeps the protection everywhere else.</p>
+
+<h2>6. Why the function case matters more than it looks</h2>
+<p>The positional-argument case in section 2 is worth calling out separately from the plain-variable case: it means <code>set -u</code> doesn't just protect against typo'd global/env variable names, it also enforces that every function in your script is called with all the arguments it expects to reference. If you're migrating an existing script to add <code>set -u</code>, expect to find and fix a few of these in functions that were quietly relying on <code>$2</code> or <code>$3</code> being empty rather than absent.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why doesn&#x27;t this error happen in my script even though I reference undefined variables?</summary><p>Because set -u (or set -o nounset) isn&#x27;t on by default in bash. We confirmed the identical reference to an undefined variable produces no error and exits 0 without it, versus a hard &#x27;unbound variable&#x27; error with it enabled.</p></details>
+<details><summary>What&#x27;s the safest fix when a variable is only sometimes set?</summary><p>${VAR:-default} for a real fallback value, or ${VAR:-} (empty default) inside an explicit -z check if you want to detect and handle the unset case yourself with a clearer error message. We tested both and confirmed each suppresses the error for that one variable while leaving set -u active for everything else.</p></details>
+<details><summary>Does set -u only catch environment/global variables?</summary><p>No — we reproduced it on a missing function argument too (myfunc() { echo &quot;$1&quot;; }; myfunc with no argument given). Any unset parameter reference triggers it, including $1/$2/etc. inside functions and scripts.</p></details>
+<details><summary>Is turning off set -u entirely a good fix?</summary><p>Only as a last resort, and ideally scoped narrowly (set +u ... set -u around just the problem section) rather than removed from the whole script — removing it globally reintroduces the exact silent-failure risk (e.g. a typo&#x27;d variable in a destructive command like rm -rf) that set -u exists to catch.</p></details>
+<details><summary>Should every bash script use set -u?</summary><p>It&#x27;s widely recommended alongside set -e and set -o pipefail (often combined as set -euo pipefail) specifically because it turns typo&#x27;d/unset variable bugs into immediate, loud failures at the point of the mistake instead of silent wrong behavior later in the script.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with GNU bash (Debian), running real scripts with set -u. Every error message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; bash is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

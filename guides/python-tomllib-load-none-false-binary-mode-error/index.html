@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tomllib.load(): False &#x27;Binary Mode&#x27; Error on None (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: tomllib.load() blames &#x27;must be opened in binary mode&#x27; on a transient None read, even though the stream already is binary.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-tomllib-load-none-false-binary-mode-error/">
+<meta property="og:title" content="tomllib.load(): False &#x27;Binary Mode&#x27; Error on None (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: tomllib.load() blames &#x27;must be opened in binary mode&#x27; on a transient None read, even though the stream already is binary.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-tomllib-load-none-false-binary-mode-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "The tomllib documentation for load() says the file object must support binary read() and mentions nothing about None or non-blocking streams. We measured that a None-returning source triggers the same error path tomllib designed for an unrelated, genuine mistake (passing a text-mode file object)."}}, {"@type": "Question", "name": "How can I tell the real binary-mode mistake from this one?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that genuinely passing a text-mode file object produces an AttributeError on a str object when .decode() is attempted, with the same resulting TypeError message; there is no way to distinguish the two causes from the exception alone. If the object you passed is verifiably already binary (e.g. you opened it with 'rb' or it's an io.BufferedReader), suspect a non-blocking None instead of your own file mode."}}, {"@type": "Question", "name": "Does this affect tomllib.loads() too?", "acceptedAnswer": {"@type": "Answer", "text": "No -- loads() takes a str directly, not a file object, so there is no read() call involved and this specific failure mode does not apply to it."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- same family already confirmed in shutil.copyfileobj, gzip/bz2/lzma, tarfile/zipfile, and ElementTree.parse(): a correctly-returned non-blocking None gets mishandled one layer above io itself. tomllib's version is unusual in that the resulting error actively names the wrong root cause, rather than just crashing generically or blaming the content."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>tomllib.load() Misdiagnoses a Non-Blocking None (tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> from <code>readinto()</code> -- distinct from the empty read that means real end-of-stream. We measured that <code>tomllib.load()</code> mishandles this signal in an unusually misleading way: rather than a generic crash or a content-blaming error, it raises <code>TypeError: File must be opened in binary mode, e.g. use open('foo.toml', 'rb')</code> -- even when the file object passed in is already a binary <code>io.BufferedReader</code>. The error actively diagnoses the wrong problem.</p>
+<h2 id="repro1">1. A real, valid TOML document behind one transient None</h2>
+<pre><code>import io, tomllib
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self, payload):
+        self.calls = 0
+        self.sent = False
+        self.payload = payload
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None            # transient: no data ready yet
+        if not self.sent:
+            self.sent = True
+            n = len(self.payload)
+            b[:n] = self.payload
+            return n               # the real, valid TOML bytes
+        return 0                   # real EOF after that
+
+payload = b'key = "value"\n'
+raw = FlakyRaw(payload)
+br = io.BufferedReader(raw)   # genuinely binary mode
+try:
+    data = tomllib.load(br)
+    print("data:", data)
+except Exception as e:
+    print("CRASHED:", type(e).__name__, e)
+print("raw calls made:", raw.calls)</code></pre>
+<pre><code>CRASHED: TypeError File must be opened in binary mode, e.g. use `open('foo.toml', 'rb')`
+raw calls made: 1</code></pre>
+<p><strong>Measured:</strong> <code>br</code> is an <code>io.BufferedReader</code> -- already binary mode, exactly as the error message demands. The TOML document is valid and complete, sitting one read call away. The error is simply wrong about what went wrong.</p>
+
+<h2 id="repro2">2. Why: tomllib's own binary-mode check is fooled by None</h2>
+<pre><code>import inspect
+print(inspect.getsource(tomllib.load))</code></pre>
+<pre><code># (from the standard library source)
+def load(fp, /, *, parse_float=float):
+    b = fp.read()
+    try:
+        s = b.decode()
+    except AttributeError:
+        raise TypeError(
+            "File must be opened in binary mode, e.g. use `open('foo.toml', 'rb')`"
+        ) from None
+    return loads(s, parse_float=parse_float)</code></pre>
+<p><strong>Measured:</strong> <code>tomllib.load()</code> calls <code>fp.read()</code> and immediately tries <code>b.decode()</code>, assuming <code>b</code> is <code>bytes</code>. If a caller passes a text-mode file object by mistake, <code>read()</code> returns <code>str</code>, which has no <code>.decode()</code> method, and the resulting <code>AttributeError</code> is caught and turned into the helpful "open it in binary mode" message -- a real, useful check for that real mistake. But <code>None</code> also has no <code>.decode()</code> method, so the identical <code>except AttributeError</code> catches that too, and reports the exact same binary-mode diagnosis for a completely different problem: a transient non-blocking read that was never about text vs. binary mode at all.</p>
+
+<h2 id="repro3">3. Contrast: plain BufferedReader.read() on the identical raw stream</h2>
+<pre><code>raw2 = FlakyRaw(b"irrelevant for this check")
+br2 = io.BufferedReader(raw2)
+print("plain read():", repr(br2.read()))</code></pre>
+<pre><code>plain read(): None</code></pre>
+<p><strong>Measured:</strong> the <code>io</code> layer preserves the <code>None</code>/EOF distinction correctly; <code>tomllib.load()</code>'s own exception-handling logic is what turns that correct signal into an incorrect diagnosis.</p>
+
+<h2 id="repro4">4. The fix: drain into a real buffer first, retrying on None</h2>
+<pre><code>def drain_retrying_on_none(raw_stream, chunk_size=65536):
+    out = io.BytesIO()
+    br3 = io.BufferedReader(raw_stream)
+    while True:
+        chunk = br3.read(chunk_size)
+        if chunk is None:
+            continue              # retry: not ready yet, not EOF
+        if not chunk:
+            break                  # real EOF
+        out.write(chunk)
+    out.seek(0)
+    return out
+
+raw3 = FlakyRaw(payload)
+safe_buf = drain_retrying_on_none(raw3)
+print("safe data:", tomllib.load(safe_buf))</code></pre>
+<pre><code>safe data: {'key': 'value'}</code></pre>
+<p><strong>Measured:</strong> resolving the <code>None</code>/EOF distinction before the bytes reach <code>tomllib.load()</code> parses the document correctly. If you ever see this exact error on a file object you already opened with <code>'rb'</code>, the real cause is almost certainly not your file mode.</p>
+<aside class="cta"><strong>Loading TOML from a non-blocking stream with tomllib.load()? A transient None read produces a &#x27;File must be opened in binary mode&#x27; error -- even when it already is:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>The tomllib documentation for load() says the file object must support binary read() and mentions nothing about None or non-blocking streams. We measured that a None-returning source triggers the same error path tomllib designed for an unrelated, genuine mistake (passing a text-mode file object).</p></details>
+<details><summary>How can I tell the real binary-mode mistake from this one?</summary><p>We measured that genuinely passing a text-mode file object produces an AttributeError on a str object when .decode() is attempted, with the same resulting TypeError message; there is no way to distinguish the two causes from the exception alone. If the object you passed is verifiably already binary (e.g. you opened it with &#x27;rb&#x27; or it&#x27;s an io.BufferedReader), suspect a non-blocking None instead of your own file mode.</p></details>
+<details><summary>Does this affect tomllib.loads() too?</summary><p>No -- loads() takes a str directly, not a file object, so there is no read() call involved and this specific failure mode does not apply to it.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>Yes -- same family already confirmed in shutil.copyfileobj, gzip/bz2/lzma, tarfile/zipfile, and ElementTree.parse(): a correctly-returned non-blocking None gets mishandled one layer above io itself. tomllib&#x27;s version is unusual in that the resulting error actively names the wrong root cause, rather than just crashing generically or blaming the content.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in tomllib.load(), reading a genuinely valid TOML document through an io.BufferedReader (already in binary mode) over a custom non-blocking RawIOBase whose readinto() returns None once before returning the real TOML bytes. PlainHeaders is our extension; Python&#x27;s tomllib and io modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

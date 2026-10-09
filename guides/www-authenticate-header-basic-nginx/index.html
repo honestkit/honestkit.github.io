@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WWW-Authenticate Header: Basic vs Bearer, nginx auth_basic and 401s, Tested</title>
+<meta name="description" content="What nginx auth_basic sends in WWW-Authenticate, every 401 case measured with curl, the &#x27;return&#x27; directive that silently skips auth_basic, and when Chrome does (and doesn&#x27;t) send credentials.">
+<link rel="canonical" href="https://honestkit.github.io/guides/www-authenticate-header-basic-nginx/">
+<meta property="og:title" content="WWW-Authenticate Header: Basic vs Bearer, nginx auth_basic and 401s, Tested">
+<meta property="og:description" content="What nginx auth_basic sends in WWW-Authenticate, every 401 case measured with curl, the &#x27;return&#x27; directive that silently skips auth_basic, and when Chrome does (and doesn&#x27;t) send credentials.">
+<meta property="og:url" content="https://honestkit.github.io/guides/www-authenticate-header-basic-nginx/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does WWW-Authenticate: Basic realm mean?", "acceptedAnswer": {"@type": "Answer", "text": "The server wants a username and password (HTTP Basic). The realm is the label from nginx's auth_basic, e.g. auth_basic \"Staging area\" sent realm=\"Staging area\" in our test."}}, {"@type": "Question", "name": "Why is nginx auth_basic not working?", "acceptedAnswer": {"@type": "Answer", "text": "In our test a location using return 200 served every request without asking for a password, because return runs before auth_basic. Also check the error log: a missing password file gave 403, not 401."}}, {"@type": "Question", "name": "Why doesn't the browser show a login prompt on 401?", "acceptedAnswer": {"@type": "Answer", "text": "The response needs WWW-Authenticate: Basic. With no WWW-Authenticate header, or a Bearer challenge, Chrome sent no credentials in our test."}}, {"@type": "Question", "name": "Can nginx auth_basic check a Bearer token?", "acceptedAnswer": {"@type": "Answer", "text": "No. A Bearer Authorization header got the Basic 401 challenge back; token checks need your app (or nginx auth_request, per the nginx docs)."}}, {"@type": "Question", "name": "What's the difference between 401 and 403 here?", "acceptedAnswer": {"@type": "Answer", "text": "401 + WWW-Authenticate means 'send credentials'. nginx answered 403 when the password file couldn't be opened."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>WWW-Authenticate header: Basic auth in nginx, Bearer, and why the login prompt doesn&#x27;t appear (tested)</h1>
+<p class="lead">A 401 response should say how to authenticate in WWW-Authenticate. We protected a folder with nginx auth_basic and logged what curl and Chrome did with each answer.</p>
+<h2>1. What nginx auth_basic answered</h2>
+<table><thead><tr><th>Request</th><th>Status</th><th>Response header / error log</th></tr></thead><tbody>
+<tr><td>No credentials</td><td>401</td><td><code>WWW-Authenticate: Basic realm="Staging area"</code></td></tr>
+<tr><td><code>curl -u alice:s3cret</code></td><td>200</td><td>page served</td></tr>
+<tr><td>Wrong password (or wrong case)</td><td>401</td><td>log: <code>user "alice": password mismatch</code></td></tr>
+<tr><td>Unknown user</td><td>401</td><td>log: <code>user "bob" was not found in "/etc/nginx/htpasswd"</code></td></tr>
+<tr><td><code>Authorization: Bearer abc</code></td><td>401</td><td>Basic challenge again: nginx only understands Basic</td></tr>
+<tr><td>Password file missing</td><td><strong>403</strong></td><td>log: <code>open() "/etc/nginx/nope" failed</code></td></tr>
+</tbody></table>
+<pre><code>location /staging/ {
+    auth_basic           "Staging area";   # becomes realm="Staging area"
+    auth_basic_user_file /etc/nginx/htpasswd;
+}
+location /staging/health { auth_basic off; }   # public exception</code></pre>
+<p>Log lines tell you which case you're in; the client always sees the same 401.</p>
+<h2>2. The trap: <code>return</code> skips auth_basic</h2>
+<p>With <code>return 200 "...";</code> in the protected location, every request got <strong>200 without credentials</strong>, no 401 at all. <code>return</code> runs in nginx's rewrite phase, before the access phase where auth_basic checks the password. Protect locations that serve files or <code>proxy_pass</code>; don't test your setup with a <code>return</code> stub.</p>
+<h2>3. Basic vs Bearer, and when the browser asks</h2>
+<ul><li><code>WWW-Authenticate: Basic realm="..."</code>: Chrome sent the stored user/password only after this challenge, then reused it for a same-origin <code>fetch()</code> (200).</li>
+<li><code>WWW-Authenticate: Bearer realm="api", error="invalid_token"</code>: Chrome sent nothing and kept the 401. Browsers never prompt for tokens; your JavaScript adds <code>Authorization: Bearer ...</code> itself (<a href="/guides/bearer-token-authorization-header/">Bearer token header, explained</a>).</li>
+<li>401 with <strong>no</strong> WWW-Authenticate: no credentials sent, no prompt. That's the usual reason a "login prompt doesn't appear": an API returns 401 for a missing token and the browser has nothing to answer.</li></ul>
+<p>Basic sends the password base64-encoded, not encrypted: use it only over HTTPS (<a href="/guides/strict-transport-security-header-nginx/">HSTS in nginx</a>). Inspect what a URL sends with the free <a href="/tools/http-headers/">HTTP headers checker</a>.</p>
+<aside class="cta"><strong>Check which WWW-Authenticate header a URL sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does WWW-Authenticate: Basic realm mean?</summary><p>The server wants a username and password (HTTP Basic). The realm is the label from nginx&#x27;s auth_basic, e.g. auth_basic &quot;Staging area&quot; sent realm=&quot;Staging area&quot; in our test.</p></details>
+<details><summary>Why is nginx auth_basic not working?</summary><p>In our test a location using return 200 served every request without asking for a password, because return runs before auth_basic. Also check the error log: a missing password file gave 403, not 401.</p></details>
+<details><summary>Why doesn&#x27;t the browser show a login prompt on 401?</summary><p>The response needs WWW-Authenticate: Basic. With no WWW-Authenticate header, or a Bearer challenge, Chrome sent no credentials in our test.</p></details>
+<details><summary>Can nginx auth_basic check a Bearer token?</summary><p>No. A Bearer Authorization header got the Basic 401 challenge back; token checks need your app (or nginx auth_request, per the nginx docs).</p></details>
+<details><summary>What&#x27;s the difference between 401 and 403 here?</summary><p>401 + WWW-Authenticate means &#x27;send credentials&#x27;. nginx answered 403 when the password file couldn&#x27;t be opened.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 with a throwaway nginx:alpine container (auth_basic + auth_basic_user_file, removed afterwards), curl, and Chromium 153 (full build) with Playwright httpCredentials against nginx and a small Node server that answered 401 with no WWW-Authenticate or with a Bearer challenge. Password hashing advice (htpasswd -B / bcrypt) is from the nginx docs, not this test; the test file used a {PLAIN} entry. PlainHeaders is our extension; the other methods are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

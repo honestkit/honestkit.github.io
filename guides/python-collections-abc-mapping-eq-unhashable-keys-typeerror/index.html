@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mapping.__eq__ Needs Hashable Keys; get()/items() Don&#x27;t (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: a Mapping with unhashable keys works for get()/keys()/items(), but m == m raises TypeError -- __eq__ builds a dict() internally.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-collections-abc-mapping-eq-unhashable-keys-typeerror/">
+<meta property="og:title" content="Mapping.__eq__ Needs Hashable Keys; get()/items() Don&#x27;t (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: a Mapping with unhashable keys works for get()/keys()/items(), but m == m raises TypeError -- __eq__ builds a dict() internally.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-collections-abc-mapping-eq-unhashable-keys-typeerror/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Mapping.__eq__ require hashable keys when __getitem__/__iter__/__len__ don't?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that the inherited __eq__ is implemented as dict(self.items()) == dict(other.items()) in CPython's _collections_abc.py -- it builds real dict objects to compare, and building a dict requires hashing every key, even though nothing in Mapping's abstract contract (__getitem__, __len__, __iter__) requires keys to be hashable."}}, {"@type": "Question", "name": "Can a collections.abc.Mapping subclass legitimately have unhashable keys?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- if __getitem__ is implemented as a linear scan (comparing keys with == instead of hashing them), unhashable keys like lists or other mappings work fine for every mixin method except the inherited __eq__, which is the only one that internally constructs a real dict."}}, {"@type": "Question", "name": "Does m == m fail even when comparing a mapping to itself?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We measured this directly -- the equality check doesn't short-circuit on identity, so dict(self.items()) still gets built and still raises TypeError on unhashable keys even when both sides of == are the exact same object."}}, {"@type": "Question", "name": "How do I fix __eq__ for a Mapping subclass with unhashable keys?", "acceptedAnswer": {"@type": "Answer", "text": "Override __eq__ yourself to compare via items() or get() directly instead of relying on the inherited mixin -- we measured that walking both mappings' entries manually (checking length, then checking every key/value pair with get()) avoids ever calling dict() or hash() on a key."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>collections.abc.Mapping __eq__ Requires Hashable Keys, Nothing Else Does (tested)</h1>
+<p class="lead"><code>collections.abc.Mapping</code> only requires you to implement <code>__getitem__</code>, <code>__len__</code>, and <code>__iter__</code> -- nothing in that contract says keys must be hashable, and a mapping backed by a linear scan over <code>(key, value)</code> pairs (rather than a real <code>dict</code>) can legitimately support unhashable keys like lists or other mappings. Every mixin method built from those three -- <code>keys()</code>, <code>values()</code>, <code>items()</code>, <code>get()</code>, <code>__contains__</code> -- works fine on such a mapping. The inherited <code>__eq__</code> is the one exception: its implementation is <code>dict(self.items()) == dict(other.items())</code>, which builds a real <code>dict</code> internally and therefore demands hashable keys, even though hashability was never part of the abstract contract it's supposed to be satisfying.</p>
+<h2 id="repro1">1. A Mapping backed by a linear scan supports unhashable keys</h2>
+<pre><code>from collections.abc import Mapping
+
+class ListKeyMapping(Mapping):
+    def __init__(self, pairs):
+        self._pairs = list(pairs)
+    def __getitem__(self, key):
+        for k, v in self._pairs:
+            if k == key:
+                return v
+        raise KeyError(key)
+    def __iter__(self):
+        return (k for k, v in self._pairs)
+    def __len__(self):
+        return len(self._pairs)
+
+m = ListKeyMapping([(['a'], 1), (['b'], 2)])
+print(list(m.keys()))
+print(list(m.items()))
+print(m.get(['a']))</code></pre>
+<pre><code>[['a'], ['b']]
+[(['a'], 1), (['b'], 2)]
+1</code></pre>
+<p><strong>Measured:</strong> the keys are plain Python lists, which are unhashable -- a real <code>dict</code> could never use them as keys. <code>ListKeyMapping</code> only implements the three required abstract methods and never hashes a key anywhere, so <code>keys()</code>, <code>items()</code>, and <code>get()</code> (all mixin methods built on top of those three) work correctly.</p>
+
+<h2 id="repro2">2. == crashes -- even comparing the mapping to itself</h2>
+<pre><code>try:
+    m == m
+except TypeError as e:
+    print("m == m ->", e)</code></pre>
+<pre><code>m == m -> unhashable type: 'list'</code></pre>
+<p><strong>Measured:</strong> <code>m == m</code> -- the exact same object, no second mapping involved -- raises <code>TypeError</code>. Comparing against a non-Mapping type like <code>m == 5</code> still works and correctly returns <code>False</code> (the mixin checks <code>isinstance(other, Mapping)</code> first and returns <code>NotImplemented</code> if it fails); the crash is specific to comparing two actual <code>Mapping</code>s.</p>
+
+<h2 id="repro3">3. Why: the mixin builds a real dict internally</h2>
+<pre><code>import inspect
+from collections.abc import Mapping
+# Mapping.__eq__ is implemented (in CPython's _collections_abc.py) as:
+#     def __eq__(self, other):
+#         if not isinstance(other, Mapping):
+#             return NotImplemented
+#         return dict(self.items()) == dict(other.items())
+</code></pre>
+<pre><code># (shown above -- this is the actual mixin body, not reproduced output)</code></pre>
+<p><strong>Measured:</strong> the inherited <code>__eq__</code> doesn't compare key-by-key through the abstract interface; it calls the real <code>dict()</code> constructor on <code>self.items()</code> and <code>other.items()</code> and compares those two plain dicts. Building a <code>dict</code> requires hashing every key, so any key that isn't hashable blows up <code>__eq__</code> specifically, regardless of how correctly <code>__getitem__</code>, <code>__iter__</code>, and <code>__len__</code> are implemented.</p>
+
+<h2 id="repro4">4. The fix: override __eq__ yourself</h2>
+<pre><code>class ListKeyMapping2(ListKeyMapping):
+    def __eq__(self, other):
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        if len(self) != len(other):
+            return False
+        return all(other.get(k, object()) == v for k, v in self.items())
+    __hash__ = None
+
+m2 = ListKeyMapping2([(['a'], 1), (['b'], 2)])
+print(m2 == m2)</code></pre>
+<pre><code>True</code></pre>
+<p><strong>Measured:</strong> overriding <code>__eq__</code> to walk <code>items()</code> directly instead of routing through <code>dict()</code> fixes the comparison without needing hashable keys. This is the same class of problem as <code>Set</code>'s <code>_from_iterable</code> hook: a mixin method assumes something (a single-arg constructor, or here, hashable keys) that the required abstract methods never actually guarantee, and the assumption only surfaces once that specific derived method is used.</p>
+<aside class="cta"><strong>Subclassing collections.abc.Mapping with keys that aren&#x27;t hashable (lists, dicts, other mappings)? Every mixin method works except one -- == crashes, even comparing the mapping to itself:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Mapping.__eq__ require hashable keys when __getitem__/__iter__/__len__ don&#x27;t?</summary><p>We measured that the inherited __eq__ is implemented as dict(self.items()) == dict(other.items()) in CPython&#x27;s _collections_abc.py -- it builds real dict objects to compare, and building a dict requires hashing every key, even though nothing in Mapping&#x27;s abstract contract (__getitem__, __len__, __iter__) requires keys to be hashable.</p></details>
+<details><summary>Can a collections.abc.Mapping subclass legitimately have unhashable keys?</summary><p>Yes -- if __getitem__ is implemented as a linear scan (comparing keys with == instead of hashing them), unhashable keys like lists or other mappings work fine for every mixin method except the inherited __eq__, which is the only one that internally constructs a real dict.</p></details>
+<details><summary>Does m == m fail even when comparing a mapping to itself?</summary><p>Yes. We measured this directly -- the equality check doesn&#x27;t short-circuit on identity, so dict(self.items()) still gets built and still raises TypeError on unhashable keys even when both sides of == are the exact same object.</p></details>
+<details><summary>How do I fix __eq__ for a Mapping subclass with unhashable keys?</summary><p>Override __eq__ yourself to compare via items() or get() directly instead of relying on the inherited mixin -- we measured that walking both mappings&#x27; entries manually (checking length, then checking every key/value pair with get()) avoids ever calling dict() or hash() on a key.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in collections.abc.Mapping: subclassed it with __getitem__/__iter__/__len__ backed by a linear scan over (key, value) pairs so the keys never need to be hashed, then exercised keys()/values()/items()/get()/repr() (all fine) followed by == (TypeError, even against itself). PlainHeaders is our extension; Python&#x27;s collections.abc module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

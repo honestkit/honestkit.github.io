@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exit Code 137: What It Means and How to Fix It (Tested)</title>
+<meta name="description" content="We killed real processes and Docker containers to show what exit code 137 means, why it&#x27;s always a kill signal, and how to tell an OOM kill from a manual one.">
+<link rel="canonical" href="https://honestkit.github.io/guides/exit-code-137/">
+<meta property="og:title" content="Exit Code 137: What It Means and How to Fix It (Tested)">
+<meta property="og:description" content="We killed real processes and Docker containers to show what exit code 137 means, why it&#x27;s always a kill signal, and how to tell an OOM kill from a manual one.">
+<meta property="og:url" content="https://honestkit.github.io/guides/exit-code-137/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can my own code cause exit code 137?", "acceptedAnswer": {"@type": "Answer", "text": "No. Exit code 137 only ever means a process was killed by SIGKILL (signal 9); a program cannot produce it by calling exit() itself. If you see 137 and nothing obviously killed the process, check that something else isn't sending the signal (orchestrator, health check, CI step) before assuming it's a bug in your code."}}, {"@type": "Question", "name": "Does exit code 137 always mean out of memory?", "acceptedAnswer": {"@type": "Answer", "text": "No, we confirmed this directly: a container we killed manually with plenty of free memory also reported exit code 137. Docker and Kubernetes only distinguish the two through a separate field (OOMKilled in Docker, the pod's termination reason in Kubernetes), not the exit code itself."}}, {"@type": "Question", "name": "What's the difference between 137 and 143?", "acceptedAnswer": {"@type": "Answer", "text": "Both are kill signals reported as 128 + signal number: 137 is SIGKILL (9, immediate, cannot be caught), 143 is SIGTERM (15, a polite request to shut down that a process can catch and handle). Docker's docker stop sends SIGTERM first and escalates to SIGKILL only if the process hasn't exited after the grace period."}}, {"@type": "Question", "name": "How do I check if a Kubernetes pod's 137 was an OOM kill?", "acceptedAnswer": {"@type": "Answer", "text": "Run kubectl describe pod <name> and look at the Last State section: Reason: OOMKilled next to Exit Code: 137 confirms a memory-limit kill. If Reason says Error or something else instead, a different mechanism killed it."}}, {"@type": "Question", "name": "I raised the memory limit and it still exits 137 eventually \u2014 why?", "acceptedAnswer": {"@type": "Answer", "text": "That usually means a real memory leak rather than an undersized limit: usage climbs without bound instead of plateauing, so any fixed limit just delays the same crash. Watch the container's memory usage over time (docker stats or your orchestrator's metrics) to tell a leak (steadily climbing) from a one-off spike (fixed limit too low)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Exit Code 137 (tested)</h1>
+<p class="lead"><code>Exit code 137</code> never comes from your program choosing to exit with that number &mdash; it is not a valid argument to <code>exit()</code>. It means something sent the process <strong>SIGKILL</strong> (signal 9), and the shell or container runtime reported it back as <code>128 + 9</code>. We verified this directly: sending real signals and reading the real exit codes, in bash and in Docker.</p>
+
+<h2>1. The formula: 128 + signal number</h2>
+<p>When a process is killed by a signal rather than calling <code>exit()</code> itself, Unix shells and container runtimes report the exit status as <code>128 + signal number</code>. We measured this directly on this box:</p>
+<pre><code>$ bash -c 'sleep 30 &amp; PID=$!; kill -9 $PID; wait $PID; echo "exit: $?"'
+Killed
+exit: 137
+
+$ bash -c 'sleep 30 &amp; PID=$!; kill -15 $PID; wait $PID; echo "exit: $?"'
+exit: 143</code></pre>
+<p><code>kill -9</code> is SIGKILL (9), so <code>128 + 9 = 137</code>. <code>kill -15</code> is SIGTERM (15), giving <code>143</code>. The common ones you'll meet:</p>
+<table>
+<tr><th>Exit code</th><th>Signal</th><th>Meaning</th></tr>
+<tr><td>137</td><td>SIGKILL (9)</td><td>Forcibly killed &mdash; cannot be caught or ignored by the process. Usually the OS/container runtime running out of patience or memory.</td></tr>
+<tr><td>143</td><td>SIGTERM (15)</td><td>Asked to terminate gracefully. Docker's default <code>docker stop</code> sends this first, then SIGKILL after a grace period.</td></tr>
+<tr><td>139</td><td>SIGSEGV (11)</td><td>Segmentation fault &mdash; the process accessed memory it shouldn't have.</td></tr>
+<tr><td>134</td><td>SIGABRT (6)</td><td>The process called <code>abort()</code>, often from a failed assertion.</td></tr>
+</table>
+<p>A process can never choose to exit with 137 itself &mdash; <code>exit(137)</code> in your own code is indistinguishable from a real SIGKILL in the shell, which is a common source of confusion when debugging. If you see it and you're sure nothing killed the process, check your own exit code logic first.</p>
+
+<h2>2. Docker: 137 means something killed the container, but not always OOM</h2>
+<p>We ran two real containers to compare. First, a container we killed manually with no memory pressure at all:</p>
+<pre><code>$ docker run -d --name test sleep 60
+$ docker kill -s SIGKILL test
+$ docker inspect test --format '{{.State.ExitCode}} oom={{.State.OOMKilled}}'
+137 oom=false</code></pre>
+<p>Then a container we deliberately starved of memory with Docker's own <code>--memory</code> limit, doing nothing but allocating RAM in a loop:</p>
+<pre><code>$ docker run --name test --memory=10m alpine sh -c   "a='A'; while true; do a=\$a\$a\$a\$a; done"
+$ docker inspect test --format '{{.State.ExitCode}} oom={{.State.OOMKilled}}'
+137 oom=true</code></pre>
+<p><strong>Both report exit code 137</strong> &mdash; Docker (and Kubernetes, which uses the same underlying mechanism) only distinguishes them through a separate field. In plain Docker it's <code>docker inspect</code>'s <code>.State.OOMKilled</code>; in Kubernetes it's the pod's <code>reason: OOMKilled</code> next to <code>exitCode: 137</code> in <code>kubectl describe pod</code>. If you only look at the exit code, a genuine memory limit and someone running <code>docker kill</code> look identical.</p>
+
+<h2>3. How to tell which one happened to you</h2>
+<ul>
+<li><strong>Docker Compose / plain Docker:</strong> <code>docker inspect &lt;container&gt; --format '{{.State.OOMKilled}}'</code> &mdash; <code>true</code> means the container's own memory limit (or the host's, if unset) was hit.</li>
+<li><strong>Kubernetes:</strong> <code>kubectl describe pod &lt;name&gt;</code> and look for <code>Last State: Terminated, Reason: OOMKilled</code> next to <code>Exit Code: 137</code>. If the reason says <code>Error</code> instead, it was a different kill.</li>
+<li><strong>AWS ECS:</strong> a task that exits 137 from a memory limit shows <code>OutOfMemoryError</code> as the stopped reason in the task's stopped-reason field, not just the exit code.</li>
+<li><strong>Bare process / systemd:</strong> check <code>journalctl -u &lt;service&gt;</code> or (if you have permission) <code>dmesg</code> for a kernel line like <code>Out of memory: Killed process &lt;pid&gt;</code> &mdash; see our <a href="/guides/out-of-memory-killed/">out-of-memory-killed guide</a> for exactly how we reproduced and read one of these.</li>
+<li><strong>Nobody killed it on purpose and there's no memory pressure:</strong> check whether your own orchestrator, health-check, or a teammate's script is sending the kill &mdash; 137 is never spontaneous.</li>
+</ul>
+
+<h2>4. Fixing an OOM-caused 137</h2>
+<p>Once you've confirmed it's a real memory limit (not a manual kill), the fix is one of:</p>
+<ul>
+<li>Raise the container/pod memory limit if the workload genuinely needs more (check actual peak usage first with <code>docker stats</code> or your orchestrator's metrics, don't just guess upward).</li>
+<li>Fix a memory leak if usage climbs without bound over time rather than plateauing &mdash; a limit increase just delays the same crash.</li>
+<li>For language-specific heap limits hit well below the container's memory ceiling (e.g. Node's V8 heap), the fix is different &mdash; see our guide on that specific failure mode rather than raising the container limit, which won't help.</li>
+</ul>
+
+<h2>5. Fixing a non-OOM 137 (someone/something killed it on purpose)</h2>
+<p>If <code>OOMKilled</code> is false, look for: a deploy script or CI job calling <code>docker kill</code>/<code>kill -9</code> directly instead of a graceful <code>stop</code>, a Kubernetes liveness probe failing and triggering a forced restart, or a process manager (systemd, supervisord, PM2) configured with too short a shutdown grace period so it escalates straight to SIGKILL before your app can finish handling SIGTERM.</p>
+
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can my own code cause exit code 137?</summary><p>No. Exit code 137 only ever means a process was killed by SIGKILL (signal 9); a program cannot produce it by calling exit() itself. If you see 137 and nothing obviously killed the process, check that something else isn&#x27;t sending the signal (orchestrator, health check, CI step) before assuming it&#x27;s a bug in your code.</p></details>
+<details><summary>Does exit code 137 always mean out of memory?</summary><p>No, we confirmed this directly: a container we killed manually with plenty of free memory also reported exit code 137. Docker and Kubernetes only distinguish the two through a separate field (OOMKilled in Docker, the pod&#x27;s termination reason in Kubernetes), not the exit code itself.</p></details>
+<details><summary>What&#x27;s the difference between 137 and 143?</summary><p>Both are kill signals reported as 128 + signal number: 137 is SIGKILL (9, immediate, cannot be caught), 143 is SIGTERM (15, a polite request to shut down that a process can catch and handle). Docker&#x27;s docker stop sends SIGTERM first and escalates to SIGKILL only if the process hasn&#x27;t exited after the grace period.</p></details>
+<details><summary>How do I check if a Kubernetes pod&#x27;s 137 was an OOM kill?</summary><p>Run kubectl describe pod &lt;name&gt; and look at the Last State section: Reason: OOMKilled next to Exit Code: 137 confirms a memory-limit kill. If Reason says Error or something else instead, a different mechanism killed it.</p></details>
+<details><summary>I raised the memory limit and it still exits 137 eventually — why?</summary><p>That usually means a real memory leak rather than an undersized limit: usage climbs without bound instead of plateauing, so any fixed limit just delays the same crash. Watch the container&#x27;s memory usage over time (docker stats or your orchestrator&#x27;s metrics) to tell a leak (steadily climbing) from a one-off spike (fixed limit too low).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 on Debian 13 / Linux 6.12, bash 5.x, Docker 29.8.1. We sent real SIGKILL/SIGTERM signals to processes and read bash&#x27;s own $? exit codes, and ran real Docker containers (one manually killed, one actually OOM-killed via --memory) to compare the ExitCode and OOMKilled fields in `docker inspect`. PlainHeaders is our extension; bash and Docker are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

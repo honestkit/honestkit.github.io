@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TypeError: X Is Not a Function: Real Causes (Tested)</title>
+<meta name="description" content="We reproduced &#x27;X is not a function&#x27; in Node 24: broken imports, lost &#x27;this&#x27;, and unset properties. Exact error text for each, and how it differs from a typo.">
+<link rel="canonical" href="https://honestkit.github.io/guides/javascript-undefined-is-not-a-function/">
+<meta property="og:title" content="TypeError: X Is Not a Function: Real Causes (Tested)">
+<meta property="og:description" content="We reproduced &#x27;X is not a function&#x27; in Node 24: broken imports, lost &#x27;this&#x27;, and unset properties. Exact error text for each, and how it differs from a typo.">
+<meta property="og:url" content="https://honestkit.github.io/guides/javascript-undefined-is-not-a-function/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is 'X is not a function' the same as calling a misspelled function name?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured a truly undeclared name and got a different error entirely: ReferenceError: X is not defined. 'TypeError: X is not a function' means X does exist as a value, it's just not callable (usually undefined)."}}, {"@type": "Question", "name": "Why does my import look right but the imported thing isn't a function?", "acceptedAnswer": {"@type": "Answer", "text": "We measured two silent-failure paths: destructuring a missing named export from require() and from dynamic import() both give you undefined with no warning, and only fail when you call it (TypeError: foo is not a function). A static import {foo} from '...' catches a missing export immediately as a SyntaxError instead."}}, {"@type": "Question", "name": "I extracted a method from an object and now it's 'not a function' \u2014 why?", "acceptedAnswer": {"@type": "Answer", "text": "You detached it from `this`. We measured that in sloppy/CommonJS code this falls back to a non-undefined object, so `this.helper` reads as undefined and fails at the call: 'this.helper is not a function'. In strict mode or a class, `this` itself is undefined, so you get a different error first: 'Cannot read properties of undefined (reading 'helper')'."}}, {"@type": "Question", "name": "Why do I get two different errors for the same kind of bug?", "acceptedAnswer": {"@type": "Answer", "text": "Strict mode changes what `this` is when a method is called standalone. We measured `this` as undefined in strict/class code (crashes on the property read) versus a fallback object in sloppy CommonJS code (crashes only when you try to call the undefined property). Same bug, different exact wording."}}, {"@type": "Question", "name": "What's the fastest way to confirm this is the bug?", "acceptedAnswer": {"@type": "Answer", "text": "Add `console.log(typeof theThingYouAreCalling)` right before the call that throws. 'undefined' confirms it; anything else (like 'string' or 'object') means you're calling a non-function value for a different reason."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TypeError: X Is Not a Function (tested)</h1>
+<p class="lead"><code>TypeError: X is not a function</code> means <code>X</code> exists as a value but is not callable &mdash; usually <code>undefined</code>, sometimes a string, number, or object. This is different from calling a name that was never declared at all. We reproduced the three real causes in Node.js v24.21.0 and captured the exact wording for each.</p>
+<h2>1. It's not usually a typo'd function name</h2>
+<p>A genuinely misspelled, never-declared name throws a different error entirely:</p>
+<pre><code>undeclaredFn();
+// ReferenceError: undeclaredFn is not defined</code></pre>
+<p>"X is not a function" means the opposite situation: <code>X</code> resolved to <em>something</em> &mdash; it's just not a function. We ran this directly:</p>
+<pre><code>const handlers = {};
+handlers.onClick();
+// TypeError: handlers.onClick is not a function</code></pre>
+<p><code>handlers.onClick</code> is <code>undefined</code> because nothing ever assigned it &mdash; a common bug when a conditional branch that sets a handler never ran. The message always names the full expression you called (<code>handlers.onClick</code>), not just the final property.</p>
+
+<h2>2. Cause: a named import that doesn't exist</h2>
+<p>We built a tiny module that only exports <code>bar</code>:</p>
+<pre><code>// modA.mjs
+export function bar() { return 'bar'; }</code></pre>
+<p>A static ESM <code>import</code> of a missing export is actually caught at load time, before any function call &mdash; Node analyzes the module graph first:</p>
+<pre><code>import { foo } from './modA.mjs';
+foo();
+// SyntaxError: The requested module './modA.mjs' does not provide an export named 'foo'</code></pre>
+<p>That's a <strong>SyntaxError</strong>, not the bug this guide is about. The real "is not a function" case shows up with <strong>CommonJS</strong> destructuring, which has no such check &mdash; a missing property just silently becomes <code>undefined</code>:</p>
+<pre><code>// modA.cjs
+module.exports = { bar: function() { return 'bar'; } };
+
+// caseCJS.cjs
+const { foo } = require('./modA.cjs');
+foo();
+// TypeError: foo is not a function</code></pre>
+<p>We confirmed the same silent failure with dynamic <code>import()</code>, which returns a plain namespace object with no export check at destructure time:</p>
+<pre><code>const { foo } = await import('./modA.mjs');
+foo();
+// TypeError: foo is not a function</code></pre>
+<p>So: static <code>import {x}</code> fails loudly and early; <code>require()</code> destructuring and dynamic <code>import()</code> destructuring both fail silently until the call site. If you renamed an export or imported from the wrong file, this is the likeliest cause.</p>
+
+<h2>3. Cause: unbound <code>this</code> loses the method</h2>
+<p>Extracting a method from an object and calling it alone detaches it from its <code>this</code>. What error you get depends on strict vs. sloppy mode. In a CommonJS (sloppy-mode) file:</p>
+<pre><code>const obj = {
+  helper: function() { return 42; },
+  run: function() { return this.helper(); }
+};
+const { run } = obj;
+run();
+// TypeError: this.helper is not a function</code></pre>
+<p>In sloppy mode, a standalone call makes <code>this</code> fall back to an object (Node's module-level <code>this</code>/global, not <code>undefined</code>), so reading <code>this.helper</code> doesn't crash &mdash; it just silently returns <code>undefined</code>, which then fails at the call. We measured the same code as a class in an ES module (always strict mode) and got a <em>different</em> error instead:</p>
+<pre><code>class Widget {
+  helper() { return 42; }
+  run() { return this.helper(); }
+}
+const w = new Widget();
+const { run } = w;
+run();
+// TypeError: Cannot read properties of undefined (reading 'helper')</code></pre>
+<p>In strict mode <code>this</code> is <code>undefined</code> when a method is called without its object, so the property <em>read</em> throws first &mdash; see <a href="/guides/cannot-read-properties-of-undefined/">Cannot Read Properties of Undefined</a> for that error on its own. Same root cause (a detached method), two different exact messages depending on strict mode.</p>
+
+<h2>4. How to tell which one you've got</h2>
+<table>
+<tr><th>Situation</th><th>Exact error we measured</th></tr>
+<tr><td>Name never declared anywhere</td><td>ReferenceError: X is not defined</td></tr>
+<tr><td>Property/variable never assigned a function</td><td>TypeError: handlers.onClick is not a function</td></tr>
+<tr><td>Static <code>import</code> of a missing named export</td><td>SyntaxError: ... does not provide an export named 'X'</td></tr>
+<tr><td><code>require()</code> destructure of a missing export</td><td>TypeError: foo is not a function</td></tr>
+<tr><td>Dynamic <code>import()</code> destructure of a missing export</td><td>TypeError: foo is not a function</td></tr>
+<tr><td>Detached method, sloppy mode</td><td>TypeError: this.helper is not a function</td></tr>
+<tr><td>Detached method, strict mode / class</td><td>TypeError: Cannot read properties of undefined (reading 'helper')</td></tr>
+</table>
+
+<h2>5. Fixes</h2>
+<ul>
+<li><strong>Check the import first.</strong> Log the imported value (<code>console.log(foo)</code>) before calling it. If it's <code>undefined</code>, the export name or path is wrong &mdash; check the module's actual export list, not what you assume it exports.</li>
+<li><strong>Prefer static <code>import</code> over destructured <code>require()</code>/dynamic <code>import()</code>.</strong> We measured that only the static form catches a missing export immediately, before any code runs.</li>
+<li><strong>Bind methods you plan to detach.</strong> Use <code>run = run.bind(obj)</code>, an arrow-function class field (<code>run = () =&gt; this.helper()</code>), or call it as <code>obj.run()</code> instead of destructuring it out.</li>
+<li><strong>Guard conditional assignment.</strong> If a property is only sometimes set to a function (like <code>handlers.onClick</code> above), give it a default no-op so a missed branch doesn't crash a later call.</li>
+</ul>
+<p>If the crash instead happens on a property <em>read</em> rather than a call, see <a href="/guides/cannot-read-properties-of-undefined/">Cannot Read Properties of Undefined</a>. If it's deep recursion blowing the stack rather than a bad call target, see <a href="/guides/maximum-call-stack-size-exceeded/">Maximum Call Stack Size Exceeded</a>.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is &#x27;X is not a function&#x27; the same as calling a misspelled function name?</summary><p>No. We measured a truly undeclared name and got a different error entirely: ReferenceError: X is not defined. &#x27;TypeError: X is not a function&#x27; means X does exist as a value, it&#x27;s just not callable (usually undefined).</p></details>
+<details><summary>Why does my import look right but the imported thing isn&#x27;t a function?</summary><p>We measured two silent-failure paths: destructuring a missing named export from require() and from dynamic import() both give you undefined with no warning, and only fail when you call it (TypeError: foo is not a function). A static import {foo} from &#x27;...&#x27; catches a missing export immediately as a SyntaxError instead.</p></details>
+<details><summary>I extracted a method from an object and now it&#x27;s &#x27;not a function&#x27; — why?</summary><p>You detached it from `this`. We measured that in sloppy/CommonJS code this falls back to a non-undefined object, so `this.helper` reads as undefined and fails at the call: &#x27;this.helper is not a function&#x27;. In strict mode or a class, `this` itself is undefined, so you get a different error first: &#x27;Cannot read properties of undefined (reading &#x27;helper&#x27;)&#x27;.</p></details>
+<details><summary>Why do I get two different errors for the same kind of bug?</summary><p>Strict mode changes what `this` is when a method is called standalone. We measured `this` as undefined in strict/class code (crashes on the property read) versus a fallback object in sloppy CommonJS code (crashes only when you try to call the undefined property). Same bug, different exact wording.</p></details>
+<details><summary>What&#x27;s the fastest way to confirm this is the bug?</summary><p>Add `console.log(typeof theThingYouAreCalling)` right before the call that throws. &#x27;undefined&#x27; confirms it; anything else (like &#x27;string&#x27; or &#x27;object&#x27;) means you&#x27;re calling a non-function value for a different reason.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Node.js v24.21.0 on Linux. Every snippet below was run as a real file in /tmp and the output is copied verbatim, not guessed. PlainHeaders is our extension; Node.js is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

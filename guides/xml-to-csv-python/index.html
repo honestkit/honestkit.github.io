@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XML to CSV in Python With ElementTree (No pandas, Nested + Repeated Elements)</title>
+<meta name="description" content="A standard-library Python script that turns repeating XML elements (RSS items, sitemap URLs, export records) into CSV rows, with attributes, nested and repeated elements as columns and namespaces handled. Tested on real feeds.">
+<link rel="canonical" href="https://honestkit.github.io/guides/xml-to-csv-python/">
+<meta property="og:title" content="XML to CSV in Python With ElementTree (No pandas, Nested + Repeated Elements)">
+<meta property="og:description" content="A standard-library Python script that turns repeating XML elements (RSS items, sitemap URLs, export records) into CSV rows, with attributes, nested and repeated elements as columns and namespaces handled. Tested on real feeds.">
+<meta property="og:url" content="https://honestkit.github.io/guides/xml-to-csv-python/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can I convert XML to CSV without pandas?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. The script above uses only xml.etree.ElementTree and csv. With pandas 1.3+, pd.read_xml('file.xml', xpath='//item').to_csv('out.csv', index=False) works for flat records (it uses lxml unless you pass parser='etree'), but it does not flatten nested elements."}}, {"@type": "Question", "name": "How do I find the row element?", "acceptedAnswer": {"@type": "Answer", "text": "Look for the element that repeats: item in RSS, url in a sitemap, entry in Atom, often record or row in exports. The browser tool lists every repeating element with its count."}}, {"@type": "Question", "name": "Why do I get an empty CSV?", "acceptedAnswer": {"@type": "Answer", "text": "The row element name is wrong, or the file uses a default namespace and you matched the full tag. The script compares local names, so pass just the name, e.g. url."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to convert XML to CSV in Python</h1>
+<p class="lead">XML to CSV comes down to two choices: which element is a row, and how nested data becomes columns. This script takes the row element as an argument and flattens everything inside it, using only the standard library.</p>
+<h2>1. The script</h2>
+<p>Save as <code>xml2csv.py</code>:</p>
+<pre><code>import csv, sys
+import xml.etree.ElementTree as ET
+
+def local(tag):  # '{http://www.sitemaps.org/schemas/sitemap/0.9}loc' -&gt; 'loc'
+    return tag.rsplit('}', 1)[-1]
+
+def flatten(el, prefix=''):
+    row = {f'{prefix or local(el.tag)}@{local(k)}': v for k, v in el.attrib.items()}
+    seen = {}
+    for child in el:
+        name = local(child.tag)
+        seen[name] = seen.get(name, 0) + 1
+        key = prefix + name + (f'_{seen[name]}' if seen[name] &gt; 1 else '')
+        if len(child):
+            row.update(flatten(child, key + '/'))
+        else:
+            row.update({f'{key}@{local(k)}': v for k, v in child.attrib.items()})
+            if (child.text or '').strip() or not child.attrib:
+                row[key] = (child.text or '').strip()
+    return row
+
+root = ET.parse(sys.argv[1]).getroot()
+record = sys.argv[2]  # the repeating element, e.g. item (RSS) or url (sitemap)
+rows = [flatten(el) for el in root.iter() if local(el.tag) == record]
+columns = list(dict.fromkeys(k for r in rows for k in r))
+with open(sys.argv[3], 'w', newline='', encoding='utf-8-sig') as f:
+    w = csv.DictWriter(f, fieldnames=columns)
+    w.writeheader()
+    w.writerows(rows)
+print(f'{len(rows)} &lt;{record}&gt; rows, {len(columns)} columns -&gt; {sys.argv[3]}')
+</code></pre>
+<h2>2. Run it</h2>
+<pre><code>curl -sL https://www.sitemaps.org/sitemap.xml -o sitemap.xml
+python3 xml2csv.py sitemap.xml url sitemap.csv</code></pre>
+<p>Our run printed <code>84 &lt;url&gt; rows, 2 columns -&gt; sitemap.csv</code>:</p>
+<pre><code>loc,lastmod
+https://www.sitemaps.org/,2016-11-21
+https://www.sitemaps.org/protocol.html,2022-12-15</code></pre>
+<p>For an RSS feed, the row element is <code>item</code>: <code>python3 xml2csv.py feed.xml item feed.csv</code>. On the BBC News feed that gave 38 rows with title, description, link, guid, pubDate and the thumbnail's width, height and url.</p>
+<h2>3. How the columns are named</h2>
+<ul><li>Attributes: <code>element@attribute</code>, e.g. <code>guid@isPermaLink</code>, <code>url@id</code>.</li>
+<li>Nested elements: <code>parent/child</code>, e.g. <code>publisher/city</code>.</li>
+<li>Repeated elements: <code>author</code>, <code>author_2</code>, … so two authors never overwrite each other.</li>
+<li>Records with different fields share one header (the union of all columns); missing values stay empty.</li></ul>
+<h2>4. Limits</h2>
+<ul><li><strong>Namespaces</strong>: ElementTree reports <code>{http://search.yahoo.com/mrss/}thumbnail</code>, and the script keeps only the local name (<code>thumbnail</code>). If two namespaces use the same name inside one record, their columns collide; the browser tool below keeps the prefix (<code>media:thumbnail</code>).</li>
+<li>Mixed content (text with inline tags, such as XHTML) keeps only the text before the first child tag.</li>
+<li>The whole file is loaded into memory. For very large files, use <code>ET.iterparse</code> and call <code>el.clear()</code> after each record.</li></ul>
+<h2>5. No code</h2>
+<p>Paste the XML into the free <a href="/tools/xml-to-csv/">XML to CSV converter</a>: it finds the repeating element itself, exports CSV, TSV, Markdown or .xlsx, and nothing is uploaded.</p>
+<aside class="cta"><strong>Skip the steps:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can I convert XML to CSV without pandas?</summary><p>Yes. The script above uses only xml.etree.ElementTree and csv. With pandas 1.3+, pd.read_xml(&#x27;file.xml&#x27;, xpath=&#x27;//item&#x27;).to_csv(&#x27;out.csv&#x27;, index=False) works for flat records (it uses lxml unless you pass parser=&#x27;etree&#x27;), but it does not flatten nested elements.</p></details>
+<details><summary>How do I find the row element?</summary><p>Look for the element that repeats: item in RSS, url in a sitemap, entry in Atom, often record or row in exports. The browser tool lists every repeating element with its count.</p></details>
+<details><summary>Why do I get an empty CSV?</summary><p>The row element name is wrong, or the file uses a default namespace and you matched the full tag. The script compares local names, so pass just the name, e.g. url.</p></details>
+</section>
+<p class="note">Written with AI assistance. The script was run on 2026-10-01 with the Python 3 standard library on the BBC News RSS feed (38 items, 9 columns) and the sitemaps.org sitemap (84 URLs); every row matched the browser XML to CSV tool cell for cell. PlainTables is our extension; the other methods are free and built into Excel, Google Sheets and pandas.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wave.open() Crashes with a Wrong Error on None (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: wave.open() crashes with TypeError: object of type NoneType has no len() on a transient non-blocking None read.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-wave-open-none-typeerror-chunkname-len/">
+<meta property="og:title" content="wave.open() Crashes with a Wrong Error on None (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: wave.open() crashes with TypeError: object of type NoneType has no len() on a transient non-blocking None read.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-wave-open-none-typeerror-chunkname-len/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "The wave module's documentation for open() says nothing about non-blocking streams or a None read result; it assumes a blocking file object. We measured that a None-returning source triggers a TypeError whose message points at an internal chunk-name attribute, not at the real cause."}}, {"@type": "Question", "name": "Does aifc have the same problem?", "acceptedAnswer": {"@type": "Answer", "text": "aifc.py was removed from the standard library in Python 3.13 (deprecated since 3.11), so we could not measure it on this version; it was built on the same underlying _aifc_params / chunk-reading approach as wave in earlier versions, so the same class of bug is plausible there too for anyone still on an older Python."}}, {"@type": "Question", "name": "How can I tell this apart from a genuinely corrupt WAV file?", "acceptedAnswer": {"@type": "Answer", "text": "A real corrupt file typically fails with a different message (for example a mismatched RIFF header once a chunk name is actually read). We measured that this specific TypeError, naming NoneType and len(), only appears when the underlying read returned None -- if you're reading from a non-blocking source, suspect the retry signal before suspecting the file."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- same family already confirmed in shutil.copyfileobj, gzip/bz2/lzma, tarfile/zipfile, TextIOWrapper.readline(), ElementTree.parse(), tomllib.load(), email.message_from_binary_file(), plistlib.load(), and http.client.HTTPResponse: a correctly-returned non-blocking None gets mishandled one layer above io itself. wave's version joins tomllib and plistlib in the wrong-diagnosis crash flavor -- the error message blames an unrelated internal detail."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>wave.open() Crashes on a Non-Blocking None (tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> from <code>readinto()</code> -- distinct from the empty read that means real end-of-stream. We measured that <code>wave.open()</code>'s underlying RIFF-chunk reader stores whatever its first read call returns as the chunk name and immediately calls <code>len()</code> on it with no <code>None</code> check -- so the transient <code>None</code> crashes with <code>TypeError: object of type 'NoneType' has no len()</code>, an error that looks like an internal library bug rather than anything related to stream readiness, on a WAV file that is valid and complete one read call away.</p>
+<h2 id="repro1">1. A real, valid WAV file behind one transient None</h2>
+<pre><code>import io, wave
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self, payload):
+        self.calls = 0
+        self.sent = False
+        self.payload = payload
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None            # transient: no data ready yet
+        if not self.sent:
+            self.sent = True
+            n = len(self.payload)
+            b[:n] = self.payload
+            return n               # the real, complete WAV file
+        return 0                   # real EOF after that
+
+buf = io.BytesIO()
+w = wave.open(buf, "wb")
+w.setnchannels(1)
+w.setsampwidth(2)
+w.setframerate(8000)
+w.writeframes(b"\x00\x01" * 100)
+w.close()
+payload = buf.getvalue()
+
+raw = FlakyRaw(payload)
+br = io.BufferedReader(raw)
+try:
+    r = wave.open(br, "rb")
+    print("nframes:", r.getnframes())
+except Exception as e:
+    print("CRASHED:", type(e).__name__, e)
+print("raw calls made:", raw.calls)</code></pre>
+<pre><code>CRASHED: TypeError object of type 'NoneType' has no len()
+raw calls made: 1</code></pre>
+<p><strong>Measured:</strong> the WAV file is valid and complete, one read call away. <code>wave.open()</code>'s internal <code>_Chunk.__init__</code> reads 4 bytes expecting the RIFF chunk name, stores whatever came back, and calls <code>len()</code> on it unconditionally -- when that read returns <code>None</code>, the <code>len()</code> call itself crashes with a <code>TypeError</code> that names an unrelated internal attribute, not the real cause.</p>
+
+<h2 id="repro2">2. The fix: drain into a real buffer first, retrying on None</h2>
+<pre><code>def drain_retrying_on_none(raw_stream, chunk_size=65536):
+    out = io.BytesIO()
+    br = io.BufferedReader(raw_stream)
+    while True:
+        chunk = br.read(chunk_size)
+        if chunk is None:
+            continue              # retry: not ready yet, not EOF
+        if not chunk:
+            break                  # real EOF
+        out.write(chunk)
+    out.seek(0)
+    return out
+
+raw2 = FlakyRaw(payload)
+safe_buf = drain_retrying_on_none(raw2)
+r2 = wave.open(safe_buf, "rb")
+print("nframes:", r2.getnframes())
+print("frames read:", len(r2.readframes(100)))</code></pre>
+<pre><code>nframes: 100
+frames read: 200</code></pre>
+<p><strong>Measured:</strong> resolving the <code>None</code>/EOF distinction before the bytes reach <code>wave.open()</code> reads the header and frames correctly.</p>
+<aside class="cta"><strong>Opening a WAV file from a non-blocking stream with wave.open()? A transient None read crashes with a TypeError about len() on a chunk name -- not about the audio data:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>The wave module&#x27;s documentation for open() says nothing about non-blocking streams or a None read result; it assumes a blocking file object. We measured that a None-returning source triggers a TypeError whose message points at an internal chunk-name attribute, not at the real cause.</p></details>
+<details><summary>Does aifc have the same problem?</summary><p>aifc.py was removed from the standard library in Python 3.13 (deprecated since 3.11), so we could not measure it on this version; it was built on the same underlying _aifc_params / chunk-reading approach as wave in earlier versions, so the same class of bug is plausible there too for anyone still on an older Python.</p></details>
+<details><summary>How can I tell this apart from a genuinely corrupt WAV file?</summary><p>A real corrupt file typically fails with a different message (for example a mismatched RIFF header once a chunk name is actually read). We measured that this specific TypeError, naming NoneType and len(), only appears when the underlying read returned None -- if you&#x27;re reading from a non-blocking source, suspect the retry signal before suspecting the file.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>Yes -- same family already confirmed in shutil.copyfileobj, gzip/bz2/lzma, tarfile/zipfile, TextIOWrapper.readline(), ElementTree.parse(), tomllib.load(), email.message_from_binary_file(), plistlib.load(), and http.client.HTTPResponse: a correctly-returned non-blocking None gets mishandled one layer above io itself. wave&#x27;s version joins tomllib and plistlib in the wrong-diagnosis crash flavor -- the error message blames an unrelated internal detail.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in wave.open(), reading a genuinely valid, complete WAV file through an io.BufferedReader over a custom non-blocking RawIOBase whose readinto() returns None once before returning the real WAV bytes. PlainHeaders is our extension; Python&#x27;s wave and io modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

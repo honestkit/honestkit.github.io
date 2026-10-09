@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>urlencode(): A List Value Silently Encodes str(list)</title>
+<meta name="description" content="We measured urlencode({&#x27;a&#x27;: [1,2,3]}) producing a=%5B1%2C+2%2C+3%5D instead of three repeated a= pairs, with no error. Fix: doseq=True.">
+<link rel="canonical" href="https://honestkit.github.io/guides/urlencode-list-value-without-doseq-encodes-str-of-list/">
+<meta property="og:title" content="urlencode(): A List Value Silently Encodes str(list)">
+<meta property="og:description" content="We measured urlencode({&#x27;a&#x27;: [1,2,3]}) producing a=%5B1%2C+2%2C+3%5D instead of three repeated a= pairs, with no error. Fix: doseq=True.">
+<meta property="og:url" content="https://honestkit.github.io/guides/urlencode-list-value-without-doseq-encodes-str-of-list/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does urlencode() turn a list value into %5B1%2C+2%2C+3%5D?", "acceptedAnswer": {"@type": "Answer", "text": "We measured urlencode() calling str() on the whole list and percent-encoding that single string by default, instead of expanding it into repeated key=value pairs."}}, {"@type": "Question", "name": "How do I send a query parameter with multiple values using urlencode?", "acceptedAnswer": {"@type": "Answer", "text": "We verified passing doseq=True to urlencode() makes list and tuple values expand into repeated key=value pairs (a=1&a=2&a=3) as most servers expect."}}, {"@type": "Question", "name": "Does urlencode raise an error if I pass a list without doseq=True?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed it runs silently and produces a syntactically valid but wrong query string containing the Python string representation of the list."}}, {"@type": "Question", "name": "What does parse_qs() return for a urlencode() list value sent without doseq=True?", "acceptedAnswer": {"@type": "Answer", "text": "We measured parse_qs() returning a single-item list containing the literal string '[1, 2, 3]', not the three separate values '1', '2', '3' most code expects."}}, {"@type": "Question", "name": "Is doseq=True safe to always use with urlencode()?", "acceptedAnswer": {"@type": "Answer", "text": "In our test, yes \u2014 plain string and non-sequence values encoded identically with or without doseq=True; only sequence values (lists, tuples) behaved differently."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>urlencode() List Value Without doseq Encodes str(list) (tested)</h1>
+<p class="lead">Passing a list as a query parameter value to <code>urllib.parse.urlencode()</code> looks like the natural way to send <code>?a=1&amp;a=2&amp;a=3</code>. We measured what it actually sends by default &mdash; and it isn't that.</p>
+<h2 id="repro1">1. The default output encodes the list's string repr, not its items</h2>
+<pre><code>from urllib.parse import urlencode
+
+print(urlencode({"a": [1, 2, 3]}))</code></pre>
+<pre><code>a=%5B1%2C+2%2C+3%5D</code></pre>
+<p><strong>Measured:</strong> no exception, and the output looks like a plausible URL-encoded query string. But decoding <code>%5B1%2C+2%2C+3%5D</code> gives the literal text <code>[1, 2, 3]</code> &mdash; <code>urlencode()</code> called <code>str()</code> on the whole list and percent-encoded that one string. A server reading this parameter gets a single value that's the Python repr of a list, not three separate values.</p>
+
+<h2 id="repro2">2. Feeding it back through parse_qs() shows exactly what a server would see</h2>
+<pre><code>from urllib.parse import parse_qs
+
+s = urlencode({"a": [1, 2, 3], "b": "x"})
+print(s)
+print(parse_qs(s))</code></pre>
+<pre><code>a=%5B1%2C+2%2C+3%5D&b=x
+{'a': ['[1, 2, 3]'], 'b': ['x']}</code></pre>
+<p><strong>Measured:</strong> round-tripping through <code>parse_qs()</code> &mdash; standing in for what a typical server-side framework does with an incoming query string &mdash; confirms <code>a</code> comes back as a single-item list containing the string <code>'[1, 2, 3]'</code>, not three separate <code>1</code>/<code>2</code>/<code>3</code> values. Any code expecting <code>request.args.getlist("a")</code>-style multi-value handling silently gets one garbled string instead.</p>
+
+<h2 id="fix">3. Fix: pass doseq=True</h2>
+<pre><code>s2 = urlencode({"a": [1, 2, 3], "b": "x"}, doseq=True)
+print(s2)
+print(parse_qs(s2))</code></pre>
+<pre><code>a=1&a=2&a=3&b=x
+{'a': ['1', '2', '3'], 'b': ['x']}</code></pre>
+<p><strong>Measured:</strong> adding <code>doseq=True</code> confirmed <code>urlencode()</code> treating list (and tuple) values as sequences to expand into repeated <code>key=value</code> pairs instead of stringifying them whole. Non-sequence values like <code>"x"</code> are encoded exactly the same either way, so <code>doseq=True</code> is safe to use as the default for any dict that might contain a list value.</p>
+
+<aside class="cta"><strong>Debugging a request that sends the wrong query string? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does urlencode() turn a list value into %5B1%2C+2%2C+3%5D?</summary><p>We measured urlencode() calling str() on the whole list and percent-encoding that single string by default, instead of expanding it into repeated key=value pairs.</p></details>
+<details><summary>How do I send a query parameter with multiple values using urlencode?</summary><p>We verified passing doseq=True to urlencode() makes list and tuple values expand into repeated key=value pairs (a=1&amp;a=2&amp;a=3) as most servers expect.</p></details>
+<details><summary>Does urlencode raise an error if I pass a list without doseq=True?</summary><p>No — we confirmed it runs silently and produces a syntactically valid but wrong query string containing the Python string representation of the list.</p></details>
+<details><summary>What does parse_qs() return for a urlencode() list value sent without doseq=True?</summary><p>We measured parse_qs() returning a single-item list containing the literal string &#x27;[1, 2, 3]&#x27;, not the three separate values &#x27;1&#x27;, &#x27;2&#x27;, &#x27;3&#x27; most code expects.</p></details>
+<details><summary>Is doseq=True safe to always use with urlencode()?</summary><p>In our test, yes — plain string and non-sequence values encoded identically with or without doseq=True; only sequence values (lists, tuples) behaved differently.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in urllib.parse module: ran urlencode() on a dict with a list value, with and without doseq=True, then fed both results back through parse_qs() to see what a server would actually receive. PlainHeaders is our extension; Python&#x27;s urllib.parse module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

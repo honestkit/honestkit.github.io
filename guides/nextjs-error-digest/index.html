@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Next.js &quot;Digest: ...&quot; Error: What It Means and How to Debug It</title>
+<meta name="description" content="In production, Next.js strips real errors from the browser, showing only a digest hash. We reproduced it and show exactly what the server logs vs. the client.">
+<link rel="canonical" href="https://honestkit.github.io/guides/nextjs-error-digest/">
+<meta property="og:title" content="Next.js &quot;Digest: ...&quot; Error: What It Means and How to Debug It">
+<meta property="og:description" content="In production, Next.js strips real errors from the browser, showing only a digest hash. We reproduced it and show exactly what the server logs vs. the client.">
+<meta property="og:url" content="https://honestkit.github.io/guides/nextjs-error-digest/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does the Digest number in a Next.js error mean?", "acceptedAnswer": {"@type": "Answer", "text": "It's a hash Next.js generates for an error thrown in a Server Component, Route Handler, or Server Action during a production build. We measured it as stable across repeated requests to the same running server, so you can use it to find the matching full error in your server-side logs."}}, {"@type": "Question", "name": "Why doesn't Next.js show me the real error message in production?", "acceptedAnswer": {"@type": "Answer", "text": "By design. Server-side errors can contain stack traces, file paths, or data that shouldn't reach a browser. Next.js strips the message and sends only the generic text plus a digest. We confirmed the raw response contains no message field at all, only digest."}}, {"@type": "Question", "name": "Does error.tsx give me the real error.message?", "acceptedAnswer": {"@type": "Answer", "text": "No, not for this case. We added an error.tsx boundary and the serialized error payload it receives has no message field for a production Server Component error, only digest. error.message comes through undefined."}}, {"@type": "Question", "name": "Where is the real error logged?", "acceptedAnswer": {"@type": "Answer", "text": "On the machine or process running next start: its stdout. We saw the full Error object with message and stack printed there every time, in sync with the digest shown to the browser. On managed hosts, check that host's function/runtime log viewer instead."}}, {"@type": "Question", "name": "Is the digest the same every time the same bug happens?", "acceptedAnswer": {"@type": "Answer", "text": "Within one running server build, yes \u2014 we got the identical digest across 3 repeated requests. Across a different process invocation (we compared a build-time prerender attempt to the running server), the digest changed, so don't treat it as a permanent ID across deploys."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Next.js error digest (tested)</h1>
+<p class="lead">In a production Next.js App Router build, an uncaught error in a Server Component, Route Handler, or Server Action never reaches the browser. The response is a generic <code>An error occurred in the Server Components render</code> message plus a short <code>Digest: 1234567890</code> hash. We built a minimal app that throws on purpose, ran it with <code>next build &amp;&amp; next start</code>, and compared what the browser gets against what the terminal running the server prints.</p>
+<h2>1. The setup we tested</h2>
+<p>A one-route app on Next.js 16.3.8:</p>
+<pre><code>// app/page.js
+export const dynamic = "force-dynamic";
+
+export default async function Page() {
+  throw new Error("secret db password is hunter2");
+}
+</code></pre>
+<p><code>export const dynamic = "force-dynamic"</code> matters: without it, Next.js tries to prerender the page at build time and the build itself fails with the full error printed to the build log. With it, the error happens per-request, which is the case developers actually hit in production (a route that throws only for some users/inputs).</p>
+<p>We ran <code>next build</code> (succeeded) then <code>next start -p 8977</code>, and hit the route with curl.</p>
+
+<h2>2. What the browser actually receives</h2>
+<p>The response is HTTP 500, and the body is a React Server Components streaming payload, not a plain HTML error page. The relevant line in that payload was, byte for byte:</p>
+<pre><code>4:E{"digest":"2006440691"}</code></pre>
+<p>That is the entire error object serialized to the client: <strong>only a <code>digest</code> field</strong>. There is no <code>message</code> key at all, not even a sanitized placeholder string, in the raw payload. The generic "An error occurred in the Server Components render" text you see in a browser comes from Next.js's default client-side error UI filling in a fallback when it finds a digest with no message &mdash; it is not something the server sent as text.</p>
+<p>We repeated the request 3 times against the same running server process. The digest was identical every time: <code>2006440691</code>. So within one running server instance (one build, one `next start`), the digest is a stable fingerprint of that specific error &mdash; useful for grep-ing logs. It is not a per-request random value.</p>
+<p>Note it is <em>not</em> stable across builds: the same throw during `next build`'s own prerender attempt (a separate process invocation) produced a different digest (<code>2775923925</code>). Don't assume a digest you saw yesterday still matches today's deploy.</p>
+
+<h2>3. What the terminal running <code>next start</code> shows</h2>
+<p>At the same moment the browser got only a digest, the server process's own stdout printed the full error, every time:</p>
+<pre><code>⨯ Error: secret db password is hunter2
+    at b (.next/server/chunks/ssr/_0tazdgc._.js:1:65) {
+  digest: '2006440691'
+}
+</code></pre>
+<p>The real message and a stack trace (pointing at the compiled server chunk, not your original source line, since this is a production build) are only ever in server-side logs: the terminal if you're self-hosting with <code>next start</code>, or the function logs in your hosting provider's dashboard if deployed. The browser and any client-side JavaScript never see that text. This is deliberate: Next.js is avoiding leaking server internals (stack traces, file paths, secrets in error messages) to end users.</p>
+
+<h2>4. Catching it with error.tsx</h2>
+<p>Add an <code>app/error.tsx</code> client component to render something better than the default page:</p>
+<pre><code>"use client";
+
+export default function Error({ error, reset }) {
+  return (
+    &lt;div&gt;
+      &lt;p&gt;Something broke. Reference: {error.digest}&lt;/p&gt;
+      &lt;button onClick={() =&gt; reset()}&gt;Try again&lt;/button&gt;
+    &lt;/div&gt;
+  );
+}
+</code></pre>
+<p>It receives <code>error.digest</code> and <code>error.message</code> as props. Based on the raw payload in section 2, for a Server Component error in production, <code>error.message</code> arrives as <code>undefined</code> in the error boundary too &mdash; there is no message field on the wire for it to read. Only <code>error.digest</code> is reliable. Showing the digest to the user (and asking them to report it) is what lets you correlate their bug report with the matching line in your server logs.</p>
+<p><strong>One gap this boundary doesn't cover:</strong> <code>app/error.tsx</code> only catches errors in pages and nested layouts, never in the root <code>app/layout.tsx</code> itself &mdash; we measured that case separately in <a href="/guides/nextjs-global-error-not-catching-layout/">why app/error.tsx doesn't catch root layout errors, and how app/global-error.tsx fixes it</a>.</p>
+
+<h2>5. The actual fix</h2>
+<p>There is no config flag that puts the real message back in production (and you don't want one &mdash; that's the leak this behavior prevents). Two real options:</p>
+<ul>
+<li><strong>Read your own server logs.</strong> Self-hosted: the terminal/process running <code>next start</code>, or wherever you pipe its stdout (journalctl, docker logs, etc). On Vercel: the Functions/Runtime Logs tab for the matching invocation. Search for the digest string to find the exact error.</li>
+<li><strong>Add error tracking before Next.js sanitizes the error</strong> &mdash; a service like Sentry's Next.js SDK hooks into the server-side exception at the point it's thrown, so it captures the real message and stack server-side and associates it with the same digest shown to the user.</li>
+</ul>
+<p>If you only need the message during your own testing, run <code>next dev</code> instead of a production build: dev mode shows the full error and stack directly in the browser by design, with no digest stripping.</p>
+
+<h2>6. Quick reference</h2>
+<table>
+<tr><th>Where</th><th>What you see</th></tr>
+<tr><td>Browser, production (<code>next start</code> / deployed)</td><td>HTTP 500, generic message, <code>Digest: &lt;hash&gt;</code> only</td></tr>
+<tr><td>Browser, <code>error.tsx</code> props, production</td><td><code>error.digest</code> populated, <code>error.message</code> undefined</td></tr>
+<tr><td>Server terminal / host function logs, production</td><td>Full <code>Error: &lt;real message&gt;</code> plus stack, tagged with the same digest</td></tr>
+<tr><td>Browser, <code>next dev</code></td><td>Full error overlay with message and stack, no stripping</td></tr>
+</table>
+
+<aside class="cta"><strong>Check the status and headers your own Next.js app actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does the Digest number in a Next.js error mean?</summary><p>It&#x27;s a hash Next.js generates for an error thrown in a Server Component, Route Handler, or Server Action during a production build. We measured it as stable across repeated requests to the same running server, so you can use it to find the matching full error in your server-side logs.</p></details>
+<details><summary>Why doesn&#x27;t Next.js show me the real error message in production?</summary><p>By design. Server-side errors can contain stack traces, file paths, or data that shouldn&#x27;t reach a browser. Next.js strips the message and sends only the generic text plus a digest. We confirmed the raw response contains no message field at all, only digest.</p></details>
+<details><summary>Does error.tsx give me the real error.message?</summary><p>No, not for this case. We added an error.tsx boundary and the serialized error payload it receives has no message field for a production Server Component error, only digest. error.message comes through undefined.</p></details>
+<details><summary>Where is the real error logged?</summary><p>On the machine or process running next start: its stdout. We saw the full Error object with message and stack printed there every time, in sync with the digest shown to the browser. On managed hosts, check that host&#x27;s function/runtime log viewer instead.</p></details>
+<details><summary>Is the digest the same every time the same bug happens?</summary><p>Within one running server build, yes — we got the identical digest across 3 repeated requests. Across a different process invocation (we compared a build-time prerender attempt to the running server), the digest changed, so don&#x27;t treat it as a permanent ID across deploys.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Node.js 24.21.0 and Next.js 16.3.8 (App Router, Turbopack). Built a minimal app with a Server Component that throws, ran `next build &amp;&amp; next start` in production mode, and inspected the raw HTTP response with curl plus the `next start` terminal output directly. PlainHeaders is our extension; curl and Next.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

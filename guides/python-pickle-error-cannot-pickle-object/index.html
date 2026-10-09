@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python Pickle Error: cannot pickle &#x27;_thread.lock&#x27; (Tested)</title>
+<meta name="description" content="We measured Python pickle errors for lambdas, nested functions, locks, files and generators: three different exception types, plus the __getstate__ fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-pickle-error-cannot-pickle-object/">
+<meta property="og:title" content="Python Pickle Error: cannot pickle &#x27;_thread.lock&#x27; (Tested)">
+<meta property="og:description" content="We measured Python pickle errors for lambdas, nested functions, locks, files and generators: three different exception types, plus the __getstate__ fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-pickle-error-cannot-pickle-object/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why do I get TypeError: cannot pickle '_thread.lock' object?", "acceptedAnswer": {"@type": "Answer", "text": "Your object (or something it references) holds a threading.Lock, which belongs to the running process. We measured the error and a fix: remove the lock in __getstate__ and create a new one in __setstate__."}}, {"@type": "Question", "name": "Why can't Python pickle a lambda?", "acceptedAnswer": {"@type": "Answer", "text": "pickle stores functions by their importable name, and a lambda doesn't have one. We measured PicklingError for a module-level lambda and AttributeError: Can't get local object for a nested one."}}, {"@type": "Question", "name": "Does except pickle.PicklingError catch all pickle errors?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured three different exception types: PicklingError, AttributeError and TypeError."}}, {"@type": "Question", "name": "What objects cannot be pickled in Python?", "acceptedAnswer": {"@type": "Answer", "text": "We measured lambdas, nested functions, locks, open files and generators failing. Sockets and database connections behave the same way: they are tied to the running process."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python pickle error: cannot pickle object (tested)</h1>
+<p class="lead"><code>TypeError: cannot pickle '_thread.lock' object</code>, <code>PicklingError: Can't pickle &lt;function &lt;lambda&gt;&gt;</code> and <code>Can't get local object</code> all mean pickle met something it can only store by name or not at all. We measured each on Python 3.13.5.</p>
+<h2 id="what">1. What can't be pickled, and the three different exceptions you get</h2>
+<pre><code>import pickle, threading
+def make(): return lambda x: x
+items = {&quot;lambda&quot;: lambda x: x, &quot;nested lambda&quot;: make(), &quot;lock&quot;: threading.Lock(),
+         &quot;open file&quot;: open(__file__), &quot;generator&quot;: (i for i in range(3))}
+for label, obj in items.items():
+    try:
+        pickle.dumps(obj)
+    except Exception as e:
+        print(f&quot;{label:14} {type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>lambda         PicklingError: Can&#x27;t pickle &lt;function &lt;lambda&gt; at 0x7fa33bd92200&gt;: attribute lookup &lt;lambda&gt; on __main__ failed
+nested lambda  AttributeError: Can&#x27;t get local object &#x27;make.&lt;locals&gt;.&lt;lambda&gt;&#x27;
+lock           TypeError: cannot pickle &#x27;_thread.lock&#x27; object
+open file      TypeError: cannot pickle &#x27;TextIOWrapper&#x27; instances
+generator      TypeError: cannot pickle &#x27;generator&#x27; object</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> pickle stores functions <em>by name</em>, so a lambda (no usable name) fails with <code>PicklingError</code>, while a function defined inside another function fails with <code>AttributeError: Can't get local object</code>. Objects tied to the running process (locks, open files, generators, sockets, database connections) raise <code>TypeError: cannot pickle '...'</code>. Because these are three unrelated exception types, <code>except pickle.PicklingError</code> alone catches only the first one. Catch <code>(pickle.PicklingError, TypeError, AttributeError)</code> if you need to handle all of them.</p>
+
+<h2 id="fix">2. Fix: drop the unpicklable attribute in __getstate__, rebuild it in __setstate__</h2>
+<pre><code>import pickle, threading
+class Worker:
+    def __init__(self):
+        self.count = 3
+        self.lock = threading.Lock()
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state[&quot;lock&quot;]              # drop what can&#x27;t be pickled
+        return state
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.lock = threading.Lock()   # rebuild it on load
+w = pickle.loads(pickle.dumps(Worker()))
+print(w.count, type(w.lock).__name__)</code></pre>
+<p>Output:</p>
+<pre><code>3 lock</code></pre>
+<p><strong>Measured:</strong> the object pickles and loads with its data (<code>count</code> = 3) and a fresh lock. Use the same pattern for open files (store the path, reopen on load) and connections (store the settings, reconnect). For functions, use a normal module-level <code>def</code> instead of a lambda or nested function, or <code>functools.partial</code> of one. With <code>multiprocessing</code>, the same errors appear when you pass these objects to a pool; see our <a href="/guides/python-multiprocessing-cant-pickle-local-object/">multiprocessing can't pickle guide</a>. To find which attribute is the problem, try <code>pickle.dumps()</code> on each value in <code>obj.__dict__</code>.</p>
+
+<aside class="cta"><strong>Caching API responses with pickle? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why do I get TypeError: cannot pickle &#x27;_thread.lock&#x27; object?</summary><p>Your object (or something it references) holds a threading.Lock, which belongs to the running process. We measured the error and a fix: remove the lock in __getstate__ and create a new one in __setstate__.</p></details>
+<details><summary>Why can&#x27;t Python pickle a lambda?</summary><p>pickle stores functions by their importable name, and a lambda doesn&#x27;t have one. We measured PicklingError for a module-level lambda and AttributeError: Can&#x27;t get local object for a nested one.</p></details>
+<details><summary>Does except pickle.PicklingError catch all pickle errors?</summary><p>No. We measured three different exception types: PicklingError, AttributeError and TypeError.</p></details>
+<details><summary>What objects cannot be pickled in Python?</summary><p>We measured lambdas, nested functions, locks, open files and generators failing. Sockets and database connections behave the same way: they are tied to the running process.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5: pickle.dumps on a lambda, a nested lambda, a threading.Lock, an open file and a generator, and a __getstate__/__setstate__ fix for a class holding a lock. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

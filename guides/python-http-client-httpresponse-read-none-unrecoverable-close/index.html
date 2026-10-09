@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>http.client.HTTPResponse.read() None Permanently Closes</title>
+<meta name="description" content="We measured Python 3.13.5: HTTPResponse.read(amt) returns None on a transient read AND closes the connection, so even retrying read() can&#x27;t recover the data.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-http-client-httpresponse-read-none-unrecoverable-close/">
+<meta property="og:title" content="http.client.HTTPResponse.read() None Permanently Closes">
+<meta property="og:description" content="We measured Python 3.13.5: HTTPResponse.read(amt) returns None on a transient read AND closes the connection, so even retrying read() can&#x27;t recover the data.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-http-client-httpresponse-read-none-unrecoverable-close/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "http.client's documentation describes read(amt) as reading and returning up to amt bytes of the response body; it says nothing about None or non-blocking sockets. We measured that a None-returning underlying read is treated identically to a real early connection close, which is itself undocumented for the None case specifically."}}, {"@type": "Question", "name": "Why is this worse than the already-confirmed HTTPResponse chunked-response finding?", "acceptedAnswer": {"@type": "Answer", "text": "The already-confirmed finding (readline()-based, used for chunked responses) raises a catchable RemoteDisconnected exception -- a caller can catch it, know something went wrong, and decide what to do. Here, read(amt) returns None with no exception at all, and silently closes the connection as a side effect -- there's no exception to catch, and by the time code notices the None, retrying is already futile."}}, {"@type": "Question", "name": "Does this affect the unbounded read() (no argument) the same way?", "acceptedAnswer": {"@type": "Answer", "text": "Not the same way. We measured read() with no argument separately: with Content-Length it raises TypeError: object of type 'NoneType' has no len(), with chunked encoding IncompleteRead(0 bytes read), and with no length it returns None and closes the connection -- see our guide on resp.read() failing three different ways. The sized-read case shown here is the one hit by callers that loop with a fixed chunk size, like xmlrpc.client.Transport.parse_response()'s while data := stream.read(1024):."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- same family already confirmed in json.load(), quopri.decode(), codecs.StreamReader, and others: a correctly-returned non-blocking None gets mishandled one layer above io itself. This is the most severe case in the family so far, because it's the only one where the standard fix of catching and retrying the None doesn't work -- the bug destroys the connection before a caller even gets the chance."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>http.client.HTTPResponse.read() Permanently Closes the Connection on None (tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> -- distinct from the empty read that means real end-of-stream. We measured that <code>HTTPResponse.read(amt)</code>'s sized-read path does <code>s = self.fp.read(amt)</code> and then <code>if not s and amt: self._close_conn()</code> -- treating a falsy result as the connection ending early and closing it as a side effect, before even returning. Every other guide in this family has a working fix: catch the <code>None</code> and retry the read. Here that fix doesn't work, because by the time the caller sees the <code>None</code>, <code>_close_conn()</code> has already run -- the next <code>read()</code> call hits <code>if self.fp is None: return b""</code> as its very first line and returns empty forever. The real, complete, <code>Content-Length</code>-declared body is gone, one read call away and unrecoverable.</p>
+<h2 id="repro1">1. A real, valid response body behind one transient None, mid-read</h2>
+<pre><code>import http.client, io
+
+class FlakyRaw(io.RawIOBase):
+    """Sends headers cleanly, then one transient None mid-body, then the body."""
+    def __init__(self, header_bytes, body_bytes):
+        self.header_bytes, self.body_bytes, self.stage = header_bytes, body_bytes, 0
+    def readable(self):
+        return True
+    def readinto(self, b):
+        if self.stage == 0:
+            n = len(self.header_bytes)
+            b[:n] = self.header_bytes
+            self.stage = 1
+            return n
+        if self.stage == 1:
+            self.stage = 2
+            return None            # transient: no data ready yet, mid-body
+        if self.stage == 2:
+            n = len(self.body_bytes)
+            b[:n] = self.body_bytes
+            self.stage = 3
+            return n               # the real, complete body
+        return 0                   # real EOF after that
+
+class FakeSocket:
+    def __init__(self, raw):
+        self.raw = raw
+    def makefile(self, mode, *a, **kw):
+        return io.BufferedReader(self.raw)
+    def close(self):
+        pass
+    def sendall(self, data):
+        pass
+
+body = b"hello world, this is the response body"
+headers = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body)
+conn = http.client.HTTPConnection("example.com")
+conn.sock = FakeSocket(FlakyRaw(headers, body))
+conn.request("GET", "/")
+resp = conn.getresponse()
+
+chunk = resp.read(1024)
+print("chunk:", chunk)
+print("resp.fp is None (connection closed)?", resp.fp is None)
+retry = resp.read(1024)
+print("retrying read() after the None:", retry)</code></pre>
+<pre><code>chunk: None
+resp.fp is None (connection closed)? True
+retrying read() after the None: b''</code></pre>
+<p><strong>Measured:</strong> the body is valid and complete, one read call away. <code>resp.read(1024)</code> returned <code>None</code> and closed the connection in the same call. Retrying <code>read()</code> -- the fix that works for every other finding in this family -- returns <code>b''</code> forever, because the connection is already gone. The data is not delayed; it is lost.</p>
+
+<h2 id="repro2">2. The fix has to happen one layer down, before HTTPResponse ever sees the None</h2>
+<pre><code>def read_retrying_on_none(buffered_reader, chunk_size=65536):
+    out = io.BytesIO()
+    while True:
+        chunk = buffered_reader.read(chunk_size)
+        if chunk is None:
+            continue   # retry: not ready yet, not real EOF
+        if not chunk:
+            break      # real EOF
+        out.write(chunk)
+    out.seek(0)
+    return out
+
+raw2 = FlakyRaw(headers, body)
+br2 = io.BufferedReader(raw2)
+raw_bytes = read_retrying_on_none(br2).read()
+recovered_body = raw_bytes.split(b"\r\n\r\n", 1)[1]
+print("recovered body:", recovered_body)
+print("matches original:", recovered_body == body)</code></pre>
+<pre><code>recovered body: b'hello world, this is the response body'
+matches original: True</code></pre>
+<p><strong>Measured:</strong> this only works by draining the raw, non-blocking socket stream directly, retrying on <code>None</code> before any of it reaches <code>http.client</code>'s own connection-management logic -- here reconstructing the full response (headers and body) from raw bytes. Once a <code>None</code> reaches <code>HTTPResponse.read()</code> itself, it's too late -- the fix has to sit underneath the socket <code>http.client</code> wraps, not around the calls you make to <code>HTTPResponse</code>.</p>
+<aside class="cta"><strong>Reading a response body with http.client.HTTPResponse.read(amt) on a non-blocking socket? A transient None doesn&#x27;t just return early -- it closes the connection too, so even retrying read() can&#x27;t get the real data back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>http.client&#x27;s documentation describes read(amt) as reading and returning up to amt bytes of the response body; it says nothing about None or non-blocking sockets. We measured that a None-returning underlying read is treated identically to a real early connection close, which is itself undocumented for the None case specifically.</p></details>
+<details><summary>Why is this worse than the already-confirmed HTTPResponse chunked-response finding?</summary><p>The already-confirmed finding (readline()-based, used for chunked responses) raises a catchable RemoteDisconnected exception -- a caller can catch it, know something went wrong, and decide what to do. Here, read(amt) returns None with no exception at all, and silently closes the connection as a side effect -- there&#x27;s no exception to catch, and by the time code notices the None, retrying is already futile.</p></details>
+<details><summary>Does this affect the unbounded read() (no argument) the same way?</summary><p>Not the same way. We measured read() with no argument separately: with Content-Length it raises TypeError: object of type &#x27;NoneType&#x27; has no len(), with chunked encoding IncompleteRead(0 bytes read), and with no length it returns None and closes the connection -- see our guide on resp.read() failing three different ways. The sized-read case shown here is the one hit by callers that loop with a fixed chunk size, like xmlrpc.client.Transport.parse_response()&#x27;s while data := stream.read(1024):.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>Yes -- same family already confirmed in json.load(), quopri.decode(), codecs.StreamReader, and others: a correctly-returned non-blocking None gets mishandled one layer above io itself. This is the most severe case in the family so far, because it&#x27;s the only one where the standard fix of catching and retrying the None doesn&#x27;t work -- the bug destroys the connection before a caller even gets the chance.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in http.client.HTTPResponse.read(amt), reading a genuinely valid, complete Content-Length response body through a custom non-blocking socket whose underlying stream returns None once, mid-body, before the real bytes. PlainHeaders is our extension; Python&#x27;s http.client and io modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

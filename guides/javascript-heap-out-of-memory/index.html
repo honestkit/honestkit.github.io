@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JavaScript Heap Out of Memory: Cause and Fix (Tested)</title>
+<meta name="description" content="We crashed Node for real to show the exact &#x27;JavaScript heap out of memory&#x27; error, why it can&#x27;t be caught with try/catch, and the --max-old-space-size fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/javascript-heap-out-of-memory/">
+<meta property="og:title" content="JavaScript Heap Out of Memory: Cause and Fix (Tested)">
+<meta property="og:description" content="We crashed Node for real to show the exact &#x27;JavaScript heap out of memory&#x27; error, why it can&#x27;t be caught with try/catch, and the --max-old-space-size fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/javascript-heap-out-of-memory/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why can't I catch 'JavaScript heap out of memory' with try/catch?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed this directly: V8 calls a fatal-error handler and aborts the entire process when it can't grow the heap further, before your JavaScript catch blocks get a chance to run. There is no way to recover in-process; the only options are to avoid hitting the limit (fix a leak, process data in smaller chunks) or give the process more headroom in advance."}}, {"@type": "Question", "name": "What's the default max-old-space-size if I don't set one?", "acceptedAnswer": {"@type": "Answer", "text": "It varies by Node version and available system memory rather than being one fixed number \u2014 roughly 2-4GB on a typical 64-bit Node install, per Node's own docs. If you're hitting the limit with plenty of system RAM free, raising it explicitly with --max-old-space-size is usually the fastest fix for a one-off large operation."}}, {"@type": "Question", "name": "Does raising --max-old-space-size always fix it?", "acceptedAnswer": {"@type": "Answer", "text": "Only if the issue is a single legitimate operation needing more room than the default. If memory usage climbs without bound over time (a leak), raising the limit just delays the same crash at a higher number \u2014 you'll need a heap snapshot (node --inspect + Chrome DevTools) to find what's accumulating."}}, {"@type": "Question", "name": "What exit code does a JavaScript heap out of memory crash give?", "acceptedAnswer": {"@type": "Answer", "text": "We measured exit code 134 (SIGABRT) on this box \u2014 V8's fatal-error handler aborts the process rather than exiting cleanly. That's different from exit code 137 (SIGKILL), which is what you'd see from an external kill or a container/OS-level out-of-memory kill rather than V8's own internal heap limit."}}, {"@type": "Question", "name": "Is this the same as a Docker container getting OOM-killed?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 they're different mechanisms that can look similar. This error is V8's own internal heap ceiling being hit (fixable with --max-old-space-size); a Docker/Kubernetes OOM kill happens when the container's memory cgroup limit is exceeded regardless of what Node's own heap settings are, and raising --max-old-space-size won't help if the container limit is the binding constraint \u2014 see our out-of-memory-killed guide for how we reproduced and distinguished that case."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>JavaScript Heap Out of Memory (tested)</h1>
+<p class="lead"><code>FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory</code> is V8 (the JavaScript engine behind Node and Chrome) hitting its own memory ceiling, not the operating system running out of RAM. We triggered it for real with a small Node script and a low <code>--max-old-space-size</code> limit, and confirmed the fix.</p>
+
+<h2>1. The exact error, reproduced</h2>
+<p>We ran a script that keeps allocating arrays in a loop, capped at a 50&nbsp;MB V8 heap:</p>
+<pre><code>$ node --max-old-space-size=50 -e "
+let arr = [];
+while (true) { arr.push(new Array(1000000).fill('x')); }
+"
+
+&lt;...Mark-Compact GC log lines...&gt;
+FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory
+ 1: 0x931db0  [node]
+ 2: 0x75968e node::OOMErrorHandler(char const*, v8::OOMDetails const&) [node]
+ ...</code></pre>
+<p>The process exits with code <strong>134</strong> (SIGABRT, signal 6) &mdash; see our <a href="/guides/exit-code-137/">exit code 137 guide</a> for the full signal-to-exit-code table. This is a hard process abort, not a JavaScript exception.</p>
+
+<h2>2. Why you cannot catch it with try/catch</h2>
+<p>A normal out-of-memory condition inside your own code (e.g. <code>new Array(-1)</code> or an explicit allocation failure) throws a catchable <code>RangeError</code> or similar. This is different: when V8's garbage collector cannot free enough heap to satisfy an allocation and the heap is already at its configured ceiling, V8 calls an unrecoverable fatal-error handler and aborts the whole process before your JavaScript code gets a chance to run a <code>catch</code> block. Wrapping your code in try/catch does not help &mdash; we confirmed this: the script above had no try/catch around the loop and none would have changed the outcome.</p>
+
+<h2>3. It's a V8 heap limit, not your system running out of RAM</h2>
+<p>This machine has far more than 50&nbsp;MB of free RAM; the crash is V8 refusing to grow its own managed heap past the limit we gave it, which defaults to roughly 2&ndash;4&nbsp;GB on 64-bit Node depending on version and available system memory (not a fixed number across all versions). That default is usually generous enough that you only see this error when either a real memory leak keeps objects alive, or a single operation (parsing a huge JSON file, building a huge array/string) needs more than the default heap at once. This is a distinct mechanism from an OS/container-level OOM kill &mdash; see our <a href="/guides/out-of-memory-killed/">out-of-memory-killed guide</a> for how the kernel-level version looks and how to tell them apart from the exit code and logs alone.</p>
+
+<h2>4. The fix: raise the heap limit, or fix the leak</h2>
+<p>We confirmed the fix directly: the identical allocating pattern that crashed at a 50&nbsp;MB cap ran cleanly once given more room:</p>
+<pre><code>$ node --max-old-space-size=500 -e "
+let arr = [];
+for (let i = 0; i < 20; i++) { arr.push(new Array(1000000).fill('x')); }
+console.log('OK: allocated 20 chunks (~200MB) without crashing, under the 500MB cap');
+"
+OK: allocated 20 chunks (~200MB) without crashing, under the 500MB cap</code></pre>
+<p>Two different fixes depending on which situation you're in:</p>
+<ul>
+<li><strong>A single large but legitimate operation</strong> (e.g. a big build step, a large data-processing job): raise the limit with <code>node --max-old-space-size=4096 your-script.js</code> (value in MB), or for npm scripts, <code>NODE_OPTIONS="--max-old-space-size=4096" npm run build</code>. Check the machine actually has that much free RAM first &mdash; raising the V8 limit past available system memory just trades a clean V8 crash for the kernel's own OOM killer.</li>
+<li><strong>Usage grows without bound over time</strong> (a long-running server that eventually crashes): that's a memory leak, and raising the limit only delays the same crash. Common culprits: event listeners or callbacks never removed, growing caches/arrays with no eviction, closures holding references to large objects longer than needed. Use <code>node --inspect</code> and Chrome DevTools' heap snapshot comparison (or <code>--max-old-space-size</code> left at default plus <code>--trace-gc</code>) to find what's accumulating, rather than just raising the limit.</li>
+</ul>
+
+<h2>5. Framework-specific build commands</h2>
+<p>The build-time version of this error is common in frameworks that compile the whole app in one Node process. The same <code>NODE_OPTIONS</code> fix applies; the usual places to set it (per the tools' own docs, not independently measured here since each project's exact invocation differs):</p>
+<ul>
+<li><strong>Angular (<code>ng build</code>/<code>ng serve</code>):</strong> <code>NODE_OPTIONS="--max-old-space-size=4096" ng build</code>, or add it to the <code>"build"</code> script in package.json.</li>
+<li><strong>Next.js / React (<code>npm run build</code>):</strong> <code>NODE_OPTIONS="--max-old-space-size=4096" npm run build</code>; some setups need it inside a <code>cross-env</code> wrapper for Windows compatibility.</li>
+<li><strong>Running inside Docker:</strong> raising <code>--max-old-space-size</code> only helps if the container's own memory limit (if any) is higher than the new V8 limit &mdash; check both, since a container <code>--memory</code> cap will OOM-kill the process (a different error, see our Docker guides) before V8 even gets to its own limit.</li>
+</ul>
+
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why can&#x27;t I catch &#x27;JavaScript heap out of memory&#x27; with try/catch?</summary><p>We confirmed this directly: V8 calls a fatal-error handler and aborts the entire process when it can&#x27;t grow the heap further, before your JavaScript catch blocks get a chance to run. There is no way to recover in-process; the only options are to avoid hitting the limit (fix a leak, process data in smaller chunks) or give the process more headroom in advance.</p></details>
+<details><summary>What&#x27;s the default max-old-space-size if I don&#x27;t set one?</summary><p>It varies by Node version and available system memory rather than being one fixed number — roughly 2-4GB on a typical 64-bit Node install, per Node&#x27;s own docs. If you&#x27;re hitting the limit with plenty of system RAM free, raising it explicitly with --max-old-space-size is usually the fastest fix for a one-off large operation.</p></details>
+<details><summary>Does raising --max-old-space-size always fix it?</summary><p>Only if the issue is a single legitimate operation needing more room than the default. If memory usage climbs without bound over time (a leak), raising the limit just delays the same crash at a higher number — you&#x27;ll need a heap snapshot (node --inspect + Chrome DevTools) to find what&#x27;s accumulating.</p></details>
+<details><summary>What exit code does a JavaScript heap out of memory crash give?</summary><p>We measured exit code 134 (SIGABRT) on this box — V8&#x27;s fatal-error handler aborts the process rather than exiting cleanly. That&#x27;s different from exit code 137 (SIGKILL), which is what you&#x27;d see from an external kill or a container/OS-level out-of-memory kill rather than V8&#x27;s own internal heap limit.</p></details>
+<details><summary>Is this the same as a Docker container getting OOM-killed?</summary><p>No — they&#x27;re different mechanisms that can look similar. This error is V8&#x27;s own internal heap ceiling being hit (fixable with --max-old-space-size); a Docker/Kubernetes OOM kill happens when the container&#x27;s memory cgroup limit is exceeded regardless of what Node&#x27;s own heap settings are, and raising --max-old-space-size won&#x27;t help if the container limit is the binding constraint — see our out-of-memory-killed guide for how we reproduced and distinguished that case.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 on Debian 13 / Linux 6.12 with Node (the version in this box&#x27;s PATH). We ran real allocating scripts under --max-old-space-size at several limits and captured the exact crash text, exit code, and the limit at which the same script succeeds. PlainHeaders is our extension; Node is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

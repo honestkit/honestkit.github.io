@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>decimal: quantize() Rounds Half to Even by Default</title>
+<meta name="description" content="We measured Python 3.13.5: Decimal(&#x27;2.5&#x27;).quantize(Decimal(&#x27;1&#x27;)) gives 2, not 3 -- the default rounding mode is banker&#x27;s rounding, not round-half-up.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-decimal-quantize-default-rounds-half-to-even-not-up/">
+<meta property="og:title" content="decimal: quantize() Rounds Half to Even by Default">
+<meta property="og:description" content="We measured Python 3.13.5: Decimal(&#x27;2.5&#x27;).quantize(Decimal(&#x27;1&#x27;)) gives 2, not 3 -- the default rounding mode is banker&#x27;s rounding, not round-half-up.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-decimal-quantize-default-rounds-half-to-even-not-up/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Decimal.quantize() round 2.5 up to 3 by default?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured Decimal('2.5').quantize(Decimal('1')) returning 2 under Python's default context. The default rounding mode is ROUND_HALF_EVEN (banker's rounding), which rounds exact halfway values to the nearest even neighbor, not always upward."}}, {"@type": "Question", "name": "What is the default rounding mode for Python's decimal module?", "acceptedAnswer": {"@type": "Answer", "text": "ROUND_HALF_EVEN -- we confirmed this via decimal.getcontext().rounding, and measured it rounding 0.5 to 0 and 2.5 to 2, while 1.5 and 3.5 both round to the even value 2 and 4 respectively."}}, {"@type": "Question", "name": "How do I get round-half-up behavior with Decimal.quantize()?", "acceptedAnswer": {"@type": "Answer", "text": "Pass rounding=ROUND_HALF_UP explicitly, e.g. d.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP). We measured this correctly rounding 0.5 to 1 and 2.5 to 3, matching conventional school and point-of-sale rounding rules."}}, {"@type": "Question", "name": "Why didn't my rounding bug show up in testing?", "acceptedAnswer": {"@type": "Answer", "text": "ROUND_HALF_EVEN and ROUND_HALF_UP only disagree on values that land exactly on a half, like 2.5 -- every other value rounds identically under both modes. We measured this directly, which is why test cases that don't happen to hit an exact tie won't reveal the difference."}}, {"@type": "Question", "name": "Is banker's rounding (ROUND_HALF_EVEN) wrong for financial calculations?", "acceptedAnswer": {"@type": "Answer", "text": "Not inherently -- it's the IEEE 754 / general decimal arithmetic standard default, chosen to avoid statistical bias across many roundings. But most point-of-sale, invoicing, and tax conventions expect round-half-up, so relying on the decimal module's default without checking which one your business rule requires is the real risk we measured."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>decimal: quantize() Defaults to Round-Half-to-Even, Not Round-Half-Up (tested)</h1>
+<p class="lead">Most people learn "round half up" in school: 2.5 rounds to 3, 0.5 rounds to 1. We measured what <code>decimal.Decimal.quantize()</code> actually does with exact halfway values under Python's default context, since <code>decimal</code> is often reached for specifically to get predictable, exact rounding for money.</p>
+<h2 id="repro1">1. The default rounding mode isn't round-half-up</h2>
+<pre><code>from decimal import Decimal, getcontext
+
+print(getcontext().rounding)
+
+for v in ("0.5", "1.5", "2.5", "3.5"):
+    d = Decimal(v)
+    print(v, "->", d.quantize(Decimal("1")))</code></pre>
+<pre><code>ROUND_HALF_EVEN
+0.5 -> 0
+1.5 -> 2
+2.5 -> 2
+3.5 -> 4</code></pre>
+<p><strong>Measured:</strong> the default context rounding mode is <code>ROUND_HALF_EVEN</code> -- "banker's rounding" -- which rounds an exact halfway value to whichever neighbor is even. <code>0.5</code> rounds down to <code>0</code>, and <code>2.5</code> rounds down to <code>2</code>, not up to <code>3</code> as school-taught "round half up" would predict. This is the IEEE 754 / general-decimal-arithmetic standard default, chosen because it doesn't statistically bias repeated roundings upward -- but it's the opposite of what most non-numerics developers assume.</p>
+
+<h2 id="repro2">2. ROUND_HALF_UP gives the "normal" behavior, but you have to ask for it</h2>
+<pre><code>from decimal import Decimal, ROUND_HALF_UP
+
+for v in ("0.5", "1.5", "2.5", "3.5"):
+    d = Decimal(v)
+    print(v, "->", d.quantize(Decimal("1"), rounding=ROUND_HALF_UP))</code></pre>
+<pre><code>0.5 -> 1
+1.5 -> 2
+2.5 -> 3
+3.5 -> 4</code></pre>
+<p><strong>Measured:</strong> passing <code>rounding=ROUND_HALF_UP</code> explicitly to <code>quantize()</code> gives the conventional result every time a value is exactly halfway -- <code>0.5</code> and <code>2.5</code> now round up. Code that quantizes without specifying <code>rounding</code> silently inherits <code>ROUND_HALF_EVEN</code> from the default context instead, which only shows a visible difference on exact halfway values -- easy to miss in testing if test cases don't happen to land exactly on <code>x.5</code>.</p>
+
+<h2 id="repro3">3. Why it matters: splitting a charge evenly lands exactly on a half-cent tie</h2>
+<pre><code>from decimal import Decimal, ROUND_HALF_UP
+
+charge = Decimal("0.05")
+split = charge / 2
+print("exact split:", split)
+print("default quantize to cents:", split.quantize(Decimal("0.01")))
+print("half-up quantize to cents:", split.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))</code></pre>
+<pre><code>exact split: 0.025
+default quantize to cents: 0.02
+half-up quantize to cents: 0.03</code></pre>
+<p><strong>Measured:</strong> splitting a 5-cent charge two ways gives an exact <code>0.025</code>, a genuine halfway value at the cent boundary -- a totally ordinary split-the-bill or fee-sharing calculation, not a contrived edge case. The default mode rounds it down to <code>0.02</code>; <code>ROUND_HALF_UP</code> rounds it up to <code>0.03</code>. Two people splitting that charge under the default mode would see their two cents not add back up to the original five (<code>0.02 + 0.02 = 0.04</code>), a one-cent discrepancy that's exactly the kind of thing accounting reconciliation catches and support tickets get filed over. If a business or legal rule expects "round half up" (most point-of-sale and accounting conventions do), pass <code>rounding=ROUND_HALF_UP</code> explicitly rather than relying on the module default.</p>
+<aside class="cta"><strong>Rounding money with Decimal.quantize() and expecting 2.5 to round up to 3? Check the default rounding mode first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Decimal.quantize() round 2.5 up to 3 by default?</summary><p>No -- we measured Decimal(&#x27;2.5&#x27;).quantize(Decimal(&#x27;1&#x27;)) returning 2 under Python&#x27;s default context. The default rounding mode is ROUND_HALF_EVEN (banker&#x27;s rounding), which rounds exact halfway values to the nearest even neighbor, not always upward.</p></details>
+<details><summary>What is the default rounding mode for Python&#x27;s decimal module?</summary><p>ROUND_HALF_EVEN -- we confirmed this via decimal.getcontext().rounding, and measured it rounding 0.5 to 0 and 2.5 to 2, while 1.5 and 3.5 both round to the even value 2 and 4 respectively.</p></details>
+<details><summary>How do I get round-half-up behavior with Decimal.quantize()?</summary><p>Pass rounding=ROUND_HALF_UP explicitly, e.g. d.quantize(Decimal(&#x27;0.01&#x27;), rounding=ROUND_HALF_UP). We measured this correctly rounding 0.5 to 1 and 2.5 to 3, matching conventional school and point-of-sale rounding rules.</p></details>
+<details><summary>Why didn&#x27;t my rounding bug show up in testing?</summary><p>ROUND_HALF_EVEN and ROUND_HALF_UP only disagree on values that land exactly on a half, like 2.5 -- every other value rounds identically under both modes. We measured this directly, which is why test cases that don&#x27;t happen to hit an exact tie won&#x27;t reveal the difference.</p></details>
+<details><summary>Is banker&#x27;s rounding (ROUND_HALF_EVEN) wrong for financial calculations?</summary><p>Not inherently -- it&#x27;s the IEEE 754 / general decimal arithmetic standard default, chosen to avoid statistical bias across many roundings. But most point-of-sale, invoicing, and tax conventions expect round-half-up, so relying on the decimal module&#x27;s default without checking which one your business rule requires is the real risk we measured.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in decimal module: quantized Decimal(&#x27;0.5&#x27;), Decimal(&#x27;1.5&#x27;), Decimal(&#x27;2.5&#x27;), and Decimal(&#x27;3.5&#x27;) to the nearest integer under the default context rounding mode, then repeated with rounding=ROUND_HALF_UP explicitly set. PlainHeaders is our extension; Python&#x27;s decimal module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

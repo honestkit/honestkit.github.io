@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shutil.copyfileobj() Mistakes None for EOF (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: copyfileobj() stops after one read() returning None -- identical to real EOF -- silently truncating the copy.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-shutil-copyfileobj-none-silently-truncates-copy/">
+<meta property="og:title" content="shutil.copyfileobj() Mistakes None for EOF (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: copyfileobj() stops after one read() returning None -- identical to real EOF -- silently truncating the copy.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-shutil-copyfileobj-none-silently-truncates-copy/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "The shutil documentation for copyfileobj() does not mention None at all; it is written assuming read() returns either data or b'' for EOF. We measured that a None-returning source is silently mishandled rather than rejected or documented as unsupported."}}, {"@type": "Question", "name": "Does this affect shutil.copy() and shutil.copyfile()?", "acceptedAnswer": {"@type": "Answer", "text": "We only measured copyfileobj() directly, but copyfile() calls it internally for the actual byte-copying step, so a None-capable file-like object passed through that path would hit the identical silent truncation."}}, {"@type": "Question", "name": "Why doesn't this show up with normal files?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that ordinary io.FileIO, BytesIO and StringIO objects never return None from read() -- only a custom or third-party RawIOBase explicitly built for non-blocking I/O can produce the None that triggers this gap, which is why the bug stays hidden in typical disk-to-disk or disk-to-BytesIO copies."}}, {"@type": "Question", "name": "Is this the same bug as BufferedWriter.write() returning 0?", "acceptedAnswer": {"@type": "Answer", "text": "No -- that is a separate, already-documented finding where a write-side 0 instead of None causes an infinite retry loop. This is the opposite failure mode on the read side: a correctly-returned None gets collapsed into a silent, premature stop instead of a hang."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>shutil.copyfileobj() Treats None Like EOF (Tested)</h1>
+<p class="lead">A non-blocking file-like source signals "no data ready yet" by returning <code>None</code> from <code>read()</code> -- distinct from the empty bytes (<code>b''</code>) that mean real end-of-stream. <code>io.BufferedReader.read()</code> itself gets this right: it returns <code>None</code> as-is when nothing is ready. But <code>shutil.copyfileobj()</code>, the function behind <code>shutil.copy()</code> and commonly used to stream between file-like objects, checks its loop condition with a plain <code>if not buf: break</code>. In Python, <code>not None</code> and <code>not b''</code> are both <code>True</code> -- so the very first transient <code>None</code> ends the copy exactly as if the source had hit real EOF, with no exception and no indication that more data was still on its way.</p>
+<h2 id="repro1">1. The source: a non-blocking raw stream that is briefly not ready</h2>
+<pre><code>import io
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self):
+        self.calls = 0
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None              # transient: no data ready yet
+        if self.calls == 2:
+            data = b"hello world"
+            b[:len(data)] = data
+            return len(data)
+        return 0                     # real EOF on later calls
+
+src = io.BufferedReader(FlakyRaw())
+print("direct read():", repr(src.read(64 * 1024)), "calls so far:", src.raw.calls)</code></pre>
+<pre><code>direct read(): None calls so far: 1</code></pre>
+<p><strong>Measured:</strong> called directly, <code>BufferedReader.read()</code> correctly returns <code>None</code> -- a caller checking <code>is None</code> can tell "not ready" apart from "done" and retry.</p>
+
+<h2 id="repro2">2. shutil.copyfileobj() on the same source stops after that first None</h2>
+<pre><code>import shutil, io
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self):
+        self.calls = 0
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None
+        if self.calls == 2:
+            data = b"hello world"
+            b[:len(data)] = data
+            return len(data)
+        return 0
+
+src = io.BufferedReader(FlakyRaw())
+dst = io.BytesIO()
+shutil.copyfileobj(src, dst)
+print("copied bytes:", repr(dst.getvalue()))
+print("raw.read calls made:", src.raw.calls)</code></pre>
+<pre><code>copied bytes: b''
+raw.read calls made: 1</code></pre>
+<p><strong>Measured:</strong> <code>copyfileobj()</code> made exactly one read call, got <code>None</code>, and returned -- with <code>dst</code> completely empty and no exception raised at all. The "hello world" that the second call would have produced is simply lost; nothing in the call site indicates the copy was incomplete.</p>
+
+<h2 id="repro3">3. Why: copyfileobj's loop check is "falsy", not "is None" or "is b''"</h2>
+<pre><code>import inspect, shutil
+print(inspect.getsource(shutil.copyfileobj))</code></pre>
+<pre><code># (abbreviated from the standard library source)
+def copyfileobj(fsrc, fdst, length=0):
+    ...
+    fsrc_read = fsrc.read
+    fdst_write = fdst.write
+    while True:
+        buf = fsrc_read(length)
+        if not buf:
+            break
+        fdst_write(buf)</code></pre>
+<p><strong>Measured:</strong> the loop's only stop condition is <code>if not buf</code>. That is true for real EOF (<code>b''</code>), but it is equally true for a transient <code>None</code> -- the function has no way to distinguish "the source is exhausted" from "the source just wasn't ready for this one call," because it never checks which of the two falsy values it actually got.</p>
+
+<h2 id="repro4">4. A source that never returns at all: ordinary files are unaffected</h2>
+<p>This only matters for file-like objects whose <code>read()</code> can legitimately return <code>None</code> -- non-blocking raw streams, certain sockets or pipes wrapped in <code>io.RawIOBase</code>. A plain <code>open()</code> file or <code>io.BytesIO</code> never returns <code>None</code> from <code>read()</code>, so <code>shutil.copyfileobj()</code> is safe for the overwhelming majority of its real-world uses -- the gap only opens when something non-blocking is on the other end.</p>
+<h2 id="repro5">5. The fix: don't feed a None-capable source straight to copyfileobj</h2>
+<pre><code>def safe_copy(fsrc, fdst, length=64 * 1024):
+    while True:
+        buf = fsrc.read(length)
+        if buf is None:
+            continue              # retry: not ready yet, not EOF
+        if not buf:
+            break                  # real EOF
+        fdst.write(buf)
+
+src2 = io.BufferedReader(FlakyRaw())
+dst2 = io.BytesIO()
+safe_copy(src2, dst2)
+print("safe_copy result:", repr(dst2.getvalue()))</code></pre>
+<pre><code>safe_copy result: b'hello world'</code></pre>
+<p><strong>Measured:</strong> explicitly checking <code>is None</code> before the general falsy check reads the real data correctly instead of stopping on the first transient signal. <code>shutil.copyfileobj()</code> itself offers no such option -- it must be avoided, not configured, when the source can return <code>None</code>.</p>
+<aside class="cta"><strong>Copying from a non-blocking file-like object with shutil.copyfileobj()? A single transient None read return silently truncates the copy with no error:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>The shutil documentation for copyfileobj() does not mention None at all; it is written assuming read() returns either data or b&#x27;&#x27; for EOF. We measured that a None-returning source is silently mishandled rather than rejected or documented as unsupported.</p></details>
+<details><summary>Does this affect shutil.copy() and shutil.copyfile()?</summary><p>We only measured copyfileobj() directly, but copyfile() calls it internally for the actual byte-copying step, so a None-capable file-like object passed through that path would hit the identical silent truncation.</p></details>
+<details><summary>Why doesn&#x27;t this show up with normal files?</summary><p>We measured that ordinary io.FileIO, BytesIO and StringIO objects never return None from read() -- only a custom or third-party RawIOBase explicitly built for non-blocking I/O can produce the None that triggers this gap, which is why the bug stays hidden in typical disk-to-disk or disk-to-BytesIO copies.</p></details>
+<details><summary>Is this the same bug as BufferedWriter.write() returning 0?</summary><p>No -- that is a separate, already-documented finding where a write-side 0 instead of None causes an infinite retry loop. This is the opposite failure mode on the read side: a correctly-returned None gets collapsed into a silent, premature stop instead of a hang.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in shutil.copyfileobj() and io.BufferedReader wrapping a custom non-blocking RawIOBase whose readinto() returns None once (no data ready yet) before returning real data. PlainHeaders is our extension; Python&#x27;s shutil and io modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

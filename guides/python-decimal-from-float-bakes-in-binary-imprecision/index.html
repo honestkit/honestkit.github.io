@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>decimal: Decimal(float) Bakes In Float Imprecision</title>
+<meta name="description" content="We measured Python 3.13.5: Decimal(0.1) is not 0.1 -- it&#x27;s 0.1000000000000000055511151231257827021181583404541015625, unlike Decimal(&#x27;0.1&#x27;).">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-decimal-from-float-bakes-in-binary-imprecision/">
+<meta property="og:title" content="decimal: Decimal(float) Bakes In Float Imprecision">
+<meta property="og:description" content="We measured Python 3.13.5: Decimal(0.1) is not 0.1 -- it&#x27;s 0.1000000000000000055511151231257827021181583404541015625, unlike Decimal(&#x27;0.1&#x27;).">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-decimal-from-float-bakes-in-binary-imprecision/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is Decimal(0.1) not exactly 0.1 in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Because the float literal 0.1 is already an imprecise binary approximation before Decimal() ever sees it -- we measured Decimal(0.1) producing 0.1000000000000000055511151231257827021181583404541015625, the exact decimal value of that binary approximation, not the number 0.1 itself."}}, {"@type": "Question", "name": "Does Decimal('0.1') equal Decimal(0.1) in Python?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured Decimal('0.1') == Decimal(0.1) returning False. The string constructor parses the exact decimal text; the float constructor converts whatever imprecise binary value the float literal actually holds."}}, {"@type": "Question", "name": "How do I safely convert a float to a Decimal without losing precision?", "acceptedAnswer": {"@type": "Answer", "text": "Convert it through str() first, e.g. Decimal(str(my_float)), which we measured giving the clean expected value for a typical price like 19.99. The most reliable fix is avoiding float entirely for values headed into Decimal -- parse from strings or integer cents at the source."}}, {"@type": "Question", "name": "Does arithmetic on Decimal values built from floats give wrong results?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, measurably -- we confirmed Decimal(0.1) + Decimal(0.2) gives 0.3000000000000000166533453694, not the clean 0.3 that Decimal('0.1') + Decimal('0.2') produces, because the float-sourced imprecision propagates through the addition."}}, {"@type": "Question", "name": "Is this a bug in Python's decimal module?", "acceptedAnswer": {"@type": "Answer", "text": "No -- Decimal(float) is documented to convert the float's exact value, and binary floats genuinely can't represent 0.1 exactly. The risk we measured is purely in code that assumes wrapping an existing float in Decimal() retroactively makes it exact, when the imprecision was already baked in before Decimal was involved."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>decimal: Decimal(float) Bakes In Binary Floating-Point Imprecision (tested)</h1>
+<p class="lead"><code>decimal.Decimal</code> exists specifically to avoid the rounding surprises of binary floating point. We measured what happens when a <code>Decimal</code> is constructed directly from a <code>float</code> value -- the natural thing to do if a price or rate already exists as a float from JSON, a database driver, or an earlier calculation -- instead of from a string.</p>
+<h2 id="repro1">1. Decimal(0.1) is not the number 0.1</h2>
+<pre><code>from decimal import Decimal
+
+print(Decimal("0.1"))
+print(Decimal(0.1))</code></pre>
+<pre><code>0.1
+0.1000000000000000055511151231257827021181583404541015625</code></pre>
+<p><strong>Measured:</strong> <code>Decimal("0.1")</code> (from a string) is the exact value <code>0.1</code>. <code>Decimal(0.1)</code> (from the float literal) is a long, ugly number -- because the Python float <code>0.1</code> is itself already an approximation (binary floating point can't represent <code>0.1</code> exactly), and <code>Decimal()</code> faithfully converts that exact binary approximation into an exact decimal representation of the wrong number. The float imprecision existed the moment <code>0.1</code> was written as a float; <code>Decimal()</code> doesn't introduce it, it just makes it visible.</p>
+
+<h2 id="repro2">2. The two constructions aren't equal, and arithmetic results differ</h2>
+<pre><code>from decimal import Decimal
+
+print(Decimal("0.1") == Decimal(0.1))
+
+a = Decimal(0.1) + Decimal(0.2)
+b = Decimal("0.1") + Decimal("0.2")
+print("from floats:", a)
+print("from strings:", b)
+print(a == b)</code></pre>
+<pre><code>False
+from floats: 0.3000000000000000166533453694
+from strings: 0.3
+False</code></pre>
+<p><strong>Measured:</strong> the two constructions compare unequal, and summing a pair built from floats gives a different, equally ugly result than summing the string-built pair, which lands exactly on <code>0.3</code>. Any code path that takes a float (from a JSON payload, an ORM field, a prior float calculation) and wraps it in <code>Decimal()</code> expecting exactness has already lost -- the float's imprecision is locked in before <code>Decimal</code> ever sees it.</p>
+
+<h2 id="repro3">3. The fix: construct from a string, or use from_float() if you must start with a float</h2>
+<pre><code>from decimal import Decimal
+
+price_from_api = 19.99  # arrived as a float
+safe = Decimal(str(price_from_api))
+print(safe)</code></pre>
+<pre><code>19.99</code></pre>
+<p><strong>Measured:</strong> converting the float to a string first, then to <code>Decimal</code>, gives the clean value a human would expect -- because <code>str()</code> on a float uses Python's shortest-round-trip repr algorithm rather than the exact binary value. This isn't foolproof for every float (some values' shortest string repr still won't be the "intended" decimal value if the float was already computed imprecisely upstream), but it avoids the specific failure mode here. The reliable fix is to never let a value touch <code>float</code> in the first place if it's going to end up in a <code>Decimal</code> -- parse it from a string or an integer-cents representation at the source.</p>
+<aside class="cta"><strong>Building a Decimal from a float value -- like Decimal(price) where price came from JSON or a calculation? Check what you actually get first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is Decimal(0.1) not exactly 0.1 in Python?</summary><p>Because the float literal 0.1 is already an imprecise binary approximation before Decimal() ever sees it -- we measured Decimal(0.1) producing 0.1000000000000000055511151231257827021181583404541015625, the exact decimal value of that binary approximation, not the number 0.1 itself.</p></details>
+<details><summary>Does Decimal(&#x27;0.1&#x27;) equal Decimal(0.1) in Python?</summary><p>No -- we measured Decimal(&#x27;0.1&#x27;) == Decimal(0.1) returning False. The string constructor parses the exact decimal text; the float constructor converts whatever imprecise binary value the float literal actually holds.</p></details>
+<details><summary>How do I safely convert a float to a Decimal without losing precision?</summary><p>Convert it through str() first, e.g. Decimal(str(my_float)), which we measured giving the clean expected value for a typical price like 19.99. The most reliable fix is avoiding float entirely for values headed into Decimal -- parse from strings or integer cents at the source.</p></details>
+<details><summary>Does arithmetic on Decimal values built from floats give wrong results?</summary><p>Yes, measurably -- we confirmed Decimal(0.1) + Decimal(0.2) gives 0.3000000000000000166533453694, not the clean 0.3 that Decimal(&#x27;0.1&#x27;) + Decimal(&#x27;0.2&#x27;) produces, because the float-sourced imprecision propagates through the addition.</p></details>
+<details><summary>Is this a bug in Python&#x27;s decimal module?</summary><p>No -- Decimal(float) is documented to convert the float&#x27;s exact value, and binary floats genuinely can&#x27;t represent 0.1 exactly. The risk we measured is purely in code that assumes wrapping an existing float in Decimal() retroactively makes it exact, when the imprecision was already baked in before Decimal was involved.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in decimal module: constructed Decimal(0.1) directly from the float literal, compared it against Decimal(&#x27;0.1&#x27;) built from the equivalent string, and summed both pairs to see whether the difference affects arithmetic results. PlainHeaders is our extension; Python&#x27;s decimal module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

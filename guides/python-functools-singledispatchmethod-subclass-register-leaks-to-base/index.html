@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>singledispatchmethod: Subclass Register Leaks to Base (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: registering on a subclass&#x27;s inherited singledispatchmethod changes the base class&#x27;s dispatch too -- one shared registry.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-functools-singledispatchmethod-subclass-register-leaks-to-base/">
+<meta property="og:title" content="singledispatchmethod: Subclass Register Leaks to Base (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: registering on a subclass&#x27;s inherited singledispatchmethod changes the base class&#x27;s dispatch too -- one shared registry.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-functools-singledispatchmethod-subclass-register-leaks-to-base/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does registering a type on a subclass's singledispatchmethod affect the base class?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, if the subclass inherited the singledispatchmethod without redeclaring it. We measured Sub.handle.register(...) adding a str overload that Base().handle() also picked up, because Sub.handle and Base.handle were the same object with one shared dispatch registry."}}, {"@type": "Question", "name": "How do I register a type on a subclass without affecting the base class?", "acceptedAnswer": {"@type": "Answer", "text": "Redeclare @singledispatchmethod on the subclass for that method name, even with an identical default body, before calling .register on it. We measured this giving the subclass its own independent dispatch registry, isolated from the base class."}}, {"@type": "Question", "name": "Is this specific to functools.singledispatchmethod, or does plain functools.singledispatch have the same issue?", "acceptedAnswer": {"@type": "Answer", "text": "The same root cause -- one shared dispatch registry per function object -- applies anywhere a singledispatch-based callable is referenced through more than one name without being redefined; it shows up with singledispatchmethod specifically because subclassing without overriding is the common case where two names end up pointing at the same object."}}, {"@type": "Question", "name": "Does Python raise any warning when this happens?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured no exception and no warning in either direction -- registering through the subclass's inherited method silently changes dispatch for the base class and any other subclass that also just inherits it, with no signal in the code that looks at the subclass alone."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>functools.singledispatchmethod Register on a Subclass Leaks Into the Base Class (tested)</h1>
+<p class="lead"><code>functools.singledispatchmethod</code> looks like ordinary method inheritance: a subclass gets its own copy of the dispatch table, so registering a new type on the subclass should only affect that subclass. That assumption is wrong whenever the subclass doesn't redeclare the <code>singledispatchmethod</code> itself. Because the subclass inherits the exact same descriptor object as the base class, calling <code>.register</code> through the subclass mutates one shared dispatch table -- and the base class, and every other subclass that also just inherits it, silently pick up the new overload too.</p>
+<h2 id="repro1">1. Registering through a subclass changes the base class's dispatch</h2>
+<pre><code>from functools import singledispatchmethod
+
+class Base:
+    @singledispatchmethod
+    def handle(self, arg):
+        return f"base default {arg!r}"
+
+    @handle.register
+    def _(self, arg: int):
+        return f"base int {arg}"
+
+class Sub(Base):
+    pass  # does not redefine handle at all
+
+@Sub.handle.register
+def _(self, arg: str):
+    return f"sub str {arg}"
+
+print(Base().handle("x"))
+print(Sub().handle("x"))</code></pre>
+<pre><code>sub str x
+sub str x</code></pre>
+<p><strong>Measured:</strong> <code>Sub</code> never redeclared <code>handle</code>, so <code>Sub.handle</code> is literally the same object as <code>Base.handle</code> -- the same underlying dispatcher and dispatch registry. Calling <code>.register</code> through <code>Sub.handle</code> adds the <code>str</code> overload to that one shared registry, so <code>Base().handle("x")</code> picks it up too, even though nothing about <code>Base</code> was touched by name. No error, no warning -- the base class's behavior just changed.</p>
+
+<h2 id="repro2">2. The fix: give the subclass its own singledispatchmethod</h2>
+<pre><code>from functools import singledispatchmethod
+
+class Base:
+    @singledispatchmethod
+    def handle(self, arg):
+        return f"base default {arg!r}"
+
+    @handle.register
+    def _(self, arg: int):
+        return f"base int {arg}"
+
+class Sub(Base):
+    @singledispatchmethod
+    def handle(self, arg):
+        return f"base default {arg!r}"
+
+@Sub.handle.register
+def _(self, arg: str):
+    return f"sub str {arg}"
+
+print(Base().handle("x"))
+print(Sub().handle("x"))</code></pre>
+<pre><code>base default 'x'
+sub str x</code></pre>
+<p><strong>Measured:</strong> once <code>Sub</code> redeclares its own <code>@singledispatchmethod handle</code> (even with an identical body), <code>Sub.handle</code> is a distinct descriptor with its own dispatch registry. Registering <code>str</code> on <code>Sub.handle</code> now only affects <code>Sub</code> -- <code>Base().handle("x")</code> falls through to the default, unaffected.</p>
+
+<h2 id="repro3">3. Why this is easy to miss in review</h2>
+<p>A class that doesn't override a method at all reads as "inherits the base behavior, unmodified" -- that's true for ordinary methods. <code>singledispatchmethod</code> breaks that intuition only at the moment someone calls <code>.register</code> through the subclass's name, which looks like a scoped, subclass-local change. The dispatch table actually lives on the single underlying function object shared by every class in the hierarchy that didn't explicitly redeclare the decorator, so the mutation is global to all of them. Reviewing a diff that only touches <code>Sub</code> gives no visual signal that <code>Base</code>'s runtime behavior just changed.</p>
+<aside class="cta"><strong>Registering a new type on a subclass&#x27;s inherited functools.singledispatchmethod and expecting only that subclass to pick it up? Check the base class too -- it probably just changed as well:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does registering a type on a subclass&#x27;s singledispatchmethod affect the base class?</summary><p>Yes, if the subclass inherited the singledispatchmethod without redeclaring it. We measured Sub.handle.register(...) adding a str overload that Base().handle() also picked up, because Sub.handle and Base.handle were the same object with one shared dispatch registry.</p></details>
+<details><summary>How do I register a type on a subclass without affecting the base class?</summary><p>Redeclare @singledispatchmethod on the subclass for that method name, even with an identical default body, before calling .register on it. We measured this giving the subclass its own independent dispatch registry, isolated from the base class.</p></details>
+<details><summary>Is this specific to functools.singledispatchmethod, or does plain functools.singledispatch have the same issue?</summary><p>The same root cause -- one shared dispatch registry per function object -- applies anywhere a singledispatch-based callable is referenced through more than one name without being redefined; it shows up with singledispatchmethod specifically because subclassing without overriding is the common case where two names end up pointing at the same object.</p></details>
+<details><summary>Does Python raise any warning when this happens?</summary><p>No. We measured no exception and no warning in either direction -- registering through the subclass&#x27;s inherited method silently changes dispatch for the base class and any other subclass that also just inherits it, with no signal in the code that looks at the subclass alone.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in functools.singledispatchmethod: defined a base class method with singledispatchmethod plus an int overload, created a subclass that does NOT redefine the method, called .register on the subclass&#x27;s (inherited) method to add a str overload, then called the method on instances of both the base class and the subclass to see which ones picked up the new overload. PlainHeaders is our extension; Python&#x27;s functools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

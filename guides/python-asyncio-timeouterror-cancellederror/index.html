@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python asyncio TimeoutError and CancelledError (Tested Fixes)</title>
+<meta name="description" content="We measured asyncio TimeoutError: empty message, wait_for vs asyncio.timeout, CancelledError inside the block, and the swallowed cancel that hides a timeout.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-asyncio-timeouterror-cancellederror/">
+<meta property="og:title" content="Python asyncio TimeoutError and CancelledError (Tested Fixes)">
+<meta property="og:description" content="We measured asyncio TimeoutError: empty message, wait_for vs asyncio.timeout, CancelledError inside the block, and the swallowed cancel that hides a timeout.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-asyncio-timeouterror-cancellederror/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is my asyncio TimeoutError message empty?", "acceptedAnswer": {"@type": "Answer", "text": "wait_for and asyncio.timeout raise TimeoutError with no message; we measured str(e) == '' on Python 3.13.5. Log repr(e) or type(e).__name__."}}, {"@type": "Question", "name": "Is asyncio.TimeoutError the same as TimeoutError?", "acceptedAnswer": {"@type": "Answer", "text": "Yes on Python 3.11+: we measured asyncio.TimeoutError is TimeoutError returning True on 3.13.5. On 3.10 and earlier they are separate classes (not tested here)."}}, {"@type": "Question", "name": "Why does my coroutine get CancelledError instead of TimeoutError?", "acceptedAnswer": {"@type": "Answer", "text": "Timeouts work by cancelling the task; the code inside sees CancelledError, and it becomes TimeoutError at the wait_for / asyncio.timeout boundary. We measured both sides."}}, {"@type": "Question", "name": "Why doesn't asyncio.wait_for time out?", "acceptedAnswer": {"@type": "Answer", "text": "If the coroutine catches CancelledError and returns, wait_for returns that value with no error. We measured exactly that after 0.1 s. Re-raise CancelledError."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>asyncio TimeoutError and CancelledError (tested)</h1>
+<p class="lead"><code>asyncio.wait_for</code> and <code>asyncio.timeout</code> raise <code>TimeoutError</code>, but the code being timed sees <code>CancelledError</code>, and getting that wrong hides timeouts entirely. We measured each case on Python 3.13.5.</p>
+<h2 id="what">1. What wait_for raises, and why the message is empty</h2>
+<pre><code>import asyncio
+async def slow():
+    await asyncio.sleep(5)
+async def main():
+    try:
+        await asyncio.wait_for(slow(), timeout=0.1)
+    except TimeoutError as e:
+        print(type(e).__name__, repr(str(e)))
+    print(asyncio.TimeoutError is TimeoutError)
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>TimeoutError &#x27;&#x27;
+True</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> <code>asyncio.wait_for</code> raises the built-in <code>TimeoutError</code>, and <code>asyncio.TimeoutError is TimeoutError</code> is <code>True</code> (they were merged in 3.11, per the docs; on 3.10 and earlier they are different classes, so catch <code>asyncio.TimeoutError</code> there). The message is an empty string, so <code>log.error(f"failed: {e}")</code> logs <code>failed: </code> with nothing after it. Log <code>repr(e)</code> or the exception type.</p>
+
+<h2 id="timeout">2. asyncio.timeout() works by cancelling</h2>
+<pre><code>import asyncio
+async def main():
+    try:
+        async with asyncio.timeout(0.1):
+            await asyncio.sleep(5)
+    except TimeoutError:
+        print(&quot;timed out&quot;)
+    # the trap: catching CancelledError inside the timed block
+    try:
+        async with asyncio.timeout(0.1):
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                print(&quot;inner saw CancelledError (that&#x27;s how timeouts work)&quot;)
+                raise
+    except TimeoutError:
+        print(&quot;outer saw TimeoutError&quot;)
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>timed out
+inner saw CancelledError (that&#x27;s how timeouts work)
+outer saw TimeoutError</code></pre>
+<p><strong>Measured:</strong> <code>async with asyncio.timeout(0.1)</code> (3.11+) raises <code>TimeoutError</code> outside the block, but the code <em>inside</em> sees <code>asyncio.CancelledError</code> first. That's the mechanism: the timeout cancels the task, then converts the cancellation into <code>TimeoutError</code> at the boundary. If you catch <code>CancelledError</code> inside to clean up, re-raise it.</p>
+
+<h2 id="swallow">3. Swallowing CancelledError silently defeats the timeout</h2>
+<pre><code>import asyncio
+async def main():
+    # swallowing the CancelledError defeats the timeout
+    async def stubborn():
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            return &quot;swallowed&quot;
+    loop = asyncio.get_running_loop(); t0 = loop.time()
+    try:
+        r = await asyncio.wait_for(stubborn(), timeout=0.1)
+        print(&quot;no TimeoutError, got&quot;, repr(r), f&quot;after {loop.time()-t0:.1f}s&quot;)
+    except TimeoutError:
+        print(&quot;TimeoutError&quot;)
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>no TimeoutError, got &#x27;swallowed&#x27; after 0.1s</code></pre>
+<p><strong>Measured:</strong> a coroutine that catches <code>CancelledError</code> and returns makes <code>wait_for</code> return that value with no <code>TimeoutError</code> at all, so the caller thinks the operation succeeded. Never swallow <code>CancelledError</code>; do cleanup in <code>finally</code> or re-raise.</p>
+
+<h2 id="catch">4. except Exception catches TimeoutError but not CancelledError</h2>
+<pre><code>import asyncio
+async def main():
+    try:
+        await asyncio.wait_for(asyncio.sleep(5), timeout=0.1)
+    except Exception as e:        # TimeoutError is an Exception ...
+        print(&quot;except Exception caught&quot;, type(e).__name__)
+    t = asyncio.create_task(asyncio.sleep(5))
+    await asyncio.sleep(0); t.cancel()
+    try:
+        await t
+    except Exception:
+        print(&quot;except Exception caught CancelledError&quot;)
+    except BaseException as e:    # ... but CancelledError is BaseException since 3.8
+        print(&quot;only BaseException caught&quot;, type(e).__name__)
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>except Exception caught TimeoutError
+only BaseException caught CancelledError</code></pre>
+<p><strong>Measured:</strong> <code>TimeoutError</code> is an <code>Exception</code>, but <code>CancelledError</code> derives from <code>BaseException</code>, so a generic <code>except Exception</code> handler lets cancellation through (which is what you want). Catching <code>BaseException</code> or using a bare <code>except:</code> around awaits causes the swallowing bug from section 3.</p>
+
+<aside class="cta"><strong>Timing out on an async HTTP call? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is my asyncio TimeoutError message empty?</summary><p>wait_for and asyncio.timeout raise TimeoutError with no message; we measured str(e) == &#x27;&#x27; on Python 3.13.5. Log repr(e) or type(e).__name__.</p></details>
+<details><summary>Is asyncio.TimeoutError the same as TimeoutError?</summary><p>Yes on Python 3.11+: we measured asyncio.TimeoutError is TimeoutError returning True on 3.13.5. On 3.10 and earlier they are separate classes (not tested here).</p></details>
+<details><summary>Why does my coroutine get CancelledError instead of TimeoutError?</summary><p>Timeouts work by cancelling the task; the code inside sees CancelledError, and it becomes TimeoutError at the wait_for / asyncio.timeout boundary. We measured both sides.</p></details>
+<details><summary>Why doesn&#x27;t asyncio.wait_for time out?</summary><p>If the coroutine catches CancelledError and returns, wait_for returns that value with no error. We measured exactly that after 0.1 s. Re-raise CancelledError.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: asyncio.wait_for and asyncio.timeout raising TimeoutError, its empty message, CancelledError inside the timed block, a coroutine that swallows cancellation, and which except clauses catch each. Every block was run verbatim and its output pasted from that run. Python 3.10 and earlier were not tested. PlainHeaders is our extension; everything else here is the standard library.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>contextlib.closing() Masks the Real Error If close() Is Missing</title>
+<meta name="description" content="We measured Python 3.13.5: contextlib.closing() checks for close() only at exit -- if missing, AttributeError buries the real exception raised inside the block.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-contextlib-closing-masks-real-error-if-close-missing/">
+<meta property="og:title" content="contextlib.closing() Masks the Real Error If close() Is Missing">
+<meta property="og:description" content="We measured Python 3.13.5: contextlib.closing() checks for close() only at exit -- if missing, AttributeError buries the real exception raised inside the block.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-contextlib-closing-masks-real-error-if-close-missing/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does contextlib.closing() check for a close() method when you create it?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured closing(obj) succeeding at construction even when obj has no close() method at all; the AttributeError only happens later, when the with block exits and __exit__ tries to call .close()."}}, {"@type": "Question", "name": "What happens if the with block raises an exception and close() is missing?", "acceptedAnswer": {"@type": "Answer", "text": "The AttributeError from the missing close() becomes the exception that actually propagates, not the original one -- we measured the real exception surviving only as __context__, which most code that logs type(e) or str(e) never sees."}}, {"@type": "Question", "name": "Does a working close() method avoid this problem?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured that when close() succeeds normally, the original exception raised inside the with block propagates unchanged. The masking is specific to close() itself failing (missing method, or an exception inside close()) while another exception is already in flight."}}, {"@type": "Question", "name": "How do I avoid the real error getting masked?", "acceptedAnswer": {"@type": "Answer", "text": "Validate that the object has a working close() before wrapping it in contextlib.closing(), so a missing method fails loudly at construction time instead of silently overwriting whatever exception the with block was about to raise."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>contextlib: closing() Masks the Real Error If close() Is Missing (tested)</h1>
+<p class="lead"><code>contextlib.closing(thing)</code> is a one-liner for "call <code>thing.close()</code> when this <code>with</code> block ends, even on an exception." It never checks that <code>thing</code> actually has a <code>close()</code> method when you construct it -- only when the block exits. We measured what happens to an exception raised inside the block when that check then fails.</p>
+<h2 id="repro1">1. An object without close() breaks even on a clean exit</h2>
+<pre><code>import contextlib
+
+class NoClose:
+    pass
+
+try:
+    with contextlib.closing(NoClose()):
+        print("inside, no exception")
+except Exception as e:
+    print(type(e).__name__, e)</code></pre>
+<pre><code>inside, no exception
+AttributeError: 'NoClose' object has no attribute 'close'</code></pre>
+<p><strong>Measured:</strong> <code>contextlib.closing()</code> does no validation up front -- <code>closing(NoClose())</code> succeeds, the body runs fine, and only on <code>__exit__</code> does it call <code>.close()</code> and discover the object doesn't have one. That's expected enough on its own: a missing method fails when called, same as anywhere else in Python.</p>
+
+<h2 id="repro2">2. But if the block itself raised a real exception, that exception vanishes</h2>
+<pre><code>import contextlib
+
+class NoClose:
+    pass
+
+try:
+    with contextlib.closing(NoClose()):
+        raise ValueError("the real bug")
+except Exception as e:
+    print("raised:", type(e).__name__, e)
+    print("the real bug is now just __context__:", e.__context__)</code></pre>
+<pre><code>raised: AttributeError 'NoClose' object has no attribute 'close'
+the real bug is now just __context__: the real bug</code></pre>
+<p><strong>Measured:</strong> the exception that actually propagates out of the <code>with</code> statement is <code>AttributeError: 'NoClose' object has no attribute 'close'</code> -- not the <code>ValueError("the real bug")</code> that was actually raised inside the block. <code>closing()</code>'s <code>__exit__</code> always calls <code>.close()</code> unconditionally, even while an exception is already propagating, and that call's own failure becomes the new, visible exception. The original <code>ValueError</code> survives only as <code>__context__</code> -- present in a full traceback, but gone from <code>str(e)</code>, <code>type(e)</code>, and anything that only logs the top-level exception.</p>
+
+<h2 id="repro3">3. This only happens because NoClose has zero close() -- a working close() doesn't interfere</h2>
+<pre><code>import contextlib
+
+class HasClose:
+    def close(self):
+        pass
+
+try:
+    with contextlib.closing(HasClose()):
+        raise ValueError("the real bug")
+except Exception as e:
+    print("raised:", type(e).__name__, e)</code></pre>
+<pre><code>raised: ValueError the real bug</code></pre>
+<p><strong>Measured:</strong> with a working <code>close()</code>, the original <code>ValueError</code> propagates normally -- the masking only happens when <code>close()</code> itself errors (missing method, or a <code>close()</code> that raises for its own reasons) while another exception is already in flight. The risk is specific to objects that only sometimes have a working <code>close()</code> -- for example a factory that can return either a real resource or a plain placeholder/mock without one.</p>
+
+<h2 id="fix">If you want the original exception to win, check up front</h2>
+<pre><code>import contextlib
+
+def safe_closing(thing):
+    if not hasattr(thing, "close"):
+        raise TypeError(f"{type(thing).__name__} has no close() method")
+    return contextlib.closing(thing)</code></pre>
+<p>This moves the failure to construction time, before anything inside the <code>with</code> block has a chance to run -- so a missing <code>close()</code> is its own clear error instead of silently replacing whatever the block itself was about to raise.</p>
+<aside class="cta"><strong>Wrapping an object in contextlib.closing() for safety? Check that it actually has a close() method -- if it doesn&#x27;t, the real bug you were debugging disappears:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does contextlib.closing() check for a close() method when you create it?</summary><p>No -- we measured closing(obj) succeeding at construction even when obj has no close() method at all; the AttributeError only happens later, when the with block exits and __exit__ tries to call .close().</p></details>
+<details><summary>What happens if the with block raises an exception and close() is missing?</summary><p>The AttributeError from the missing close() becomes the exception that actually propagates, not the original one -- we measured the real exception surviving only as __context__, which most code that logs type(e) or str(e) never sees.</p></details>
+<details><summary>Does a working close() method avoid this problem?</summary><p>Yes -- we measured that when close() succeeds normally, the original exception raised inside the with block propagates unchanged. The masking is specific to close() itself failing (missing method, or an exception inside close()) while another exception is already in flight.</p></details>
+<details><summary>How do I avoid the real error getting masked?</summary><p>Validate that the object has a working close() before wrapping it in contextlib.closing(), so a missing method fails loudly at construction time instead of silently overwriting whatever exception the with block was about to raise.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in contextlib module: raised an exception inside a contextlib.closing() block wrapping an object with no close() method, and checked which exception actually propagates. PlainHeaders is our extension; Python&#x27;s contextlib module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

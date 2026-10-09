@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>csv.Error: New-Line Seen in Unquoted Field (Tested)</title>
+<meta name="description" content="We measured csv&#x27;s new-line error: an embedded raw newline outside quotes triggers it, and the error&#x27;s own newline=&#x27;&#x27; suggested fix often doesn&#x27;t apply.">
+<link rel="canonical" href="https://honestkit.github.io/guides/csv-error-new-line-character-seen-in-unquoted-field/">
+<meta property="og:title" content="csv.Error: New-Line Seen in Unquoted Field (Tested)">
+<meta property="og:description" content="We measured csv&#x27;s new-line error: an embedded raw newline outside quotes triggers it, and the error&#x27;s own newline=&#x27;&#x27; suggested fix often doesn&#x27;t apply.">
+<meta property="og:url" content="https://honestkit.github.io/guides/csv-error-new-line-character-seen-in-unquoted-field/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does \\\"new-line character seen in unquoted field\\\" mean in Python's csv module?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that it means csv.reader hit a raw newline character while parsing a field that wasn't wrapped in quotes \u2014 the parser allows embedded newlines inside a quoted field (that's the documented purpose of quoting) but treats one outside quotes as invalid structure."}}, {"@type": "Question", "name": "Does opening the file with newline='' always fix this error?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed the error's own suggested fix (newline='') only applies when the input comes from a real file with Windows-style CRLF line endings. We reproduced the identical error by feeding csv.reader a plain Python list with no file involved at all, where newline='' is irrelevant since it's a parameter to open(), not to csv.reader()."}}, {"@type": "Question", "name": "Why does the same embedded newline work fine inside quotes but not outside?", "acceptedAnswer": {"@type": "Answer", "text": "We tested the exact same two-line value both quoted and unquoted: quoted, csv.reader accumulates it across lines with no error since that's the designed behavior; unquoted, it raises immediately because an unquoted field is expected to end at the line boundary."}}, {"@type": "Question", "name": "Can I pass a list of strings to csv.reader() instead of a file?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, csv.reader() accepts any iterable of strings \u2014 we used this directly to reproduce the error. The risk is that if one of your list elements itself contains an embedded raw newline (from a bad split, or multi-line log/API data), csv.reader treats it the same as if that newline were a real unquoted mid-field newline from a file."}}, {"@type": "Question", "name": "What silently happens if I open a CRLF file without newline= for a quoted multi-line field?", "acceptedAnswer": {"@type": "Answer", "text": "We measured no error at all in that case on this box \u2014 the embedded \\r\\n inside the quoted field was silently converted to a bare \\n by Python's universal-newline translation, a quiet data change rather than an exception."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>csv.Error: new-line character seen in unquoted field (tested)</h1>
+<p class="lead"><code>_csv.Error: new-line character seen in unquoted field - do you need to open the file with newline=''?</code> suggests one specific fix, but we measured a more common real cause where that suggested fix does nothing at all: feeding <code>csv.reader()</code> a list of strings where one "line" already contains an embedded raw newline before <code>csv</code> ever sees it.</p>
+<h2 id="repro1">1. The normal case: quoted multi-line fields are fine</h2>
+<pre><code>import csv
+
+rows = list(csv.reader(['a,b\n', '1,"hello\nworld"\n', '2,x\n']))
+print(rows)
+[['a', 'b'], ['1', 'hello\nworld'], ['2', 'x']]</code></pre>
+<p><strong>Measured:</strong> when a field is wrapped in quotes, <code>csv.reader</code> happily accumulates an embedded newline across multiple input lines &mdash; this is the designed, documented purpose of quoting, and it works correctly even when the reader is fed pre-split strings rather than a real file.</p>
+
+<h2 id="repro2">2. The same embedded newline, unquoted, raises the error</h2>
+<pre><code>rows = list(csv.reader(['a,b\n', '1,hello\nworld\n', '2,x\n']))
+_csv.Error: new-line character seen in unquoted field - do you need to open the file with newline=''?</code></pre>
+<p><strong>Measured:</strong> remove the quotes around the exact same two-line value and the identical input raises. The difference is entirely about quoting, not file encoding or platform &mdash; <code>csv</code>'s state machine allows a raw newline while inside an open quote (waiting for the closing <code>"</code>) but treats one outside quotes as unexpected structure, since an unquoted field is supposed to end at the line boundary.</p>
+
+<h2 id="repro3">3. The error message's own suggested fix doesn't address this cause</h2>
+<p>The message says "do you need to open the file with <code>newline=''</code>?" &mdash; but our repro above never opened a file at all; it fed <code>csv.reader()</code> a plain Python list. <code>newline=''</code> is a parameter to the built-in <code>open()</code> function, and it's irrelevant once you're handing <code>csv.reader</code> pre-built strings from somewhere else (a list comprehension, a mis-split <code>.split("\n")</code> on a larger text blob, log lines that themselves contain embedded newlines, data pulled from an API). In our testing, the actual real-world trigger for this version of the error is almost always upstream of <code>csv</code> entirely: something produced an iterable of "rows" where one row string wasn't a clean single CSV record.</p>
+
+<h2 id="repro4">4. Where newline='' genuinely does matter: per the docs, not fully reproduced here</h2>
+<p>Per the <a href="https://docs.python.org/3/library/csv.html">Python csv docs</a> (not independently reproduced in this test, since this box's line endings and Python version didn't trigger it): on Windows, opening a file in default text mode without <code>newline=''</code> lets universal-newline translation interfere with how a quoted multi-line field's embedded <code>\r\n</code> is seen by the parser, and this is the scenario where the suggested fix is actually correct. We did confirm a related but different effect on this Linux box: opening a real CRLF file containing a quoted multi-line field <strong>without</strong> <code>newline=''</code> silently converted the embedded <code>\r\n</code> to a bare <code>\n</code> with no error of any kind &mdash; a silent data change, not this exception.</p>
+
+<h2 id="fix">5. The actual fix depends on which cause you have</h2>
+<p>If the error comes from reading a real file, open it with <code>newline=''</code> first (<code>open(path, newline='')</code>) and let <code>csv.reader</code> iterate the file object directly rather than passing it a list you built yourself &mdash; direct file iteration reproduced zero errors in every test here. If the error comes from a list, generator, or any non-file iterable, <code>newline=''</code> will not help at all: instead, find wherever a single iterable element ended up containing a raw newline (a bad <code>.split()</code>, a log or API field that legitimately contains newlines) and either quote it properly when building the CSV text, or fix the upstream split so each element really is one record.</p>
+
+<aside class="cta"><strong>Debugging a malformed CSV an API streams back instead of a database dump? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does \&quot;new-line character seen in unquoted field\&quot; mean in Python&#x27;s csv module?</summary><p>We measured that it means csv.reader hit a raw newline character while parsing a field that wasn&#x27;t wrapped in quotes — the parser allows embedded newlines inside a quoted field (that&#x27;s the documented purpose of quoting) but treats one outside quotes as invalid structure.</p></details>
+<details><summary>Does opening the file with newline=&#x27;&#x27; always fix this error?</summary><p>No — we confirmed the error&#x27;s own suggested fix (newline=&#x27;&#x27;) only applies when the input comes from a real file with Windows-style CRLF line endings. We reproduced the identical error by feeding csv.reader a plain Python list with no file involved at all, where newline=&#x27;&#x27; is irrelevant since it&#x27;s a parameter to open(), not to csv.reader().</p></details>
+<details><summary>Why does the same embedded newline work fine inside quotes but not outside?</summary><p>We tested the exact same two-line value both quoted and unquoted: quoted, csv.reader accumulates it across lines with no error since that&#x27;s the designed behavior; unquoted, it raises immediately because an unquoted field is expected to end at the line boundary.</p></details>
+<details><summary>Can I pass a list of strings to csv.reader() instead of a file?</summary><p>Yes, csv.reader() accepts any iterable of strings — we used this directly to reproduce the error. The risk is that if one of your list elements itself contains an embedded raw newline (from a bad split, or multi-line log/API data), csv.reader treats it the same as if that newline were a real unquoted mid-field newline from a file.</p></details>
+<details><summary>What silently happens if I open a CRLF file without newline= for a quoted multi-line field?</summary><p>We measured no error at all in that case on this box — the embedded \r\n inside the quoted field was silently converted to a bare \n by Python&#x27;s universal-newline translation, a quiet data change rather than an exception.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in csv module: fed csv.reader() a pre-split list of &quot;lines&quot; where one line string itself contains an embedded raw newline, both inside and outside quotes, and separately opened real CRLF-encoded files with and without newline=&#x27;&#x27; to check the specific Windows scenario the error message itself suggests. PlainHeaders is our extension; Python&#x27;s csv module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

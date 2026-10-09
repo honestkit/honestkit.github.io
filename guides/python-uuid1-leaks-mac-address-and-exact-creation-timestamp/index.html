@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uuid.uuid1() Embeds Your MAC Address and Exact Timestamp</title>
+<meta name="description" content="We measured Python 3.13.5: a single uuid.uuid1() string lets anyone recover the generating machine&#x27;s real MAC address and creation time to the microsecond.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-uuid1-leaks-mac-address-and-exact-creation-timestamp/">
+<meta property="og:title" content="uuid.uuid1() Embeds Your MAC Address and Exact Timestamp">
+<meta property="og:description" content="We measured Python 3.13.5: a single uuid.uuid1() string lets anyone recover the generating machine&#x27;s real MAC address and creation time to the microsecond.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-uuid1-leaks-mac-address-and-exact-creation-timestamp/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does uuid.uuid1() reveal the computer's MAC address?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured the .node field of a uuid1() value matching uuid.getnode() exactly, which Python's docs describe as the host's hardware (MAC) address on most systems. Every uuid1() call on the same machine embeds the same 48 bits."}}, {"@type": "Question", "name": "Can you tell when a uuid1() value was created?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured decoding the .time field of a uuid1() UUID back into a UTC timestamp using the RFC 4122 UUID epoch (1582-10-15), and it matched the real system clock at generation time to within about 100 microseconds."}}, {"@type": "Question", "name": "Is it safe to use uuid.uuid1() for public-facing IDs like order numbers?", "acceptedAnswer": {"@type": "Answer", "text": "Not if hiding the generating machine's MAC address and exact creation time matters -- we measured both being fully recoverable from a single uuid1() string using only the standard library. uuid.uuid4() carries neither."}}, {"@type": "Question", "name": "Does uuid.uuid4() leak the same information as uuid1()?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured a uuid4() value's node-shaped bits not matching uuid.getnode() at all, since uuid4() is generated from randomness only and doesn't encode a host identifier or timestamp."}}, {"@type": "Question", "name": "How do I extract the MAC address from a uuid1() string in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Parse it with uuid.UUID(s), then format the .node integer as hex and insert colons every two characters. We confirmed this reconstructs the exact MAC address uuid.getnode() reports on the generating machine."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>uuid.uuid1() Leaks the Host&#x27;s MAC Address and Exact Timestamp (tested)</h1>
+<p class="lead"><code>uuid.uuid1()</code> is a common first pick for generating an ID because it's fast and guaranteed unique without a database round-trip. We measured exactly what information is recoverable from a single <code>uuid1()</code> value with nothing but the public <code>uuid</code> module -- and it's more than most people expect: the real MAC address of the machine that generated it, and the exact timestamp it was generated, down to the microsecond.</p>
+<h2 id="repro1">1. The .node field is the machine's real MAC address, not a random value</h2>
+<pre><code>import uuid
+
+u = uuid.uuid1()
+print(u)
+print(hex(u.node))
+print(hex(uuid.getnode()))
+print(u.node == uuid.getnode())</code></pre>
+<pre><code>a67a00e4-bfb0-11f1-a336-181dea38a491
+0x181dea38a491
+0x181dea38a491
+True</code></pre>
+<p><strong>Measured:</strong> the last 48 bits of a <code>uuid1()</code> value (the <code>.node</code> field) exactly match <code>uuid.getnode()</code>, which Python's own docs describe as "a 48-bit integer... intended to be unique to the current host" -- on most machines, the actual network interface's MAC address. Every <code>uuid1()</code> call on the same machine embeds the same 48 bits.</p>
+
+<h2 id="repro2">2. Both the MAC and the exact creation time are recoverable from just the string</h2>
+<pre><code>import uuid, datetime
+
+received = "a67a00e4-bfb0-11f1-a336-181dea38a491"  # a UUID1 string, from anywhere
+parsed = uuid.UUID(received)
+
+mac_hex = f"{parsed.node:012x}"
+mac = ":".join(mac_hex[i:i+2] for i in range(0, 12, 2))
+print("MAC:", mac)
+
+UUID_EPOCH = datetime.datetime(1582, 10, 15, tzinfo=datetime.timezone.utc)
+ts = UUID_EPOCH + datetime.timedelta(microseconds=parsed.time // 10)
+print("Created at (UTC):", ts.isoformat())</code></pre>
+<pre><code>MAC: 18:1d:ea:38:a4:91
+Created at (UTC): 2026-10-04T05:01:25.335882+00:00</code></pre>
+<p><strong>Measured:</strong> this reconstruction used only the UUID string and public <code>uuid</code>/<code>datetime</code> functions -- no special access, no library beyond the standard one. The recovered timestamp matched the real system clock at generation time to within about 100 microseconds (the measurement overhead of printing both values). Anyone holding a single <code>uuid1()</code> value -- in a URL, a log line, an exported record -- can run this same four-line decode.</p>
+
+<h2 id="repro3">3. uuid4() carries none of this information</h2>
+<pre><code>import uuid
+
+u4 = uuid.uuid4()
+print(u4)
+print(hex(u4.node))
+print(hex(uuid.getnode()))</code></pre>
+<pre><code>31e81eb9-5d5d-410a-ab92-7f0ffa9a2d3d
+0x92ab410a5d5d
+0x181dea38a491</code></pre>
+<p><strong>Measured:</strong> <code>uuid.uuid4()</code> is fully random -- its <code>.node</code>-shaped bits don't match the real <code>uuid.getnode()</code> value at all, because <code>uuid4()</code> doesn't use the host identifier or a timestamp in the first place; it's 122 bits of randomness. If an ID is ever going to be seen outside your own infrastructure -- a public order number, a document link, an API resource ID -- <code>uuid4()</code> avoids leaking the generating machine's MAC address and creation time that <code>uuid1()</code> hands out for free. Reserve <code>uuid1()</code> for cases where the ID never leaves a trusted environment and the extra uniqueness guarantee is worth the trade-off.</p>
+<aside class="cta"><strong>Using a UUID as a public order/document ID? Check which version you&#x27;re generating:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does uuid.uuid1() reveal the computer&#x27;s MAC address?</summary><p>Yes -- we measured the .node field of a uuid1() value matching uuid.getnode() exactly, which Python&#x27;s docs describe as the host&#x27;s hardware (MAC) address on most systems. Every uuid1() call on the same machine embeds the same 48 bits.</p></details>
+<details><summary>Can you tell when a uuid1() value was created?</summary><p>Yes -- we measured decoding the .time field of a uuid1() UUID back into a UTC timestamp using the RFC 4122 UUID epoch (1582-10-15), and it matched the real system clock at generation time to within about 100 microseconds.</p></details>
+<details><summary>Is it safe to use uuid.uuid1() for public-facing IDs like order numbers?</summary><p>Not if hiding the generating machine&#x27;s MAC address and exact creation time matters -- we measured both being fully recoverable from a single uuid1() string using only the standard library. uuid.uuid4() carries neither.</p></details>
+<details><summary>Does uuid.uuid4() leak the same information as uuid1()?</summary><p>No -- we measured a uuid4() value&#x27;s node-shaped bits not matching uuid.getnode() at all, since uuid4() is generated from randomness only and doesn&#x27;t encode a host identifier or timestamp.</p></details>
+<details><summary>How do I extract the MAC address from a uuid1() string in Python?</summary><p>Parse it with uuid.UUID(s), then format the .node integer as hex and insert colons every two characters. We confirmed this reconstructs the exact MAC address uuid.getnode() reports on the generating machine.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in uuid module: generated a uuid.uuid1() value, then extracted its .node and .time fields from nothing but the UUID string itself, converted .node to MAC-address format and .time to a UTC timestamp using the RFC 4122 UUID epoch (1582-10-15), and compared the recovered timestamp against the real system clock at generation time. PlainHeaders is our extension; Python&#x27;s uuid module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OSError: [Errno 22] Invalid argument in Python, Tested</title>
+<meta name="description" content="We measured Python&#x27;s OSError errno 22: colons in filenames from datetime, negative seek, a directory moved into itself, and negative os sizes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-oserror-errno-22-invalid-argument/">
+<meta property="og:title" content="OSError: [Errno 22] Invalid argument in Python, Tested">
+<meta property="og:description" content="We measured Python&#x27;s OSError errno 22: colons in filenames from datetime, negative seek, a directory moved into itself, and negative os sizes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-oserror-errno-22-invalid-argument/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does OSError: [Errno 22] Invalid argument mean in Python?", "acceptedAnswer": {"@type": "Answer", "text": "The operating system rejected a value you passed. We measured it on Linux from seek(-10), os.rename of a directory into itself, os.read(fd, -1) and os.truncate(path, -1)."}}, {"@type": "Question", "name": "Why do I get Errno 22 on Windows but not on Linux?", "acceptedAnswer": {"@type": "Answer", "text": "Often a filename with a character Windows doesn't allow, such as the colons in str(datetime). We measured Linux creating 'report 2026-10-09 14:30:00.txt' without error."}}, {"@type": "Question", "name": "How do I make a timestamp safe for a filename?", "acceptedAnswer": {"@type": "Answer", "text": "Format it without colons, e.g. f'{stamp:%Y-%m-%d_%H-%M-%S}', or replace <>:\"/\\|?* with underscores. We measured both."}}, {"@type": "Question", "name": "Why does f.seek give Invalid argument?", "acceptedAnswer": {"@type": "Answer", "text": "A negative absolute position. We measured seek(-10) raising errno 22 while seek(-3, 2) in binary mode read the last 3 bytes."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>OSError [Errno 22] Invalid argument (tested)</h1>
+<p class="lead"><code>OSError: [Errno 22] Invalid argument</code> means the operating system rejected a value Python passed it. We reproduced four causes on Python 3.13.5, including the filename bug that only shows up on Windows.</p>
+<h2 id="filename">1. A filename with a colon (works on Linux, not on Windows)</h2>
+<pre><code>import datetime, os, re
+stamp = datetime.datetime(2026, 10, 9, 14, 30, 0)
+name = f&quot;report {stamp}.txt&quot;
+print(repr(name))
+open(name, &quot;w&quot;).close()          # works on Linux; &#x27;:&#x27; is not allowed on Windows
+print(&quot;created on Linux:&quot;, os.path.exists(name))
+
+def safe_filename(s):
+    return re.sub(r&#x27;[&lt;&gt;:&quot;/\\|?*\x00-\x1f]&#x27;, &quot;_&quot;, s).rstrip(&quot;. &quot;)
+
+print(repr(safe_filename(name)))
+print(repr(f&quot;report {stamp:%Y-%m-%d_%H-%M-%S}.txt&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>&#x27;report 2026-10-09 14:30:00.txt&#x27;
+created on Linux: True
+&#x27;report 2026-10-09 14_30_00.txt&#x27;
+&#x27;report 2026-10-09_14-30-00.txt&#x27;</code></pre>
+<p><strong>Measured on Python 3.13.5 on Linux:</strong> a filename built from <code>str(datetime)</code> contains colons, and Linux creates it without complaint. Windows doesn't allow <code>&lt;&gt;:"/\|?*</code> in names (a common cause of errno 22 there), so code tested on Linux or macOS can fail the first time it runs on Windows. (We couldn't run the Windows side on this Linux box; what we measured is that Linux accepts the name.) Format timestamps with <code>-</code> or <code>_</code>, or pass user-supplied names through a function like <code>safe_filename</code>.</p>
+
+<h2 id="seek">2. Seeking to a negative position</h2>
+<pre><code>import os
+with open(&quot;f.txt&quot;, &quot;rb&quot;) as f:
+    try:
+        f.seek(-10)               # absolute position before the start
+    except OSError as e:
+        print(&quot;seek(-10):&quot;, e)
+    print(&quot;seek(-3, 2):&quot;, f.seek(-3, 2), f.read())   # relative to the end: fine
+with open(&quot;f.txt&quot;) as f:
+    try:
+        f.seek(-3, 2)             # text mode: only seek(0, 2) is allowed
+    except Exception as e:
+        print(&quot;text seek(-3, 2):&quot;, type(e).__name__, e)</code></pre>
+<p>Output:</p>
+<pre><code>seek(-10): [Errno 22] Invalid argument
+seek(-3, 2): 3 b&#x27;lo\n&#x27;
+text seek(-3, 2): UnsupportedOperation can&#x27;t do nonzero end-relative seeks</code></pre>
+<p><strong>Measured:</strong> <code>seek(-10)</code> means "absolute position -10", which is errno 22. To read the end of a file, seek relative to the end with <code>whence=2</code>, in binary mode. Text mode refuses any non-zero end-relative seek with a different error, <code>UnsupportedOperation</code>.</p>
+
+<h2 id="rename">3. Moving a directory into itself</h2>
+<pre><code>import os, shutil
+os.makedirs(&quot;data&quot;, exist_ok=True)
+try:
+    os.rename(&quot;data&quot;, &quot;data/backup&quot;)
+except OSError as e:
+    print(&quot;os.rename:&quot;, e)
+try:
+    shutil.move(&quot;data&quot;, &quot;data/backup&quot;)
+except Exception as e:
+    print(&quot;shutil.move:&quot;, type(e).__name__, e)</code></pre>
+<p>Output:</p>
+<pre><code>os.rename: [Errno 22] Invalid argument: &#x27;data&#x27; -&gt; &#x27;data/backup&#x27;
+shutil.move: Error Cannot move a directory &#x27;data&#x27; into itself &#x27;data/backup&#x27;.</code></pre>
+<p><strong>Measured:</strong> <code>os.rename</code> reports this as a bare errno 22 with both paths; <code>shutil.move</code> checks first and says what's wrong. <code>shutil.Error</code> is an <code>OSError</code> subclass, so <code>except OSError</code> catches both.</p>
+
+<h2 id="negative">4. Negative sizes and impossible values in os calls</h2>
+<pre><code>import os
+fd = os.open(&quot;f.txt&quot;, os.O_RDONLY)
+for name, call in [(&quot;os.read(fd, -1)&quot;, lambda: os.read(fd, -1)),
+                   (&quot;os.truncate(path, -1)&quot;, lambda: os.truncate(&quot;f.txt&quot;, -1)),
+                   (&quot;os.sched_setaffinity(0, {999})&quot;, lambda: os.sched_setaffinity(0, {999}))]:
+    try:
+        call()
+    except OSError as e:
+        print(f&quot;{name:32} -&gt; errno {e.errno}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>os.read(fd, -1)                  -&gt; errno 22: [Errno 22] Invalid argument
+os.truncate(path, -1)            -&gt; errno 22: [Errno 22] Invalid argument: &#x27;f.txt&#x27;
+os.sched_setaffinity(0, {999})   -&gt; errno 22: [Errno 22] Invalid argument</code></pre>
+<p><strong>Measured:</strong> the <code>os</code> module passes values to the kernel as they are, and the kernel answers <code>EINVAL</code>: a negative read size, a negative length, a CPU that doesn't exist. Print the arguments right before the failing call; one is usually negative, zero or out of range from an earlier calculation. Other errno numbers are in our <a href="/guides/python-oserror-errno-codes-list/">errno codes list</a>.</p>
+
+<aside class="cta"><strong>Saving files downloaded from the web? Check the Content-Disposition filename the server sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does OSError: [Errno 22] Invalid argument mean in Python?</summary><p>The operating system rejected a value you passed. We measured it on Linux from seek(-10), os.rename of a directory into itself, os.read(fd, -1) and os.truncate(path, -1).</p></details>
+<details><summary>Why do I get Errno 22 on Windows but not on Linux?</summary><p>Often a filename with a character Windows doesn&#x27;t allow, such as the colons in str(datetime). We measured Linux creating &#x27;report 2026-10-09 14:30:00.txt&#x27; without error.</p></details>
+<details><summary>How do I make a timestamp safe for a filename?</summary><p>Format it without colons, e.g. f&#x27;{stamp:%Y-%m-%d_%H-%M-%S}&#x27;, or replace &lt;&gt;:&quot;/\|?* with underscores. We measured both.</p></details>
+<details><summary>Why does f.seek give Invalid argument?</summary><p>A negative absolute position. We measured seek(-10) raising errno 22 while seek(-3, 2) in binary mode read the last 3 bytes.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: a datetime-based filename, negative and end-relative seeks in binary and text mode, os.rename vs shutil.move into itself, and negative os.read/os.truncate values. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

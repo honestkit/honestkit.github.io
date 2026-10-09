@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HSTS Preload List: Requirements, Error Codes and Removal (Tested)</title>
+<meta name="description" content="What hstspreload.org requires (max-age of at least 31536000, includeSubDomains, preload, http to https on the same host first), the exact API error codes we got back, proof that Chromium 153 upgrades preloaded domains with a 307 Internal Redirect, and why removal takes months.">
+<link rel="canonical" href="https://honestkit.github.io/guides/hsts-preload-list-requirements/">
+<meta property="og:title" content="HSTS Preload List: Requirements, Error Codes and Removal (Tested)">
+<meta property="og:description" content="What hstspreload.org requires (max-age of at least 31536000, includeSubDomains, preload, http to https on the same host first), the exact API error codes we got back, proof that Chromium 153 upgrades preloaded domains with a 307 Internal Redirect, and why removal takes months.">
+<meta property="og:url" content="https://honestkit.github.io/guides/hsts-preload-list-requirements/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What are the HSTS preload requirements?", "acceptedAnswer": {"@type": "Answer", "text": "Per hstspreload.org: a valid certificate, http redirecting to https on the same host first, all subdomains on HTTPS, and a header on the apex with max-age of at least 31536000, includeSubDomains and preload."}}, {"@type": "Question", "name": "What does redirects.http.www_first mean?", "acceptedAnswer": {"@type": "Answer", "text": "http://yourdomain redirects straight to www (http or https) instead of to https://yourdomain first. google.com and cloudflare.com both returned it from the hstspreload.org API in our check."}}, {"@type": "Question", "name": "How do I check if a domain is on the HSTS preload list?", "acceptedAnswer": {"@type": "Answer", "text": "Query https://hstspreload.org/api/v2/status?domain=example.com. github.com and wikipedia.org returned status preloaded; example.com returned unknown."}}, {"@type": "Question", "name": "How long does removal from the HSTS preload list take?", "acceptedAnswer": {"@type": "Answer", "text": "hstspreload.org documents that removal takes months to reach users through browser updates and is not guaranteed for all browsers. Remove the preload directive, then submit the removal form."}}, {"@type": "Question", "name": "How can I tell a browser used the preload list?", "acceptedAnswer": {"@type": "Answer", "text": "In Chromium 153 a fresh profile loading http://github.com/ showed a 307 Internal Redirect with Non-Authoritative-Reason: HSTS before any network request; http://example.com/ was sent over plain http."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>HSTS preload list requirements (tested)</h1>
+<p class="lead">The HSTS preload list is a list of domains compiled into Chrome, Firefox, Safari and Edge that are only ever loaded over HTTPS, even on the very first visit. We queried the official checker for real domains and watched Chromium upgrade a preloaded domain before it touched the network.</p>
+<h2>1. The submission requirements (from hstspreload.org)</h2>
+<p>These rules are hstspreload.org's published requirements, not our test results. To be accepted, the domain must:</p>
+<ul>
+<li>serve a valid certificate;</li>
+<li>redirect <code>http://</code> to <code>https://</code> <strong>on the same host first</strong> (<code>http://example.com</code> to <code>https://example.com</code>, only then to <code>www</code>) if it listens on port 80;</li>
+<li>serve all subdomains over HTTPS, including <code>www</code> if it exists in DNS;</li>
+<li>send this header on the base domain over HTTPS: <code>max-age</code> of at least <code>31536000</code> (one year), the <code>includeSubDomains</code> directive and the <code>preload</code> directive; the header on an HTTPS redirect must include them too.</li>
+</ul>
+<pre><code>Strict-Transport-Security: max-age=63072000; includeSubDomains; preload</code></pre>
+<p>Only the registrable domain (e.g. <code>example.com</code>) can be submitted, not a subdomain. Setting the header in nginx, including the <code>add_header ... always</code> and nested-location traps we measured, is covered in <a href="/guides/strict-transport-security-header-nginx/">Strict-Transport-Security not set in nginx</a>.</p>
+<h2>2. What the official checker returned</h2>
+<p>We called <code>https://hstspreload.org/api/v2/status?domain=...</code> and <code>/api/v2/preloadable?domain=...</code>:</p>
+<table><thead><tr><th>Domain</th><th>Header we saw (curl)</th><th>status</th><th>preloadable errors</th></tr></thead><tbody>
+<tr><td>github.com</td><td><code>max-age=31536000; includeSubdomains; preload</code></td><td><code>preloaded</code></td><td>none</td></tr>
+<tr><td>wikipedia.org</td><td><code>max-age=106384710; includeSubDomains; preload</code></td><td><code>preloaded</code></td><td>(not checked)</td></tr>
+<tr><td>cloudflare.com</td><td><code>max-age=15780000; includeSubDomains</code></td><td><code>preloaded</code></td><td><code>header.preloadable.preload.missing</code>, <code>header.preloadable.max_age.below_1_year</code>, <code>redirects.http.www_first</code></td></tr>
+<tr><td>google.com</td><td>none on the apex</td><td><code>unknown</code></td><td><code>response.no_header</code>, <code>redirects.http.www_first</code></td></tr>
+<tr><td>example.com</td><td>none</td><td><code>unknown</code></td><td><code>response.no_header</code>, <code>redirects.http.no_redirect</code></td></tr>
+<tr><td>unregistered domain</td><td>-</td><td><code>unknown</code></td><td><code>domain.tls.cannot_connect</code></td></tr>
+</tbody></table>
+<p>Two things stand out. <code>redirects.http.www_first</code> is the most common real-world failure: the checker's message says <code>http://google.com</code> "should immediately redirect to <code>https://google.com</code> (HTTPS) before adding the www subdomain", so the browser records HSTS for the apex. And cloudflare.com is still <code>preloaded</code> although it would fail a new submission today: the checker validates new submissions, and an existing entry is not removed just because the header changed.</p>
+<h2>3. What the browser did (observed)</h2>
+<p>In a fresh Chromium 153 profile (no prior visits, so no dynamic HSTS), CDP <code>Network.requestWillBeSent</code> events showed:</p>
+<table><thead><tr><th>Typed URL</th><th>First hop</th></tr></thead><tbody>
+<tr><td><code>http://github.com/</code></td><td><strong>307 Internal Redirect</strong>, <code>Non-Authoritative-Reason: HSTS</code>, to <code>https://github.com/</code>, no remote IP (never hit the network)</td></tr>
+<tr><td><code>http://web.dev/</code> (the whole <code>.dev</code> TLD is preloaded)</td><td>same 307 Internal Redirect, reason HSTS</td></tr>
+<tr><td><code>http://example.com/</code></td><td>sent over plain http to the server, no upgrade</td></tr>
+</tbody></table>
+<p>That is the point of preloading: the first visit is protected too. With HSTS from the header alone, the very first <code>http://</code> request still goes out in clear text before the browser learns the policy. In DevTools the same upgrade shows as a <code>307 Internal Redirect</code> row.</p>
+<h2>4. Removal is slow (as documented by hstspreload.org)</h2>
+<p>hstspreload.org states that removal can take months to reach users and cannot be guaranteed for every browser, and that you should only submit if you are sure every subdomain will support HTTPS long term. To request removal: drop <code>preload</code> from the header, then use the removal form on hstspreload.org. Until users get a browser update, every subdomain (intranet hosts, printers, dev boxes with self-signed certs) must keep serving valid HTTPS, because browsers will refuse plain http with no click-through. Lower <code>max-age</code> does not help users whose browser ships the preload list.</p>
+<h2>5. Checklist before you submit</h2>
+<pre><code># 1. apex http must go to https on the SAME host first
+curl -sI http://example.com/ | grep -i '^location'      # expect https://example.com/
+# 2. header on the apex over https
+curl -sI https://example.com/ | grep -i strict-transport
+# 3. official check (errors[] must be empty)
+curl -s 'https://hstspreload.org/api/v2/preloadable?domain=example.com'
+curl -s 'https://hstspreload.org/api/v2/status?domain=example.com'</code></pre>
+<p>Roll out in steps: <code>max-age=300; includeSubDomains</code>, then a week, then a month, and only then two years plus <code>preload</code>. Related: <a href="/guides/strict-transport-security-header-nginx/">HSTS in nginx</a>.</p>
+<aside class="cta"><strong>Check the Strict-Transport-Security header your site sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What are the HSTS preload requirements?</summary><p>Per hstspreload.org: a valid certificate, http redirecting to https on the same host first, all subdomains on HTTPS, and a header on the apex with max-age of at least 31536000, includeSubDomains and preload.</p></details>
+<details><summary>What does redirects.http.www_first mean?</summary><p>http://yourdomain redirects straight to www (http or https) instead of to https://yourdomain first. google.com and cloudflare.com both returned it from the hstspreload.org API in our check.</p></details>
+<details><summary>How do I check if a domain is on the HSTS preload list?</summary><p>Query https://hstspreload.org/api/v2/status?domain=example.com. github.com and wikipedia.org returned status preloaded; example.com returned unknown.</p></details>
+<details><summary>How long does removal from the HSTS preload list take?</summary><p>hstspreload.org documents that removal takes months to reach users through browser updates and is not guaranteed for all browsers. Remove the preload directive, then submit the removal form.</p></details>
+<details><summary>How can I tell a browser used the preload list?</summary><p>In Chromium 153 a fresh profile loading http://github.com/ showed a 307 Internal Redirect with Non-Authoritative-Reason: HSTS before any network request; http://example.com/ was sent over plain http.</p></details>
+</section>
+<p class="note">Written with AI assistance. Checked on 2026-10-01: the public hstspreload.org API (/api/v2/status and /api/v2/preloadable) queried for github.com, wikipedia.org, cloudflare.com, google.com, example.com and an unregistered domain, plus headless Chromium 153.0.8010.12 (Playwright, fresh profile, CDP Network events) loading http:// URLs. The submission rules are quoted from hstspreload.org, not invented by us; the error codes and browser behaviour are what we observed. PlainHeaders is our extension; hstspreload.org and curl are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

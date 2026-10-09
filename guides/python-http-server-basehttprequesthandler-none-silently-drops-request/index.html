@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>http.server Silently Drops a Valid Request on None (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: BaseHTTPRequestHandler silently drops a complete, valid HTTP request on one transient None -- no error, no response, no log line.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-http-server-basehttprequesthandler-none-silently-drops-request/">
+<meta property="og:title" content="http.server Silently Drops a Valid Request on None (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: BaseHTTPRequestHandler silently drops a complete, valid HTTP request on one transient None -- no error, no response, no log line.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-http-server-basehttprequesthandler-none-silently-drops-request/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "http.server's documentation describes handle_one_request() as reading and dispatching a single HTTP request; it says nothing about None or non-blocking sockets. We measured that the existing not self.raw_requestline check -- meant only to detect a genuine client disconnect -- can't distinguish that from a collapsed transient None, since both look like an empty readline() result."}}, {"@type": "Question", "name": "Does the standard socketserver.TCPServer hit this in practice?", "acceptedAnswer": {"@type": "Answer", "text": "Not with its default blocking sockets -- a blocking socket's readinto() simply waits for data rather than returning None. This applies specifically to servers built on BaseHTTPRequestHandler over a socket that has been put in non-blocking mode, or wrapped in a custom non-blocking RawIOBase, which is a real but deliberate setup choice, not the out-of-the-box default."}}, {"@type": "Question", "name": "Is this worse than the client-side findings in this family?", "acceptedAnswer": {"@type": "Answer", "text": "In one sense, yes: the already-confirmed http.client/smtplib/poplib findings at least raise an exception a caller can catch and log. Here, nothing raises -- the server just quietly closes the connection and moves on, which means there is no exception, traceback, or log line marking the dropped request at all."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- it's a direct, more severe consequence of the already-confirmed io.BufferedReader.readline() None-to-b'' collapse (the same mechanism behind the http.client/smtplib/poplib trio), but applied on the server side of a connection instead of the client side, where the existing disconnect-detection logic has no way to tell a transient retry signal from a real goodbye."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>http.server Silently Drops a Valid Request on a Transient None (tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> from <code>readinto()</code> -- distinct from the empty read that means real end-of-stream, and already confirmed to collapse to <code>b''</code> through <code>io.BufferedReader.readline()</code>. We measured that <code>BaseHTTPRequestHandler.handle_one_request()</code> reads the request line with exactly one call -- <code>self.raw_requestline = self.rfile.readline(65537)</code> -- and then checks <code>if not self.raw_requestline: self.close_connection = True; return</code>. That check exists to detect a client that closed the connection before sending anything. A collapsed transient <code>None</code> looks identical: the server marks the connection closed and returns, with no exception, no error response, and no log line -- silently dropping a request that was valid and complete one read call away.</p>
+<h2 id="repro1">1. A real, valid HTTP request behind one transient None</h2>
+<pre><code>import http.server, io
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self, payload):
+        self.calls = 0
+        self.sent = False
+        self.payload = payload
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None            # transient: no data ready yet
+        if not self.sent:
+            self.sent = True
+            n = len(self.payload)
+            b[:n] = self.payload
+            return n               # the real, complete request
+        return 0                   # real EOF after that
+
+class DummyHandler(http.server.BaseHTTPRequestHandler):
+    def setup(self): pass
+    def finish(self): pass
+    def do_GET(self):
+        self.handled = True
+        self.send_response(200)
+        self.end_headers()
+
+payload = b"GET /hello HTTP/1.1\r\nHost: example.com\r\n\r\n"
+raw = FlakyRaw(payload)
+br = io.BufferedReader(raw)
+
+h = DummyHandler.__new__(DummyHandler)
+h.rfile = br
+h.wfile = io.BytesIO()
+h.close_connection = False
+h.handled = False
+h.server = None
+h.client_address = ('127.0.0.1', 12345)
+h.request_version = 'HTTP/1.1'
+h.handle_one_request()
+
+print("close_connection:", h.close_connection)
+print("handled a real request:", h.handled)
+print("response bytes written:", h.wfile.getvalue())
+print("raw calls made:", raw.calls)</code></pre>
+<pre><code>close_connection: True
+handled a real request: False
+response bytes written: b''
+raw calls made: 1</code></pre>
+<p><strong>Measured:</strong> the request is valid and complete, one read call away, and only one raw read happened. <code>handle_one_request()</code> treated the collapsed empty <code>readline()</code> result exactly like a client that disconnected before sending anything -- it set <code>close_connection = True</code> and returned, with no exception raised anywhere and nothing written back to the client. There is nothing here for a <code>try</code>/<code>except</code> around request handling to catch, because nothing failed from the server's point of view.</p>
+
+<h2 id="repro2">2. The fix: drain the request line into a real buffer first, retrying on None</h2>
+<pre><code>def readline_retrying_on_none(buffered_reader, size=65537):
+    while True:
+        line = buffered_reader.readline(size)
+        if line == b'' and buffered_reader.peek(1) != b'':
+            continue   # collapsed None, not real EOF -- retry
+        return line
+
+raw2 = FlakyRaw(payload)
+br2 = io.BufferedReader(raw2)
+h2 = DummyHandler.__new__(DummyHandler)
+h2.rfile = br2
+h2.wfile = io.BytesIO()
+h2.close_connection = False
+h2.handled = False
+h2.server = None
+h2.client_address = ('127.0.0.1', 12345)
+h2.request_version = 'HTTP/1.1'
+h2.raw_requestline = readline_retrying_on_none(h2.rfile)
+if h2.parse_request():
+    h2.do_GET()
+print("handled a real request:", h2.handled)
+print("response bytes written:", h2.wfile.getvalue())</code></pre>
+<pre><code>handled a real request: True
+response bytes written: b'HTTP/1.0 200 OK\r\nServer: BaseHTTP/0.6 Python/3.13.5\r\nDate: ...\r\n\r\n'</code></pre>
+<p><strong>Measured:</strong> distinguishing a collapsed transient <code>None</code> from a genuine client disconnect -- by checking whether more data is actually available with <code>peek()</code> -- before giving up lets the server process the same request correctly. If a server built on <code>BaseHTTPRequestHandler</code> occasionally drops requests with no error and no log entry under load, and the socket involved is non-blocking, this silent collapse is a plausible cause worth ruling out.</p>
+<aside class="cta"><strong>Building an HTTP server on a non-blocking socket with http.server.BaseHTTPRequestHandler? A transient None on the very first read silently drops a complete, valid request -- no error, no response, no log line:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>http.server&#x27;s documentation describes handle_one_request() as reading and dispatching a single HTTP request; it says nothing about None or non-blocking sockets. We measured that the existing not self.raw_requestline check -- meant only to detect a genuine client disconnect -- can&#x27;t distinguish that from a collapsed transient None, since both look like an empty readline() result.</p></details>
+<details><summary>Does the standard socketserver.TCPServer hit this in practice?</summary><p>Not with its default blocking sockets -- a blocking socket&#x27;s readinto() simply waits for data rather than returning None. This applies specifically to servers built on BaseHTTPRequestHandler over a socket that has been put in non-blocking mode, or wrapped in a custom non-blocking RawIOBase, which is a real but deliberate setup choice, not the out-of-the-box default.</p></details>
+<details><summary>Is this worse than the client-side findings in this family?</summary><p>In one sense, yes: the already-confirmed http.client/smtplib/poplib findings at least raise an exception a caller can catch and log. Here, nothing raises -- the server just quietly closes the connection and moves on, which means there is no exception, traceback, or log line marking the dropped request at all.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>Yes -- it&#x27;s a direct, more severe consequence of the already-confirmed io.BufferedReader.readline() None-to-b&#x27;&#x27; collapse (the same mechanism behind the http.client/smtplib/poplib trio), but applied on the server side of a connection instead of the client side, where the existing disconnect-detection logic has no way to tell a transient retry signal from a real goodbye.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in http.server.BaseHTTPRequestHandler.handle_one_request(), feeding it a genuinely valid, complete HTTP/1.1 GET request through an io.BufferedReader over a custom non-blocking RawIOBase whose readinto() returns None once before returning the real request bytes. PlainHeaders is our extension; Python&#x27;s http.server and io modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

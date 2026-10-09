@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fractions: limit_denominator() Ties Round Toward Floor</title>
+<meta name="description" content="We measured Python 3.13.5: limit_denominator() rounds halfway values toward floor (1.5-&gt;1), not round-half-even like round() (1.5-&gt;2) -- every tie disagrees.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-fractions-limit-denominator-breaks-ties-toward-floor-not-round-half-even/">
+<meta property="og:title" content="fractions: limit_denominator() Ties Round Toward Floor">
+<meta property="og:description" content="We measured Python 3.13.5: limit_denominator() rounds halfway values toward floor (1.5-&gt;1), not round-half-even like round() (1.5-&gt;2) -- every tie disagrees.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-fractions-limit-denominator-breaks-ties-toward-floor-not-round-half-even/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Fraction.limit_denominator() round halfway values the same as round()?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured limit_denominator(1) breaking every exact .5 tie toward floor (1.5 -> 1, 2.5 -> 2), while Python's round() breaks ties to the nearest even number (1.5 -> 2, 2.5 -> 2). They agree on 2.5 by coincidence but disagree on 1.5, 3.5, and every other odd-rounding tie."}}, {"@type": "Question", "name": "How does Fraction.limit_denominator() handle an exact halfway value?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it consistently rounding toward floor (more negative, or toward zero only for positive ties) -- 1/2 -> 0, 3/2 -> 1, 5/2 -> 2, and -1/2 -> -1, -3/2 -> -2. This matches math.floor() on the equivalent value in every case we tested, not round-half-even or round-half-up."}}, {"@type": "Question", "name": "Why did switching from round() to Fraction.limit_denominator() change my rounding results?", "acceptedAnswer": {"@type": "Answer", "text": "Because the two use different tie-breaking rules for exact halfway values -- we confirmed limit_denominator() rounds ties toward floor while round() rounds ties to the nearest even number. Only values that land on an exact tie after the switch are affected; everything else rounds the same."}}, {"@type": "Question", "name": "Does Fraction.limit_denominator() round negative ties toward zero?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured Fraction(-1, 2).limit_denominator(1) returning -1, not 0. Ties round toward floor regardless of sign, which for negative numbers means away from zero, matching math.floor(-0.5) == -1."}}, {"@type": "Question", "name": "What rounding mode does Fraction.limit_denominator() use?", "acceptedAnswer": {"@type": "Answer", "text": "Based on what we measured (every exact tie landing on the floor value), it behaves like round-half-down-toward-floor, not round-half-up, round-half-to-even, or round-half-away-from-zero. If a specific rounding rule matters, round explicitly with decimal.Decimal.quantize() and a named rounding mode instead."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>fractions: limit_denominator() Breaks Ties Toward Floor (tested)</h1>
+<p class="lead"><code>Fraction.limit_denominator(max_denominator)</code> finds the closest fraction to a value with a denominator no larger than the given limit -- a common way to round a <code>Fraction</code> to a coarser precision. We measured what it does for exact halfway values, where "closest" is ambiguous, and compared it to Python's built-in <code>round()</code>, which everyone already knows rounds halves to even.</p>
+<h2 id="repro1">1. round() breaks ties to the nearest even number -- well known, shown for reference</h2>
+<pre><code>print(round(0.5), round(1.5), round(2.5), round(3.5))</code></pre>
+<pre><code>0 2 2 4</code></pre>
+<p><strong>Measured:</strong> Python's built-in <code>round()</code> uses round-half-to-even (banker's rounding): <code>0.5</code> rounds to <code>0</code>, but <code>1.5</code> rounds up to <code>2</code> (the nearer even number), and <code>2.5</code> rounds down to <code>2</code> for the same reason. This is documented and widely known.</p>
+
+<h2 id="repro2">2. Fraction.limit_denominator() does something different: it always breaks ties toward floor</h2>
+<pre><code>from fractions import Fraction
+
+for n, d in [(1, 2), (3, 2), (5, 2), (7, 2)]:
+    f = Fraction(n, d)
+    print(f, "-> limit_denominator(1):", f.limit_denominator(1))</code></pre>
+<pre><code>1/2 -> limit_denominator(1): 0
+3/2 -> limit_denominator(1): 1
+5/2 -> limit_denominator(1): 2
+7/2 -> limit_denominator(1): 3</code></pre>
+<p><strong>Measured:</strong> rounding to the nearest whole number via <code>limit_denominator(1)</code> gives <code>1/2 -> 0</code>, <code>3/2 -> 1</code>, <code>5/2 -> 2</code>, <code>7/2 -> 3</code> -- every exact halfway case rounds <em>down</em>, regardless of whether the result lands on an even or odd number. <code>round(1.5)</code> gives <code>2</code> (nearest even); <code>Fraction(3,2).limit_denominator(1)</code> gives <code>1</code> instead. These two "round to nearest whole number" operations disagree on every single tie.</p>
+
+<h2 id="repro3">3. For negative values, "toward floor" means away from zero, not toward it</h2>
+<pre><code>from fractions import Fraction
+
+for n, d in [(-1, 2), (-3, 2), (-5, 2)]:
+    f = Fraction(n, d)
+    print(f, "-> limit_denominator(1):", f.limit_denominator(1))</code></pre>
+<pre><code>-1/2 -> limit_denominator(1): -1
+-3/2 -> limit_denominator(1): -2
+-5/2 -> limit_denominator(1): -3</code></pre>
+<p><strong>Measured:</strong> <code>-1/2</code> rounds to <code>-1</code>, not <code>0</code> -- confirming the tie-break is toward floor (more negative), not toward zero or toward even. This matches <code>math.floor()</code> on the equivalent value exactly (<code>math.floor(-0.5) == -1</code>), and is the opposite of what round-half-up or round-half-even would give for a negative halfway value.</p>
+<p>If code switched from <code>round()</code> on floats to <code>Fraction.limit_denominator()</code> for exact decimal-safe rounding (a reasonable-looking migration), every value that happens to land on an exact tie after the conversion will silently round differently -- current code review or tests built around <code>round()</code>'s round-half-even expectations won't catch it, because non-tie values round identically either way. Don't assume <code>limit_denominator()</code> matches <code>round()</code>'s tie-breaking; if a specific rounding rule matters, round explicitly (e.g. with <code>decimal.Decimal.quantize()</code> and an explicit rounding mode) instead of relying on <code>limit_denominator()</code>'s undocumented tie behavior.</p>
+<aside class="cta"><strong>Rounding a Fraction to a coarser denominator with limit_denominator()? Check how it handles an exact halfway value first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Fraction.limit_denominator() round halfway values the same as round()?</summary><p>No -- we measured limit_denominator(1) breaking every exact .5 tie toward floor (1.5 -&gt; 1, 2.5 -&gt; 2), while Python&#x27;s round() breaks ties to the nearest even number (1.5 -&gt; 2, 2.5 -&gt; 2). They agree on 2.5 by coincidence but disagree on 1.5, 3.5, and every other odd-rounding tie.</p></details>
+<details><summary>How does Fraction.limit_denominator() handle an exact halfway value?</summary><p>We measured it consistently rounding toward floor (more negative, or toward zero only for positive ties) -- 1/2 -&gt; 0, 3/2 -&gt; 1, 5/2 -&gt; 2, and -1/2 -&gt; -1, -3/2 -&gt; -2. This matches math.floor() on the equivalent value in every case we tested, not round-half-even or round-half-up.</p></details>
+<details><summary>Why did switching from round() to Fraction.limit_denominator() change my rounding results?</summary><p>Because the two use different tie-breaking rules for exact halfway values -- we confirmed limit_denominator() rounds ties toward floor while round() rounds ties to the nearest even number. Only values that land on an exact tie after the switch are affected; everything else rounds the same.</p></details>
+<details><summary>Does Fraction.limit_denominator() round negative ties toward zero?</summary><p>No -- we measured Fraction(-1, 2).limit_denominator(1) returning -1, not 0. Ties round toward floor regardless of sign, which for negative numbers means away from zero, matching math.floor(-0.5) == -1.</p></details>
+<details><summary>What rounding mode does Fraction.limit_denominator() use?</summary><p>Based on what we measured (every exact tie landing on the floor value), it behaves like round-half-down-toward-floor, not round-half-up, round-half-to-even, or round-half-away-from-zero. If a specific rounding rule matters, round explicitly with decimal.Decimal.quantize() and a named rounding mode instead.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in fractions module: called limit_denominator(1) (rounding to the nearest whole number) on Fractions that land on an exact .5 halfway point, for both positive and negative values, and compared the results to Python&#x27;s built-in round() on the equivalent floats. PlainHeaders is our extension; Python&#x27;s fractions module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

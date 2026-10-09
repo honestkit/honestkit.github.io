@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PermissionError: [Errno 13] Permission denied in Python (Tested)</title>
+<meta name="description" content="We measured Python&#x27;s Errno 13 Permission denied: read-only files, system folders, ports under 1024, and the folder-as-file mistake. Fixes, no sudo needed.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-permissionerror-errno-13-permission-denied/">
+<meta property="og:title" content="PermissionError: [Errno 13] Permission denied in Python (Tested)">
+<meta property="og:description" content="We measured Python&#x27;s Errno 13 Permission denied: read-only files, system folders, ports under 1024, and the folder-as-file mistake. Fixes, no sudo needed.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-permissionerror-errno-13-permission-denied/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does PermissionError: [Errno 13] Permission denied mean?", "acceptedAnswer": {"@type": "Answer", "text": "The operating system refused the operation for your user. We measured it on Linux from writing a read-only file, creating a file in /etc, and binding port 80 as a normal user."}}, {"@type": "Question", "name": "Why do I get Permission denied when opening a folder in Python?", "acceptedAnswer": {"@type": "Answer", "text": "You passed a directory to open(). On Linux we measured IsADirectoryError [Errno 21]; on Windows it's reported as PermissionError [Errno 13]. Join a filename onto the folder path."}}, {"@type": "Question", "name": "Should I run my Python script with sudo to fix Errno 13?", "acceptedAnswer": {"@type": "Answer", "text": "Usually not. Write to a location you own instead; we measured os.access() showing /etc not writable and the current directory writable for a normal user."}}, {"@type": "Question", "name": "Why can't Python bind to port 80?", "acceptedAnswer": {"@type": "Answer", "text": "Ports below 1024 need extra privileges on Linux. We measured PermissionError [Errno 13] with no filename; use 1024 or above, or a reverse proxy."}}, {"@type": "Question", "name": "How do I check permissions from Python?", "acceptedAnswer": {"@type": "Answer", "text": "os.access(path, os.W_OK) for writability and stat.filemode(os.stat(path).st_mode) for the mode string; we measured both."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>PermissionError: [Errno 13] Permission denied (tested)</h1>
+<p class="lead"><code>PermissionError: [Errno 13] Permission denied</code> means the OS refused what your script asked for. We reproduced each common cause on Python 3.13.5 on Linux and tested a fix for each that doesn't involve <code>sudo</code> or <code>chmod 777</code>.</p>
+<h2 id="causes">1. What raises it</h2>
+<pre><code>import os, socket, stat
+
+os.makedirs(&quot;reports&quot;, exist_ok=True)
+with open(&quot;locked.txt&quot;, &quot;w&quot;) as f:
+    f.write(&quot;x&quot;)
+os.chmod(&quot;locked.txt&quot;, stat.S_IRUSR)        # read-only for the owner
+
+tests = {
+    &quot;open a directory&quot;:      lambda: open(&quot;reports&quot;),
+    &quot;write read-only file&quot;:  lambda: open(&quot;locked.txt&quot;, &quot;w&quot;),
+    &quot;write to /etc&quot;:         lambda: open(&quot;/etc/myapp.conf&quot;, &quot;w&quot;),
+    &quot;bind port 80&quot;:          lambda: socket.socket().bind((&quot;127.0.0.1&quot;, 80)),
+}
+for name, f in tests.items():
+    try:
+        f()
+        print(f&quot;{name}: ok&quot;)
+    except OSError as e:
+        print(f&quot;{name}: {type(e).__name__}: {e}&quot;)
+os.chmod(&quot;locked.txt&quot;, stat.S_IRUSR | stat.S_IWUSR)</code></pre>
+<pre><code>open a directory: IsADirectoryError: [Errno 21] Is a directory: &#x27;reports&#x27;
+write read-only file: PermissionError: [Errno 13] Permission denied: &#x27;locked.txt&#x27;
+write to /etc: PermissionError: [Errno 13] Permission denied: &#x27;/etc/myapp.conf&#x27;
+bind port 80: PermissionError: [Errno 13] Permission denied</code></pre>
+<p><strong>Measured (Linux, as a normal user):</strong> writing to a file whose mode is read-only, creating a file in a directory you don't own (<code>/etc</code>), and binding a port below 1024 all raised <code>PermissionError: [Errno 13] Permission denied</code>. The port error has no filename in it, which is how you tell it apart. Opening a <em>directory</em> as a file raised <code>IsADirectoryError: [Errno 21]</code> here; on Windows the same mistake is widely reported as <code>PermissionError: [Errno 13]</code> instead (we didn't test Windows), so on Windows check first that the path isn't a folder.</p>
+
+<h2 id="fix">2. Fixes</h2>
+<pre><code>import os, stat
+
+os.makedirs(&quot;reports&quot;, exist_ok=True)
+path = os.path.join(&quot;reports&quot;, &quot;summary.txt&quot;)   # a file inside the folder
+with open(path, &quot;w&quot;) as f:
+    f.write(&quot;ok&quot;)
+print(open(path).read())
+
+print(os.access(&quot;/etc&quot;, os.W_OK), os.access(&quot;.&quot;, os.W_OK))
+mode = stat.filemode(os.stat(&quot;/etc&quot;).st_mode)
+print(&quot;/etc&quot;, mode, &quot;owner uid&quot;, os.stat(&quot;/etc&quot;).st_uid, &quot;me&quot;, os.getuid())</code></pre>
+<pre><code>ok
+False True
+/etc drwxr-xr-x owner uid 0 me 1000</code></pre>
+<ul>
+<li><strong>Path is a folder:</strong> join a filename onto it (<code>os.path.join("reports", "summary.txt")</code>), as above.</li>
+<li><strong>Directory you don't own:</strong> <code>os.access(path, os.W_OK)</code> told us <code>/etc</code> isn't writable (owner uid 0, mode <code>drwxr-xr-x</code>) while the current directory is. Write somewhere you own (your project, the user's home, <code>tempfile</code>) rather than running the script with <code>sudo</code>.</li>
+<li><strong>Read-only file:</strong> check its mode with <code>ls -l</code> or <code>stat.filemode(os.stat(p).st_mode)</code> and fix ownership or permissions on purpose; don't <code>chmod 777</code>.</li>
+<li><strong>Port below 1024:</strong> use a port of 1024 or above (8000, 8080) in development, and put a reverse proxy in front for 80/443.</li>
+<li><strong>Windows, file in use:</strong> a file open in Excel or another program gives <code>PermissionError: [WinError 32]</code> or Errno 13 there; close it and retry (not tested here).</li>
+</ul>
+
+<aside class="cta"><strong>Running a local web server on a high port? Check the headers it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does PermissionError: [Errno 13] Permission denied mean?</summary><p>The operating system refused the operation for your user. We measured it on Linux from writing a read-only file, creating a file in /etc, and binding port 80 as a normal user.</p></details>
+<details><summary>Why do I get Permission denied when opening a folder in Python?</summary><p>You passed a directory to open(). On Linux we measured IsADirectoryError [Errno 21]; on Windows it&#x27;s reported as PermissionError [Errno 13]. Join a filename onto the folder path.</p></details>
+<details><summary>Should I run my Python script with sudo to fix Errno 13?</summary><p>Usually not. Write to a location you own instead; we measured os.access() showing /etc not writable and the current directory writable for a normal user.</p></details>
+<details><summary>Why can&#x27;t Python bind to port 80?</summary><p>Ports below 1024 need extra privileges on Linux. We measured PermissionError [Errno 13] with no filename; use 1024 or above, or a reverse proxy.</p></details>
+<details><summary>How do I check permissions from Python?</summary><p>os.access(path, os.W_OK) for writability and stat.filemode(os.stat(path).st_mode) for the mode string; we measured both.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux as a non-root user: writing a chmod-read-only file, creating a file in /etc, binding 127.0.0.1:80, opening a directory with open(), and the os.access/stat checks. Every code block was run verbatim and its output pasted from that run. Windows behavior is noted from common reports, not tested. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Object of Type X Is Not JSON Serializable — Tested Fix</title>
+<meta name="description" content="We measured why json.dumps() rejects datetime, set, bytes and Decimal, why int dict keys silently become strings, and the default= fix, in Python 3.13.">
+<link rel="canonical" href="https://honestkit.github.io/guides/json-object-not-json-serializable/">
+<meta property="og:title" content="Object of Type X Is Not JSON Serializable — Tested Fix">
+<meta property="og:description" content="We measured why json.dumps() rejects datetime, set, bytes and Decimal, why int dict keys silently become strings, and the default= fix, in Python 3.13.">
+<meta property="og:url" content="https://honestkit.github.io/guides/json-object-not-json-serializable/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does json.dumps() say \"Object of type datetime is not JSON serializable\" instead of naming the value?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed the message reports only the Python type, never the value or which dict key it came from, even three levels deep in a nested structure \u2014 you have to locate the field yourself."}}, {"@type": "Question", "name": "Does json.dumps() error on integer or boolean dict keys?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured that int, float, bool and None keys are silently converted to their string form (1 becomes \"1\", True becomes \"true\") with no error; only a genuinely unsupported key type like a tuple raises, and with a differently worded message than the value-side error."}}, {"@type": "Question", "name": "What does the default= argument to json.dumps() actually do?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed it's called once per object json can't natively serialize, and whatever it returns is serialized in its place \u2014 it isn't automatically recursive, so if it returns another non-serializable object, that one needs handling too."}}, {"@type": "Question", "name": "Does json.dumps() reject NaN and Infinity?", "acceptedAnswer": {"@type": "Answer", "text": "Not by default \u2014 we measured that json.dumps(float('nan')) returns the bare token NaN, which is not valid per the JSON spec and can break strict parsers in other languages; passing allow_nan=False makes it raise a ValueError instead."}}, {"@type": "Question", "name": "What's the fastest fix for a dataclass or Pydantic model that won't serialize?", "acceptedAnswer": {"@type": "Answer", "text": "Convert it first \u2014 we'd reach for dataclasses.asdict() or the model's own .model_dump()/.dict() method before calling json.dumps(), rather than writing a default= callback that handles every field type by hand."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TypeError: Object of type X Is Not JSON Serializable (tested)</h1>
+<p class="lead"><code>json.dumps()</code> only knows how to write a handful of Python types. Everything else raises <code>TypeError: Object of type X is not JSON serializable</code> &mdash; and the message never tells you which key in your dict broke. We fed it the common offenders and measured exactly what happens.</p>
+<h2 id="repro1">1. The error, for every common offender</h2>
+<pre><code>import json, datetime, decimal
+
+json.dumps(datetime.datetime(2024, 1, 1))
+TypeError: Object of type datetime is not JSON serializable
+
+json.dumps(datetime.date(2024, 1, 1))
+TypeError: Object of type date is not JSON serializable
+
+json.dumps({1, 2, 3})
+TypeError: Object of type set is not JSON serializable
+
+json.dumps(b"hello")
+TypeError: Object of type bytes is not JSON serializable
+
+json.dumps(decimal.Decimal("1.5"))
+TypeError: Object of type Decimal is not JSON serializable
+
+json.dumps(1 + 2j)
+TypeError: Object of type complex is not JSON serializable</code></pre>
+<p><strong>Measured:</strong> <code>json.dumps()</code> natively handles exactly <code>dict</code>, <code>list</code>, <code>tuple</code>, <code>str</code>, <code>int</code>, <code>float</code>, <code>bool</code>, and <code>None</code>. Every other type raises this same <code>TypeError</code>, naming only the type &mdash; not the value, not which field it came from.</p>
+
+<h2 id="repro2">2. The message does not tell you which key broke</h2>
+<pre><code>json.dumps({"a": 1, "b": {"c": datetime.datetime(2024, 1, 1)}})
+TypeError: Object of type datetime is not JSON serializable</code></pre>
+<p><strong>Measured:</strong> nesting the bad value three levels deep produced the exact same message as dumping it directly &mdash; no key path, no indication it was under <code>"b"</code> &gt; <code>"c"</code>. On a large real-world dict this is the actual debugging problem: you know the type, not the location. The fastest way to find it is a small recursive walk that applies <code>json.dumps()</code> to each leaf value and reports the first one that fails, rather than guessing from the type alone.</p>
+
+<h2 id="repro3">3. The fix: a default= callback</h2>
+<pre><code>def default(o):
+    if isinstance(o, datetime.datetime):
+        return o.isoformat()
+    raise TypeError(f"not serializable: {type(o)}")
+
+json.dumps({"a": datetime.datetime(2024, 1, 1)}, default=default)
+'{"a": "2024-01-01T00:00:00"}'</code></pre>
+<p><strong>Measured:</strong> <code>default=</code> is called once per unhandled object and whatever it returns is serialized in place. It is not recursive magic &mdash; if it returns another non-serializable object, that object goes through the normal rules next (a dict or a JSON-safe type works; another <code>datetime</code> would need handling too). Returning <code>str(o)</code> as a catch-all default is the fastest blanket fix when you don't care about round-tripping the type back.</p>
+
+<h2 id="repro4">4. A surprise: dict keys don't need to be strings</h2>
+<pre><code>json.dumps({1: "a", 2: "b"})
+'{"1": "a", "2": "b"}'
+
+json.dumps({(1, 2): "a"})
+TypeError: keys must be str, int, float, bool or None, not tuple</code></pre>
+<p><strong>Measured:</strong> <code>int</code>, <code>float</code>, <code>bool</code> and <code>None</code> keys are silently coerced to their string form &mdash; no error, no warning, and <code>True</code> becomes the string <code>"true"</code> while <code>None</code> becomes <code>"null"</code>. Only a genuinely unsupported key type, like a <code>tuple</code>, raises &mdash; and that error message is worded differently from the value-side one above (<code>keys must be str, int, float, bool or None, not X</code> vs. <code>Object of type X is not JSON serializable</code>), which is a useful tell for whether the broken value is a key or a value.</p>
+
+<h2 id="repro5">5. NaN and Infinity serialize by default &mdash; and that JSON is invalid</h2>
+<pre><code>json.dumps(float("nan"))
+'NaN'
+json.dumps(float("inf"))
+'Infinity'
+
+json.dumps(float("nan"), allow_nan=False)
+ValueError: Out of range float values are not JSON compliant: nan</code></pre>
+<p><strong>Measured:</strong> by default <code>json.dumps()</code> happily writes <code>NaN</code> and <code>Infinity</code> as bare, unquoted tokens &mdash; valid Python-ish output, but not valid per the JSON spec (RFC 8259), which has no representation for non-finite numbers. A strict parser in another language will reject that output. Pass <code>allow_nan=False</code> to catch these before they leak into a response, which raises a <code>ValueError</code>, not the <code>TypeError</code> the type errors above raise.</p>
+
+<h2 id="fix">6. Fast fixes, in order of how often we'd reach for them</h2>
+<ul>
+<li>Dates and times: pass <code>default=str</code> for a quick fix, or <code>default=lambda o: o.isoformat()</code> to keep ISO 8601 format.</li>
+<li>Sets: convert at the source, <code>list(my_set)</code>, since set order isn't guaranteed anyway.</li>
+<li>Decimal: <code>default=str</code> preserves precision as text; <code>default=float</code> loses precision but stays numeric.</li>
+<li>Dataclasses and Pydantic models: use <code>dataclasses.asdict()</code> or the model's own <code>.model_dump()</code> / <code>.dict()</code> before calling <code>json.dumps()</code>, rather than writing a <code>default=</code> for every field type.</li>
+<li>Can't find which field broke in a big object: write a one-off recursive walker that calls <code>json.dumps()</code> on each value and prints the first key path that raises, since the exception itself won't tell you.</li>
+</ul>
+
+<aside class="cta"><strong>Debugging an API that returns broken JSON instead of a Python error? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does json.dumps() say &quot;Object of type datetime is not JSON serializable&quot; instead of naming the value?</summary><p>We confirmed the message reports only the Python type, never the value or which dict key it came from, even three levels deep in a nested structure — you have to locate the field yourself.</p></details>
+<details><summary>Does json.dumps() error on integer or boolean dict keys?</summary><p>No — we measured that int, float, bool and None keys are silently converted to their string form (1 becomes &quot;1&quot;, True becomes &quot;true&quot;) with no error; only a genuinely unsupported key type like a tuple raises, and with a differently worded message than the value-side error.</p></details>
+<details><summary>What does the default= argument to json.dumps() actually do?</summary><p>We confirmed it&#x27;s called once per object json can&#x27;t natively serialize, and whatever it returns is serialized in its place — it isn&#x27;t automatically recursive, so if it returns another non-serializable object, that one needs handling too.</p></details>
+<details><summary>Does json.dumps() reject NaN and Infinity?</summary><p>Not by default — we measured that json.dumps(float(&#x27;nan&#x27;)) returns the bare token NaN, which is not valid per the JSON spec and can break strict parsers in other languages; passing allow_nan=False makes it raise a ValueError instead.</p></details>
+<details><summary>What&#x27;s the fastest fix for a dataclass or Pydantic model that won&#x27;t serialize?</summary><p>Convert it first — we&#x27;d reach for dataclasses.asdict() or the model&#x27;s own .model_dump()/.dict() method before calling json.dumps(), rather than writing a default= callback that handles every field type by hand.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in json module, calling json.dumps() directly on each value and printing the exact exception text. Every message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s json module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

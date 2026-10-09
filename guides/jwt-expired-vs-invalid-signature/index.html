@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JWT: TokenExpiredError vs Invalid Signature (Tested)</title>
+<meta name="description" content="We measured jsonwebtoken 9.0.3: TokenExpiredError&#x27;s exact fields, &#x27;invalid signature&#x27;, and the precise clockTolerance boundary that decides pass or fail.">
+<link rel="canonical" href="https://honestkit.github.io/guides/jwt-expired-vs-invalid-signature/">
+<meta property="og:title" content="JWT: TokenExpiredError vs Invalid Signature (Tested)">
+<meta property="og:description" content="We measured jsonwebtoken 9.0.3: TokenExpiredError&#x27;s exact fields, &#x27;invalid signature&#x27;, and the precise clockTolerance boundary that decides pass or fail.">
+<meta property="og:url" content="https://honestkit.github.io/guides/jwt-expired-vs-invalid-signature/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does TokenExpiredError always have an expiredAt property?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, in jsonwebtoken 9.0.3 we confirmed Object.keys(error) is exactly ['name', 'message', 'expiredAt'] on every expired-token error, and expiredAt is a real Date instance built from the token's exp claim."}}, {"@type": "Question", "name": "Does JsonWebTokenError have an expiredAt property?", "acceptedAnswer": {"@type": "Answer", "text": "No. We checked Object.keys() on a wrong-secret JsonWebTokenError and got only ['name', 'message']. Accessing error.expiredAt on it returns undefined rather than throwing, so a careless check like 'if (err.expiredAt)' will silently treat every invalid-signature error as not-expired, which is true but easy to mis-read as 'this error has no expiry info at all'."}}, {"@type": "Question", "name": "If I set clockTolerance to 2, will a token expired by exactly 2 seconds verify?", "acceptedAnswer": {"@type": "Answer", "text": "No, we measured this directly: it still throws TokenExpiredError. The installed package's verify.js uses clockTimestamp >= payload.exp + clockTolerance, so tolerance must be strictly greater than the overage, not equal to it."}}, {"@type": "Question", "name": "Is JsonWebTokenError's 'invalid signature' message different for a wrong secret versus a tampered payload?", "acceptedAnswer": {"@type": "Answer", "text": "No. Both produce the identical JsonWebTokenError: invalid signature. The signature check recomputes the HMAC over whatever header and payload bytes are present and compares it to the token's third segment, so a wrong key and an edited payload fail the same comparison the same way."}}, {"@type": "Question", "name": "Do Node's jsonwebtoken and Python's PyJWT throw the same error names?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured TokenExpiredError/JsonWebTokenError in jsonwebtoken 9.0.3 versus ExpiredSignatureError/InvalidSignatureError in PyJWT 2.15.1, with different message text in both cases. Match error-handling logic on each library's own class, not on a shared message string."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>JWT expired vs invalid signature (tested)</h1>
+<p class="lead"><code>TokenExpiredError</code> and <code>JsonWebTokenError: invalid signature</code> are both thrown by <code>jwt.verify()</code>, and both get caught by the same generic <code>catch</code> block, but they mean unrelated things: one token ran out of time, the other failed a cryptographic check. We signed and verified real tokens with jsonwebtoken 9.0.3 to capture the exact error shape of each, and found the clockTolerance boundary is stricter than it looks.</p>
+<h2>1. Two unrelated failures, same catch block</h2>
+<p>A token can be <strong>expired</strong>: it was signed correctly, but its <code>exp</code> claim is now in the past. Or it can be <strong>invalid</strong>: the signature doesn't match the header and payload for the secret you verified with, usually because the token was signed with a different secret, or the payload was edited after signing. <code>jsonwebtoken</code> represents these as two different classes: <code>TokenExpiredError</code> extends <code>JsonWebTokenError</code>. That inheritance means a <code>catch (err)</code> block that only checks <code>err instanceof JsonWebTokenError</code> cannot tell the two apart. See <a href="/guides/jwt-malformed-invalid-signature-expired/">malformed vs invalid signature vs expired</a> for a third failure mode, a bad token shape.</p>
+
+<h2>2. What we ran</h2>
+<p>Three scripts against jsonwebtoken 9.0.3 on Node 24.21.0: sign a token with a past <code>exp</code> and verify it; sign with one secret and verify with another; and sign a token that expires in exactly 1&ndash;2 seconds to test <code>clockTolerance</code> with a fixed, fake verification clock so timing jitter couldn't skew the result.</p>
+<pre><code>const jwt = require('jsonwebtoken');
+const expired = jwt.sign({ foo: 'bar' }, 'secretA', { expiresIn: -10 });
+jwt.verify(expired, 'secretA');</code></pre>
+
+<h2>3. TokenExpiredError: exact name, message, and expiredAt</h2>
+<p>Verifying the token above threw an error with these exact properties:</p>
+<table>
+<tr><th>Property</th><th>Measured value</th></tr>
+<tr><td>error.name</td><td>TokenExpiredError</td></tr>
+<tr><td>error.message</td><td>jwt expired</td></tr>
+<tr><td>error.expiredAt</td><td>a real <code>Date</code> instance, e.g. <code>2026-10-02T22:14:31.000Z</code> &mdash; not a number</td></tr>
+<tr><td>Object.keys(error)</td><td><code>['name', 'message', 'expiredAt']</code></td></tr>
+<tr><td>err instanceof TokenExpiredError</td><td>true</td></tr>
+<tr><td>err instanceof JsonWebTokenError</td><td>true</td></tr>
+</table>
+<p><code>expiredAt</code> is built straight from the <code>exp</code> claim, so it reflects the token's stated expiry, not the moment you called <code>verify()</code>.</p>
+
+<h2>4. JsonWebTokenError "invalid signature": no expiredAt at all</h2>
+<p>We signed with one secret and verified with a different one:</p>
+<pre><code>const token = jwt.sign({ foo: 'bar' }, 'secretA', { expiresIn: '1h' });
+jwt.verify(token, 'secretB');</code></pre>
+<table>
+<tr><th>Property</th><th>Measured value</th></tr>
+<tr><td>error.name</td><td>JsonWebTokenError</td></tr>
+<tr><td>error.message</td><td>invalid signature</td></tr>
+<tr><td>error.expiredAt</td><td>undefined &mdash; the property doesn't exist on this error at all</td></tr>
+<tr><td>Object.keys(error)</td><td><code>['name', 'message']</code></td></tr>
+<tr><td>err instanceof TokenExpiredError</td><td>false</td></tr>
+<tr><td>err instanceof JsonWebTokenError</td><td>true</td></tr>
+</table>
+<p>The token in this test had a valid, unexpired <code>exp</code> claim. The signature check runs independently of the expiry check, so a token can be simultaneously "not expired" and "invalid" &mdash; verify() still rejects it, with no mention of time anywhere in the error.</p>
+
+<h2>5. clockTolerance: the boundary is stricter than "within N seconds"</h2>
+<p>We fixed the verification clock with jsonwebtoken's own <code>clockTimestamp</code> option, so there was no real-time jitter, then signed tokens with <code>exp</code> set exactly 1 or 2 seconds before that fixed clock:</p>
+<table>
+<tr><th>Token expired by</th><th>clockTolerance</th><th>Result</th></tr>
+<tr><td>1 s</td><td>0 (default)</td><td>TokenExpiredError</td></tr>
+<tr><td>1 s</td><td>1</td><td>TokenExpiredError (still throws)</td></tr>
+<tr><td>1 s</td><td>2</td><td>OK, payload returned</td></tr>
+<tr><td>2 s</td><td>1</td><td>TokenExpiredError</td></tr>
+<tr><td>2 s</td><td>2</td><td>TokenExpiredError (still throws)</td></tr>
+<tr><td>2 s</td><td>3</td><td>OK, payload returned</td></tr>
+</table>
+<p>A token expired by exactly N seconds still throws when <code>clockTolerance</code> equals N &mdash; tolerance has to be <strong>strictly greater</strong> than the overage, not merely equal to it. The installed package's <code>verify.js</code> confirms why, in the literal comparison it runs:</p>
+<pre><code>if (clockTimestamp &gt;= payload.exp + (options.clockTolerance || 0)) {
+  return done(new TokenExpiredError('jwt expired', new Date(payload.exp * 1000)));
+}</code></pre>
+<p>Because the check uses <code>&gt;=</code>, setting <code>clockTolerance</code> to exactly the amount of clock drift you expect is not enough; give it at least one second of headroom beyond the worst skew you want to tolerate.</p>
+
+<h2>6. PyJWT gives different names and a different option</h2>
+<p>We ran the same two cases through PyJWT 2.15.1 in a Python 3.13 venv:</p>
+<table>
+<tr><th>Case</th><th>jsonwebtoken (Node)</th><th>PyJWT (Python)</th></tr>
+<tr><td>Expired token</td><td>TokenExpiredError: "jwt expired"</td><td>ExpiredSignatureError: "Signature has expired"</td></tr>
+<tr><td>Wrong secret</td><td>JsonWebTokenError: "invalid signature"</td><td>InvalidSignatureError: "Signature verification failed"</td></tr>
+<tr><td>Tolerance option</td><td><code>clockTolerance</code> (seconds, keyword option)</td><td><code>leeway</code> (seconds, keyword argument)</td></tr>
+</table>
+<p>PyJWT's <code>leeway=2</code> let a 1-second-expired token verify in our test, the same direction as Node's <code>clockTolerance</code>, though we did not check PyJWT's exact boundary case. If you're porting error-handling logic between a Node and a Python service, match on the error class, not the message string &mdash; the wording isn't shared between libraries.</p>
+
+<h2>7. Tell them apart in your catch block</h2>
+<p>Check the more specific class first, since <code>TokenExpiredError</code> also satisfies <code>instanceof JsonWebTokenError</code>:</p>
+<pre><code>try {
+  jwt.verify(token, secret);
+} catch (err) {
+  if (err instanceof jwt.TokenExpiredError) {
+    // respond 401, token expired at err.expiredAt, client can refresh
+  } else if (err instanceof jwt.JsonWebTokenError) {
+    // invalid signature / malformed &mdash; respond 401, do not offer a refresh
+  } else {
+    throw err;
+  }
+}</code></pre>
+<p>Treat the two differently on purpose: an expired token usually means "refresh and retry silently," while an invalid signature means the token was forged, edited, or signed for a different service, and should not be retried the same way. To inspect a token's claims and expiry by hand while debugging either case, use our <a href="/tools/jwt-decoder/">JWT Decoder</a> &mdash; it decodes client-side without sending the token anywhere. For the full set of <code>jwt.verify()</code> failure messages including malformed tokens, see <a href="/guides/jwt-expired-tokenexpirederror-vs-invalid-signature/">our longer JWT verify errors breakdown</a>.</p>
+<aside class="cta"><strong>Paste the token and check its exp claim before you debug further:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does TokenExpiredError always have an expiredAt property?</summary><p>Yes, in jsonwebtoken 9.0.3 we confirmed Object.keys(error) is exactly [&#x27;name&#x27;, &#x27;message&#x27;, &#x27;expiredAt&#x27;] on every expired-token error, and expiredAt is a real Date instance built from the token&#x27;s exp claim.</p></details>
+<details><summary>Does JsonWebTokenError have an expiredAt property?</summary><p>No. We checked Object.keys() on a wrong-secret JsonWebTokenError and got only [&#x27;name&#x27;, &#x27;message&#x27;]. Accessing error.expiredAt on it returns undefined rather than throwing, so a careless check like &#x27;if (err.expiredAt)&#x27; will silently treat every invalid-signature error as not-expired, which is true but easy to mis-read as &#x27;this error has no expiry info at all&#x27;.</p></details>
+<details><summary>If I set clockTolerance to 2, will a token expired by exactly 2 seconds verify?</summary><p>No, we measured this directly: it still throws TokenExpiredError. The installed package&#x27;s verify.js uses clockTimestamp &gt;= payload.exp + clockTolerance, so tolerance must be strictly greater than the overage, not equal to it.</p></details>
+<details><summary>Is JsonWebTokenError&#x27;s &#x27;invalid signature&#x27; message different for a wrong secret versus a tampered payload?</summary><p>No. Both produce the identical JsonWebTokenError: invalid signature. The signature check recomputes the HMAC over whatever header and payload bytes are present and compares it to the token&#x27;s third segment, so a wrong key and an edited payload fail the same comparison the same way.</p></details>
+<details><summary>Do Node&#x27;s jsonwebtoken and Python&#x27;s PyJWT throw the same error names?</summary><p>No. We measured TokenExpiredError/JsonWebTokenError in jsonwebtoken 9.0.3 versus ExpiredSignatureError/InvalidSignatureError in PyJWT 2.15.1, with different message text in both cases. Match error-handling logic on each library&#x27;s own class, not on a shared message string.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 and jsonwebtoken 9.0.3 (npm), reading verify.js in the installed package for the exact clockTolerance comparison, plus Python 3.13 and PyJWT 2.15.1 in a venv for the cross-library row. All error strings and the clockTolerance boundary are from running the code, not from documentation. PlainHeaders is our extension; the JWT Decoder tool is ours too. Node.js, jsonwebtoken and PyJWT are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

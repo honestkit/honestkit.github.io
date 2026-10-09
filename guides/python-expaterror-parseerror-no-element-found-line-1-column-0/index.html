@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ExpatError: no element found: line 1, column 0 (Python)</title>
+<meta name="description" content="Every cause measured in Python 3.13.5: column 0 means the parser got zero bytes (empty file, file already read, no seek(0)); later columns mean truncated XML.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-expaterror-parseerror-no-element-found-line-1-column-0/">
+<meta property="og:title" content="ExpatError: no element found: line 1, column 0 (Python)">
+<meta property="og:description" content="Every cause measured in Python 3.13.5: column 0 means the parser got zero bytes (empty file, file already read, no seek(0)); later columns mean truncated XML.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-expaterror-parseerror-no-element-found-line-1-column-0/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does 'no element found: line 1, column 0' mean?", "acceptedAnswer": {"@type": "Answer", "text": "The parser got no input at all. We measured it for an empty file, an empty string, b'', a file object that had already been read, and a StringIO that was written to without seek(0)."}}, {"@type": "Question", "name": "Why does it fail even though the file has valid XML?", "acceptedAnswer": {"@type": "Answer", "text": "Most often because something already read the file object (a debug print(f.read()), a size check, an earlier parse) and the position is at the end. Call f.seek(0) before parsing, or reopen the file."}}, {"@type": "Question", "name": "Is ParseError different from ExpatError?", "acceptedAnswer": {"@type": "Answer", "text": "ElementTree raises xml.etree.ElementTree.ParseError and minidom raises xml.parsers.expat.ExpatError, but both come from the same expat parser with the same message. Catch the one for the module you use."}}, {"@type": "Question", "name": "Does an XML declaration or comment count as an element?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured that input containing only <?xml version=\"1.0\"?> or only a comment still raises 'no element found' -- a document needs one root element."}}, {"@type": "Question", "name": "I get it when parsing requests' r.content. Why?", "acceptedAnswer": {"@type": "Answer", "text": "r.content is b'' -- ET.fromstring(b'') raises the same 'no element found: line 1, column 0'. Check r.status_code and the headers first; the server sent an empty body."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ExpatError / ParseError: no element found: line 1, column 0 (tested)</h1>
+<p class="lead"><code>xml.parsers.expat.ExpatError: no element found: line 1, column 0</code> (or <code>xml.etree.ElementTree.ParseError</code> with the same text) means the XML ended before a complete root element. We reproduced every common cause and found the position is the key clue: <code>line 1, column 0</code> means the parser received zero bytes -- usually an empty file or response, or a file object that was already read to the end -- while a later position means the document was truncated or had no root element.</p>
+<h2 id="repro">1. Every common cause, measured</h2>
+<pre><code>import io, os, tempfile
+import xml.etree.ElementTree as ET
+import xml.dom.minidom, xml.parsers.expat
+
+def try_parse(label, fn):
+    try:
+        fn()
+        print(f"{label:38} OK")
+    except Exception as e:
+        print(f"{label:38} {type(e).__module__}.{type(e).__name__}: {e}")
+
+path = os.path.join(tempfile.mkdtemp(), "data.xml")
+open(path, "w").close()                                  # empty file
+try_parse("ET.parse(empty file)", lambda: ET.parse(path))
+try_parse("minidom.parse(empty file)", lambda: xml.dom.minidom.parse(path))
+try_parse("ET.fromstring('')", lambda: ET.fromstring(""))
+try_parse("ET.fromstring(whitespace only)", lambda: ET.fromstring("  \n "))
+try_parse("minidom.parseString('')", lambda: xml.dom.minidom.parseString(""))
+try_parse("ET.fromstring(declaration only)", lambda: ET.fromstring('&lt;?xml version="1.0"?&gt;\n'))
+try_parse("ET.fromstring(comment only)", lambda: ET.fromstring("&lt;!-- nothing --&gt;"))
+
+with open(path, "w") as f:
+    f.write("&lt;root&gt;&lt;item&gt;1&lt;/item&gt;&lt;/root&gt;")
+with open(path) as f:
+    f.read()                                             # something already read it
+    try_parse("ET.parse(file already read)", lambda: ET.parse(f))
+    f.seek(0)
+    try_parse("ET.parse(after f.seek(0))", lambda: ET.parse(f))
+
+buf = io.StringIO()
+buf.write("&lt;root/&gt;")                                     # written, not rewound
+try_parse("ET.parse(StringIO, no seek)", lambda: ET.parse(buf))
+buf.seek(0)
+try_parse("ET.parse(StringIO, after seek(0))", lambda: ET.parse(buf))
+try_parse("ET.fromstring(truncated)", lambda: ET.fromstring("&lt;root&gt;&lt;item&gt;1&lt;/item&gt;"))</code></pre>
+<pre><code>ET.parse(empty file)                   xml.etree.ElementTree.ParseError: no element found: line 1, column 0
+minidom.parse(empty file)              xml.parsers.expat.ExpatError: no element found: line 1, column 0
+ET.fromstring('')                      xml.etree.ElementTree.ParseError: no element found: line 1, column 0
+ET.fromstring(whitespace only)         xml.etree.ElementTree.ParseError: no element found: line 2, column 1
+minidom.parseString('')                xml.parsers.expat.ExpatError: no element found: line 1, column 0
+ET.fromstring(declaration only)        xml.etree.ElementTree.ParseError: no element found: line 2, column 0
+ET.fromstring(comment only)            xml.etree.ElementTree.ParseError: no element found: line 1, column 16
+ET.parse(file already read)            xml.etree.ElementTree.ParseError: no element found: line 1, column 0
+ET.parse(after f.seek(0))              OK
+ET.parse(StringIO, no seek)            xml.etree.ElementTree.ParseError: no element found: line 1, column 0
+ET.parse(StringIO, after seek(0))      OK
+ET.fromstring(truncated)               xml.etree.ElementTree.ParseError: no element found: line 1, column 20</code></pre>
+
+<h2 id="read">2. Read the line and column: they tell you which cause it is</h2>
+<table><thead><tr><th>Position in the error</th><th>What it means</th><th>Typical cause</th></tr></thead><tbody>
+<tr><td><code>line 1, column 0</code></td><td>The parser received <strong>zero bytes</strong></td><td>Empty file; empty string or <code>b''</code> HTTP body; a file object already read to the end; a <code>StringIO</code>/<code>BytesIO</code> you wrote to and never rewound</td></tr>
+<tr><td>Further along, at the end of the input</td><td>Input ended before any root element <em>started</em>, or before it was closed</td><td>Whitespace only; only an <code>&lt;?xml ...?&gt;</code> declaration; only a comment; a truncated document (<code>&lt;root&gt;&lt;item&gt;1&lt;/item&gt;</code> fails at column 20, its end)</td></tr>
+</tbody></table>
+<p><strong>Measured:</strong> <code>xml.etree.ElementTree</code> raises <code>ParseError</code> and <code>xml.dom.minidom</code> raises <code>xml.parsers.expat.ExpatError</code>, both with the same expat message -- the module name differs, the meaning doesn't. "no element found" never means your XML has a syntax error in the middle; it means the document ended before a complete root element.</p>
+
+<h2 id="fix">3. Fixes</h2>
+<ul>
+<li><strong>File already read / buffer not rewound:</strong> call <code>f.seek(0)</code> (or <code>buf.seek(0)</code>) before parsing. Measured above: the same handle parses fine after <code>seek(0)</code>.</li>
+<li><strong>Empty file or empty response:</strong> check before parsing -- <code>if not data.strip(): ...</code> -- and log where the empty input came from. For HTTP, check <code>r.status_code</code> and <code>r.content</code> first: a 204, a redirect you didn't follow, or an error page served as an empty body all end up here.</li>
+<li><strong>Truncated document:</strong> the source was cut off (interrupted download, a writer that hadn't flushed/closed the file yet, a size-limited read). Fix the producer, or for an HTTP body see our <a href="/guides/python-incompleteread-chunkedencodingerror-connection-broken/">IncompleteRead guide</a>.</li>
+</ul>
+<p>Related: <a href="/guides/python-xml-etree-parse-none-parseerror-no-element-found/">ElementTree.parse() on a non-blocking stream</a> and <a href="/guides/python-xmlrpc-client-serverproxy-none-expaterror-no-element-found/">xmlrpc.client ServerProxy ExpatError on a valid reply</a>, two less obvious ways to get zero bytes.</p>
+<aside class="cta"><strong>Parsing XML from an HTTP response? Check the status, Content-Type and Content-Length it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &#x27;no element found: line 1, column 0&#x27; mean?</summary><p>The parser got no input at all. We measured it for an empty file, an empty string, b&#x27;&#x27;, a file object that had already been read, and a StringIO that was written to without seek(0).</p></details>
+<details><summary>Why does it fail even though the file has valid XML?</summary><p>Most often because something already read the file object (a debug print(f.read()), a size check, an earlier parse) and the position is at the end. Call f.seek(0) before parsing, or reopen the file.</p></details>
+<details><summary>Is ParseError different from ExpatError?</summary><p>ElementTree raises xml.etree.ElementTree.ParseError and minidom raises xml.parsers.expat.ExpatError, but both come from the same expat parser with the same message. Catch the one for the module you use.</p></details>
+<details><summary>Does an XML declaration or comment count as an element?</summary><p>No. We measured that input containing only &lt;?xml version=&quot;1.0&quot;?&gt; or only a comment still raises &#x27;no element found&#x27; -- a document needs one root element.</p></details>
+<details><summary>I get it when parsing requests&#x27; r.content. Why?</summary><p>r.content is b&#x27;&#x27; -- ET.fromstring(b&#x27;&#x27;) raises the same &#x27;no element found: line 1, column 0&#x27;. Check r.status_code and the headers first; the server sent an empty body.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in xml.etree.ElementTree, xml.dom.minidom and xml.parsers.expat, parsing empty, whitespace-only, declaration-only, comment-only and truncated input, plus file and StringIO objects that were already at end-of-file. PlainHeaders is our extension; Python&#x27;s XML modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

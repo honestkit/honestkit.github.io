@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dataclasses: InitVar Defaults Leave a Stale Class Attribute</title>
+<meta name="description" content="We measured Python 3.13.5: an InitVar field with a default silently returns that default, never the value passed in, instead of raising AttributeError.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-dataclasses-initvar-default-leaves-stale-class-attribute/">
+<meta property="og:title" content="dataclasses: InitVar Defaults Leave a Stale Class Attribute">
+<meta property="og:description" content="We measured Python 3.13.5: an InitVar field with a default silently returns that default, never the value passed in, instead of raising AttributeError.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-dataclasses-initvar-default-leaves-stale-class-attribute/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does accessing a dataclasses.InitVar field after construction raise an error?", "acceptedAnswer": {"@type": "Answer", "text": "It depends on whether the InitVar has a default. We measured an InitVar with no default raising AttributeError on access, as documented. But an InitVar with a default value instead returns that default silently on every instance, regardless of what was actually passed to __init__."}}, {"@type": "Question", "name": "Why does my dataclasses.InitVar field return the wrong value?", "acceptedAnswer": {"@type": "Answer", "text": "Because giving an InitVar a default causes dataclasses to set that default as a class attribute, the same mechanism used for ordinary field defaults. Since the InitVar never becomes an instance attribute, attribute lookup falls through to that stale class-level default -- we confirmed this returns the literal default from the class body, not the value passed to any specific instance."}}, {"@type": "Question", "name": "Is it safe to read a dataclasses.InitVar field back after __post_init__ runs?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured that InitVar fields never become instance attributes regardless of default. If you need the init-time value later, assign it to a real field inside __post_init__ instead of relying on the InitVar name."}}, {"@type": "Question", "name": "Does an InitVar with no default behave differently from one with a default?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, measurably -- we confirmed an InitVar with no default raises AttributeError on access (fails loudly), while one with a default returns that default value with no error at all (fails silently, with wrong data), even though both are equally unavailable as real instance state."}}, {"@type": "Question", "name": "What's the safe way to keep an InitVar's value accessible on a dataclass instance?", "acceptedAnswer": {"@type": "Answer", "text": "Copy it into a real field inside __post_init__, e.g. self.multiplier_used = multiplier. We measured this producing a correct, instance-specific value, unlike reading the InitVar name directly."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>dataclasses: InitVar Defaults Leave a Stale Class Attribute (tested)</h1>
+<p class="lead"><code>dataclasses.InitVar</code> marks a field as init-only: it's accepted by the generated <code>__init__</code> and handed to <code>__post_init__</code>, but it's documented as not becoming a real instance attribute. We measured what happens when code -- a method added later, a subclass, a debugger -- accesses that field by name anyway, and whether giving it a default value changes the answer.</p>
+<h2 id="repro1">1. An InitVar with no default fails loudly on access, as expected</h2>
+<pre><code>from dataclasses import dataclass, InitVar
+
+@dataclass
+class Config:
+    name: str
+    multiplier: InitVar[int]
+    value: int = 0
+
+    def __post_init__(self, multiplier):
+        self.value = self.value * multiplier if self.value else multiplier
+
+c = Config("x", 7, value=3)
+print(c.value)
+print(c.multiplier)</code></pre>
+<pre><code>21
+Traceback (most recent call last):
+  ...
+AttributeError: 'Config' object has no attribute 'multiplier'</code></pre>
+<p><strong>Measured:</strong> <code>__post_init__</code> correctly receives <code>multiplier=7</code> and computes <code>value</code>. Accessing <code>c.multiplier</code> afterward raises <code>AttributeError</code> -- exactly as documented, since InitVar fields are never stored on the instance. Code that tries to reach for the field by name fails immediately and visibly.</p>
+
+<h2 id="repro2">2. The identical field with a default value returns the wrong value instead of raising</h2>
+<pre><code>from dataclasses import dataclass, InitVar
+
+@dataclass
+class Config:
+    name: str
+    multiplier: InitVar[int] = 1
+    value: int = 0
+
+    def __post_init__(self, multiplier):
+        self.value = self.value * multiplier if self.value else multiplier
+
+c1 = Config("a", multiplier=5, value=3)
+c2 = Config("b", multiplier=9, value=2)
+print(c1.value, c2.value)
+print(c1.multiplier, c2.multiplier)</code></pre>
+<pre><code>15 18
+1 1</code></pre>
+<pre><code># Config.multiplier (class attribute) == 1</code></pre>
+<p><strong>Measured:</strong> both instances compute the correct <code>value</code> from their own <code>multiplier</code> argument (5 and 9) inside <code>__post_init__</code>. But <code>c1.multiplier</code> and <code>c2.multiplier</code> both read back as <code>1</code> -- neither the value actually passed in. Giving an InitVar a default value makes dataclasses set that default as a class attribute (the same mechanism used for normal field defaults), and since no instance attribute of that name ever gets created, attribute lookup silently falls through to the stale class-level default instead of raising. The field looks readable and present; the value it returns has no relationship to what the instance was constructed with.</p>
+
+<h2 id="repro3">3. The fix: don't rely on reading an InitVar back -- store what you need in a real field</h2>
+<pre><code>from dataclasses import dataclass, field, InitVar
+
+@dataclass
+class Config:
+    name: str
+    multiplier: InitVar[int] = 1
+    value: int = 0
+    multiplier_used: int = field(default=0, repr=False)
+
+    def __post_init__(self, multiplier):
+        self.value = self.value * multiplier if self.value else multiplier
+        self.multiplier_used = multiplier
+
+c = Config("a", multiplier=5, value=3)
+print(c.value, c.multiplier_used)</code></pre>
+<pre><code>15 5</code></pre>
+<p><strong>Measured:</strong> assigning the InitVar's value to a normal field inside <code>__post_init__</code> makes it a real, correct instance attribute. If any code might need to read the value back later -- including a future maintainer who doesn't know <code>multiplier</code> is init-only -- an InitVar with a default is a trap precisely because the wrong read succeeds instead of failing.</p>
+<aside class="cta"><strong>Giving a dataclasses.InitVar field a default value? Check what accessing it on an instance actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does accessing a dataclasses.InitVar field after construction raise an error?</summary><p>It depends on whether the InitVar has a default. We measured an InitVar with no default raising AttributeError on access, as documented. But an InitVar with a default value instead returns that default silently on every instance, regardless of what was actually passed to __init__.</p></details>
+<details><summary>Why does my dataclasses.InitVar field return the wrong value?</summary><p>Because giving an InitVar a default causes dataclasses to set that default as a class attribute, the same mechanism used for ordinary field defaults. Since the InitVar never becomes an instance attribute, attribute lookup falls through to that stale class-level default -- we confirmed this returns the literal default from the class body, not the value passed to any specific instance.</p></details>
+<details><summary>Is it safe to read a dataclasses.InitVar field back after __post_init__ runs?</summary><p>No -- we measured that InitVar fields never become instance attributes regardless of default. If you need the init-time value later, assign it to a real field inside __post_init__ instead of relying on the InitVar name.</p></details>
+<details><summary>Does an InitVar with no default behave differently from one with a default?</summary><p>Yes, measurably -- we confirmed an InitVar with no default raises AttributeError on access (fails loudly), while one with a default returns that default value with no error at all (fails silently, with wrong data), even though both are equally unavailable as real instance state.</p></details>
+<details><summary>What&#x27;s the safe way to keep an InitVar&#x27;s value accessible on a dataclass instance?</summary><p>Copy it into a real field inside __post_init__, e.g. self.multiplier_used = multiplier. We measured this producing a correct, instance-specific value, unlike reading the InitVar name directly.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in dataclasses module: declared an InitVar field with a default value, constructed instances passing different values for it, then accessed the field by name on each instance and compared against a second class using an InitVar with no default. PlainHeaders is our extension; Python&#x27;s dataclasses module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python BadZipFile: File is not a zip file - Causes and Fix</title>
+<meta name="description" content="Measured in Python 3.13.5: empty files, saved HTML pages, truncated downloads and renamed CSVs all raise it. Even a truncated zip starting with PK fails.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-badzipfile-file-is-not-a-zip-file/">
+<meta property="og:title" content="Python BadZipFile: File is not a zip file - Causes and Fix">
+<meta property="og:description" content="Measured in Python 3.13.5: empty files, saved HTML pages, truncated downloads and renamed CSVs all raise it. Even a truncated zip starting with PK fails.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-badzipfile-file-is-not-a-zip-file/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does a file starting with PK still raise BadZipFile?", "acceptedAnswer": {"@type": "Answer", "text": "zipfile finds the archive through the end-of-central-directory record at the end of the file. We measured a 60% truncated copy of a valid zip: it starts with PK\\x03\\x04 but raises 'File is not a zip file' because the end is missing."}}, {"@type": "Question", "name": "I get it when opening an .xlsx with pandas or openpyxl. Why?", "acceptedAnswer": {"@type": "Answer", "text": ".xlsx files are zip archives, so the same causes apply: the file is empty, is really a CSV or HTML with an .xlsx name, or was cut off. Check the first bytes as shown; a real .xlsx starts with PK."}}, {"@type": "Question", "name": "How do I check if a file is a valid zip?", "acceptedAnswer": {"@type": "Answer", "text": "zipfile.is_zipfile(path). We measured it returning False for the empty, HTML, truncated and CSV cases and True only for the complete archive."}}, {"@type": "Question", "name": "Can I recover a truncated zip?", "acceptedAnswer": {"@type": "Answer", "text": "Not with zipfile's normal reader, since the central directory at the end is gone. Re-download it; tools like zip -FF can sometimes salvage entries but the missing data is still missing."}}, {"@type": "Question", "name": "Could a file position issue cause it?", "acceptedAnswer": {"@type": "Answer", "text": "Not for zipfile: we measured ZipFile opening a BytesIO positioned at the end without problems, because it seeks itself."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>BadZipFile: File is not a zip file in Python (tested)</h1>
+<p class="lead"><code>zipfile.BadZipFile: File is not a zip file</code> is the same message for four different problems. We reproduced each: an <strong>empty file</strong>, an <strong>HTML error page</strong> saved under a .zip name, a <strong>truncated download</strong>, and a <strong>non-zip file with a zip-type extension</strong> (like a CSV named .xlsx). The truncated case is the confusing one -- it starts with the zip signature <code>PK</code> and still fails, because zipfile reads the archive's directory from the end of the file.</p>
+<h2 id="repro">1. Every common cause gives the same message</h2>
+<pre><code>import io, os, tempfile, zipfile
+
+d = tempfile.mkdtemp()
+good = os.path.join(d, "good.zip")
+with zipfile.ZipFile(good, "w") as z:
+    z.writestr("a.txt", "hello " * 1000)
+data = open(good, "rb").read()
+
+cases = {
+    "empty file": b"",
+    "HTML page saved as .zip": b"&lt;!DOCTYPE html&gt;&lt;html&gt;&lt;body&gt;404 Not Found&lt;/body&gt;&lt;/html&gt;",
+    "truncated download (first 60%)": data[: int(len(data) * 0.6)],
+    "CSV renamed to .xlsx": b"name,qty\nwidget,3\n",
+    "valid zip": data,
+}
+for label, blob in cases.items():
+    p = os.path.join(d, "f.zip")
+    open(p, "wb").write(blob)
+    try:
+        with zipfile.ZipFile(p) as z:
+            print(f"{label:32} OK, members: {z.namelist()}")
+    except zipfile.BadZipFile as e:
+        print(f"{label:32} BadZipFile: {e} | is_zipfile: {zipfile.is_zipfile(p)} | starts: {blob[:4]!r}")
+
+# A BytesIO you wrote into is fine: ZipFile seeks itself
+buf = io.BytesIO(data)
+buf.seek(0, 2)
+print("BytesIO positioned at end      ", zipfile.ZipFile(buf).namelist())</code></pre>
+<pre><code>empty file                       BadZipFile: File is not a zip file | is_zipfile: False | starts: b''
+HTML page saved as .zip          BadZipFile: File is not a zip file | is_zipfile: False | starts: b'&lt;!DO'
+truncated download (first 60%)   BadZipFile: File is not a zip file | is_zipfile: False | starts: b'PK\x03\x04'
+CSV renamed to .xlsx             BadZipFile: File is not a zip file | is_zipfile: False | starts: b'name'
+valid zip                        OK, members: ['a.txt']
+BytesIO positioned at end       ['a.txt']</code></pre>
+<p><strong>Measured:</strong> an empty file, an HTML page saved under a <code>.zip</code> name, a truncated download, and a CSV renamed to <code>.xlsx</code> all raise the identical <code>BadZipFile: File is not a zip file</code>. The first four bytes tell them apart: a real zip starts with <code>PK\x03\x04</code>.</p>
+<p>The surprise is the truncated download: it <em>starts</em> like a valid zip, yet <code>zipfile</code> still says it is "not a zip file". <code>zipfile</code> locates the archive by reading the <strong>end of central directory</strong> record at the end of the file; when the end is missing, it cannot find it and gives the same message as for a file that was never a zip. A <code>BytesIO</code> left positioned at the end is <strong>not</strong> a cause -- <code>ZipFile</code> seeks on its own.</p>
+
+<h2 id="diagnose">2. Find out which one you have</h2>
+<pre><code>with open(path, "rb") as f:
+    head = f.read(64)
+print(os.path.getsize(path), head)</code></pre>
+<ul>
+<li><code>0</code> bytes: the download or write failed, or you are reading the file before the writer has finished.</li>
+<li>Starts with <code>&lt;!DOCTYPE</code> or <code>&lt;html</code>: you saved an error, login or redirect page. With requests, check <code>r.status_code</code> and <code>r.headers["Content-Type"]</code> before writing, and call <code>r.raise_for_status()</code>.</li>
+<li>Starts with <code>PK\x03\x04</code> but fails: truncated. Compare the size with the server's <code>Content-Length</code>, and re-download; see our <a href="/guides/python-incompleteread-chunkedencodingerror-connection-broken/">IncompleteRead guide</a> for connections cut mid-body.</li>
+<li>Readable text like <code>name,qty</code>: it is a CSV (or other format) with a <code>.zip</code>/<code>.xlsx</code>/<code>.docx</code> extension. Read it with the right reader, e.g. <code>pandas.read_csv</code>.</li>
+</ul>
+
+<h2 id="fix">3. Guard before opening</h2>
+<pre><code>if not zipfile.is_zipfile(path):
+    raise ValueError(f"{path} is not a complete zip ({os.path.getsize(path)} bytes)")</code></pre>
+<p><code>zipfile.is_zipfile()</code> returned <code>False</code> for all four bad inputs above, including the truncated one, so it is a cheap check before handing the file to anything that expects a zip-based format (<code>.xlsx</code>, <code>.docx</code>, <code>.jar</code>, <code>.whl</code>, <code>.apk</code> are all zip archives).</p>
+<aside class="cta"><strong>Downloaded file won&#x27;t open? Check the Content-Type and Content-Length the server sent for it:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does a file starting with PK still raise BadZipFile?</summary><p>zipfile finds the archive through the end-of-central-directory record at the end of the file. We measured a 60% truncated copy of a valid zip: it starts with PK\x03\x04 but raises &#x27;File is not a zip file&#x27; because the end is missing.</p></details>
+<details><summary>I get it when opening an .xlsx with pandas or openpyxl. Why?</summary><p>.xlsx files are zip archives, so the same causes apply: the file is empty, is really a CSV or HTML with an .xlsx name, or was cut off. Check the first bytes as shown; a real .xlsx starts with PK.</p></details>
+<details><summary>How do I check if a file is a valid zip?</summary><p>zipfile.is_zipfile(path). We measured it returning False for the empty, HTML, truncated and CSV cases and True only for the complete archive.</p></details>
+<details><summary>Can I recover a truncated zip?</summary><p>Not with zipfile&#x27;s normal reader, since the central directory at the end is gone. Re-download it; tools like zip -FF can sometimes salvage entries but the missing data is still missing.</p></details>
+<details><summary>Could a file position issue cause it?</summary><p>Not for zipfile: we measured ZipFile opening a BytesIO positioned at the end without problems, because it seeks itself.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in zipfile module, opening an empty file, an HTML page, a truncated (60%) copy of a valid zip, a CSV with a zip-type name, and a valid zip. PlainHeaders is our extension; Python&#x27;s zipfile is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>
