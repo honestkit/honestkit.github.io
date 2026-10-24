@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pip install torch: externally-managed-environment Fix (Tested)</title>
+<meta name="description" content="pip install torch fails with externally-managed-environment on Debian/Ubuntu, even with --user. Reproduced, fixed with a venv and the CPU-only wheel.">
+<link rel="canonical" href="https://honestkit.github.io/guides/torch-error-externally-managed-environment/">
+<meta property="og:title" content="pip install torch: externally-managed-environment Fix (Tested)">
+<meta property="og:description" content="pip install torch fails with externally-managed-environment on Debian/Ubuntu, even with --user. Reproduced, fixed with a venv and the CPU-only wheel.">
+<meta property="og:url" content="https://honestkit.github.io/guides/torch-error-externally-managed-environment/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does pip install torch say externally-managed-environment?", "acceptedAnswer": {"@type": "Answer", "text": "Debian and Ubuntu mark the system Python as externally managed (PEP 668), so pip refuses to install any package into it, including with --user."}}, {"@type": "Question", "name": "How do I install PyTorch on Debian or Ubuntu?", "acceptedAnswer": {"@type": "Answer", "text": "python3 -m venv ~/torch-env, then ~/torch-env/bin/pip install torch (add --index-url https://download.pytorch.org/whl/cpu for a CPU-only build)."}}, {"@type": "Question", "name": "Can I use apt install python3-torch?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, it needs no pip, but Debian 13 packages torch 2.6.0, while PyPI has 2.14.1."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pip install torch &quot;error: externally-managed-environment&quot; (tested)</h1>
+<p class="lead"><code>pip install torch</code> on Debian 12+/Ubuntu 23.04+ stops with <code>error: externally-managed-environment</code>, and <code>--user</code> fails the same way. Install PyTorch into a virtual environment instead, and use the CPU index if you have no NVIDIA GPU; reproduced and fixed below.</p>
+<h2 id="repro">1. Reproduce: pip install torch on Debian's Python</h2>
+<p><code>run.sh</code> runs in a fresh <code>debian:trixie-slim</code> container (Debian 13; Ubuntu 23.04+ behaves the same), installs the distro <code>python3-pip</code>, tries to install PyTorch system-wide, then installs it into a virtual environment:</p>
+<pre><code>#!/bin/sh
+# Debian 13 (trixie), distro Python: install PyTorch
+apt-get update -qq &gt;/dev/null &amp;&amp; apt-get install -y -qq python3-pip python3-venv &gt;/dev/null 2&gt;&amp;1
+python3 --version; pip --version | cut -d&#x27; &#x27; -f1-2
+echo &#x27;== 1. pip install torch&#x27;
+pip install torch 2&gt;&amp;1 | head -4; echo &quot;exit status: $(pip install torch &gt;/dev/null 2&gt;&amp;1; echo $?)&quot;
+echo &#x27;== 2. sudo-less --user does not help&#x27;
+pip install --user torch 2&gt;&amp;1 | head -1
+echo &#x27;== 3. what apt offers&#x27;
+apt-cache policy python3-torch | head -3
+echo &#x27;== 4. venv + CPU-only wheel (dry run)&#x27;
+python3 -m venv /opt/torch
+/opt/torch/bin/pip install --dry-run torch --index-url https://download.pytorch.org/whl/cpu 2&gt;&amp;1 | grep &#x27;^Would install&#x27; | fold -s -w 100
+echo &#x27;== 5. venv + default PyPI wheel (dry run)&#x27;
+/opt/torch/bin/pip install --dry-run torch 2&gt;&amp;1 | grep &#x27;^Would install&#x27; | fold -s -w 100
+echo &#x27;== 6. real install of the CPU wheel, then import&#x27;
+/opt/torch/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu 2&gt;&amp;1 | tail -1
+/opt/torch/bin/python -c &quot;import torch; print(torch.__version__, torch.tensor([1., 2.]).sum().item())&quot;
+du -sh /opt/torch | cut -f1</code></pre>
+<p>Output:</p>
+<pre><code>Python 3.13.5
+pip 25.1.1
+== 1. pip install torch
+error: externally-managed-environment
+
+× This environment is externally managed
+╰─&gt; To install Python packages system-wide, try apt install
+exit status: 1
+== 2. sudo-less --user does not help
+error: externally-managed-environment
+== 3. what apt offers
+python3-torch:
+  Installed: (none)
+  Candidate: 2.6.0+dfsg-7
+== 4. venv + CPU-only wheel (dry run)
+Would install Jinja2-3.1.6 MarkupSafe-3.0.3 filelock-3.32.3 fsspec-2026.7.0 mpmath-1.3.0 
+networkx-3.6.1 setuptools-78.1.0 sympy-1.14.0 torch-2.14.1+cpu typing_extensions-4.16.0
+== 5. venv + default PyPI wheel (dry run)
+Would install Jinja2-3.1.6 MarkupSafe-3.0.4 cuda-bindings-13.4.4 cuda-pathfinder-1.8.4 
+cuda-toolkit-13.0.3.0 filelock-4.2.4 fsspec-2026.9.0 mpmath-1.3.0 networkx-3.7 
+nvidia-cublas-13.1.1.3 nvidia-cuda-cupti-13.0.85 nvidia-cuda-nvrtc-13.0.88 
+nvidia-cuda-runtime-13.0.96 nvidia-cudnn-cu13-9.24.0.43 nvidia-cufft-12.0.0.61 
+nvidia-cufile-1.15.1.6 nvidia-curand-10.4.0.35 nvidia-cusolver-12.0.4.66 nvidia-cusparse-12.6.3.3 
+nvidia-cusparselt-cu13-0.8.1 nvidia-nccl-cu13-2.30.7 nvidia-nvjitlink-13.4.92 
+nvidia-nvshmem-cu13-3.4.5 nvidia-nvtx-13.0.85 setuptools-84.2.1 sympy-1.14.0 torch-2.14.1 
+triton-3.8.0 typing_extensions-4.16.0
+== 6. real install of the CPU wheel, then import
+/opt/torch/lib/python3.13/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named &#x27;numpy&#x27; (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device(&quot;cpu&quot;))
+2.14.1+cpu 3.0
+899M</code></pre>
+<h2 id="meaning">2. What it means</h2>
+<p>Debian marks its Python as <b>externally managed</b> (PEP 668), so pip refuses to install anything into it. <code>pip install torch</code> and <code>pip install --user torch</code> both stop with exit status 1 before a byte of PyTorch is downloaded. Nothing is wrong with torch; every package fails the same way (see <a href="/guides/pip-error-externally-managed-environment/">pip "externally-managed-environment"</a>).</p>
+<h2 id="fix">3. Fix: a venv, and pick the right wheel</h2>
+<ul><li><code>python3 -m venv ~/torch-env</code> (needs <code>python3-venv</code>), then <code>~/torch-env/bin/pip install torch</code>. Inside the venv pip is no longer blocked.</li>
+<li><b>No NVIDIA GPU? Use the CPU index:</b> <code>pip install torch --index-url https://download.pytorch.org/whl/cpu</code>. Step 4 shows it pulls 10 packages and no CUDA libraries. The default PyPI wheel (step 5) also pulls <code>cuda-toolkit</code>, cuDNN, NCCL, <code>triton</code> and 18 <code>nvidia-*</code>/<code>cuda-*</code> packages. The CPU venv came to 899 MB on disk.</li>
+<li>The CPU install printed <code>Failed to initialize NumPy: No module named 'numpy'</code> on import: torch does not depend on numpy, so add <code>pip install numpy</code> if you use <code>.numpy()</code> (see <a href="/guides/torch-runtimeerror-numpy-is-not-available/">RuntimeError: Numpy is not available</a>).</li>
+<li><code>apt install python3-torch</code> works without pip, but Debian 13 ships torch 2.6.0, well behind the 2.14.1 wheel on PyPI.</li>
+<li><code>--break-system-packages</code> silences the error but writes torch and its dependencies into the OS Python; prefer the venv.</li></ul>
+<p>Related: <a href="/guides/torch-install-error-no-matching-distribution/">pip install torch: No matching distribution found</a>, <a href="/guides/python-modulenotfounderror-no-module-named-torch/">No module named 'torch'</a>, <a href="/guides/torch-not-compiled-with-cuda-enabled/">Torch not compiled with CUDA enabled</a>, <a href="/guides/docker-pip-error-externally-managed-environment/">externally-managed-environment in Docker</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does pip install torch say externally-managed-environment?</summary><p>Debian and Ubuntu mark the system Python as externally managed (PEP 668), so pip refuses to install any package into it, including with --user.</p></details>
+<details><summary>How do I install PyTorch on Debian or Ubuntu?</summary><p>python3 -m venv ~/torch-env, then ~/torch-env/bin/pip install torch (add --index-url https://download.pytorch.org/whl/cpu for a CPU-only build).</p></details>
+<details><summary>Can I use apt install python3-torch?</summary><p>Yes, it needs no pip, but Debian 13 packages torch 2.6.0, while PyPI has 2.14.1.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 in a debian:trixie-slim container (Python 3.13.5, distro pip 25.1.1; torch 2.14.1+cpu from the PyTorch CPU index). The script ran verbatim and the output was pasted unedited. PlainTables is our extension; PyTorch is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

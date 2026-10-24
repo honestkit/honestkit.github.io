@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>celery beat vs celery worker: why periodic tasks don&#x27;t run</title>
+<meta name="description" content="celery beat sends scheduled tasks, the worker runs them. Measured: worker alone runs 0 periodic tasks, worker -B embeds beat, separate beat for production.">
+<link rel="canonical" href="https://honestkit.github.io/guides/celery-beat-vs-celery-worker/">
+<meta property="og:title" content="celery beat vs celery worker: why periodic tasks don&#x27;t run">
+<meta property="og:description" content="celery beat sends scheduled tasks, the worker runs them. Measured: worker alone runs 0 periodic tasks, worker -B embeds beat, separate beat for production.">
+<meta property="og:url" content="https://honestkit.github.io/guides/celery-beat-vs-celery-worker/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between celery beat and celery worker?", "acceptedAnswer": {"@type": "Answer", "text": "Beat is a scheduler that publishes due tasks from beat_schedule to the broker; the worker consumes and executes tasks. Periodic tasks need both."}}, {"@type": "Question", "name": "Why are my Celery periodic tasks not running?", "acceptedAnswer": {"@type": "Answer", "text": "Usually no beat process is running. A worker alone ignores beat_schedule. Start celery -A proj beat or add -B to one worker."}}, {"@type": "Question", "name": "Can I run celery beat inside the worker?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, with worker -B, but only on one worker; it is meant for development."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>celery beat vs celery worker (tested)</h1>
+<p class="lead"><code>celery beat</code> only <em>sends</em> scheduled tasks; <code>celery worker</code> <em>runs</em> them. You need both: a worker alone ran our 2-second periodic task 0 times. Run one <code>celery -A proj beat</code> plus your workers, or <code>worker -B</code> for development.</p>
+<p><strong>celery beat</strong> is a scheduler: it reads <code>beat_schedule</code> and, when an entry is due, <em>sends</em> a task message to the broker. A <strong>celery worker</strong> consumes messages and <em>runs</em> tasks. Beat never runs tasks itself, and a worker never looks at <code>beat_schedule</code>. Measured with Celery 5.6.3 and Redis 7, a 2-second schedule, 10 seconds per run.</p>
+<h2 id="worker-only">1. Worker alone: periodic tasks never run</h2>
+<pre><code>$ cat celery_app.py
+from celery import Celery
+app = Celery(&quot;proj&quot;, broker=&quot;redis://127.0.0.1:8964/0&quot;)
+app.conf.beat_schedule = {
+    &quot;ping-every-2s&quot;: {&quot;task&quot;: &quot;celery_app.ping&quot;, &quot;schedule&quot;: 2.0},
+}
+
+@app.task
+def ping():
+    print(&quot;ping ran&quot;)
+$ celery -A celery_app worker -c 1 --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ echo &quot;ping ran: $(grep -c &quot;ping ran&quot; worker.log) times in 10s&quot;
+ping ran: 0 times in 10s</code></pre>
+<p>The schedule is defined and the task is registered, but nothing sends the messages, so it ran 0 times and the worker logged no error. This is the usual cause of "celery beat not running tasks".</p>
+<h2 id="embedded">2. Worker with -B: beat embedded in the worker</h2>
+<pre><code>$ celery -A celery_app worker -B -c 1 --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ echo &quot;ping ran: $(grep -c &quot;ping ran&quot; worker.log) times in 10s&quot;
+ping ran: 4 times in 10s
+$ grep -m2 -E &quot;beat: Starting|Sending due task&quot; worker.log | sed -E &quot;s/^\[[^]]*\] //&quot;
+beat: Starting...
+Scheduler: Sending due task ping-every-2s (celery_app.ping)</code></pre>
+<p><code>-B</code> starts a beat thread inside the worker. Convenient for development; Celery's documentation advises against it in production, because every worker started with <code>-B</code> runs its own scheduler and you must never have more than one beat sending the same schedule.</p>
+<h2 id="separate">3. Separate beat process (production setup)</h2>
+<pre><code>$ celery -A celery_app worker -c 1 --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ celery -A celery_app beat --loglevel=INFO &gt; beat.log 2&gt;&amp;1 &amp;
+$ echo &quot;ping ran: $(grep -c &quot;ping ran&quot; worker.log) times in 10s&quot;
+ping ran: 6 times in 10s
+$ grep -m2 &quot;Sending due task&quot; beat.log | sed -E &quot;s/^\[[^]]*\] //&quot;
+Scheduler: Sending due task ping-every-2s (celery_app.ping)
+Scheduler: Sending due task ping-every-2s (celery_app.ping)</code></pre>
+<p>Run exactly one <code>celery beat</code> process and as many workers as you need. Beat stores its last-run times in <code>celerybeat-schedule</code> in the working directory (change with <code>-s</code>), so give it a writable directory.</p>
+<p>Related: <a href="/guides/celery-received-unregistered-task-of-type-keyerror/">Celery Received unregistered task</a> (beat sends the task name; the worker must have the task registered), <a href="/guides/celery-task-timeout-error-time-limit/">Celery task time limits</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between celery beat and celery worker?</summary><p>Beat is a scheduler that publishes due tasks from beat_schedule to the broker; the worker consumes and executes tasks. Periodic tasks need both.</p></details>
+<details><summary>Why are my Celery periodic tasks not running?</summary><p>Usually no beat process is running. A worker alone ignores beat_schedule. Start celery -A proj beat or add -B to one worker.</p></details>
+<details><summary>Can I run celery beat inside the worker?</summary><p>Yes, with worker -B, but only on one worker; it is meant for development.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Celery 5.6.3 (kombu 5.6.2, redis-py 8.1.0) on Python 3.13.5, Redis 7 (Docker) as broker. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Celery and Redis are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

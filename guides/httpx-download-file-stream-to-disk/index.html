@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx download file: stream large files to disk (tested)</title>
+<meta name="description" content="Download a file with httpx.stream() and iter_bytes() to disk without loading it in memory. follow_redirects avoids a 0-byte file; async version included.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-download-file-stream-to-disk/">
+<meta property="og:title" content="httpx download file: stream large files to disk (tested)">
+<meta property="og:description" content="Download a file with httpx.stream() and iter_bytes() to disk without loading it in memory. follow_redirects avoids a 0-byte file; async version included.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-download-file-stream-to-disk/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I download a large file with httpx?", "acceptedAnswer": {"@type": "Answer", "text": "with httpx.stream('GET', url) as r: write each chunk from r.iter_bytes() to a file opened in 'wb' mode. Memory use stays at one chunk."}}, {"@type": "Question", "name": "Why is my httpx download 0 bytes?", "acceptedAnswer": {"@type": "Answer", "text": "The URL redirected and httpx does not follow redirects by default; the 302 body is empty. Pass follow_redirects=True."}}, {"@type": "Question", "name": "How do I show download progress with httpx?", "acceptedAnswer": {"@type": "Answer", "text": "Compare r.num_bytes_downloaded with int(r.headers['Content-Length']) inside the iter_bytes() loop."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx download file: stream to disk in chunks (tested)</h1>
+<p class="lead">Use <code>with httpx.stream("GET", url, follow_redirects=True) as r:</code>, call <code>r.raise_for_status()</code>, then write <code>r.iter_bytes()</code> chunks to a file opened with <code>"wb"</code>. Without <code>follow_redirects</code> a redirecting link saves a 0-byte file.</p>
+<p>To download a file with httpx without loading it all into memory, use <code>httpx.stream()</code> (or <code>client.stream()</code>) and write <code>iter_bytes()</code> chunks to a file opened in <code>"wb"</code> mode. Measured with httpx 0.28.1 on Python 3.13.5 against a local <code>http.server</code> (<code>srv.py</code>) serving a 1 MiB <code>/file.bin</code>, a 302 at <code>/r</code> and a 404 at <code>/missing</code>.</p>
+<h2 id="download">1. httpx download file in chunks</h2>
+<pre><code>import os, httpx
+from srv import start
+base = start()
+
+with httpx.stream(&quot;GET&quot;, base + &quot;/file.bin&quot;) as r:
+    r.raise_for_status()
+    total = int(r.headers[&quot;Content-Length&quot;])
+    with open(&quot;file.bin&quot;, &quot;wb&quot;) as f:
+        for chunk in r.iter_bytes(chunk_size=65536):
+            f.write(chunk)
+    print(&quot;downloaded&quot;, r.num_bytes_downloaded, &quot;of&quot;, total)
+print(&quot;on disk:&quot;, os.path.getsize(&quot;file.bin&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>downloaded 1048576 of 1048576
+on disk: 1048576</code></pre>
+<p><code>r.num_bytes_downloaded</code> counts raw bytes received, which is what you compare with <code>Content-Length</code> for a progress bar.</p>
+<h2 id="redirect">2. Gotcha: redirects are not followed</h2>
+<pre><code>import os, httpx
+from srv import start
+base = start()
+
+# without follow_redirects you save the empty 302 body
+with httpx.stream(&quot;GET&quot;, base + &quot;/r&quot;) as r:
+    with open(&quot;a.bin&quot;, &quot;wb&quot;) as f:
+        for chunk in r.iter_bytes():
+            f.write(chunk)
+print(r.status_code, os.path.getsize(&quot;a.bin&quot;), &quot;bytes&quot;)
+
+with httpx.stream(&quot;GET&quot;, base + &quot;/r&quot;, follow_redirects=True) as r:
+    with open(&quot;a.bin&quot;, &quot;wb&quot;) as f:
+        for chunk in r.iter_bytes():
+            f.write(chunk)
+print(r.status_code, os.path.getsize(&quot;a.bin&quot;), &quot;bytes&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>302 0 bytes
+200 1048576 bytes</code></pre>
+<p>Without <code>follow_redirects=True</code> the loop happily writes the empty 302 body and you get a 0-byte file. Many download links (GitHub releases, CDNs) redirect, so pass it and call <code>raise_for_status()</code> before opening the output file.</p>
+<h2 id="error">3. Reading the error body of a streamed response</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+try:
+    with httpx.stream(&quot;GET&quot;, base + &quot;/missing&quot;) as r:
+        r.raise_for_status()
+except httpx.HTTPStatusError as e:
+    print(e.response.status_code)
+    try:
+        print(e.response.text)
+    except httpx.ResponseNotRead as e2:
+        print(&quot;ResponseNotRead:&quot;, e2)</code></pre>
+<p>Output:</p>
+<pre><code>404
+ResponseNotRead: Attempted to access streaming response content, without having called `read()`.</code></pre>
+<p>Inside <code>stream()</code> the body has not been read, so <code>e.response.text</code> raises <code>ResponseNotRead</code>. Call <code>r.read()</code> before <code>raise_for_status()</code> when the status is an error if you want to log it.</p>
+<h2 id="async">4. AsyncClient download</h2>
+<pre><code>import asyncio, os, httpx
+from srv import start
+base = start()
+
+async def main():
+    async with httpx.AsyncClient() as client:
+        async with client.stream(&quot;GET&quot;, base + &quot;/file.bin&quot;) as r:
+            r.raise_for_status()
+            with open(&quot;async.bin&quot;, &quot;wb&quot;) as f:
+                async for chunk in r.aiter_bytes(65536):
+                    f.write(chunk)
+    print(&quot;on disk:&quot;, os.path.getsize(&quot;async.bin&quot;))
+
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>on disk: 1048576</code></pre>
+<p>Related: <a href="/guides/httpx-stream-response-iter-bytes/">httpx stream and iter_bytes</a>, <a href="/guides/httpx-follow-redirects/">httpx follow redirects</a>, <a href="/guides/httpx-raise-for-status-httpstatuserror/">httpx raise_for_status</a>, <a href="/guides/httpx-upload-file-post-files-multipart/">httpx upload file</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I download a large file with httpx?</summary><p>with httpx.stream(&#x27;GET&#x27;, url) as r: write each chunk from r.iter_bytes() to a file opened in &#x27;wb&#x27; mode. Memory use stays at one chunk.</p></details>
+<details><summary>Why is my httpx download 0 bytes?</summary><p>The URL redirected and httpx does not follow redirects by default; the 302 body is empty. Pass follow_redirects=True.</p></details>
+<details><summary>How do I show download progress with httpx?</summary><p>Compare r.num_bytes_downloaded with int(r.headers[&#x27;Content-Length&#x27;]) inside the iter_bytes() loop.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5 against a local http.server serving a 1 MiB file. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

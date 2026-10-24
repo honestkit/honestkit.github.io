@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>astimezone() on a Naive datetime Assumes Local Time, Silently</title>
+<meta name="description" content="We measured .astimezone() on a naive UTC value returning a time off by the full UTC offset, no exception -- fixed with .replace(tzinfo=utc) first.">
+<link rel="canonical" href="https://honestkit.github.io/guides/datetime-astimezone-on-naive-datetime-silently-assumes-local-tz/">
+<meta property="og:title" content="astimezone() on a Naive datetime Assumes Local Time, Silently">
+<meta property="og:description" content="We measured .astimezone() on a naive UTC value returning a time off by the full UTC offset, no exception -- fixed with .replace(tzinfo=utc) first.">
+<meta property="og:url" content="https://honestkit.github.io/guides/datetime-astimezone-on-naive-datetime-silently-assumes-local-tz/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does .astimezone() raise an error on a naive datetime?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it running silently and returning a value, just converted from the wrong assumed starting timezone (the system's local time) rather than erroring."}}, {"@type": "Question", "name": "What timezone does Python assume for a naive datetime?", "acceptedAnswer": {"@type": "Answer", "text": "Per the datetime docs, .astimezone() on a naive instance assumes it represents the system's local time before converting. We confirmed this changes the result depending on the server's configured timezone."}}, {"@type": "Question", "name": "How do I correctly convert a naive value that I know is UTC?", "acceptedAnswer": {"@type": "Answer", "text": "Use .replace(tzinfo=timezone.utc) first to attach the correct timezone without altering the numbers, then call .astimezone() if you need a different target zone. We confirmed this gives the correct result regardless of local system timezone."}}, {"@type": "Question", "name": "Why did the same code give different results on two machines?", "acceptedAnswer": {"@type": "Answer", "text": "Because .astimezone() on a naive value uses the local system timezone as its starting assumption. We measured identical code producing different output purely from a different TZ environment setting."}}, {"@type": "Question", "name": "Is this related to datetime.utcnow() being deprecated?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- utcnow() returns a naive value despite the name, which is exactly the shape that triggers this trap if it's later passed through .astimezone(). The docs recommend datetime.now(timezone.utc) instead, which returns an aware value from the start."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>datetime.astimezone() on a Naive Value Silently Assumes Local Time (tested)</h1>
+<p class="lead">A <code>datetime.datetime</code> with no timezone attached is called &quot;naive.&quot; We measured what happens when you call <code>.astimezone()</code> on a naive value that is really a UTC timestamp (a common shape coming out of a database or JSON API): Python assumes it's <strong>local system time</strong> instead, and converts from there &mdash; no exception, just a wrong answer.</p>
+<h2 id="repro1">1. A naive value that is really UTC, converted under TZ=America/New_York</h2>
+<pre><code>from datetime import datetime, timezone
+
+# Imagine this came from a DB column or JSON field that is documented as UTC,
+# but the value itself carries no tzinfo:
+naive_utc_value = datetime(2026, 6, 15, 12, 0, 0)  # really means 12:00 UTC
+
+wrong = naive_utc_value.astimezone(timezone.utc)
+print(wrong)</code></pre>
+<pre><code>2026-06-15 16:00:00+00:00</code></pre>
+<p><strong>Measured:</strong> run with <code>TZ=America/New_York</code> (UTC-4 in June), <code>.astimezone(timezone.utc)</code> turned <code>12:00</code> into <code>16:00</code> &mdash; a 4-hour shift. Per the docs, <code>.astimezone()</code> on a naive instance first assumes the value is in the <strong>system's local timezone</strong>, then converts to the target. Since the value was actually already UTC, that assumption is wrong, and the result is off by exactly the local UTC offset. No exception is raised either way.</p>
+
+<h2 id="repro2">2. Same code, different server timezone, different wrong answer</h2>
+<pre><code># Same naive_utc_value, same code, run on a box set to BST (+01:00) instead:
+wrong_bst = naive_utc_value.astimezone(timezone.utc)
+print(wrong_bst)</code></pre>
+<pre><code>2026-06-15 11:00:00+00:00</code></pre>
+<p><strong>Measured:</strong> identical input, identical code, but a different result (<code>11:00</code> instead of <code>16:00</code>) purely because the machine running it had a different local timezone set. This is what makes the bug easy to miss in testing: a dev laptop set to UTC would see <code>.astimezone()</code> do nothing visible, while the exact same code on a server in another timezone silently produces a different, wrong timestamp.</p>
+
+<h2 id="fix">3. Fix: label the value's real timezone before converting</h2>
+<pre><code>right = naive_utc_value.replace(tzinfo=timezone.utc).astimezone(timezone.utc)
+print(right)</code></pre>
+<pre><code>2026-06-15 12:00:00+00:00</code></pre>
+<p><strong>Measured:</strong> calling <code>.replace(tzinfo=timezone.utc)</code> first attaches the correct, known timezone to the existing wall-clock numbers without changing them, then <code>.astimezone()</code> converts from the right starting point. The result matches the original <code>12:00</code>, independent of the server's local timezone. The rule: <code>.astimezone()</code> only does the right thing on a datetime that already knows what timezone it's in; a naive value needs <code>.replace(tzinfo=...)</code> (not <code>.astimezone()</code>) to attach the correct one for the first time.</p>
+
+<h2 id="why">4. Why this is easy to ship by accident</h2>
+<ul>
+<li>Many APIs and ORMs return naive <code>datetime</code> objects for columns that are documented as UTC &mdash; the timezone is a convention, not something Python enforces.</li>
+<li><code>datetime.utcnow()</code> itself returns a naive value (deprecated since 3.12 for this exact reason, per the docs) &mdash; code that mixes <code>utcnow()</code> with later <code>.astimezone()</code> calls hits this same trap.</li>
+<li>No exception at any point means tests on a UTC CI runner or a UTC-configured server can pass clean while production (or a developer's laptop in another timezone) gets a silently wrong timestamp.</li>
+</ul>
+<aside class="cta"><strong>Debugging a timestamp an API returned that looked off by a few hours? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does .astimezone() raise an error on a naive datetime?</summary><p>No -- we measured it running silently and returning a value, just converted from the wrong assumed starting timezone (the system&#x27;s local time) rather than erroring.</p></details>
+<details><summary>What timezone does Python assume for a naive datetime?</summary><p>Per the datetime docs, .astimezone() on a naive instance assumes it represents the system&#x27;s local time before converting. We confirmed this changes the result depending on the server&#x27;s configured timezone.</p></details>
+<details><summary>How do I correctly convert a naive value that I know is UTC?</summary><p>Use .replace(tzinfo=timezone.utc) first to attach the correct timezone without altering the numbers, then call .astimezone() if you need a different target zone. We confirmed this gives the correct result regardless of local system timezone.</p></details>
+<details><summary>Why did the same code give different results on two machines?</summary><p>Because .astimezone() on a naive value uses the local system timezone as its starting assumption. We measured identical code producing different output purely from a different TZ environment setting.</p></details>
+<details><summary>Is this related to datetime.utcnow() being deprecated?</summary><p>Yes -- utcnow() returns a naive value despite the name, which is exactly the shape that triggers this trap if it&#x27;s later passed through .astimezone(). The docs recommend datetime.now(timezone.utc) instead, which returns an aware value from the start.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in datetime module, running the same script under TZ=America/New_York and the system&#x27;s default BST (+0100) to compare. Called .astimezone() on a naive datetime.datetime that was actually a UTC value, both directly and after .replace(tzinfo=timezone.utc), and compared results. PlainHeaders is our extension; Python&#x27;s datetime module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

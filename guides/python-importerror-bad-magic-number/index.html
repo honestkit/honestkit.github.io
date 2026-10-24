@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python ImportError: Bad Magic Number (Tested Causes and Fix)</title>
+<meta name="description" content="We measured Python&#x27;s ImportError: bad magic number: .pyc files from another version, files that aren&#x27;t bytecode, and why __pycache__ isn&#x27;t the cause.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-importerror-bad-magic-number/">
+<meta property="og:title" content="Python ImportError: Bad Magic Number (Tested Causes and Fix)">
+<meta property="og:description" content="We measured Python&#x27;s ImportError: bad magic number: .pyc files from another version, files that aren&#x27;t bytecode, and why __pycache__ isn&#x27;t the cause.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-importerror-bad-magic-number/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does ImportError: bad magic number mean?", "acceptedAnswer": {"@type": "Answer", "text": "Python found a .pyc file whose first 4 bytes don't match its own bytecode version. We measured it with a .pyc from a different magic and no .py source, on Python 3.13.5."}}, {"@type": "Question", "name": "How do I fix bad magic number in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Delete the stray .pyc (one outside __pycache__) so Python uses the .py source, or recompile with your Python via python3 -m compileall. If the bytes shown look like text, the file isn't bytecode at all."}}, {"@type": "Question", "name": "Does a stale __pycache__ cause bad magic number?", "acceptedAnswer": {"@type": "Answer", "text": "Not when the .py source exists: we measured a garbage cache file being ignored and rewritten. The error comes from .pyc files loaded without source."}}, {"@type": "Question", "name": "Can I run a .pyc from another Python version?", "acceptedAnswer": {"@type": "Answer", "text": "No, bytecode differs between minor versions; the magic number check rejects it."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ImportError: bad magic number (tested)</h1>
+<p class="lead"><code>ImportError: bad magic number in 'mod': b'...'</code> means Python tried to load a <code>.pyc</code> file it can't use. We measured the three situations behind it on Python 3.13.5.</p>
+<h2 id="what">1. What the magic number is</h2>
+<pre><code>import importlib.util, os, py_compile, sys
+os.makedirs(&quot;pkg&quot;, exist_ok=True)
+open(&quot;pkg/mod.py&quot;, &quot;w&quot;).write(&quot;X = 1\n&quot;)
+pyc = py_compile.compile(&quot;pkg/mod.py&quot;, cfile=&quot;pkg/mod.pyc&quot;)
+os.remove(&quot;pkg/mod.py&quot;)                       # only the .pyc is left (shipped or stale)
+data = bytearray(open(pyc, &quot;rb&quot;).read())
+data[0:2] = (3000).to_bytes(2, &quot;little&quot;)      # pretend another Python version wrote it
+open(pyc, &quot;wb&quot;).write(data)
+sys.path.insert(0, &quot;pkg&quot;)
+try:
+    import mod
+except ImportError as e:
+    print(&quot;ImportError:&quot;, e)
+print(&quot;this Python&#x27;s magic:&quot;, importlib.util.MAGIC_NUMBER)</code></pre>
+<p>Output:</p>
+<pre><code>ImportError: bad magic number in &#x27;mod&#x27;: b&#x27;\xb8\x0b\r\n&#x27;
+this Python&#x27;s magic: b&#x27;\xf3\r\r\n&#x27;</code></pre>
+<p>Every <code>.pyc</code> file starts with a 4-byte magic number that identifies the Python version that compiled it. <strong>Measured on Python 3.13.5:</strong> a <code>.pyc</code> written with a different magic, and with no <code>.py</code> source next to it, fails with <code>ImportError: bad magic number in 'mod'</code> and shows the bytes it found. Bytecode is not portable across minor versions, so a <code>.pyc</code>-only package built for 3.11 won't import on 3.13. Fix: get the <code>.py</code> source, or rebuild the <code>.pyc</code> with the Python you run (<code>python3 -m compileall</code>).</p>
+
+<h2 id="notpyc">2. A file that isn't bytecode at all</h2>
+<pre><code>import os, sys
+os.makedirs(&quot;pkg2&quot;, exist_ok=True)
+open(&quot;pkg2/notes.pyc&quot;, &quot;w&quot;).write(&quot;these are not bytecode\n&quot;)   # a text file named .pyc
+sys.path.insert(0, &quot;pkg2&quot;)
+try:
+    import notes
+except ImportError as e:
+    print(&quot;ImportError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>ImportError: bad magic number in &#x27;notes&#x27;: b&#x27;thes&#x27;</code></pre>
+<p><strong>Measured:</strong> the "magic" shown is just the first 4 bytes of the file, here <code>b'thes'</code> from a text file. If the bytes look like text, HTML (<code>b'&lt;!DO'</code>) or zeros, the file is a misnamed file or a broken download (for example an HTML error page saved as <code>.pyc</code>), not a version mismatch.</p>
+
+<h2 id="cache">3. Stale __pycache__ files are not the problem</h2>
+<pre><code>import os, sys
+os.makedirs(&quot;pkg3/__pycache__&quot;, exist_ok=True)
+open(&quot;pkg3/mod3.py&quot;, &quot;w&quot;).write(&quot;X = &#x27;from source&#x27;\n&quot;)
+# a bad cache file next to the source is ignored and rewritten, not an error
+open(f&quot;pkg3/__pycache__/mod3.{sys.implementation.cache_tag}.pyc&quot;, &quot;wb&quot;).write(b&quot;\x00&quot; * 16)
+sys.path.insert(0, &quot;pkg3&quot;)
+import mod3
+print(mod3.X)</code></pre>
+<p>Output:</p>
+<pre><code>from source</code></pre>
+<p><strong>Measured:</strong> a garbage file in <code>__pycache__</code> next to a real <code>.py</code> is ignored: the import used the source and rewrote the cache file (we checked: it went from 16 bytes of zeros to a valid file). So if you see this error, look for a <code>.pyc</code> sitting <em>outside</em> <code>__pycache__</code>, which Python loads only when there is no <code>.py</code> beside it. Deleting stray <code>*.pyc</code> files (<code>find . -name "*.pyc" -not -path "*/__pycache__/*"</code>) is the usual fix.</p>
+
+<aside class="cta"><strong>Downloaded a file that turned out to be an HTML page? Check what a URL really returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does ImportError: bad magic number mean?</summary><p>Python found a .pyc file whose first 4 bytes don&#x27;t match its own bytecode version. We measured it with a .pyc from a different magic and no .py source, on Python 3.13.5.</p></details>
+<details><summary>How do I fix bad magic number in Python?</summary><p>Delete the stray .pyc (one outside __pycache__) so Python uses the .py source, or recompile with your Python via python3 -m compileall. If the bytes shown look like text, the file isn&#x27;t bytecode at all.</p></details>
+<details><summary>Does a stale __pycache__ cause bad magic number?</summary><p>Not when the .py source exists: we measured a garbage cache file being ignored and rewritten. The error comes from .pyc files loaded without source.</p></details>
+<details><summary>Can I run a .pyc from another Python version?</summary><p>No, bytecode differs between minor versions; the magic number check rejects it.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: a sourceless .pyc with a different magic number, a text file named .pyc, and a garbage __pycache__ entry next to real source (and its rewritten size). Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

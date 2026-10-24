@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JavaScript Unexpected Token: 3 Real Causes (Tested)</title>
+<meta name="description" content="We reproduced &#x27;Unexpected token&#x27; for real syntax typos, JSON.parse() on bad data, and import/export in a CommonJS file. Exact Node 24 wording for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/javascript-unexpected-token/">
+<meta property="og:title" content="JavaScript Unexpected Token: 3 Real Causes (Tested)">
+<meta property="og:description" content="We reproduced &#x27;Unexpected token&#x27; for real syntax typos, JSON.parse() on bad data, and import/export in a CommonJS file. Exact Node 24 wording for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/javascript-unexpected-token/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does 'Unexpected token' show up in so many unrelated bugs?", "acceptedAnswer": {"@type": "Answer", "text": "It's a generic SyntaxError name both JavaScript's own parser and JSON.parse() use whenever they hit a character or keyword that doesn't fit the grammar at that point. We measured it for a stray comma, a mismatched bracket, bad JSON, and import/export in the wrong file type -- the fix is different in each case, so the exact wording and where it points matters more than the headline."}}, {"@type": "Question", "name": "Why does my JSON.parse() error mention an HTML tag?", "acceptedAnswer": {"@type": "Answer", "text": "You likely parsed an HTML error page (a 404 or 500 response) as if it were JSON. We measured this directly: parsing '<html>...' with JSON.parse() gives SyntaxError: Unexpected token '<', with the HTML snippet quoted in the message. Check the HTTP status code before parsing the body."}}, {"@type": "Question", "name": "Is a trailing comma valid JSON?", "acceptedAnswer": {"@type": "Answer", "text": "No, even though it's valid JavaScript. We confirmed {\"a\":1,} and [1,2,] are both invalid JSON (JSON.parse throws on each) but run fine as JS object/array literals. Code copied from JS source with a trailing comma left in will fail specifically through JSON.parse()."}}, {"@type": "Question", "name": "Why did my import/export syntax work in one file but not another?", "acceptedAnswer": {"@type": "Answer", "text": "Node decides module type per file. We measured that a plain .js file with no package.json nearby gets auto-detected as a module and just works, but the same code forced into CommonJS (.cjs extension, or \"type\": \"commonjs\" in package.json) throws: 'Cannot use import statement outside a module' for import, or the generic 'Unexpected token 'export'' for export."}}, {"@type": "Question", "name": "How do I quickly tell a real JS syntax error from a JSON.parse() error?", "acceptedAnswer": {"@type": "Answer", "text": "Check which function is on the stack trace. A real syntax error crashes while Node is loading your file, before any of your code runs, and the trace has no JSON.parse frame. A JSON.parse() error happens while your code is already running, at the specific line calling JSON.parse(), and the message includes the literal text it failed on."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>JavaScript &#x27;Unexpected token&#x27; (tested)</h1>
+<p class="lead"><code>Unexpected token</code> is a generic SyntaxError name used by both JavaScript's own parser and <code>JSON.parse()</code>, which has a stricter, different grammar. The same words show up for a real typo, a bad API response you tried to parse as JSON, and ES module syntax in the wrong kind of file. We reproduced all three in Node.js v24.21.0.</p>
+<h2>1. A real JavaScript syntax mistake</h2>
+<p>An extra comma in an object literal:</p>
+<pre><code>const obj = {
+  a: 1,,
+  b: 2
+};
+// SyntaxError: Unexpected token ','</code></pre>
+<p>A mismatched bracket:</p>
+<pre><code>function f() {
+  return [1, 2, 3);
+}
+// SyntaxError: Unexpected token ')'</code></pre>
+<p>These crash immediately, before any of the file's code runs &mdash; the parser rejects the whole file. The message names the exact character the parser didn't expect, and the pointer (<code>^</code>) in Node's output lands on it directly.</p>
+
+<h2>2. JSON.parse() on invalid or unexpected text</h2>
+<p><code>JSON.parse()</code> uses the strict JSON grammar, not JavaScript's, so the wording differs by what's wrong. We measured each case separately:</p>
+<pre><code>JSON.parse('');
+// SyntaxError: Unexpected end of JSON input
+
+JSON.parse('&lt;html&gt;&lt;body&gt;404&lt;/body&gt;&lt;/html&gt;');
+// SyntaxError: Unexpected token '&lt;', "&lt;html&gt;&lt;bod"... is not valid JSON
+
+JSON.parse('{"a":1,}');
+// SyntaxError: Expected double-quoted property name in JSON at position 7 (line 1 column 8)
+
+JSON.parse('[1,2,]');
+// SyntaxError: Unexpected token ']', "[1,2,]" is not valid JSON</code></pre>
+<p>An empty string is the classic symptom of parsing a response body that was actually empty (a 204, or a failed request with no body) &mdash; see <a href="/guides/unexpected-end-of-json-input/">Unexpected end of JSON input</a> for that one on its own. The <code>'&lt;'</code> case is what you get parsing an HTML error page (a 404 or 500 page) as if it were JSON &mdash; the giveaway is the literal <code>&lt;</code> character and an HTML snippet quoted in the message.</p>
+<p>Trailing commas are the sharpest trap: <code>{"a":1,}</code> and <code>[1,2,]</code> are both <strong>invalid JSON</strong> (the JSON spec forbids trailing commas) but <strong>valid JavaScript</strong> &mdash; we confirmed the same text runs fine as a JS object literal via <code>Function</code>:</p>
+<pre><code>const f = Function('return {"a":1,}');
+f();
+// { a: 1 }   -- no error, because this is JS, not JSON.parse()</code></pre>
+<p>So code copied from a JS object literal (with a trailing comma left in) will fail specifically when run through <code>JSON.parse()</code>, even though it looks fine as JavaScript.</p>
+
+<h2>3. import/export syntax in a CommonJS file</h2>
+<p>Node 24 auto-detects ES module syntax in a plain <code>.js</code> file with no <code>package.json</code> nearby and just runs it as a module &mdash; we confirmed a bare <code>export const x = 1;</code> in an extension-less-config <code>.js</code> file ran with no error at all. The classic error only appears once a file is <em>forced</em> into CommonJS, either via a <code>.cjs</code> extension or an explicit <code>"type": "commonjs"</code> in the nearest <code>package.json</code>. We measured both forms:</p>
+<pre><code>// forcedCjs.cjs
+import { foo } from './bar.js';
+// SyntaxError: Cannot use import statement outside a module
+
+// forcedCjs2.cjs
+export const x = 1;
+// SyntaxError: Unexpected token 'export'</code></pre>
+<p><code>import</code> gets its own named message ("Cannot use import statement outside a module"); <code>export</code> falls through to the generic "Unexpected token 'export'" because, to a CommonJS parser, <code>export</code> isn't a reserved keyword it treats specially &mdash; it's just a token in a place that doesn't parse. Both are real Node.js v24.21.0 output; we also saw a companion warning line pointing at <code>"type": "module"</code> or the <code>.mjs</code> extension as the fix, which is accurate.</p>
+
+<h2>4. Side-by-side comparison</h2>
+<table>
+<tr><th>Situation</th><th>Exact message we measured</th></tr>
+<tr><td>Extra comma in JS object literal</td><td>SyntaxError: Unexpected token ','</td></tr>
+<tr><td>Mismatched bracket in JS</td><td>SyntaxError: Unexpected token ')'</td></tr>
+<tr><td>JSON.parse('')</td><td>SyntaxError: Unexpected end of JSON input</td></tr>
+<tr><td>JSON.parse of an HTML error page</td><td>SyntaxError: Unexpected token '&lt;', "...". is not valid JSON</td></tr>
+<tr><td>JSON.parse with trailing comma in an object</td><td>SyntaxError: Expected double-quoted property name in JSON at position N</td></tr>
+<tr><td>JSON.parse with trailing comma in an array</td><td>SyntaxError: Unexpected token ']', "..." is not valid JSON</td></tr>
+<tr><td><code>import</code> forced into a CommonJS file</td><td>SyntaxError: Cannot use import statement outside a module</td></tr>
+<tr><td><code>export</code> forced into a CommonJS file</td><td>SyntaxError: Unexpected token 'export'</td></tr>
+</table>
+
+<h2>5. Fixes</h2>
+<ul>
+<li><strong>Real syntax error:</strong> Node's own pointer (<code>^</code> under the bad character) is accurate &mdash; look exactly there, one character at a time, for a stray or missing comma/bracket/quote.</li>
+<li><strong>JSON.parse() failing:</strong> log the raw text before parsing it (<code>console.log(JSON.stringify(text))</code>). An empty string or anything starting with <code>&lt;</code> means you parsed the wrong response (check the HTTP status first); a trailing comma means the text was hand-written or template-built as JS, not real JSON &mdash; run it through a JSON validator/linter or <code>JSON.stringify(JSON.parse(...))</code> round-trip during development to catch it early.</li>
+<li><strong>import/export in the wrong file type:</strong> either rename the file to <code>.mjs</code>, or add <code>"type": "module"</code> to the nearest <code>package.json</code>. If you need to stay CommonJS, use <code>require()</code>/<code>module.exports</code> instead &mdash; see <a href="/guides/require-is-not-defined-in-es-module-scope/">require is not defined in ES module scope</a> for the opposite mismatch.</li>
+</ul>
+<p>If the token in question is specifically end-of-input on an otherwise-empty response body, see <a href="/guides/unexpected-end-of-json-input/">Unexpected end of JSON input</a> for that case on its own. For the equivalent error in a different language, see <a href="/guides/bash-syntax-error-unexpected-token/">bash: syntax error near unexpected token</a>.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does &#x27;Unexpected token&#x27; show up in so many unrelated bugs?</summary><p>It&#x27;s a generic SyntaxError name both JavaScript&#x27;s own parser and JSON.parse() use whenever they hit a character or keyword that doesn&#x27;t fit the grammar at that point. We measured it for a stray comma, a mismatched bracket, bad JSON, and import/export in the wrong file type -- the fix is different in each case, so the exact wording and where it points matters more than the headline.</p></details>
+<details><summary>Why does my JSON.parse() error mention an HTML tag?</summary><p>You likely parsed an HTML error page (a 404 or 500 response) as if it were JSON. We measured this directly: parsing &#x27;&lt;html&gt;...&#x27; with JSON.parse() gives SyntaxError: Unexpected token &#x27;&lt;&#x27;, with the HTML snippet quoted in the message. Check the HTTP status code before parsing the body.</p></details>
+<details><summary>Is a trailing comma valid JSON?</summary><p>No, even though it&#x27;s valid JavaScript. We confirmed {&quot;a&quot;:1,} and [1,2,] are both invalid JSON (JSON.parse throws on each) but run fine as JS object/array literals. Code copied from JS source with a trailing comma left in will fail specifically through JSON.parse().</p></details>
+<details><summary>Why did my import/export syntax work in one file but not another?</summary><p>Node decides module type per file. We measured that a plain .js file with no package.json nearby gets auto-detected as a module and just works, but the same code forced into CommonJS (.cjs extension, or &quot;type&quot;: &quot;commonjs&quot; in package.json) throws: &#x27;Cannot use import statement outside a module&#x27; for import, or the generic &#x27;Unexpected token &#x27;export&#x27;&#x27; for export.</p></details>
+<details><summary>How do I quickly tell a real JS syntax error from a JSON.parse() error?</summary><p>Check which function is on the stack trace. A real syntax error crashes while Node is loading your file, before any of your code runs, and the trace has no JSON.parse frame. A JSON.parse() error happens while your code is already running, at the specific line calling JSON.parse(), and the message includes the literal text it failed on.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Node.js v24.21.0 on Linux. Every snippet was run as a real file or expression and the output is copied verbatim. PlainHeaders is our extension; Node.js is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>net::ERR_BLOCKED_BY_CLIENT and ERR_ABORTED: Causes and Fixes</title>
+<meta name="description" content="We blocked /ads.js and /analytics with a real MV3 extension in Chromium 153 and recorded what console, fetch and onerror see. Plus 5 measured ERR_ABORTED cases.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-blocked-by-client/">
+<meta property="og:title" content="net::ERR_BLOCKED_BY_CLIENT and ERR_ABORTED: Causes and Fixes">
+<meta property="og:description" content="We blocked /ads.js and /analytics with a real MV3 extension in Chromium 153 and recorded what console, fetch and onerror see. Plus 5 measured ERR_ABORTED cases.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-blocked-by-client/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does ERR_BLOCKED_BY_CLIENT mean my server is down?", "acceptedAnswer": {"@type": "Answer", "text": "No. The request never left the browser. In our test the server logged zero hits for the blocked URLs, and the same URLs returned 200 with curl. An extension or browser policy blocked it."}}, {"@type": "Question", "name": "Can JavaScript detect that a request was blocked by an extension?", "acceptedAnswer": {"@type": "Answer", "text": "Not exactly. fetch throws the generic TypeError: Failed to fetch, XHR gets status 0, and script or img onerror fires. These look the same as network or CORS errors. Only DevTools shows ERR_BLOCKED_BY_CLIENT."}}, {"@type": "Question", "name": "Why is my own /api/analytics endpoint blocked?", "acceptedAnswer": {"@type": "Answer", "text": "Filter lists match URL substrings like /analytics, /ads/ and pixel (per the EasyList docs). Our test rule urlFilter /analytics blocked fetch, XHR, img, sendBeacon and navigation. Rename the route to something neutral."}}, {"@type": "Question", "name": "Is net::ERR_ABORTED an error I need to fix?", "acceptedAnswer": {"@type": "Answer", "text": "Usually not. In our tests it came from a second navigation, a download, a 204 response, or an explicit abort(). None of them wrote a console error. Fix it only if a request you needed is being cancelled."}}, {"@type": "Question", "name": "Why does Playwright page.goto throw net::ERR_ABORTED on a 204?", "acceptedAnswer": {"@type": "Answer", "text": "A 204 has no content to show, so Chromium cancels the navigation and stays on the old page. We measured Document 204 followed by net::ERR_ABORTED. Use page.request or fetch for that endpoint instead."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>net::ERR_BLOCKED_BY_CLIENT and net::ERR_ABORTED (tested)</h1>
+<p class="lead"><code>net::ERR_BLOCKED_BY_CLIENT</code> means something inside the browser, almost always an ad or privacy blocker extension, cancelled the request before it left the machine. Your server never sees it. <code>net::ERR_ABORTED</code> means the browser itself cancelled a request, usually on purpose. We reproduced both in Chromium 153 and logged exactly what each layer reports.</p>
+<h2>1. What the two errors mean</h2>
+<p><strong>ERR_BLOCKED_BY_CLIENT</strong>: the "client" is the browser plus its extensions. An extension rule matched the URL, and Chromium refused to send the request. There is no HTTP status, because there was no HTTP exchange.</p>
+<p><strong>ERR_ABORTED</strong>: the request started, and then the browser dropped it. Common reasons: a new navigation replaced it, the response was a download, the response was a 204, or your code called <code>abort()</code>. Most ERR_ABORTED entries are harmless.</p>
+
+<h2>2. Our test setup</h2>
+<p>We wrote a minimal Manifest V3 extension with two <code>declarativeNetRequest</code> block rules: <code>urlFilter: "/ads.js"</code> and <code>urlFilter: "/analytics"</code>. We loaded it unpacked with Playwright's <code>launchPersistentContext</code> and <code>--load-extension</code>.</p>
+<pre><code>{"id":1,"priority":1,"action":{"type":"block"},
+ "condition":{"urlFilter":"/ads.js",
+   "resourceTypes":["script","xmlhttprequest","image","ping","main_frame"]}}</code></pre>
+<p>A note on headless: with Playwright's default headless shell, the extension did <em>not</em> load. <code>/ads.js</code> ran normally. With <code>channel: 'chromium'</code> (the new headless mode) the extension loaded and blocked as expected. All extension results below use that mode.</p>
+<p>The test page loaded <code>&lt;script src="/ads.js"&gt;</code> and an <code>&lt;img src="/analytics/pixel.gif"&gt;</code>, then ran <code>fetch</code>, XHR and <code>sendBeacon</code> against <code>/analytics/...</code>.</p>
+
+<h2>3. Results: what each layer sees when an extension blocks a request</h2>
+<table>
+<tr><th>Request</th><th>What your code sees</th><th>Console</th><th>DevTools protocol (Network panel)</th></tr>
+<tr><td><code>&lt;script src="/ads.js"&gt;</code></td><td><code>onerror</code> fires (event type <code>error</code>). Script does not run.</td><td>Failed to load resource: net::ERR_BLOCKED_BY_CLIENT</td><td>Script, errorText net::ERR_BLOCKED_BY_CLIENT, blockedReason "other"</td></tr>
+<tr><td><code>&lt;img src="/analytics/pixel.gif"&gt;</code></td><td><code>onerror</code> fires</td><td>same message</td><td>Image, ERR_BLOCKED_BY_CLIENT</td></tr>
+<tr><td><code>fetch('/analytics/collect')</code></td><td><code>TypeError: Failed to fetch</code></td><td>same message</td><td>Fetch, ERR_BLOCKED_BY_CLIENT</td></tr>
+<tr><td>XHR GET <code>/analytics/x</code></td><td><code>onerror</code>, <code>status</code> 0, <code>readyState</code> 4</td><td>same message</td><td>XHR, ERR_BLOCKED_BY_CLIENT</td></tr>
+<tr><td><code>navigator.sendBeacon('/analytics/b')</code></td><td>Returned <code>true</code>, even though it was blocked</td><td>same message</td><td>Ping, ERR_BLOCKED_BY_CLIENT</td></tr>
+<tr><td>Top-level navigation to <code>/analytics/page</code></td><td>Error page: "127.0.0.1 is blocked. This page has been blocked by an extension. Try disabling your extensions. ERR_BLOCKED_BY_CLIENT"</td><td>-</td><td>Document, ERR_BLOCKED_BY_CLIENT; Playwright <code>page.goto: net::ERR_BLOCKED_BY_CLIENT</code></td></tr>
+</table>
+<p>Our server log had <strong>zero</strong> hits for <code>/ads.js</code> or <code>/analytics</code> during this run. The block happens before any network traffic. Server logs, curl and uptime checks will all look fine.</p>
+<p>The fetch error is the same generic <code>TypeError: Failed to fetch</code> you get for CORS failures and refused connections. JavaScript cannot tell them apart. See <a href="/guides/typeerror-failed-to-fetch/">TypeError: Failed to fetch</a> for the full list.</p>
+<p>Also note <code>sendBeacon</code>: it returning <code>true</code> only means the beacon was queued. It does not mean it was delivered.</p>
+
+<h2>4. Testing without an extension</h2>
+<p>Playwright can fake the same error with <code>route.abort('blockedbyclient')</code>. In our run, script and image <code>onerror</code> fired and fetch threw <code>TypeError: Failed to fetch</code>, just like the real extension. One visible difference: the console said <code>net::ERR_BLOCKED_BY_CLIENT.Inspector</code>. That suffix marks a block made by DevTools, not by an extension.</p>
+<pre><code>await page.route('**/ads.js', r =&gt; r.abort('blockedbyclient'));</code></pre>
+
+<h2>5. Which URLs get blocked (from the docs, not measured)</h2>
+<p>Real blockers use filter lists such as EasyList and EasyPrivacy. Per the EasyList and uBlock Origin docs, they match on URL substrings and domains, not on what the file does. Patterns that often match:</p>
+<ul>
+<li>Paths with <code>/ads/</code>, <code>/ad/</code>, <code>/adv/</code>, <code>ads.js</code>, <code>banner</code>, <code>sponsor</code></li>
+<li>Tracker names like <code>analytics.js</code>, <code>gtag</code>, <code>/collect</code>, <code>pixel</code>, <code>track</code>, <code>beacon</code></li>
+<li>Whole third-party domains of ad and analytics vendors</li>
+</ul>
+<p>So an innocent file named <code>/static/ads.js</code> or an API route <code>/api/analytics/</code> can break your own site for blocker users.</p>
+
+<h2>6. How to fix ERR_BLOCKED_BY_CLIENT</h2>
+<ul>
+<li><strong>If it is your own code:</strong> rename files and routes so they do not look like ads or tracking. <code>/api/analytics</code> becomes <code>/api/stats</code>; <code>ads.js</code> becomes <code>promo-slots.js</code>. Do this for honest naming, not to sneak trackers past users.</li>
+<li><strong>Fail soft:</strong> treat blocked third-party scripts as optional. Wrap calls like <code>window.gtag?.(...)</code> and catch fetch errors, so a missing analytics script never breaks checkout or login.</li>
+<li><strong>Confirm the cause:</strong> open the page in a private window with extensions off, or another browser. If the error disappears, it was an extension. The URL returns fine with curl.</li>
+<li><strong>Respect the user:</strong> if the blocked request is a tracker, the user chose to block it. Do not try to bypass it.</li>
+</ul>
+
+<h2>7. net::ERR_ABORTED: five cases we measured</h2>
+<p>Same Chromium 153, no extension. A <code>/slow</code> route answered after 3 s.</p>
+<table>
+<tr><th>Case</th><th>What happened</th><th>Network / Playwright</th><th>Console</th></tr>
+<tr><td>Navigation interrupted by another navigation (<code>location.href</code> set again after 300 ms, or a second <code>page.goto</code>)</td><td>New page loads; first request cancelled</td><td>Document, net::ERR_ABORTED, canceled=true; first <code>page.goto</code> rejects with <code>net::ERR_ABORTED at .../slow</code></td><td>Nothing</td></tr>
+<tr><td>Navigating to a response with <code>Content-Disposition: attachment</code></td><td>Response 200 arrived, then became a download; page stayed on old URL</td><td>Document 200, then net::ERR_ABORTED; <code>page.goto</code> throws "Download is starting"</td><td>Nothing</td></tr>
+<tr><td>Navigating to a 204 No Content</td><td>Response 204 arrived; page stayed on old URL</td><td>Document 204, then net::ERR_ABORTED; <code>page.goto</code> throws <code>net::ERR_ABORTED</code></td><td>Nothing</td></tr>
+<tr><td><code>fetch</code> + <code>AbortController.abort()</code> at 300 ms</td><td><code>AbortError: signal is aborted without reason</code></td><td>Fetch, net::ERR_ABORTED, canceled=true</td><td>Nothing</td></tr>
+<tr><td><code>XMLHttpRequest.abort()</code> at 300 ms</td><td><code>onabort</code> fires, <code>status</code> 0</td><td>XHR, net::ERR_ABORTED, canceled=true</td><td>Nothing</td></tr>
+</table>
+<p>Two more fetch variants: <code>AbortSignal.timeout(300)</code> threw <code>TimeoutError: signal timed out</code>. <code>abort('user left')</code> rejected with the plain string <code>"user left"</code>, not an Error object. Check <code>signal.aborted</code> rather than <code>err.name</code> if you pass a custom reason.</p>
+<p>Unlike ERR_BLOCKED_BY_CLIENT, none of the ERR_ABORTED cases wrote a console error. You mostly see them in the Network panel, in test runners like Playwright, and in error monitoring tools.</p>
+<p>On the server side, an aborted request did arrive, and the client just left early. nginx logs that as <a href="/guides/499-client-closed-request/">499 Client Closed Request</a>.</p>
+
+<h2>8. How to fix ERR_ABORTED</h2>
+<ul>
+<li><strong>Downloads:</strong> expected. In Playwright, use <code>page.waitForEvent('download')</code> and click the link instead of <code>page.goto</code>. See <a href="/guides/content-disposition-header-filename/">Content-Disposition filename</a>.</li>
+<li><strong>204 on navigation:</strong> expected. Do not navigate to endpoints that return 204. Call them with <code>fetch</code>, or return 200 / a redirect for form posts.</li>
+<li><strong>Double navigation:</strong> look for code that sets <code>location</code> twice, a form submit plus a JS redirect, or a link with both <code>href</code> and an <code>onclick</code> that navigates.</li>
+<li><strong>Your own aborts:</strong> filter them out of error reporting: <code>if (signal.aborted) return;</code></li>
+<li><strong>Tests:</strong> wait for the navigation you actually want (<code>waitForURL</code>) before starting the next one.</li>
+</ul>
+<p>For CORS messages that also end in "Failed to fetch", see <a href="/guides/cors-error-messages-explained/">CORS error messages explained</a>.</p>
+<aside class="cta"><strong>Check the status and headers a URL really returns, outside any ad blocker:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does ERR_BLOCKED_BY_CLIENT mean my server is down?</summary><p>No. The request never left the browser. In our test the server logged zero hits for the blocked URLs, and the same URLs returned 200 with curl. An extension or browser policy blocked it.</p></details>
+<details><summary>Can JavaScript detect that a request was blocked by an extension?</summary><p>Not exactly. fetch throws the generic TypeError: Failed to fetch, XHR gets status 0, and script or img onerror fires. These look the same as network or CORS errors. Only DevTools shows ERR_BLOCKED_BY_CLIENT.</p></details>
+<details><summary>Why is my own /api/analytics endpoint blocked?</summary><p>Filter lists match URL substrings like /analytics, /ads/ and pixel (per the EasyList docs). Our test rule urlFilter /analytics blocked fetch, XHR, img, sendBeacon and navigation. Rename the route to something neutral.</p></details>
+<details><summary>Is net::ERR_ABORTED an error I need to fix?</summary><p>Usually not. In our tests it came from a second navigation, a download, a 204 response, or an explicit abort(). None of them wrote a console error. Fix it only if a request you needed is being cancelled.</p></details>
+<details><summary>Why does Playwright page.goto throw net::ERR_ABORTED on a 204?</summary><p>A 204 has no content to show, so Chromium cancels the navigation and stays on the old page. We measured Document 204 followed by net::ERR_ABORTED. Use page.request or fetch for that endpoint instead.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Chromium 153.0.8010.12 driven by Playwright 1.63 (new headless mode via channel &#x27;chromium&#x27;), a test Manifest V3 extension with declarativeNetRequest block rules, and a Node.js 24.21.0 server. Which URLs real blocklists match is from the EasyList and uBlock Origin docs, not measured. PlainHeaders is our extension; Chromium, Playwright and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

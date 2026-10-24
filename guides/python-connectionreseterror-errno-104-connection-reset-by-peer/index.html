@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ConnectionResetError: [Errno 104] Connection reset by peer</title>
+<meta name="description" content="Python [Errno 104] Connection reset by peer reproduced with a local server, how it looks through requests, how to catch it, and when retrying helps.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-connectionreseterror-errno-104-connection-reset-by-peer/">
+<meta property="og:title" content="ConnectionResetError: [Errno 104] Connection reset by peer">
+<meta property="og:description" content="Python [Errno 104] Connection reset by peer reproduced with a local server, how it looks through requests, how to catch it, and when retrying helps.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-connectionreseterror-errno-104-connection-reset-by-peer/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Connection reset by peer mean in Python?", "acceptedAnswer": {"@type": "Answer", "text": "The remote side aborted the TCP connection with an RST: it crashed, restarted, rejected the request, or a proxy/firewall dropped the connection."}}, {"@type": "Question", "name": "How do I catch Errno 104?", "acceptedAnswer": {"@type": "Answer", "text": "except ConnectionResetError (a subclass of ConnectionError and OSError). With requests, catch requests.exceptions.ConnectionError."}}, {"@type": "Question", "name": "Should I retry on Connection reset by peer?", "acceptedAnswer": {"@type": "Answer", "text": "Only for transient resets. If every request is reset, the server is refusing the request; check its logs instead."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ConnectionResetError: [Errno 104] Connection reset by peer (tested)</h1>
+<p class="lead"><code>ConnectionResetError: [Errno 104] Connection reset by peer</code> means the other side aborted the TCP connection (sent RST) while you were reading or writing. We reproduced it with a local server, showed the requests version (<code>Connection aborted.</code>), and tested a retry with backoff.</p>
+<h2 id="test">1. Reproduce it: the other side aborts the connection</h2>
+<pre><code>import socket, struct, threading
+
+srv = socket.create_server((&quot;127.0.0.1&quot;, 8965))
+def handler():
+    conn, _ = srv.accept()
+    conn.recv(100)
+    # close with SO_LINGER 0: the kernel sends RST instead of a normal FIN
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack(&quot;ii&quot;, 1, 0))
+    conn.close()
+threading.Thread(target=handler).start()
+
+c = socket.create_connection((&quot;127.0.0.1&quot;, 8965))
+c.sendall(b&quot;GET / HTTP/1.0\r\n\r\n&quot;)
+c.recv(100)</code></pre>
+<p>Output:</p>
+<pre><code>Traceback (most recent call last):
+  File &quot;/tmp/cr370/b1.py&quot;, line 14, in &lt;module&gt;
+    c.recv(100)
+    ~~~~~~^^^^^
+ConnectionResetError: [Errno 104] Connection reset by peer</code></pre>
+<p>A reset means the peer sent a TCP RST instead of closing normally. Here the server forces one with <code>SO_LINGER</code> 0. In real life the usual causes are a server process that crashed or was restarted mid-request, a proxy, load balancer or firewall dropping an idle connection, the server rejecting the request (too large, bad TLS/protocol, rate limit) by cutting it off, or reusing a keep-alive connection the server already timed out.</p>
+<h2 id="type">2. It is ConnectionResetError, a ConnectionError</h2>
+<pre><code>import errno, socket, struct, threading
+
+srv = socket.create_server((&quot;127.0.0.1&quot;, 8966))
+def handler():
+    conn, _ = srv.accept(); conn.recv(100)
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack(&quot;ii&quot;, 1, 0)); conn.close()
+threading.Thread(target=handler).start()
+
+c = socket.create_connection((&quot;127.0.0.1&quot;, 8966))
+c.sendall(b&quot;hello&quot;)
+try:
+    c.recv(100)
+except ConnectionResetError as e:
+    print(type(e).__name__, e.errno, errno.errorcode[e.errno])
+    print(&quot;ConnectionError?&quot;, isinstance(e, ConnectionError), &quot;| OSError?&quot;, isinstance(e, OSError))</code></pre>
+<p>Output:</p>
+<pre><code>ConnectionResetError 104 ECONNRESET
+ConnectionError? True | OSError? True</code></pre>
+<p>Errno 104 (<code>ECONNRESET</code>) maps to <code>ConnectionResetError</code>, so <code>except ConnectionResetError</code> or <code>except ConnectionError</code> both catch it.</p>
+<h2 id="requests">3. Through requests: Connection aborted</h2>
+<pre><code>import socket, struct, threading, http.server, requests
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack(&quot;ii&quot;, 1, 0))
+        self.connection.close()                       # drop the client without a response
+srv = http.server.HTTPServer((&quot;127.0.0.1&quot;, 8967), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+try:
+    requests.get(&quot;http://127.0.0.1:8967/&quot;, timeout=5)
+except requests.exceptions.ConnectionError as e:
+    print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>ConnectionError: (&#x27;Connection aborted.&#x27;, ConnectionResetError(104, &#x27;Connection reset by peer&#x27;))</code></pre>
+<p>requests reports it as <code>requests.exceptions.ConnectionError: ('Connection aborted.', ConnectionResetError(104, ...))</code>. The real cause is the server side: check its logs for a crash, a timeout or a rejected request at that moment.</p>
+<h2 id="retry">4. Retry with backoff (for transient resets only)</h2>
+<pre><code>import socket, struct, threading, time
+
+srv = socket.create_server((&quot;127.0.0.1&quot;, 8964))
+def handler():
+    while True:
+        conn, _ = srv.accept(); conn.recv(100)
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack(&quot;ii&quot;, 1, 0)); conn.close()
+threading.Thread(target=handler, daemon=True).start()
+
+def fetch(retries=3):
+    for attempt in range(1, retries + 1):
+        try:
+            c = socket.create_connection((&quot;127.0.0.1&quot;, 8964), timeout=5)
+            c.sendall(b&quot;ping&quot;); return c.recv(100)
+        except ConnectionResetError as e:
+            print(f&quot;attempt {attempt}: {e}&quot;)
+            time.sleep(0.1 * 2 ** attempt)              # back off before retrying
+    return None
+print(&quot;result:&quot;, fetch())</code></pre>
+<p>Output:</p>
+<pre><code>attempt 1: [Errno 104] Connection reset by peer
+attempt 2: [Errno 104] Connection reset by peer
+attempt 3: [Errno 104] Connection reset by peer
+result: None</code></pre>
+<p>Retrying helps when resets are transient (an idle connection dropped by a proxy, a server restart). Against a server that resets every request, as here, retries just fail three times; that points to a request the server refuses, so fix the request instead of retrying harder. With requests, a <code>Session</code> plus <code>urllib3.util.Retry</code> on the <code>HTTPAdapter</code> does the same.</p>
+<p>Related: <a href="/guides/err-connection-reset-econnreset/">ECONNRESET (Node/browser)</a> · <a href="/guides/python-brokenpipeerror-errno-32-broken-pipe/">[Errno 32] Broken pipe</a> · <a href="/guides/python-requests-exceptions-list-and-error-handling/">requests exceptions list</a> · <a href="/guides/python-socket-error-handling-exceptions-and-errno-codes/">socket errors and errno codes</a>.</p>
+
+<aside class="cta"><strong>Server cutting you off? Check the headers and status it returns when it does answer:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Connection reset by peer mean in Python?</summary><p>The remote side aborted the TCP connection with an RST: it crashed, restarted, rejected the request, or a proxy/firewall dropped the connection.</p></details>
+<details><summary>How do I catch Errno 104?</summary><p>except ConnectionResetError (a subclass of ConnectionError and OSError). With requests, catch requests.exceptions.ConnectionError.</p></details>
+<details><summary>Should I retry on Connection reset by peer?</summary><p>Only for transient resets. If every request is reset, the server is refusing the request; check its logs instead.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Python 3.13.5 and requests 2.32.3 on Linux, against local servers. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

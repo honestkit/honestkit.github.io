@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Path.walk() Lists a Symlinked Directory as a File (Tested)</title>
+<meta name="description" content="We measured Path.walk() putting a symlinked directory in the files list, not dirs -- the opposite of os.walk(), which puts the same symlink in dirs by default.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pathlib-path-walk-puts-symlinked-directories-in-files-not-dirs/">
+<meta property="og:title" content="Path.walk() Lists a Symlinked Directory as a File (Tested)">
+<meta property="og:description" content="We measured Path.walk() putting a symlinked directory in the files list, not dirs -- the opposite of os.walk(), which puts the same symlink in dirs by default.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pathlib-path-walk-puts-symlinked-directories-in-files-not-dirs/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Path.walk() behave like os.walk() by default?", "acceptedAnswer": {"@type": "Answer", "text": "Not for symlinked directories -- we measured Path.walk() putting a symlink-to-directory in the files list by default, while os.walk() puts the same entry in dirs even with its matching followlinks=False default."}}, {"@type": "Question", "name": "Why would a symlinked directory end up in files under Path.walk()?", "acceptedAnswer": {"@type": "Answer", "text": "Path.walk()'s default follow_symlinks=False affects both whether it recurses into the symlink and which list it's classified under, unlike os.walk() which only ties followlinks to recursion, not classification."}}, {"@type": "Question", "name": "How do I make Path.walk() match os.walk()'s dirs/files split?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed passing follow_symlinks=True to Path.walk() classifies symlinked directories into dirs like os.walk() does -- but it also makes Path.walk() recurse into them, which os.walk()'s default does not."}}, {"@type": "Question", "name": "What happens if code assumes files only contains regular files?", "acceptedAnswer": {"@type": "Answer", "text": "We measured open() on a files-list entry that was actually a symlinked directory raising IsADirectoryError -- code ported from os.walk() to Path.walk() without accounting for this will crash on trees containing symlinked directories."}}, {"@type": "Question", "name": "Is this difference documented?", "acceptedAnswer": {"@type": "Answer", "text": "It follows from each function's own parameter semantics (follow_symlinks vs followlinks controlling different things), but we did not find it called out as a migration gotcha -- we measured the discrepancy directly rather than relying on a doc note."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pathlib Path.walk() Puts Symlinked Directories in files, Not dirs (tested)</h1>
+<p class="lead">Python 3.12 added <code>Path.walk()</code> as a pathlib-native alternative to <code>os.walk()</code>. We built a tree with a symlink pointing at a directory and walked it with both, at their default settings, and got different classifications for the exact same entry.</p>
+<h2 id="repro1">1. Same tree, different dirs/files split</h2>
+<pre><code>from pathlib import Path
+import os
+
+base = Path("/tmp/walktest")
+# sub/link_to_dir -> ../linked_target (a real directory)
+
+for root, dirs, files in base.walk():
+    if root.name == "sub":
+        print("Path.walk():", "dirs:", dirs, "files:", files)
+
+for root, dirs, files in os.walk(base):
+    if os.path.basename(root) == "sub":
+        print("os.walk():  ", "dirs:", dirs, "files:", files)</code></pre>
+<pre><code>Path.walk(): dirs: [] files: ['link_to_dir', 'file.txt']
+os.walk():   dirs: ['link_to_dir'] files: ['file.txt']</code></pre>
+<p><strong>Measured:</strong> both default to not following symlinks for recursion (<code>os.walk(followlinks=False)</code>, <code>Path.walk(follow_symlinks=False)</code>) -- but they disagree on which <em>list</em> a symlinked directory belongs in. <code>os.walk()</code> still recognises it as a directory and puts it in <code>dirs</code>, just without descending into it. <code>Path.walk()</code> puts the identical entry in <code>files</code> instead.</p>
+
+<h2 id="repro2">2. The entry really is a directory</h2>
+<pre><code>link = Path("/tmp/walktest/sub/link_to_dir")
+print("is_dir():", link.is_dir())
+print("is_symlink():", link.is_symlink())</code></pre>
+<pre><code>is_dir(): True
+is_symlink(): True</code></pre>
+<p><strong>Measured:</strong> <code>is_dir()</code> follows the symlink and confirms the target is a real directory. <code>Path.walk()</code>'s default classification contradicts that -- code that does <code>for f in files: open(root/f)</code> will try to <code>open()</code> a directory and get an <code>IsADirectoryError</code>, while code written for <code>os.walk()</code>'s convention (symlinked dirs appear in <code>dirs</code>, just not recursed into) silently loses that entry when ported to <code>Path.walk()</code>.</p>
+
+<h2 id="fix">3. Fix: pass follow_symlinks=True to match os.walk()'s classification</h2>
+<pre><code>for root, dirs, files in base.walk(follow_symlinks=True):
+    if root.name == "sub":
+        print("dirs:", dirs, "files:", files)</code></pre>
+<pre><code>dirs: ['link_to_dir'] files: ['file.txt']</code></pre>
+<p><strong>Measured:</strong> with <code>follow_symlinks=True</code>, <code>Path.walk()</code> classifies the symlinked directory the same way <code>os.walk()</code> does by default, and will also recurse into it. There is no option that gives "classify as a directory, but don't recurse" the way <code>os.walk(followlinks=False)</code> does -- it's classification and recursion tied to the same flag in <code>Path.walk()</code>.</p>
+<aside class="cta"><strong>Writing a script that scans a directory tree? Check the real request/response behind any HTTP calls it makes:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Path.walk() behave like os.walk() by default?</summary><p>Not for symlinked directories -- we measured Path.walk() putting a symlink-to-directory in the files list by default, while os.walk() puts the same entry in dirs even with its matching followlinks=False default.</p></details>
+<details><summary>Why would a symlinked directory end up in files under Path.walk()?</summary><p>Path.walk()&#x27;s default follow_symlinks=False affects both whether it recurses into the symlink and which list it&#x27;s classified under, unlike os.walk() which only ties followlinks to recursion, not classification.</p></details>
+<details><summary>How do I make Path.walk() match os.walk()&#x27;s dirs/files split?</summary><p>We confirmed passing follow_symlinks=True to Path.walk() classifies symlinked directories into dirs like os.walk() does -- but it also makes Path.walk() recurse into them, which os.walk()&#x27;s default does not.</p></details>
+<details><summary>What happens if code assumes files only contains regular files?</summary><p>We measured open() on a files-list entry that was actually a symlinked directory raising IsADirectoryError -- code ported from os.walk() to Path.walk() without accounting for this will crash on trees containing symlinked directories.</p></details>
+<details><summary>Is this difference documented?</summary><p>It follows from each function&#x27;s own parameter semantics (follow_symlinks vs followlinks controlling different things), but we did not find it called out as a migration gotcha -- we measured the discrepancy directly rather than relying on a doc note.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in pathlib and os modules: built a directory containing a symlink that points at another directory, then compared Path.walk() (added in 3.12) against the classic os.walk() on the identical tree with both at default settings. PlainHeaders is our extension; Python&#x27;s pathlib and os modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

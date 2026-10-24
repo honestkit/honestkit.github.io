@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python OSError: [Errno 5] Input/output error (Fix)</title>
+<meta name="description" content="[Errno 5] Input/output error in Python: a closed pty, a background job that lost its terminal, or a failing disk. Reproduced in Python 3.13 with a tested fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-oserror-errno-5-input-output-error/">
+<meta property="og:title" content="Python OSError: [Errno 5] Input/output error (Fix)">
+<meta property="og:description" content="[Errno 5] Input/output error in Python: a closed pty, a background job that lost its terminal, or a failing disk. Reproduced in Python 3.13 with a tested fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-oserror-errno-5-input-output-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes [Errno 5] Input/output error in Python?", "acceptedAnswer": {"@type": "Answer", "text": "A pseudo-terminal whose other side closed, a background process using a terminal it lost, or a disk, USB or network-mount failure."}}, {"@type": "Question", "name": "How do I fix Errno 5 when reading from a pty?", "acceptedAnswer": {"@type": "Answer", "text": "Catch OSError, check e.errno == errno.EIO and treat it as end of output."}}, {"@type": "Question", "name": "How do I fix Errno 5 for a background script?", "acceptedAnswer": {"@type": "Answer", "text": "Redirect stdin from /dev/null and output to a log file, or run it under systemd, tmux or screen."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>OSError: [Errno 5] Input/output error (tested fix)</h1>
+<p class="lead"><code>OSError: [Errno 5] Input/output error</code> is the OS reporting that a low-level read or write failed. Most often a terminal (pty) went away, but it can also be failing hardware. We reproduced the pty case in Python 3.13 and tested the fix.</p>
+<h2 id="what">1. What Errno 5 is</h2>
+<pre><code>import errno, os
+print(errno.EIO, errno.errorcode[5], os.strerror(5))</code></pre>
+<p>Output:</p>
+<pre><code>5 EIO Input/output error</code></pre>
+<p><code>EIO</code> is the operating system saying a low-level read or write failed. Python only passes it on. The common causes: a pseudo-terminal (pty) whose other side has closed, a process in the background reading from or writing to a terminal it no longer controls (for example after <code>nohup</code>, <code>&amp;</code> or a closed SSH session), and real hardware trouble: a failing disk, an unplugged USB drive or SD card, or a dropped network mount.</p>
+<h2 id="pty">2. Reproduced: reading a pty after the other side closes</h2>
+<pre><code>import os, pty
+master, slave = pty.openpty()
+os.write(slave, b&quot;hello\n&quot;)
+os.close(slave)                 # the &quot;terminal&quot; side goes away
+print(os.read(master, 100))     # buffered data still arrives
+try:
+    os.read(master, 100)        # nothing left and no writer
+except OSError as e:
+    print(type(e).__name__, e.errno, e)</code></pre>
+<p>Output:</p>
+<pre><code>b&#x27;hello\r\n&#x27;
+OSError 5 [Errno 5] Input/output error</code></pre>
+<p>The buffered data still arrives (note the <code>\n</code> became <code>\r\n</code>: the terminal driver translates newlines). Once it is drained and no one holds the other end, Linux raises <code>[Errno 5]</code> instead of returning <code>b&quot;&quot;</code> like a pipe would. This is what <code>pexpect</code>-style code and <code>pty.spawn</code> wrappers hit when the child exits.</p>
+<h2 id="fix">3. Fix for pty readers: treat EIO as end of output</h2>
+<pre><code>import os, pty, subprocess
+master, slave = pty.openpty()
+p = subprocess.Popen([&quot;echo&quot;, &quot;done&quot;], stdout=slave, stderr=slave)
+os.close(slave)
+p.wait()
+out = b&quot;&quot;
+while True:
+    try:
+        chunk = os.read(master, 1024)
+    except OSError as e:
+        if e.errno == 5:        # EIO == child closed the pty: treat as EOF
+            break
+        raise
+    if not chunk:
+        break
+    out += chunk
+print(out)</code></pre>
+<p>Output:</p>
+<pre><code>b&#x27;done\r\n&#x27;</code></pre>
+<p>Catch <code>OSError</code>, check <code>e.errno == errno.EIO</code> (5), and stop reading. Re-raise anything else.</p>
+<h2 id="other">4. The other causes (not reproduced here)</h2>
+<ul><li><strong>Background job or lost terminal:</strong> <code>input()</code> or <code>print()</code> from a script started with <code>&amp;</code>, or after its SSH session ended. Redirect stdin from <code>/dev/null</code> and stdout/stderr to a file (<code>python3 job.py &lt; /dev/null &gt; job.log 2&gt;&amp;1 &amp;</code>), or run it under systemd, tmux or screen.</li>
+<li><strong>Disk, USB or SD card:</strong> run <code>dmesg | tail</code> right after the error; I/O error lines naming a device mean hardware or a removed drive. Copy your data off before retrying.</li>
+<li><strong>Network mounts (NFS, SMB, sshfs):</strong> the connection dropped mid-read; remount and retry.</li></ul>
+<p>We did not reproduce these three (they need a real terminal session or failing hardware); the advice is the standard diagnosis. Related: <a href="/guides/python-oserror-errno-codes-list/">OSError errno codes list</a> and <a href="/guides/python-oserror-errno-9-bad-file-descriptor/">[Errno 9] Bad file descriptor</a>.</p>
+
+<aside class="cta"><strong>Debugging a script that calls web APIs? Check what headers a URL actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes [Errno 5] Input/output error in Python?</summary><p>A pseudo-terminal whose other side closed, a background process using a terminal it lost, or a disk, USB or network-mount failure.</p></details>
+<details><summary>How do I fix Errno 5 when reading from a pty?</summary><p>Catch OSError, check e.errno == errno.EIO and treat it as end of output.</p></details>
+<details><summary>How do I fix Errno 5 for a background script?</summary><p>Redirect stdin from /dev/null and output to a log file, or run it under systemd, tmux or screen.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-22 on Debian with Python 3.13.5: errno 5 name and message, reading a pty master after the slave closes, and an EIO-as-EOF read loop around a subprocess. Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

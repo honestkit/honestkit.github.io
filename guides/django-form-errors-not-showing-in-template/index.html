@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Django Form Errors Not Showing in Template (Tested Fixes)</title>
+<meta name="description" content="Django form errors not showing? Tested on 6.1.2: fields rendered without .errors, non_field_errors from clean(), and views that replace the bound form.">
+<link rel="canonical" href="https://honestkit.github.io/guides/django-form-errors-not-showing-in-template/">
+<meta property="og:title" content="Django Form Errors Not Showing in Template (Tested Fixes)">
+<meta property="og:description" content="Django form errors not showing? Tested on 6.1.2: fields rendered without .errors, non_field_errors from clean(), and views that replace the bound form.">
+<meta property="og:url" content="https://honestkit.github.io/guides/django-form-errors-not-showing-in-template/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why are my Django form errors not displayed?", "acceptedAnswer": {"@type": "Answer", "text": "Rendering {{ form.field }} prints only the widget. Add {{ form.field.errors }} and {{ form.non_field_errors }}, and pass the same bound form back to the template."}}, {"@type": "Question", "name": "Where do errors raised in a form's clean() method appear?", "acceptedAnswer": {"@type": "Answer", "text": "In form.non_field_errors(), not on any field. The template must render {{ form.non_field_errors }}."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Django form errors not showing in template (tested)</h1>
+<p class="lead">When a Django form fails <code>is_valid()</code> but the page shows no messages, the template is not printing <code>{{ field.errors }}</code> or <code>{{ form.non_field_errors }}</code>, or the view re-renders a new, unbound form.</p>
+<h2 id="setup">Setup used in every block</h2>
+<p><code>common.py</code> configures Django with the template engine and defines a form with an email, a minimum age, and a form-wide <code>clean()</code> rule. <code>render()</code> prints a template rendered with the form, whitespace collapsed:</p>
+<pre><code>import django
+from django.conf import settings
+settings.configure(TEMPLATES=[{&#x27;BACKEND&#x27;: &#x27;django.template.backends.django.DjangoTemplates&#x27;}])
+django.setup()
+from django import forms
+from django.template import Template, Context
+class SignupForm(forms.Form):
+    email = forms.EmailField()
+    age = forms.IntegerField(min_value=18)
+    def clean(self):
+        d = super().clean()
+        if d.get(&#x27;email&#x27;, &#x27;&#x27;).endswith(&#x27;@test.io&#x27;):
+            raise forms.ValidationError(&#x27;Test addresses are not allowed.&#x27;)
+        return d
+def render(src, form):
+    out = Template(src).render(Context({&#x27;form&#x27;: form}))
+    print(&#x27; &#x27;.join(out.split()) or &#x27;(empty)&#x27;)</code></pre>
+<h2 id="fields">1. Fields rendered one by one, errors never printed</h2>
+<pre><code>from common import *
+form = SignupForm({&#x27;email&#x27;: &#x27;nope&#x27;, &#x27;age&#x27;: &#x27;12&#x27;})
+print(&#x27;is_valid:&#x27;, form.is_valid())
+print(&#x27;errors:&#x27;, form.errors.get_json_data())
+print(&#x27;--- template renders fields one by one, no errors:&#x27;)
+render(&#x27;{{ form.email }} {{ form.age }}&#x27;, form)
+print(&#x27;--- with field errors added:&#x27;)
+render(&#x27;{{ form.email }}{{ form.email.errors }} {{ form.age }}{{ form.age.errors }}&#x27;, form)</code></pre>
+<p>Output:</p>
+<pre><code>is_valid: False
+errors: {&#x27;email&#x27;: [{&#x27;message&#x27;: &#x27;Enter a valid email address.&#x27;, &#x27;code&#x27;: &#x27;invalid&#x27;}], &#x27;age&#x27;: [{&#x27;message&#x27;: &#x27;Ensure this value is greater than or equal to 18.&#x27;, &#x27;code&#x27;: &#x27;min_value&#x27;}]}
+--- template renders fields one by one, no errors:
+&lt;input type=&quot;email&quot; name=&quot;email&quot; value=&quot;nope&quot; maxlength=&quot;320&quot; required aria-invalid=&quot;true&quot; aria-describedby=&quot;id_email_error&quot; id=&quot;id_email&quot;&gt; &lt;input type=&quot;number&quot; name=&quot;age&quot; value=&quot;12&quot; min=&quot;18&quot; required aria-invalid=&quot;true&quot; aria-describedby=&quot;id_age_error&quot; id=&quot;id_age&quot;&gt;
+--- with field errors added:
+&lt;input type=&quot;email&quot; name=&quot;email&quot; value=&quot;nope&quot; maxlength=&quot;320&quot; required aria-invalid=&quot;true&quot; aria-describedby=&quot;id_email_error&quot; id=&quot;id_email&quot;&gt;&lt;ul class=&quot;errorlist&quot; id=&quot;id_email_error&quot;&gt;&lt;li&gt;Enter a valid email address.&lt;/li&gt;&lt;/ul&gt; &lt;input type=&quot;number&quot; name=&quot;age&quot; value=&quot;12&quot; min=&quot;18&quot; required aria-invalid=&quot;true&quot; aria-describedby=&quot;id_age_error&quot; id=&quot;id_age&quot;&gt;&lt;ul class=&quot;errorlist&quot; id=&quot;id_age_error&quot;&gt;&lt;li&gt;Ensure this value is greater than or equal to 18.&lt;/li&gt;&lt;/ul&gt;</code></pre>
+<p>The form is invalid and <code>form.errors</code> has both messages, but <code>{{ form.email }}</code> renders only the input widget. Django 6.1 marks it <code>aria-invalid="true"</code>, but no message appears. Add <code>{{ form.email.errors }}</code> after each field (or use <code>{{ form.email.as_field_group }}</code>, <code>{{ form }}</code> or <code>{{ form.as_div }}</code>, which include the label, the input and its errors).</p>
+<h2 id="nonfield">2. Errors from clean() are non-field errors</h2>
+<pre><code>from common import *
+form = SignupForm({&#x27;email&#x27;: &#x27;a@test.io&#x27;, &#x27;age&#x27;: &#x27;30&#x27;})
+print(&#x27;is_valid:&#x27;, form.is_valid())
+print(&#x27;field errors:&#x27;, {k: v for k, v in form.errors.items() if k != &#x27;__all__&#x27;})
+print(&#x27;non_field_errors:&#x27;, list(form.non_field_errors()))
+print(&#x27;--- per-field template misses it:&#x27;)
+render(&#x27;{{ form.email.errors }}{{ form.age.errors }}&#x27;, form)
+print(&#x27;--- add non_field_errors:&#x27;)
+render(&#x27;{{ form.non_field_errors }}&#x27;, form)</code></pre>
+<p>Output:</p>
+<pre><code>is_valid: False
+field errors: {}
+non_field_errors: [&#x27;Test addresses are not allowed.&#x27;]
+--- per-field template misses it:
+(empty)
+--- add non_field_errors:
+&lt;ul class=&quot;errorlist nonfield&quot;&gt;&lt;li&gt;Test addresses are not allowed.&lt;/li&gt;&lt;/ul&gt;</code></pre>
+<p>An error raised in the form's <code>clean()</code> (or added with <code>add_error(None, ...)</code>) belongs to no field: every per-field <code>.errors</code> is empty and the template prints nothing. Put <code>{{ form.non_field_errors }}</code> at the top of the form.</p>
+<h2 id="view">3. The view replaces the bound form</h2>
+<pre><code>from common import *
+def view_bug(data):
+    form = SignupForm(data)
+    if form.is_valid():
+        return &#x27;saved&#x27;
+    form = SignupForm()          # BUG: replaces the bound form
+    return form
+def view_ok(data):
+    form = SignupForm(data)
+    if form.is_valid():
+        return &#x27;saved&#x27;
+    return form                  # re-render the same bound form
+for v in (view_bug, view_ok):
+    f = v({&#x27;email&#x27;: &#x27;nope&#x27;, &#x27;age&#x27;: &#x27;12&#x27;})
+    print(v.__name__, &#x27;is_bound:&#x27;, f.is_bound, &#x27;errors:&#x27;, dict(f.errors))</code></pre>
+<p>Output:</p>
+<pre><code>view_bug is_bound: False errors: {}
+view_ok is_bound: True errors: {&#x27;email&#x27;: [&#x27;Enter a valid email address.&#x27;], &#x27;age&#x27;: [&#x27;Ensure this value is greater than or equal to 18.&#x27;]}</code></pre>
+<p>If the view creates a fresh <code>SignupForm()</code> after <code>is_valid()</code> fails, the template gets an unbound form with no errors (and no submitted values). Pass the same bound form back to <code>render()</code> instead. A <code>redirect()</code> after an invalid POST has the same effect, because the next GET builds a new form; only redirect after a successful save.</p>
+<p>Related: <a href="/guides/django-admin-please-correct-the-error-below/">Django admin "Please correct the error below"</a>, <a href="/guides/django-csrf-verification-failed-cookie-not-set/">Django CSRF verification failed</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers your Django view returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why are my Django form errors not displayed?</summary><p>Rendering {{ form.field }} prints only the widget. Add {{ form.field.errors }} and {{ form.non_field_errors }}, and pass the same bound form back to the template.</p></details>
+<details><summary>Where do errors raised in a form&#x27;s clean() method appear?</summary><p>In form.non_field_errors(), not on any field. The template must render {{ form.non_field_errors }}.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Django 6.1.2 and Python 3.14.7 (python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Django are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nginx “upstream prematurely closed connection”: Fixed</title>
+<meta name="description" content="nginx logs this when the upstream dies before sending full headers. We reproduced it with a Node proxy and measured the causes and the fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/nginx-upstream-prematurely-closed-connection/">
+<meta property="og:title" content="nginx “upstream prematurely closed connection”: Fixed">
+<meta property="og:description" content="nginx logs this when the upstream dies before sending full headers. We reproduced it with a Node proxy and measured the causes and the fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/nginx-upstream-prematurely-closed-connection/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does the client ever see the exact words \"upstream prematurely closed connection\"?", "acceptedAnswer": {"@type": "Answer", "text": "No. That line only goes to nginx's error log. The client gets a 502 Bad Gateway with no body text referencing it, which is what our Node proxy reproduced when the fake upstream died before sending complete headers."}}, {"@type": "Question", "name": "Why does nginx only log this specific message during the header phase?", "acceptedAnswer": {"@type": "Answer", "text": "Because that is the only point where nginx hasn't sent anything to the client yet, so it can still substitute a clean 502. We measured this directly: once our proxy had already parsed and started forwarding headers, a later close produced a broken response (curl errors 52 or 18), not a 502, because the response was already committed."}}, {"@type": "Question", "name": "Is this the same as 504 Gateway Timeout?", "acceptedAnswer": {"@type": "Answer", "text": "No. 504 is nginx giving up after waiting proxy_read_timeout for an upstream that is still alive but too slow. This message is the upstream's connection dying outright (crash, restart, reset) while nginx is still reading headers, which is usually much faster than a full timeout."}}, {"@type": "Question", "name": "What's the difference from \"no live upstreams\"?", "acceptedAnswer": {"@type": "Answer", "text": "\"No live upstreams\" means every server in the upstream group is already marked down from earlier failures, so nginx doesn't even attempt a new connection. The premature-close message is a single connection that nginx did open, and that died mid-request."}}, {"@type": "Question", "name": "Can I make nginx retry automatically instead of returning 502?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, if you have more than one server in the upstream group: proxy_next_upstream error timeout; (the default for the error case) tells nginx to try the next server before giving up. With only one upstream server there's nothing to retry to, so the client still gets a 502."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>upstream prematurely closed connection (tested)</h1>
+<p class="lead"><code>upstream prematurely closed connection while reading response header from upstream</code> is a line nginx writes to its <strong>error log</strong>, not something a client ever sees. It means nginx opened a connection to your app server, sent the request, and the app server's connection died before nginx got a complete set of response headers back. The client just sees <a href="/guides/502-bad-gateway/">502 Bad Gateway</a>. We have no nginx on our test box, so we rebuilt the exact failure with a Node.js reverse proxy in front of a fake upstream that closes its socket at four different points, and measured what the proxying process sees and what the client ends up with at each one.</p>
+<h2>1. What the log line actually means</h2>
+<p>Split it in two. "Prematurely closed connection" is the upstream closing the TCP connection before nginx expected it to. "While reading response header from upstream" is nginx telling you exactly which phase it was in: it had sent the request and was waiting for the status line and headers, and the socket died before that was complete. That second clause is the important part &mdash; it is not "while reading the body", it is specifically the header phase.</p>
+<p>Because nginx had not yet seen a complete, valid response, it has committed nothing to the client. So it does the only safe thing: it can still swap in its own response, and (by default, see section 5) it sends the client a clean <a href="/guides/502-bad-gateway/">502 Bad Gateway</a>. A related line, <code>no live upstreams</code>, is logged instead when every server in an upstream group is already marked down from previous failures, so nginx does not even try to connect. That one is about the upstream group's health bookkeeping; this guide is about a single connection dying mid-request.</p>
+
+<h2>2. Our test setup</h2>
+<p>We built a minimal reverse proxy with Node's <code>http</code> module (no <code>http-proxy</code> package, just <code>http.request</code> piped to the client response) listening on port 8985, standing in for nginx's <code>proxy_pass</code>. Behind it, a fake upstream on port 8986 uses the raw <code>net</code> module (not <code>http</code>), so we can write exact, incomplete byte sequences to the socket and destroy it on command:</p>
+<pre><code>// upstream: 4 behaviours, selected by request path
+if (path === '/no-bytes')        socket.destroy();                 // dies on accept
+if (path === '/partial-headers') { socket.write('HTTP/1.1 200 OK\r\nContent-Type: text/pla'); socket.destroy(); }
+if (path === '/headers-no-body') { socket.write(fullHeaders); socket.destroy(); }      // headers done, 0 body bytes
+if (path === '/partial-body')    { socket.write(fullHeaders); socket.write('short'); socket.destroy(); } // 5 of 20 promised bytes</code></pre>
+<p>The proxy logs the <code>error</code> event on its outgoing <code>http.request</code>, and the <code>aborted</code>/<code>close</code> events on the response object, with <code>proxyRes.complete</code>:</p>
+<pre><code>proxyReq.on('error', (err) =&gt; {
+  console.log('proxyReq error:', err.code, err.message);
+  if (!clientRes.headersSent) { clientRes.writeHead(502, ...); clientRes.end('502 Bad Gateway'); }
+});
+proxyRes.on('close', () =&gt; {
+  if (!proxyRes.complete) console.log('upstream closed mid-response, complete=false');
+});</code></pre>
+
+<h2>3. Results: it matters whether headers were finished</h2>
+<table>
+<tr><th>Upstream behaviour</th><th>What the proxy's http.request saw</th><th>What curl got</th></tr>
+<tr><td><code>/no-bytes</code> &mdash; dies before any byte</td><td><code>error</code> event, <code>code=ECONNRESET</code>, <code>message=socket hang up</code>, 1&ndash;7 ms after connect</td><td><code>HTTP/1.1 502</code> (proxy substituted it, headers not yet committed)</td></tr>
+<tr><td><code>/partial-headers</code> &mdash; dies mid status-line/headers</td><td>Same: <code>error</code> event, <code>ECONNRESET</code>, <code>socket hang up</code>, ~41 ms after connect &mdash; <strong>indistinguishable from no-bytes</strong></td><td><code>HTTP/1.1 502</code></td></tr>
+<tr><td><code>/headers-no-body</code> &mdash; headers complete, 0 body bytes</td><td>Response object created (status 200 parsed OK), <strong>then</strong> <code>aborted</code> + <code>close</code> with <code>complete=false</code>, ~41&ndash;45 ms later</td><td><code>curl: (52) Empty reply from server</code> &mdash; no 502, nothing usable reached the socket</td></tr>
+<tr><td><code>/partial-body</code> &mdash; headers complete, 5 of 20 promised body bytes</td><td>Response object created, then <code>aborted</code> + <code>close</code>, <code>complete=false</code>, ~42&ndash;48 ms later</td><td><code>curl: (18) transfer closed with 15 bytes remaining to read</code> &mdash; got <code>short</code>, then cut off</td></tr>
+<tr><td><code>/normal</code> &mdash; full response (baseline)</td><td><code>close</code> with <code>complete=true</code></td><td>200, full body</td></tr>
+</table>
+<p>The split at "headers complete or not" is exactly what nginx's wording is telling you. <code>/no-bytes</code> and <code>/partial-headers</code> both fail during the header phase, and both look identical to the proxying process: a plain connection reset with nothing parseable yet. That is the case nginx logs as "prematurely closed connection while reading response header from upstream", and it is also the only case where nginx can still swap in a clean 502, because it has not sent anything to the client yet.</p>
+<p>Once headers are fully parsed, the proxy has already started committing a response to the client (Node calls <code>writeHead</code> as soon as it has a status line and headers). If the upstream then dies, there is no 502 to fall back on &mdash; Node's own equivalent is <code>curl: (52) Empty reply from server</code> for zero body bytes, or <code>curl: (18) ... bytes remaining to read</code> for a partial body. nginx has its own separate log line for this later failure (commonly a plain client-side reset, not the "while reading response header" message), because by then it is past the header-reading phase this guide is about.</p>
+
+<h2>4. What a real browser user sees</h2>
+<p>We also drove headless Chromium against the same four paths. For <code>/no-bytes</code> and <code>/partial-headers</code> it rendered the 502 body fine &mdash; a normal, fast error page. <code>/partial-body</code> was the interesting one: with the default <code>page.goto(url)</code> (which waits for the <code>load</code> event), navigation did not reject or resolve &mdash; it hung for the full 8000&nbsp;ms timeout we set, because the page never reaches <code>load</code> when the body is short of its promised <code>Content-Length</code>. Using <code>waitUntil: 'commit'</code> instead, the same navigation resolved in 50&nbsp;ms with status 200, because the status line and headers did arrive fine &mdash; only the body was cut short. In other words: a user who hits this mid-body case doesn't see an error, they see a tab that looks like it's still loading. Only the header-phase failures (sections 3's first two rows) turn into a clean, fast error page.</p>
+
+<h2>5. Common causes of the header-phase failure</h2>
+<ul>
+<li><strong>Upstream process crashed or was OOM-killed</strong> mid-request, closing its sockets. Check the app server's own log and exit status for the same timestamp.</li>
+<li><strong>Worker recycling.</strong> App servers that restart workers after N requests (common in PHP-FPM, Gunicorn, uWSGI) can close an in-flight connection if a worker is recycled while it still owns a request.</li>
+<li><strong>Upstream-side timeout shorter than nginx's.</strong> If the app server's own request/keepalive timeout fires before it finishes writing headers, it closes the socket from its side. Per the nginx docs, <code>proxy_read_timeout</code> (default 60s) governs how long nginx itself waits for the upstream, but it does not stop the upstream from timing out first on its own, shorter setting.</li>
+<li><strong>Keepalive race.</strong> If nginx reuses a pooled upstream connection (<code>keepalive</code> in the <code>upstream</code> block) that the app server was simultaneously closing for being idle too long, the request lands on a socket that's already going away. This shows up as sporadic failures that correlate with the upstream's idle-timeout interval.</li>
+<li><strong>TLS or proxy_pass misconfiguration to the wrong port</strong> can also produce a reset that looks the same, if something on that port speaks a different protocol and hangs up on the first bytes.</li>
+</ul>
+
+<h2>6. How to fix or reduce it (per the nginx docs, not measured on this box)</h2>
+<pre><code>upstream backend {
+    server 127.0.0.1:9000;
+    keepalive 16;
+}
+location / {
+    proxy_pass http://backend;
+    proxy_next_upstream error timeout;   # retry a different upstream server on this exact error
+    proxy_read_timeout 60s;
+}</code></pre>
+<ul>
+<li><code>proxy_next_upstream error timeout;</code> (on by default for <code>error</code>) makes nginx retry the request on another server in the upstream group when this happens, instead of giving the client a 502 immediately &mdash; useful if you have more than one upstream server.</li>
+<li>Make sure your app server's idle/keepalive timeout is <strong>longer</strong> than nginx's <code>keepalive_timeout</code> for upstream connections, so the app server is never the one that closes a pooled connection first.</li>
+<li>If the cause is worker recycling, set the recycling limit high enough, or make your app server finish in-flight requests before a worker exits (most have a graceful-shutdown or "max requests" grace option).</li>
+<li>If it correlates with deploys, it is almost always the app server's own shutdown closing in-flight connections before finishing a response &mdash; use a rolling restart with a drain period instead of a hard kill.</li>
+</ul>
+<p>For the client-visible side of this (the 502 itself, retries, caching implications), see <a href="/guides/502-bad-gateway/">502 Bad Gateway</a>. If connections are failing without ever reaching the header phase, compare <a href="/guides/err-connection-reset-econnreset/">ERR_CONNECTION_RESET / ECONNRESET</a>. If nginx is giving up on a slow (not dead) upstream instead, that is <a href="/guides/504-gateway-timeout/">504 Gateway Timeout</a>, not this message.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does the client ever see the exact words &quot;upstream prematurely closed connection&quot;?</summary><p>No. That line only goes to nginx&#x27;s error log. The client gets a 502 Bad Gateway with no body text referencing it, which is what our Node proxy reproduced when the fake upstream died before sending complete headers.</p></details>
+<details><summary>Why does nginx only log this specific message during the header phase?</summary><p>Because that is the only point where nginx hasn&#x27;t sent anything to the client yet, so it can still substitute a clean 502. We measured this directly: once our proxy had already parsed and started forwarding headers, a later close produced a broken response (curl errors 52 or 18), not a 502, because the response was already committed.</p></details>
+<details><summary>Is this the same as 504 Gateway Timeout?</summary><p>No. 504 is nginx giving up after waiting proxy_read_timeout for an upstream that is still alive but too slow. This message is the upstream&#x27;s connection dying outright (crash, restart, reset) while nginx is still reading headers, which is usually much faster than a full timeout.</p></details>
+<details><summary>What&#x27;s the difference from &quot;no live upstreams&quot;?</summary><p>&quot;No live upstreams&quot; means every server in the upstream group is already marked down from earlier failures, so nginx doesn&#x27;t even attempt a new connection. The premature-close message is a single connection that nginx did open, and that died mid-request.</p></details>
+<details><summary>Can I make nginx retry automatically instead of returning 502?</summary><p>Yes, if you have more than one server in the upstream group: proxy_next_upstream error timeout; (the default for the error case) tells nginx to try the next server before giving up. With only one upstream server there&#x27;s nothing to retry to, so the client still gets a 502.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0, curl 8.14.1, and headless Chromium 153.0.8010.12 (via Playwright), against a hand-rolled Node.js reverse proxy standing in for nginx (ports 8985/8986), fronting a raw-socket fake upstream that closes at four different points. The box has no nginx installed, so the exact nginx log wording and directive defaults are from the nginx docs, not measured; the connection mechanics (what the proxying process sees, what the client ends up with) are measured. PlainHeaders is our extension; curl, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

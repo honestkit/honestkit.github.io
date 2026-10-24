@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python decimal.InvalidOperation: ConversionSyntax, Tested</title>
+<meta name="description" content="We measured Python&#x27;s decimal.InvalidOperation: unparseable strings, why except ValueError misses it, quantize past precision, and 0/0 vs 1/0.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-decimal-invalidoperation-conversionsyntax/">
+<meta property="og:title" content="Python decimal.InvalidOperation: ConversionSyntax, Tested">
+<meta property="og:description" content="We measured Python&#x27;s decimal.InvalidOperation: unparseable strings, why except ValueError misses it, quantize past precision, and 0/0 vs 1/0.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-decimal-invalidoperation-conversionsyntax/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does decimal.InvalidOperation [<class 'decimal.ConversionSyntax'>] mean?", "acceptedAnswer": {"@type": "Answer", "text": "Decimal() was given a string it can't parse. We measured '1,000.50', '$5' and '' all raising it on Python 3.13.5; whitespace around a number is fine."}}, {"@type": "Question", "name": "Why doesn't except ValueError catch decimal.InvalidOperation?", "acceptedAnswer": {"@type": "Answer", "text": "InvalidOperation subclasses ArithmeticError, not ValueError. We checked its MRO and an except ValueError that let it through. Catch decimal.InvalidOperation."}}, {"@type": "Question", "name": "Why does quantize raise InvalidOperation?", "acceptedAnswer": {"@type": "Answer", "text": "The result needs more digits than the context precision (28 by default). We measured Decimal(10**30).quantize(Decimal('0.01')) raising it; raise prec to fix."}}, {"@type": "Question", "name": "Is Decimal 0/0 a ZeroDivisionError?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured 0/0 raising InvalidOperation, which is not a ZeroDivisionError, while 1/0 raises DivisionByZero, which is."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>decimal.InvalidOperation ConversionSyntax (tested)</h1>
+<p class="lead"><code>decimal.InvalidOperation: [&lt;class 'decimal.ConversionSyntax'&gt;]</code> usually means <code>Decimal()</code> got a string like <code>'1,000.50'</code>. We reproduced it and three other causes on Python 3.13.5, and found that <code>except ValueError</code> doesn't catch it.</p>
+<h2 id="conversion">1. Decimal() got a string it can't parse</h2>
+<pre><code>from decimal import Decimal
+for s in [&quot;19.99&quot;, &quot; 3.5 &quot;, &quot;1,000.50&quot;, &quot;$5&quot;, &quot;&quot;, &quot;nan&quot;]:
+    try:
+        print(repr(s), &quot;-&gt;&quot;, repr(Decimal(s)))
+    except Exception as e:
+        print(repr(s), &quot;-&gt;&quot;, type(e).__name__, e)</code></pre>
+<p>Output:</p>
+<pre><code>&#x27;19.99&#x27; -&gt; Decimal(&#x27;19.99&#x27;)
+&#x27; 3.5 &#x27; -&gt; Decimal(&#x27;3.5&#x27;)
+&#x27;1,000.50&#x27; -&gt; InvalidOperation [&lt;class &#x27;decimal.ConversionSyntax&#x27;&gt;]
+&#x27;$5&#x27; -&gt; InvalidOperation [&lt;class &#x27;decimal.ConversionSyntax&#x27;&gt;]
+&#x27;&#x27; -&gt; InvalidOperation [&lt;class &#x27;decimal.ConversionSyntax&#x27;&gt;]
+&#x27;nan&#x27; -&gt; Decimal(&#x27;NaN&#x27;)</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> the bracketed <code>[&lt;class 'decimal.ConversionSyntax'&gt;]</code> is the whole message, and it means the string isn't a number Decimal understands. Thousands separators, currency signs and the empty string all fail. Surrounding whitespace is stripped and accepted, and <code>"nan"</code> is accepted silently as <code>Decimal('NaN')</code>, which then flows on into your totals.</p>
+
+<h2 id="not-valueerror">2. except ValueError doesn't catch it</h2>
+<pre><code>from decimal import Decimal, InvalidOperation
+print(InvalidOperation.__mro__)
+print(issubclass(InvalidOperation, ValueError))
+try:
+    try:
+        Decimal(&quot;1,000.50&quot;)
+    except ValueError:
+        print(&quot;caught by except ValueError&quot;)
+except InvalidOperation:
+    print(&quot;missed by except ValueError, caught by except InvalidOperation&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>(&lt;class &#x27;decimal.InvalidOperation&#x27;&gt;, &lt;class &#x27;decimal.DecimalException&#x27;&gt;, &lt;class &#x27;ArithmeticError&#x27;&gt;, &lt;class &#x27;Exception&#x27;&gt;, &lt;class &#x27;BaseException&#x27;&gt;, &lt;class &#x27;object&#x27;&gt;)
+False
+missed by except ValueError, caught by except InvalidOperation</code></pre>
+<p><strong>Measured:</strong> <code>InvalidOperation</code> is an <code>ArithmeticError</code>, not a <code>ValueError</code>, so the usual <code>except ValueError</code> you'd write around <code>int()</code> or <code>float()</code> lets it straight through. Catch <code>decimal.InvalidOperation</code> by name.</p>
+
+<h2 id="parse">3. A parser that cleans input and rejects NaN</h2>
+<pre><code>from decimal import Decimal, InvalidOperation
+
+def parse_money(s):
+    cleaned = s.strip().replace(&quot;,&quot;, &quot;&quot;).replace(&quot;$&quot;, &quot;&quot;)
+    try:
+        d = Decimal(cleaned)
+    except InvalidOperation:
+        raise ValueError(f&quot;not a number: {s!r}&quot;) from None
+    if not d.is_finite():
+        raise ValueError(f&quot;not a finite number: {s!r}&quot;)
+    return d
+
+for s in [&quot;1,000.50&quot;, &quot;$5&quot;, &quot; 3.5 &quot;, &quot;nan&quot;, &quot;&quot;, &quot;abc&quot;]:
+    try:
+        print(repr(s), &quot;-&gt;&quot;, parse_money(s))
+    except ValueError as e:
+        print(repr(s), &quot;-&gt; ValueError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>&#x27;1,000.50&#x27; -&gt; 1000.50
+&#x27;$5&#x27; -&gt; 5
+&#x27; 3.5 &#x27; -&gt; 3.5
+&#x27;nan&#x27; -&gt; ValueError: not a finite number: &#x27;nan&#x27;
+&#x27;&#x27; -&gt; ValueError: not a number: &#x27;&#x27;
+&#x27;abc&#x27; -&gt; ValueError: not a number: &#x27;abc&#x27;</code></pre>
+<p><strong>Measured:</strong> strip separators and currency symbols before converting, turn <code>InvalidOperation</code> into a <code>ValueError</code> your callers already handle, and check <code>is_finite()</code> so <code>"nan"</code> and <code>"inf"</code> don't slip in. Only strip commas if your input never uses a comma as the decimal point.</p>
+
+<h2 id="quantize">4. quantize() on a number bigger than the precision</h2>
+<pre><code>from decimal import Decimal, getcontext
+print(&quot;precision:&quot;, getcontext().prec)
+big = Decimal(10) ** 30
+try:
+    print(big.quantize(Decimal(&quot;0.01&quot;)))
+except Exception as e:
+    print(type(e).__name__, e)
+print(Decimal(&quot;123.456&quot;).quantize(Decimal(&quot;0.01&quot;)))</code></pre>
+<p>Output:</p>
+<pre><code>precision: 28
+InvalidOperation [&lt;class &#x27;decimal.InvalidOperation&#x27;&gt;]
+123.46</code></pre>
+<p><strong>Measured:</strong> the default context has 28 significant digits. Rounding 10<sup>30</sup> to 2 decimal places needs 33 digits, so <code>quantize()</code> raises <code>InvalidOperation</code> with no hint about why. Raise the precision (<code>getcontext().prec = 50</code>, or a local <code>localcontext()</code>) for very large amounts. More in our <a href="/guides/python-decimal-prec-is-significant-digits-not-decimal-places/">prec is significant digits guide</a>.</p>
+
+<h2 id="zero">5. 0/0 is InvalidOperation, 1/0 is not</h2>
+<pre><code>from decimal import Decimal
+for a, b in [(&quot;0&quot;, &quot;0&quot;), (&quot;1&quot;, &quot;0&quot;)]:
+    try:
+        print(a, &quot;/&quot;, b, &quot;=&quot;, Decimal(a) / Decimal(b))
+    except Exception as e:
+        print(a, &quot;/&quot;, b, &quot;-&gt;&quot;, type(e).__name__, &quot;| ZeroDivisionError?&quot;, isinstance(e, ZeroDivisionError))</code></pre>
+<p>Output:</p>
+<pre><code>0 / 0 -&gt; InvalidOperation | ZeroDivisionError? False
+1 / 0 -&gt; DivisionByZero | ZeroDivisionError? True</code></pre>
+<p><strong>Measured:</strong> dividing zero by zero raises <code>InvalidOperation</code>, which is not a <code>ZeroDivisionError</code>. Dividing anything else by zero raises <code>DivisionByZero</code>, which is. An <code>except ZeroDivisionError</code> around a Decimal average misses the empty-total case.</p>
+
+<h2 id="none">6. None and floats are different errors</h2>
+<pre><code>from decimal import Decimal
+for v in [None, 0.1, &quot;0.1&quot;]:
+    try:
+        print(repr(v), &quot;-&gt;&quot;, repr(Decimal(v)))
+    except Exception as e:
+        print(repr(v), &quot;-&gt;&quot;, type(e).__name__, e)</code></pre>
+<p>Output:</p>
+<pre><code>None -&gt; TypeError conversion from NoneType to Decimal is not supported
+0.1 -&gt; Decimal(&#x27;0.1000000000000000055511151231257827021181583404541015625&#x27;)
+&#x27;0.1&#x27; -&gt; Decimal(&#x27;0.1&#x27;)</code></pre>
+<p><strong>Measured:</strong> <code>Decimal(None)</code> is a <code>TypeError</code>, not <code>InvalidOperation</code>. A float converts without any error but keeps the binary error of the float; pass a string instead. See our <a href="/guides/python-decimal-from-float-bakes-in-binary-imprecision/">Decimal from float guide</a>.</p>
+
+<aside class="cta"><strong>Parsing prices from an API? Check the raw headers and content type the server really sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does decimal.InvalidOperation [&lt;class &#x27;decimal.ConversionSyntax&#x27;&gt;] mean?</summary><p>Decimal() was given a string it can&#x27;t parse. We measured &#x27;1,000.50&#x27;, &#x27;$5&#x27; and &#x27;&#x27; all raising it on Python 3.13.5; whitespace around a number is fine.</p></details>
+<details><summary>Why doesn&#x27;t except ValueError catch decimal.InvalidOperation?</summary><p>InvalidOperation subclasses ArithmeticError, not ValueError. We checked its MRO and an except ValueError that let it through. Catch decimal.InvalidOperation.</p></details>
+<details><summary>Why does quantize raise InvalidOperation?</summary><p>The result needs more digits than the context precision (28 by default). We measured Decimal(10**30).quantize(Decimal(&#x27;0.01&#x27;)) raising it; raise prec to fix.</p></details>
+<details><summary>Is Decimal 0/0 a ZeroDivisionError?</summary><p>No. We measured 0/0 raising InvalidOperation, which is not a ZeroDivisionError, while 1/0 raises DivisionByZero, which is.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5: Decimal() on six strings, the InvalidOperation MRO, a cleaning parser, quantize past precision 28, 0/0 vs 1/0, and None/float input. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

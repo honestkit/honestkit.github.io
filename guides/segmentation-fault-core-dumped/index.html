@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Segmentation Fault (Core Dumped): What It Means and Why (Tested)</title>
+<meta name="description" content="We crashed a real C program on Linux and captured the exact shell text, exit code 139, and when &quot;(core dumped)&quot; appears vs. when it doesn&#x27;t.">
+<link rel="canonical" href="https://honestkit.github.io/guides/segmentation-fault-core-dumped/">
+<meta property="og:title" content="Segmentation Fault (Core Dumped): What It Means and Why (Tested)">
+<meta property="og:description" content="We crashed a real C program on Linux and captured the exact shell text, exit code 139, and when &quot;(core dumped)&quot; appears vs. when it doesn&#x27;t.">
+<meta property="og:url" content="https://honestkit.github.io/guides/segmentation-fault-core-dumped/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does \"Segmentation fault (core dumped)\" actually mean?", "acceptedAnswer": {"@type": "Answer", "text": "The kernel killed your process with SIGSEGV because it accessed memory it wasn't allowed to. \"(core dumped)\" just means a memory snapshot (a core file) was also written, which only happens if ulimit -c allows it. We measured both: the fault text is identical either way, only the suffix changes."}}, {"@type": "Question", "name": "Why don't I see \"(core dumped)\" on my machine?", "acceptedAnswer": {"@type": "Answer", "text": "Because your shell's core size limit is 0 by default, which is what we found on this Debian 13 box with ulimit -c. Run ulimit -c unlimited first, then reproduce the crash, and the suffix appears along with an actual core.<pid> file."}}, {"@type": "Question", "name": "What exit code does a segfault produce?", "acceptedAnswer": {"@type": "Answer", "text": "139, which we confirmed in every run. That's 128 + 11, where 11 is SIGSEGV's signal number. Checking for 139 in scripts is more reliable than matching the printed text, since the text varies by shell."}}, {"@type": "Question", "name": "Where does the core file go?", "acceptedAnswer": {"@type": "Answer", "text": "Wherever /proc/sys/kernel/core_pattern says. We found the plain pattern \"core\" on this box, so files appeared as core.<pid> in the working directory. Some distros instead pipe dumps to systemd-coredump, in which case you list and inspect them with coredumpctl rather than looking for a file."}}, {"@type": "Question", "name": "Does the shell matter, e.g. bash vs sh?", "acceptedAnswer": {"@type": "Answer", "text": "No. We reproduced the identical pair of outputs, Segmentation fault and Segmentation fault (core dumped), under both bash and dash (Debian's /bin/sh). The deciding factor is the process's core resource limit, not which shell launched it."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Segmentation fault (core dumped) (tested)</h1>
+<p class="lead"><code>Segmentation fault</code> means your program touched memory it isn't allowed to touch, and the kernel killed it with SIGSEGV. The optional <code>(core dumped)</code> suffix just means the shell also wrote a core file. We reproduced both the crash and the suffix on a real box to show exactly when each appears.</p>
+<h2>1. What actually happens</h2>
+<p>A segmentation fault is the kernel stopping a process that tried to read or write memory it doesn't own, most often through a null or wild pointer. The kernel sends the process signal 11 (<code>SIGSEGV</code>). The process usually has no handler for it, so it dies, and the shell that started it prints a message.</p>
+<p>We wrote this minimal C program:</p>
+<pre><code>#include &lt;stdio.h&gt;
+int main(void) {
+    int *p = NULL;
+    printf("before crash\n");
+    fflush(stdout);
+    *p = 42;
+    printf("never gets here\n");
+    return 0;
+}</code></pre>
+<p>Compiled with <code>gcc -O0 -g -o segfault segfault.c</code> on gcc 14.2.0, no warnings. Writing through <code>p</code> dereferences a null pointer, which is unmapped memory, so the kernel delivers SIGSEGV.</p>
+
+<h2>2. The exact shell output we measured</h2>
+<p>Running the compiled binary under bash gave:</p>
+<pre><code>$ ./segfault
+before crash
+Segmentation fault      (core dumped)
+$ echo $?
+139</code></pre>
+<p>With core dumps disabled (<code>ulimit -c 0</code>, the box's default) the same crash printed:</p>
+<pre><code>$ ulimit -c 0
+$ ./segfault
+before crash
+Segmentation fault
+$ echo $?
+139</code></pre>
+<p>Only the trailing <code>(core dumped)</code> changes. The job-control line bash shows (<code>[1]+  Segmentation fault (core dumped)  ./segfault</code>) also includes a job number and PID when the process is backgrounded; in a plain foreground run bash just prints <code>Segmentation fault</code> with or without the suffix. We confirmed the same two outputs under <code>dash</code> (Debian's <code>/bin/sh</code>), so this is shell-independent: it's controlled by the resource limit, not the shell.</p>
+<p>Exit code was <strong>139</strong> in every run. That is the standard <code>128 + signal number</code> convention: 128 + 11 (SIGSEGV) = 139. This is how scripts and CI detect a segfault reliably, since the text message can vary by shell and locale but the exit code does not.</p>
+
+<h2>3. What controls "(core dumped)"</h2>
+<p>The suffix appears only if two things are both true: the process's core resource limit allows a dump, and the kernel successfully wrote one. We tested both settings in the same shell session:</p>
+<table>
+<tr><th>Setting</th><th>Command</th><th>Shell output</th><th>Core file written?</th></tr>
+<tr><td>Disabled (box default)</td><td><code>ulimit -c 0</code></td><td><code>Segmentation fault</code></td><td>No</td></tr>
+<tr><td>Enabled</td><td><code>ulimit -c unlimited</code></td><td><code>Segmentation fault (core dumped)</code></td><td>Yes, 438272 bytes</td></tr>
+</table>
+<p>We checked <code>ulimit -c</code> before changing anything: it was <code>0</code> by default on this box, which is why most interactive shells only ever show the plain <code>Segmentation fault</code> message unless something has raised the limit.</p>
+<p>After <code>ulimit -c unlimited</code>, the crash left a real file named <code>core.&lt;pid&gt;</code> (for example <code>core.2098362</code>) in the current directory. That naming and location come from <code>/proc/sys/kernel/core_pattern</code>, which on this box was the plain default <code>core</code> (pattern <code>core.%p</code> is common too; check your own box, don't assume). <code>file core.2098362</code> confirmed it: <code>ELF 64-bit LSB core file, x86-64 ... from './segfault'</code>.</p>
+<p>Some distros point <code>core_pattern</code> at <code>systemd-coredump</code> instead of a plain file (a line starting with <code>|</code> and a path like <code>/usr/lib/systemd/systemd-coredump</code>). This box does not: <code>core_pattern</code> was the literal string <code>core</code>, and the <code>coredumpctl</code> command was not installed, so dumps land as ordinary files you inspect with <code>gdb</code> or <code>file</code> directly, not through <code>coredumpctl</code>.</p>
+
+<h2>4. Reproduce it yourself</h2>
+<pre><code>cat &gt; segfault.c &lt;&lt;'EOF'
+int main(void) { int *p = 0; *p = 1; return 0; }
+EOF
+gcc -O0 -g -o segfault segfault.c
+ulimit -c unlimited   # enable core dumps for this shell
+./segfault
+echo $?                # 139
+ls core.*               # the dump, if core_pattern writes plain files</code></pre>
+<p>If you have <code>gdb</code> installed, open the dump with <code>gdb ./segfault core.&lt;pid&gt;</code> and run <code>bt</code> for a backtrace showing the crashing line. On systems that route dumps to systemd, use <code>coredumpctl list</code> and <code>coredumpctl debug</code> instead of a bare filename.</p>
+
+<h2>5. Common real causes</h2>
+<ul>
+<li><strong>Null pointer dereference.</strong> Exactly what we reproduced: reading or writing through a pointer that is <code>NULL</code> or was never initialized.</li>
+<li><strong>Use-after-free.</strong> Writing to memory already released by <code>free()</code>; the mapping may still exist until something else overwrites it, so it can crash later and unpredictably.</li>
+<li><strong>Buffer overrun.</strong> Writing past the end of an array walks into memory the process doesn't own.</li>
+<li><strong>Stack overflow from deep or infinite recursion.</strong> Each call frame needs stack space; past the limit, the next push hits unmapped memory.</li>
+<li><strong>Mismatched types across a library boundary.</strong> Calling a function pointer with the wrong signature, or a mismatched struct layout between a program and a shared library it links.</li>
+</ul>
+
+<h2>6. How to actually debug one</h2>
+<ul>
+<li>Compile with <code>-g</code> (debug symbols) and without optimization (<code>-O0</code>) while you investigate; optimized code can reorder or inline things so the crash line in a backtrace is misleading.</li>
+<li>Enable core dumps for the session: <code>ulimit -c unlimited</code>, then reproduce the crash and load the resulting file in <code>gdb</code>.</li>
+<li>Or run the program directly under <code>gdb --args ./yourprogram args...</code> and type <code>run</code>; gdb stops at the fault and <code>bt</code> shows the call stack immediately, no core file needed.</li>
+<li>For memory bugs that don't always crash (use-after-free, off-by-one), rebuild with <code>-fsanitize=address</code> (AddressSanitizer); it reports the exact bad access with a stack trace instead of waiting for a segfault.</li>
+<li>In scripts and CI, check for exit code 139 rather than matching the text message, since the text depends on the shell and <code>ulimit -c</code> state.</li>
+</ul>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &quot;Segmentation fault (core dumped)&quot; actually mean?</summary><p>The kernel killed your process with SIGSEGV because it accessed memory it wasn&#x27;t allowed to. &quot;(core dumped)&quot; just means a memory snapshot (a core file) was also written, which only happens if ulimit -c allows it. We measured both: the fault text is identical either way, only the suffix changes.</p></details>
+<details><summary>Why don&#x27;t I see &quot;(core dumped)&quot; on my machine?</summary><p>Because your shell&#x27;s core size limit is 0 by default, which is what we found on this Debian 13 box with ulimit -c. Run ulimit -c unlimited first, then reproduce the crash, and the suffix appears along with an actual core.&lt;pid&gt; file.</p></details>
+<details><summary>What exit code does a segfault produce?</summary><p>139, which we confirmed in every run. That&#x27;s 128 + 11, where 11 is SIGSEGV&#x27;s signal number. Checking for 139 in scripts is more reliable than matching the printed text, since the text varies by shell.</p></details>
+<details><summary>Where does the core file go?</summary><p>Wherever /proc/sys/kernel/core_pattern says. We found the plain pattern &quot;core&quot; on this box, so files appeared as core.&lt;pid&gt; in the working directory. Some distros instead pipe dumps to systemd-coredump, in which case you list and inspect them with coredumpctl rather than looking for a file.</p></details>
+<details><summary>Does the shell matter, e.g. bash vs sh?</summary><p>No. We reproduced the identical pair of outputs, Segmentation fault and Segmentation fault (core dumped), under both bash and dash (Debian&#x27;s /bin/sh). The deciding factor is the process&#x27;s core resource limit, not which shell launched it.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 on Debian GNU/Linux 13 (trixie), gcc 14.2.0, bash 5.x and dash, kernel 6.12.107+deb13-amd64. Compiled a tiny C program with a null-pointer write and ran it under both ulimit -c 0 and ulimit -c unlimited. PlainHeaders is our extension; gcc, bash and dash are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

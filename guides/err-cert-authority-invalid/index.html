@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NET::ERR_CERT_AUTHORITY_INVALID: Causes and Fixes (Tested)</title>
+<meta name="description" content="We served 8 broken certificates to Chromium 153, curl, Node fetch and Python. What each one reports, why expired certs can show this error, and fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-cert-authority-invalid/">
+<meta property="og:title" content="NET::ERR_CERT_AUTHORITY_INVALID: Causes and Fixes (Tested)">
+<meta property="og:description" content="We served 8 broken certificates to Chromium 153, curl, Node fetch and Python. What each one reports, why expired certs can show this error, and fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-cert-authority-invalid/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Chrome say ERR_CERT_AUTHORITY_INVALID when my certificate is expired?", "acceptedAnswer": {"@type": "Answer", "text": "Chrome reports the trust problem first. In our test an expired certificate from an untrusted CA showed ERR_CERT_AUTHORITY_INVALID in Chromium 153. Per the Chromium docs, ERR_CERT_DATE_INVALID appears when the issuer is trusted."}}, {"@type": "Question", "name": "The site works in Chrome but curl says 'unable to get local issuer certificate'. Why?", "acceptedAnswer": {"@type": "Answer", "text": "Most likely the server does not send its intermediate certificate. Chromium fetched the missing intermediate from the certificate's AIA URL in our test; curl, Node and Python did not. Serve the full chain."}}, {"@type": "Question", "name": "How do I make Node.js trust my private CA?", "acceptedAnswer": {"@type": "Answer", "text": "Start Node with NODE_EXTRA_CA_CERTS=/path/to/root.crt. In our Node 24 test that turned DEPTH_ZERO_SELF_SIGNED_CERT and UNABLE_TO_VERIFY_LEAF_SIGNATURE into a normal 200 without touching the system store."}}, {"@type": "Question", "name": "What do DEPTH_ZERO_SELF_SIGNED_CERT and UNABLE_TO_VERIFY_LEAF_SIGNATURE mean?", "acceptedAnswer": {"@type": "Answer", "text": "DEPTH_ZERO_SELF_SIGNED_CERT: the server sent one self-signed certificate. UNABLE_TO_VERIFY_LEAF_SIGNATURE: Node could not find the leaf's issuer, either a private CA or a missing intermediate. Both appeared in our tests."}}, {"@type": "Question", "name": "Is it safe to click 'Proceed anyway'?", "acceptedAnswer": {"@type": "Answer", "text": "Only on a machine or server you control and know uses a self-signed or private certificate. On a public site the error can also mean someone is intercepting the connection. Per the Chromium docs, if the site uses HSTS, Chrome does not offer the link at all."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>NET::ERR_CERT_AUTHORITY_INVALID (tested)</h1>
+<p class="lead"><code>NET::ERR_CERT_AUTHORITY_INVALID</code> means Chrome could not build a chain from the site's certificate to a root it trusts. The usual causes are a self-signed certificate, a private CA, or a server that forgets to send its intermediate. We built each case with OpenSSL, served it, and recorded the exact error from Chromium, curl, Node and Python.</p>
+<h2>1. What the error means</h2>
+<p>Every HTTPS certificate is signed by an issuer. The browser follows the issuers up to a root certificate in its trust store. If that walk does not end at a trusted root, Chromium shows <code>NET::ERR_CERT_AUTHORITY_INVALID</code> and (per the Chrome help docs, not measured in headless mode) the page says "Your connection is not private".</p>
+<p>It is a trust problem, not an encryption problem. The TLS handshake worked. The browser just does not believe who signed the certificate.</p>
+
+<h2>2. Our test setup</h2>
+<p>We used OpenSSL to make a private root CA, an intermediate CA signed by it, and several leaf certificates for <code>localhost</code>. A Node <code>https.createServer</code> served each one on port 8990. Then four clients loaded <code>https://localhost:8990/</code>.</p>
+<pre><code># private root CA
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout root.key -out root.crt -days 365 -subj "/CN=Test Root CA" \
+  -addext basicConstraints=critical,CA:TRUE \
+  -addext keyUsage=critical,keyCertSign,cRLSign
+
+# self-signed leaf
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout ss.key -out ss.crt -days 30 -subj /CN=localhost \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+# expired leaf (OpenSSL 3.4+)
+openssl x509 -req -in expired.csr -CA root.crt -CAkey root.key \
+  -out expired.crt -extfile leaf.ext \
+  -not_before 20250101000000Z -not_after 20250201000000Z</code></pre>
+
+<h2>3. Results: what each client reports</h2>
+<p>No CA file was given to any client here. This is what a visitor or a default client sees.</p>
+<table>
+<tr><th>Case</th><th>Chromium 153</th><th>curl (exit 60)</th><th>Node fetch <code>cause.code</code></th><th>Python <code>verify_code</code></th></tr>
+<tr><td>Self-signed leaf</td><td>net::ERR_CERT_AUTHORITY_INVALID</td><td>self-signed certificate</td><td>DEPTH_ZERO_SELF_SIGNED_CERT</td><td>18 self-signed certificate</td></tr>
+<tr><td>Leaf signed by private CA</td><td>net::ERR_CERT_AUTHORITY_INVALID</td><td>unable to get local issuer certificate</td><td>UNABLE_TO_VERIFY_LEAF_SIGNATURE</td><td>20 unable to get local issuer certificate</td></tr>
+<tr><td>Leaf only, intermediate missing</td><td>net::ERR_CERT_AUTHORITY_INVALID</td><td>unable to get local issuer certificate</td><td>UNABLE_TO_VERIFY_LEAF_SIGNATURE</td><td>20 unable to get local issuer certificate</td></tr>
+<tr><td>Leaf + intermediate (full chain), private root</td><td>net::ERR_CERT_AUTHORITY_INVALID</td><td>unable to get local issuer certificate</td><td>UNABLE_TO_GET_ISSUER_CERT_LOCALLY</td><td>20 unable to get local issuer certificate</td></tr>
+<tr><td>Expired leaf, private CA</td><td>net::ERR_CERT_AUTHORITY_INVALID</td><td>unable to get local issuer certificate</td><td>CERT_HAS_EXPIRED</td><td>20 unable to get local issuer certificate</td></tr>
+<tr><td>Wrong hostname, private CA</td><td>net::ERR_CERT_AUTHORITY_INVALID</td><td>unable to get local issuer certificate</td><td>UNABLE_TO_VERIFY_LEAF_SIGNATURE</td><td>20 unable to get local issuer certificate</td></tr>
+<tr><td>Expired self-signed</td><td>net::ERR_CERT_AUTHORITY_INVALID</td><td>self-signed certificate</td><td>CERT_HAS_EXPIRED</td><td>18 self-signed certificate</td></tr>
+<tr><td>Wrong hostname, self-signed</td><td>net::ERR_CERT_AUTHORITY_INVALID</td><td>self-signed certificate</td><td>DEPTH_ZERO_SELF_SIGNED_CERT</td><td>18 self-signed certificate</td></tr>
+</table>
+<p>Two things stand out:</p>
+<ul>
+<li><strong>Chromium reported ERR_CERT_AUTHORITY_INVALID for all 8 cases.</strong> An expired or wrong-host certificate from an untrusted issuer did not give <code>ERR_CERT_DATE_INVALID</code> or <code>ERR_CERT_COMMON_NAME_INVALID</code>. Fix trust first; the other errors may appear after that.</li>
+<li><strong>Node is the odd one out.</strong> For expired certificates it reported <code>CERT_HAS_EXPIRED</code> even though the issuer was untrusted. curl and Python reported the trust problem.</li>
+</ul>
+<p>Node 24 also adds a hint to some messages: <code>self-signed certificate; if the root CA is installed locally, try running Node.js with --use-system-ca</code>. Python's full message was <code>[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1029)</code>.</p>
+<p>Per the Chromium docs (not measured, because we did not touch the trust store), once the root is trusted, an expired certificate shows <code>NET::ERR_CERT_DATE_INVALID</code> and a hostname mismatch shows <code>NET::ERR_CERT_COMMON_NAME_INVALID</code>. Our clients that we <em>could</em> point at the CA (next section) behaved exactly that way.</p>
+
+<h2>4. Trusting a private CA for one client (no system changes)</h2>
+<p>For a development or internal CA, give the client the root certificate. All three methods worked for the self-signed and private-CA cases (HTTP 200):</p>
+<pre><code>curl --cacert root.crt https://localhost:8990/
+NODE_EXTRA_CA_CERTS=root.crt node app.js
+python3 -c "import ssl,urllib.request as u; \
+  print(u.urlopen('https://localhost:8990/', \
+  context=ssl.create_default_context(cafile='root.crt')).status)"</code></pre>
+<p>For a self-signed leaf, pass the leaf itself as the CA file. That also worked.</p>
+<p>With the CA trusted, the hidden errors came out:</p>
+<table>
+<tr><th>Case (root trusted)</th><th>curl</th><th>Node fetch</th><th>Python</th></tr>
+<tr><td>Expired leaf</td><td>certificate has expired</td><td>CERT_HAS_EXPIRED</td><td>10 certificate has expired</td></tr>
+<tr><td>Wrong hostname</td><td>no alternative certificate subject name matches target hostname 'localhost'</td><td>ERR_TLS_CERT_ALTNAME_INVALID</td><td>62 Hostname mismatch, certificate is not valid for 'localhost'.</td></tr>
+<tr><td>Intermediate missing</td><td>unable to get local issuer certificate</td><td>UNABLE_TO_VERIFY_LEAF_SIGNATURE</td><td>20 unable to get local issuer certificate</td></tr>
+</table>
+<p>Note the last row. Trusting the root does <em>not</em> fix a missing intermediate. The client still cannot link the leaf to the root.</p>
+
+<h2>5. Missing intermediate: serve the full chain</h2>
+<p>This is the most common cause on real public sites. The server sends only its own certificate and leaves out the intermediate. Check what the server sends:</p>
+<pre><code>openssl s_client -connect example.com:443 -servername example.com &lt;/dev/null \
+  | sed -n '/Certificate chain/,/---/p'</code></pre>
+<p>With only the leaf configured we saw one entry (<code>0 s:CN=localhost</code>, <code>i:CN=Test Intermediate CA</code>) and <code>Verify return code: 21 (unable to verify the first certificate)</code>. After serving <code>cat leaf.crt intermediate.crt &gt; fullchain.crt</code> we saw two entries and <code>Verify return code: 0 (ok)</code>. curl, Node and Python then all returned 200 with the root as CA.</p>
+<ul>
+<li>nginx: <code>ssl_certificate</code> must point at the full chain file (with Let's Encrypt, <code>fullchain.pem</code>, not <code>cert.pem</code>, per the certbot docs).</li>
+<li>Node: pass the leaf followed by the intermediate in <code>cert</code>.</li>
+<li>Order matters: leaf first, then the intermediate. The root is not needed.</li>
+</ul>
+<p>A client-side workaround also worked: a bundle of root + intermediate passed to <code>curl --cacert</code>, <code>NODE_EXTRA_CA_CERTS</code> or Python's <code>cafile</code> gave 200. Fix the server instead; you cannot ship a bundle to every visitor.</p>
+
+<h2>6. Does Chrome fetch missing intermediates (AIA)?</h2>
+<p>Yes, we saw it happen. Our test leaf had an Authority Information Access <code>caIssuers</code> URL pointing at a logging server on port 8991. Chromium 153 requested <code>/int.der</code> once per page load, with its normal HeadlessChrome user agent. curl, Node fetch and Python never requested it.</p>
+<p>This is why a site with a broken chain can work in Chrome and still fail in curl, Node, Python, Java and many mobile apps. Do not rely on AIA fetching. Serve the full chain.</p>
+
+<h2>7. How to fix it</h2>
+<ul>
+<li><strong>Public site:</strong> use a certificate from a public CA (for example Let's Encrypt) and serve the full chain. Check with <code>openssl s_client</code> as in section 5.</li>
+<li><strong>Self-signed or private CA for development:</strong> pass the CA to the one client that needs it (<code>--cacert</code>, <code>NODE_EXTRA_CA_CERTS</code>, <code>cafile</code>). Do not turn verification off in code.</li>
+<li><strong>Corporate proxy or antivirus (not measured):</strong> these re-sign HTTPS traffic with their own root. If the error shows on every site, that is the likely cause.</li>
+<li><strong>Clock wrong on the device:</strong> fix the date, then look again. Expiry is a separate error once trust is fixed.</li>
+</ul>
+<p>To keep a valid certificate from quietly expiring, see <a href="/guides/check-ssl-certificate-expiry/">how to check SSL certificate expiry</a>. Once HTTPS loads, you can review <a href="/guides/strict-transport-security-header-nginx/">HSTS in nginx</a>, which, per the Chromium docs, removes the "proceed anyway" link from this error page.</p>
+<aside class="cta"><strong>Once the certificate loads, check the headers your HTTPS server sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Chrome say ERR_CERT_AUTHORITY_INVALID when my certificate is expired?</summary><p>Chrome reports the trust problem first. In our test an expired certificate from an untrusted CA showed ERR_CERT_AUTHORITY_INVALID in Chromium 153. Per the Chromium docs, ERR_CERT_DATE_INVALID appears when the issuer is trusted.</p></details>
+<details><summary>The site works in Chrome but curl says &#x27;unable to get local issuer certificate&#x27;. Why?</summary><p>Most likely the server does not send its intermediate certificate. Chromium fetched the missing intermediate from the certificate&#x27;s AIA URL in our test; curl, Node and Python did not. Serve the full chain.</p></details>
+<details><summary>How do I make Node.js trust my private CA?</summary><p>Start Node with NODE_EXTRA_CA_CERTS=/path/to/root.crt. In our Node 24 test that turned DEPTH_ZERO_SELF_SIGNED_CERT and UNABLE_TO_VERIFY_LEAF_SIGNATURE into a normal 200 without touching the system store.</p></details>
+<details><summary>What do DEPTH_ZERO_SELF_SIGNED_CERT and UNABLE_TO_VERIFY_LEAF_SIGNATURE mean?</summary><p>DEPTH_ZERO_SELF_SIGNED_CERT: the server sent one self-signed certificate. UNABLE_TO_VERIFY_LEAF_SIGNATURE: Node could not find the leaf&#x27;s issuer, either a private CA or a missing intermediate. Both appeared in our tests.</p></details>
+<details><summary>Is it safe to click &#x27;Proceed anyway&#x27;?</summary><p>Only on a machine or server you control and know uses a self-signed or private certificate. On a public site the error can also mean someone is intercepting the connection. Per the Chromium docs, if the site uses HSTS, Chrome does not offer the link at all.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright), curl 8.14.1 (OpenSSL 3.5.7), Node.js 24.21.0 fetch and Python 3.13.5 ssl/urllib. Certificates were made with OpenSSL 3.5.7 and served by a Node https server on localhost. Nothing was added to any system trust store. Behaviour with a trusted root in Chromium is from the Chromium docs, not measured. PlainHeaders is our extension; OpenSSL, curl, Python, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

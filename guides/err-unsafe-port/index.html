@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>net::ERR_UNSAFE_PORT: Why Chrome Blocks Ports and How to Fix It</title>
+<meta name="description" content="Chrome refuses ports like 6000, 6667 and 10080 with ERR_UNSAFE_PORT. We tested 20 ports in Chromium 153, Node fetch and curl, plus the flag that unblocks them.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-unsafe-port/">
+<meta property="og:title" content="net::ERR_UNSAFE_PORT: Why Chrome Blocks Ports and How to Fix It">
+<meta property="og:description" content="Chrome refuses ports like 6000, 6667 and 10080 with ERR_UNSAFE_PORT. We tested 20 ports in Chromium 153, Node fetch and curl, plus the flag that unblocks them.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-unsafe-port/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Chrome say ERR_UNSAFE_PORT when my server is running?", "acceptedAnswer": {"@type": "Answer", "text": "Chrome refused before connecting, so your server is never reached. The port is on the browser's bad-port list. In Chromium 153 we saw it on ports such as 6000, 6665-6669, 10080, 5060 and 22."}}, {"@type": "Question", "name": "Why does curl work but the browser does not?", "acceptedAnswer": {"@type": "Answer", "text": "curl has no port block list. In our test curl tried port 6000 and got a normal connection refused. Chromium and Node.js fetch refused the port without trying."}}, {"@type": "Question", "name": "How do I allow a blocked port in Chrome?", "acceptedAnswer": {"@type": "Answer", "text": "Start Chrome with --explicitly-allowed-ports=6000 (comma-separate several ports). In our test this changed port 6000 from ERR_UNSAFE_PORT to a normal connection attempt. It only affects that browser, so it is not a fix for users."}}, {"@type": "Question", "name": "Does Node.js fetch block unsafe ports?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Node.js 24 fetch threw TypeError: fetch failed with cause \"bad port\" for 6000, 10080 and others. The http module and http.get did not block, and got ECONNREFUSED."}}, {"@type": "Question", "name": "What does fetch() show for an unsafe port in the browser?", "acceptedAnswer": {"@type": "Answer", "text": "Only TypeError: Failed to fetch. The net::ERR_UNSAFE_PORT detail appears in the DevTools console and Network tab, not in the error object."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>net::ERR_UNSAFE_PORT (tested)</h1>
+<p class="lead"><code>net::ERR_UNSAFE_PORT</code> means the browser refused to connect because the port is on its blocked list. Nothing went over the network. Your server may be fine. We tested which ports Chromium 153 blocks, what <code>fetch()</code> reports, and that Node.js fetch blocks the same ports while curl does not.</p>
+<h2>1. What ERR_UNSAFE_PORT means</h2>
+<p>Browsers keep a list of "bad ports". These are ports used by other protocols, such as SSH (22), SMTP (25), IRC (6665-6669) and X11 (6000). A web page could otherwise trick the browser into sending HTTP-shaped data to those services. So the browser refuses before it opens a socket.</p>
+<p>The key clue: with nothing listening on the port, a normal port gives <code>ERR_CONNECTION_REFUSED</code>. A blocked port gives <code>ERR_UNSAFE_PORT</code>. The browser never even tried.</p>
+
+<h2>2. Our test setup</h2>
+<p>We pointed headless Chromium 153 at <code>http://127.0.0.1:&lt;port&gt;/</code> for each port, with no server on any of them. For each port we did one navigation (<code>page.goto</code>) and one <code>fetch()</code> from a page. Then we did the same from Node.js 24, curl and Python.</p>
+
+<h2>3. Results: which ports Chromium 153 blocks</h2>
+<table>
+<tr><th>Port</th><th>Usual use</th><th>Chromium navigation</th></tr>
+<tr><td>1</td><td>tcpmux</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>21</td><td>FTP</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>22</td><td>SSH</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>25</td><td>SMTP</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>110</td><td>POP3</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>143</td><td>IMAP</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>2049</td><td>NFS</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>3659</td><td>Apple SASL</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>4045</td><td>NFS lockd</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>5060</td><td>SIP</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>6000</td><td>X11</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>6566</td><td>SANE scanner</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>6665, 6666, 6667, 6668, 6669</td><td>IRC</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>6697</td><td>IRC over TLS</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>10080</td><td>Amanda backup</td><td>net::ERR_UNSAFE_PORT</td></tr>
+<tr><td>4000, 5000, 5173, 8080</td><td>common dev ports</td><td>net::ERR_CONNECTION_REFUSED (allowed)</td></tr>
+</table>
+<p>The same block applied to <code>https://127.0.0.1:6000/</code> (<code>net::ERR_UNSAFE_PORT</code>) and to a WebSocket on <code>ws://127.0.0.1:6000/</code>. The WebSocket closed with code 1006 and the console said:</p>
+<pre><code>WebSocket connection to 'ws://127.0.0.1:6000/' failed: Error in connection establishment: net::ERR_UNSAFE_PORT</code></pre>
+
+<h2>4. What fetch() throws</h2>
+<p>In the page, <code>fetch()</code> to a blocked port threw only <code>TypeError: Failed to fetch</code>. That is the exact same error as a refused port or a CORS failure. It failed in about 3 ms. The real reason only appears in the DevTools console:</p>
+<pre><code>Failed to load resource: net::ERR_UNSAFE_PORT</code></pre>
+<p>So if your JavaScript only logs the error, you will see "Failed to fetch" and nothing more. Open the console or the Network tab. See <a href="/guides/typeerror-failed-to-fetch/">TypeError: Failed to fetch</a> for the other causes of that message.</p>
+
+<h2>5. Node.js fetch blocks too, curl does not</h2>
+<table>
+<tr><th>Client</th><th>Port 6000 (nothing listening)</th><th>Port 8080 (nothing listening)</th></tr>
+<tr><td>Chromium 153 navigation</td><td>net::ERR_UNSAFE_PORT</td><td>net::ERR_CONNECTION_REFUSED</td></tr>
+<tr><td>Chromium 153 fetch()</td><td>TypeError: Failed to fetch</td><td>TypeError: Failed to fetch</td></tr>
+<tr><td>Node.js 24 fetch()</td><td>TypeError: fetch failed, <code>cause</code>: Error "bad port"</td><td>TypeError: fetch failed, <code>cause</code>: ECONNREFUSED</td></tr>
+<tr><td>Node.js 24 http.get</td><td>ECONNREFUSED (not blocked)</td><td>ECONNREFUSED</td></tr>
+<tr><td>curl 8.14.1</td><td>exit 7, "Failed to connect to 127.0.0.1 port 6000 after 0 ms: Could not connect to server" (not blocked)</td><td>exit 7, same</td></tr>
+<tr><td>Python urllib</td><td>ConnectionRefusedError(111) (not blocked)</td><td>ConnectionRefusedError(111)</td></tr>
+</table>
+<p>Node.js <code>fetch()</code> follows the same Fetch standard bad-port list as browsers. It rejected ports 1, 2049, 5060, 6000, 6665 and 10080 with <code>cause.message</code> = <code>bad port</code> and no error code. The older <code>http</code> module has no such list. Always print <code>err.cause</code> in Node:</p>
+<pre><code>try {
+  await fetch('http://127.0.0.1:6000/');
+} catch (err) {
+  console.log(err.message, '|', err.cause?.message);
+  // fetch failed | bad port
+}</code></pre>
+<p>This explains a common confusion: "curl works but the browser and fetch fail". curl does not check ports at all.</p>
+
+<h2>6. The Chromium flag that unblocks a port</h2>
+<p>Chromium accepts <code>--explicitly-allowed-ports</code>. We launched it with <code>--explicitly-allowed-ports=6000,10080</code>. Navigation to 6000 and 10080 changed from <code>ERR_UNSAFE_PORT</code> to <code>ERR_CONNECTION_REFUSED</code>, so the block was lifted. Port 6665, not in the flag, was still blocked.</p>
+<pre><code># Chrome / Chromium
+google-chrome --explicitly-allowed-ports=6000,10080
+
+# Playwright
+chromium.launch({ args: ['--explicitly-allowed-ports=6000'] });</code></pre>
+<p>This only fixes your own browser. Your users will still be blocked. Use it for local testing, not as a fix.</p>
+<p>Firefox has a similar setting, <code>network.security.ports.banned.override</code>, in <code>about:config</code>. It takes a comma-separated list of ports. That is per the Firefox docs, not measured here. Firefox shows its own error page ("This address is restricted") rather than the Chromium code.</p>
+
+<h2>7. The real fix: pick a different port</h2>
+<ul>
+<li>Move your dev server to a port that is not on the list, such as 4000, 5000, 5173 or 8080. All of the ones we tested gave <code>ERR_CONNECTION_REFUSED</code>, not <code>ERR_UNSAFE_PORT</code>, so the browser was willing to connect.</li>
+<li>For a public site, serve on 80 and 443 and put the app behind a reverse proxy. Then the backend port does not matter to browsers.</li>
+<li>Watch for "random" ports. 6000 to 6697 and 10080 are easy to land on by accident with <code>PORT=6000</code> or an IRC bridge.</li>
+<li>If the error turns into <code>ERR_CONNECTION_REFUSED</code> after the move, the block is gone and nothing is listening. See <a href="/guides/err-connection-refused-econnrefused/">ERR_CONNECTION_REFUSED / ECONNREFUSED</a>.</li>
+</ul>
+<aside class="cta"><strong>Once your server is on a safe port, check the headers it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Chrome say ERR_UNSAFE_PORT when my server is running?</summary><p>Chrome refused before connecting, so your server is never reached. The port is on the browser&#x27;s bad-port list. In Chromium 153 we saw it on ports such as 6000, 6665-6669, 10080, 5060 and 22.</p></details>
+<details><summary>Why does curl work but the browser does not?</summary><p>curl has no port block list. In our test curl tried port 6000 and got a normal connection refused. Chromium and Node.js fetch refused the port without trying.</p></details>
+<details><summary>How do I allow a blocked port in Chrome?</summary><p>Start Chrome with --explicitly-allowed-ports=6000 (comma-separate several ports). In our test this changed port 6000 from ERR_UNSAFE_PORT to a normal connection attempt. It only affects that browser, so it is not a fix for users.</p></details>
+<details><summary>Does Node.js fetch block unsafe ports?</summary><p>Yes. Node.js 24 fetch threw TypeError: fetch failed with cause &quot;bad port&quot; for 6000, 10080 and others. The http module and http.get did not block, and got ECONNREFUSED.</p></details>
+<details><summary>What does fetch() show for an unsafe port in the browser?</summary><p>Only TypeError: Failed to fetch. The net::ERR_UNSAFE_PORT detail appears in the DevTools console and Network tab, not in the error object.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright), Node.js 24.21.0 fetch and http.get, curl 8.14.1 and Python 3 urllib, against 127.0.0.1 with nothing listening on the tested ports. The Firefox parts are from the Firefox docs, not measured. PlainHeaders is our extension; Chromium, Node.js, curl and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

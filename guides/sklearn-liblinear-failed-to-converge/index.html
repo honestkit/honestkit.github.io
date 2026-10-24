@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Liblinear Failed to Converge, Increase Iterations (Tested Fix)</title>
+<meta name="description" content="sklearn ConvergenceWarning: Liblinear failed to converge. Tested: max_iter=100000 still warned; LinearSVC(dual=False) converged in 27 iterations.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sklearn-liblinear-failed-to-converge/">
+<meta property="og:title" content="Liblinear Failed to Converge, Increase Iterations (Tested Fix)">
+<meta property="og:description" content="sklearn ConvergenceWarning: Liblinear failed to converge. Tested: max_iter=100000 still warned; LinearSVC(dual=False) converged in 27 iterations.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sklearn-liblinear-failed-to-converge/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I fix 'Liblinear failed to converge'?", "acceptedAnswer": {"@type": "Answer", "text": "If n_samples > n_features, use LinearSVC(dual=False) (or the default dual='auto'). Otherwise scale features with StandardScaler and raise max_iter."}}, {"@type": "Question", "name": "Does increasing max_iter fix the liblinear warning?", "acceptedAnswer": {"@type": "Answer", "text": "Not always. In our test the dual solver still hit the limit at max_iter=100000, while dual=False converged in 27 iterations."}}, {"@type": "Question", "name": "How do I suppress the liblinear ConvergenceWarning?", "acceptedAnswer": {"@type": "Answer", "text": "from sklearn.exceptions import ConvergenceWarning, then warnings.simplefilter('ignore', category=ConvergenceWarning) inside warnings.catch_warnings()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Liblinear failed to converge, increase the number of iterations (tested)</h1>
+<p class="lead"><code>ConvergenceWarning: Liblinear failed to converge, increase the number of iterations.</code> comes from <code>LinearSVC</code> or <code>LogisticRegression(solver='liblinear')</code>. In our test, raising <code>max_iter</code> to 100000 did not help; switching to <code>dual=False</code> converged in 27 iterations. Tested on scikit-learn 1.9.1.</p>
+<h2 id="test">1. The warning</h2>
+<pre><code>import warnings
+warnings.simplefilter(&quot;always&quot;)
+from sklearn.datasets import load_breast_cancer
+from sklearn.svm import LinearSVC
+
+X, y = load_breast_cancer(return_X_y=True)
+clf = LinearSVC(dual=True).fit(X, y)
+print(&quot;n_iter_:&quot;, clf.n_iter_, &quot;max_iter:&quot;, clf.max_iter)</code></pre>
+<p>Output:</p>
+<pre><code>/usr/local/lib/python3.15/site-packages/sklearn/svm/_base.py:1295: ConvergenceWarning: Liblinear failed to converge, increase the number of iterations.
+  warnings.warn(
+n_iter_: 1000 max_iter: 1000</code></pre>
+<p><code>LinearSVC</code> (and <code>LogisticRegression(solver="liblinear")</code>) use the liblinear library. With <code>dual=True</code> on this data (569 samples, 30 unscaled features) it hits <code>max_iter=1000</code> without converging: <code>n_iter_</code> equals <code>max_iter</code> and scikit-learn emits <code>ConvergenceWarning: Liblinear failed to converge, increase the number of iterations.</code></p>
+<h2 id="maxiter">2. Raising max_iter or scaling did not fix it here</h2>
+<pre><code>import warnings
+warnings.simplefilter(&quot;always&quot;)
+from sklearn.datasets import load_breast_cancer
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVC
+
+X, y = load_breast_cancer(return_X_y=True)
+clf = make_pipeline(StandardScaler(), LinearSVC(dual=True)).fit(X, y)
+print(&quot;scaled n_iter_:&quot;, clf[-1].n_iter_, &quot;accuracy:&quot;, round(clf.score(X, y), 3))
+
+for n in (10_000, 100_000):
+    raw = LinearSVC(dual=True, max_iter=n).fit(X, y)
+    print(f&quot;unscaled max_iter={n}: n_iter_ =&quot;, raw.n_iter_)</code></pre>
+<p>Output:</p>
+<pre><code>/usr/local/lib/python3.15/site-packages/sklearn/svm/_base.py:1295: ConvergenceWarning: Liblinear failed to converge, increase the number of iterations.
+  warnings.warn(
+/usr/local/lib/python3.15/site-packages/sklearn/svm/_base.py:1295: ConvergenceWarning: Liblinear failed to converge, increase the number of iterations.
+  warnings.warn(
+/usr/local/lib/python3.15/site-packages/sklearn/svm/_base.py:1295: ConvergenceWarning: Liblinear failed to converge, increase the number of iterations.
+  warnings.warn(
+scaled n_iter_: 1000 accuracy: 0.988
+unscaled max_iter=10000: n_iter_ = 10000
+unscaled max_iter=100000: n_iter_ = 100000</code></pre>
+<p>The warning text says to increase iterations, but here the dual solver used every iteration even at <code>max_iter=100000</code>, and scaling with <code>StandardScaler</code> did not make it converge within 1000 either (accuracy was still 0.988, so the model is usable, just not at the optimum).</p>
+<h2 id="fix">3. Fix: solve the primal problem (dual=False)</h2>
+<pre><code>from sklearn.datasets import load_breast_cancer
+from sklearn.svm import LinearSVC
+
+X, y = load_breast_cancer(return_X_y=True)
+print(X.shape)  # (n_samples, n_features)
+clf = LinearSVC(dual=False).fit(X, y)
+print(&quot;dual=False n_iter_:&quot;, clf.n_iter_)</code></pre>
+<p>Output:</p>
+<pre><code>(569, 30)
+dual=False n_iter_: 27</code></pre>
+<p>When you have more samples than features, use <code>dual=False</code>: it converged in 27 iterations, no warning. In current scikit-learn the default is <code>dual="auto"</code>, which picks the primal problem in this case, so the warning usually comes from code that sets <code>dual=True</code> explicitly (or from older scikit-learn versions where <code>True</code> was the default). If you have more features than samples, keep <code>dual=True</code> and scale the features.</p>
+<h2 id="suppress">4. Suppress it (when you accept the result)</h2>
+<pre><code>import warnings
+from sklearn.datasets import load_breast_cancer
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.svm import LinearSVC
+
+X, y = load_breast_cancer(return_X_y=True)
+with warnings.catch_warnings():
+    warnings.simplefilter(&quot;ignore&quot;, category=ConvergenceWarning)
+    clf = LinearSVC(dual=True).fit(X, y)
+print(&quot;no warning printed; n_iter_ is still&quot;, clf.n_iter_)</code></pre>
+<p>Output:</p>
+<pre><code>no warning printed; n_iter_ is still 1000</code></pre>
+<p>Ignore only <code>ConvergenceWarning</code> inside <code>warnings.catch_warnings()</code> so other warnings stay visible. Silencing does not change the fit: <code>n_iter_</code> is still 1000.</p>
+<p>Related: <a href="/guides/sklearn-convergencewarning-lbfgs-failed-to-converge/">lbfgs failed to converge</a> · <a href="/guides/sklearn-suppress-warnings/">suppress scikit-learn warnings</a>.</p>
+
+<aside class="cta"><strong>Building a dataset from web tables? Copy them as CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I fix &#x27;Liblinear failed to converge&#x27;?</summary><p>If n_samples &gt; n_features, use LinearSVC(dual=False) (or the default dual=&#x27;auto&#x27;). Otherwise scale features with StandardScaler and raise max_iter.</p></details>
+<details><summary>Does increasing max_iter fix the liblinear warning?</summary><p>Not always. In our test the dual solver still hit the limit at max_iter=100000, while dual=False converged in 27 iterations.</p></details>
+<details><summary>How do I suppress the liblinear ConvergenceWarning?</summary><p>from sklearn.exceptions import ConvergenceWarning, then warnings.simplefilter(&#x27;ignore&#x27;, category=ConvergenceWarning) inside warnings.catch_warnings().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 in Docker: python:3-slim (Python 3.15.1) with scikit-learn 1.9.1. Each block was run verbatim and the output pasted unedited. PlainTables is our extension; Python and scikit-learn are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

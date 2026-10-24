@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JSON to CSV in Python Without pandas (Nested Keys Flattened)</title>
+<meta name="description" content="A standard-library Python script that turns a JSON array (or an API response) into CSV, flattens nested objects into address.city-style columns, and handles missing keys, with real output and its limits.">
+<link rel="canonical" href="https://honestkit.github.io/guides/json-to-csv-python/">
+<meta property="og:title" content="JSON to CSV in Python Without pandas (Nested Keys Flattened)">
+<meta property="og:description" content="A standard-library Python script that turns a JSON array (or an API response) into CSV, flattens nested objects into address.city-style columns, and handles missing keys, with real output and its limits.">
+<meta property="og:url" content="https://honestkit.github.io/guides/json-to-csv-python/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can I do this without pandas?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. The script above uses only json and csv from the standard library. With pandas, pd.json_normalize(data).to_csv('out.csv', index=False) does a similar flattening."}}, {"@type": "Question", "name": "Why do I get 'dict contains fields not in fieldnames'?", "acceptedAnswer": {"@type": "Answer", "text": "Your records do not all have the same keys, and fieldnames was built from the first record only. Build it from the union of all keys, as the script does."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to convert JSON to CSV in Python</h1>
+<p class="lead">csv.DictWriter does the writing; the work is flattening nested objects and collecting every key, because API records rarely all have the same fields. This script does both with no dependencies.</p>
+<h2>1. The script</h2>
+<p>Save as <code>json2csv.py</code>:</p>
+<pre><code>import csv, json, sys
+
+def flatten(obj, prefix=''):
+    # {"a": {"b": 1}, "tags": ["x", "y"]} -&gt; {"a.b": 1, "tags.0": "x", "tags.1": "y"}
+    out = {}
+    items = obj.items() if isinstance(obj, dict) else enumerate(obj)
+    for key, value in items:
+        name = f'{prefix}{key}'
+        if isinstance(value, (dict, list)) and value:
+            out.update(flatten(value, name + '.'))
+        else:
+            out[name] = '' if value is None or value in ({}, []) else value
+    return out
+
+data = json.load(open(sys.argv[1], encoding='utf-8'))
+if isinstance(data, dict):  # a single object, or {"results": [...]}
+    lists = [v for v in data.values() if isinstance(v, list)]
+    data = lists[0] if len(lists) == 1 else [data]
+rows = [flatten(r) if isinstance(r, (dict, list)) else {'value': r} for r in data]
+columns = list(dict.fromkeys(k for r in rows for k in r))  # union of keys, first-seen order
+with open(sys.argv[2], 'w', newline='', encoding='utf-8-sig') as f:
+    w = csv.DictWriter(f, fieldnames=columns)
+    w.writeheader()
+    w.writerows(rows)
+print(f'{len(rows)} rows, {len(columns)} columns -&gt; {sys.argv[2]}')
+</code></pre>
+<h2>2. Run it</h2>
+<pre><code>curl -s https://jsonplaceholder.typicode.com/users -o users.json
+python3 json2csv.py users.json users.csv</code></pre>
+<p>Our run printed <code>10 rows, 15 columns -&gt; users.csv</code>. The nested <code>address</code> and <code>company</code> objects become their own columns:</p>
+<pre><code>id,name,username,email,address.street,address.suite,address.city,address.zipcode,address.geo.lat,address.geo.lng,phone,website,company.name,company.catchPhrase,company.bs
+1,Leanne Graham,Bret,Sincere@april.biz,Kulas Light,Apt. 556,Gwenborough,92998-3874,-37.3159,81.1496,1-770-736-8031 x56442,hildegard.org,Romaguera-Crona,Multi-layered client-server neural-net,harness real-time e-markets</code></pre>
+<h2>3. What it handles</h2>
+<ul><li><strong>Missing keys</strong>: the header is the union of every record's keys, so a field that only some records have gets its own column and is left empty elsewhere. (Plain <code>DictWriter(fieldnames=rows[0].keys())</code> raises <code>ValueError: dict contains fields not in fieldnames</code> on such data.)</li>
+<li><strong>Wrapped responses</strong>: a top-level object holding exactly one list, like <code>{"results": [...]}</code>, is unwrapped. Any other object becomes one row.</li>
+<li><strong>Commas, quotes and newlines</strong> inside values are quoted by the <code>csv</code> module: <code>he said "hi", ok</code> is written as <code>"he said ""hi"", ok"</code>.</li>
+<li><strong>Excel</strong>: the file is written as UTF-8 with a BOM (<code>utf-8-sig</code>), so accented and non-Latin text opens correctly in Excel. Use <code>encoding='utf-8'</code> if another program chokes on the BOM.</li></ul>
+<h2>4. Limits</h2>
+<ul><li>Lists become numbered columns (<code>tags.0</code>, <code>tags.1</code>). A record with long lists can add many columns; the GitHub issues API gave 90. To keep a list in one cell instead, replace the list branch with <code>out[name] = json.dumps(value)</code>.</li>
+<li><code>true</code>/<code>false</code> are written as <code>True</code>/<code>False</code>, and <code>null</code> as an empty cell.</li>
+<li>The whole file is loaded into memory. For multi-gigabyte files or JSON Lines (one object per line), read line by line with <code>json.loads</code> instead.</li></ul>
+<h2>5. No code</h2>
+<p>To convert a pasted JSON array without Python, use the free <a href="/tools/json-to-csv/">JSON to CSV tool</a>; it runs in your browser and the data is not uploaded. For tables on web pages, <a href="/plaintables/">PlainTables</a> exports them to CSV or Excel in one click.</p>
+<aside class="cta"><strong>Skip the steps:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can I do this without pandas?</summary><p>Yes. The script above uses only json and csv from the standard library. With pandas, pd.json_normalize(data).to_csv(&#x27;out.csv&#x27;, index=False) does a similar flattening.</p></details>
+<details><summary>Why do I get &#x27;dict contains fields not in fieldnames&#x27;?</summary><p>Your records do not all have the same keys, and fieldnames was built from the first record only. Build it from the union of all keys, as the script does.</p></details>
+</section>
+<p class="note">Written with AI assistance. The script was run on 2026-10-01 with Python 3 standard library only, on the JSONPlaceholder /users API (10 rows, nested address and company objects → 15 columns), the GitHub issues API for python/cpython (5 issues → 90 columns, every row the same width) and a hand-made file with a &#x27;results&#x27; wrapper object, nulls, lists and quotes. PlainTables is our extension; the other methods are free and built into Excel, Google Sheets and pandas.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pydantic: Extra inputs are not permitted (extra_forbidden)</title>
+<meta name="description" content="Pydantic Extra inputs are not permitted tested on 2.14: extra=&#x27;forbid&#x27; vs ignore vs allow, model_extra, and aliases that turn field names into extras.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pydantic-extra-inputs-are-not-permitted/">
+<meta property="og:title" content="Pydantic: Extra inputs are not permitted (extra_forbidden)">
+<meta property="og:description" content="Pydantic Extra inputs are not permitted tested on 2.14: extra=&#x27;forbid&#x27; vs ignore vs allow, model_extra, and aliases that turn field names into extras.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pydantic-extra-inputs-are-not-permitted/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Pydantic say Extra inputs are not permitted?", "acceptedAnswer": {"@type": "Answer", "text": "The model sets extra='forbid' and the input has a key that is not a field. The key is printed on the line above the message."}}, {"@type": "Question", "name": "Does Pydantic 2 forbid extra fields by default?", "acceptedAnswer": {"@type": "Answer", "text": "No. The default, extra='ignore', silently drops them. Only extra='forbid' raises."}}, {"@type": "Question", "name": "Why do I get extra_forbidden for a field that exists?", "acceptedAnswer": {"@type": "Answer", "text": "It has an alias: input must use the alias. Passing the field name gives missing + extra_forbidden unless populate_by_name=True."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pydantic: Extra inputs are not permitted (tested)</h1>
+<p class="lead"><code>Extra inputs are not permitted [type=extra_forbidden]</code> means the model has <code>extra="forbid"</code> and the input contains a key that is not a field. With aliases, passing the Python field name instead of the alias also triggers it.</p>
+<h2 id="modes">1. extra="ignore", "forbid", "allow"</h2>
+<pre><code>from pydantic import BaseModel, ConfigDict, ValidationError
+class Default(BaseModel):
+    name: str
+class Strict(BaseModel):
+    model_config = ConfigDict(extra=&quot;forbid&quot;)
+    name: str
+class Keep(BaseModel):
+    model_config = ConfigDict(extra=&quot;allow&quot;)
+    name: str
+data = {&quot;name&quot;: &quot;pen&quot;, &quot;colour&quot;: &quot;red&quot;}
+print(&quot;default:&quot;, repr(Default(**data)), &quot;-&gt; extra silently ignored&quot;)
+try:
+    Strict(**data)
+except ValidationError as e:
+    print(e)
+k = Keep(**data)
+print(&quot;allow:&quot;, repr(k), &quot;| model_extra:&quot;, k.model_extra)</code></pre>
+<p>Output:</p>
+<pre><code>default: Default(name=&#x27;pen&#x27;) -&gt; extra silently ignored
+1 validation error for Strict
+colour
+  Extra inputs are not permitted [type=extra_forbidden, input_value=&#x27;red&#x27;, input_type=str]
+    For further information visit https://errors.pydantic.dev/2.14/v/extra_forbidden
+allow: Keep(name=&#x27;pen&#x27;, colour=&#x27;red&#x27;) | model_extra: {&#x27;colour&#x27;: &#x27;red&#x27;}</code></pre>
+<p>By default Pydantic 2 ignores unknown keys. The error only appears when the model (or a parent class, or a shared base model) sets <code>extra="forbid"</code>; the line above the message is the unexpected key. Either remove that key from the input, add it as a field, or switch the model to <code>"ignore"</code> (drop it) or <code>"allow"</code> (keep it in <code>model_extra</code>).</p>
+<h2 id="alias">2. The hidden cause: aliases</h2>
+<pre><code>from pydantic import BaseModel, ConfigDict, Field, ValidationError
+class User(BaseModel):
+    model_config = ConfigDict(extra=&quot;forbid&quot;)
+    user_name: str = Field(alias=&quot;userName&quot;)
+for data in [{&quot;userName&quot;: &quot;ada&quot;}, {&quot;user_name&quot;: &quot;ada&quot;}]:
+    try:
+        print(data, &quot;-&gt;&quot;, repr(User(**data)))
+    except ValidationError as e:
+        print(data, &quot;-&gt;&quot;, [(x[&quot;type&quot;], x[&quot;loc&quot;]) for x in e.errors()])
+class User2(BaseModel):
+    model_config = ConfigDict(extra=&quot;forbid&quot;, populate_by_name=True)
+    user_name: str = Field(alias=&quot;userName&quot;)
+print(&quot;populate_by_name:&quot;, repr(User2(user_name=&quot;ada&quot;)))</code></pre>
+<p>Output:</p>
+<pre><code>{&#x27;userName&#x27;: &#x27;ada&#x27;} -&gt; User(user_name=&#x27;ada&#x27;)
+{&#x27;user_name&#x27;: &#x27;ada&#x27;} -&gt; [(&#x27;missing&#x27;, (&#x27;userName&#x27;,)), (&#x27;extra_forbidden&#x27;, (&#x27;user_name&#x27;,))]
+populate_by_name: User2(user_name=&#x27;ada&#x27;)</code></pre>
+<p>With an alias, the input must use the alias (<code>userName</code>). Passing the Python field name (<code>user_name</code>) gives two errors at once: the alias is <code>missing</code> and the field name is an extra input. Send the alias, or set <code>populate_by_name=True</code> so both work.</p>
+<h2 id="checklist">Checklist</h2>
+<ul><li>Read the field name printed above "Extra inputs are not permitted": it is the key Pydantic did not expect.</li><li>Look for <code>extra="forbid"</code> on the model and on every base class.</li><li>Check aliases and camelCase/snake_case mismatches between the client and the model.</li><li>In FastAPI the same error shows up as a 422 with <code>type: extra_forbidden</code>.</li></ul>
+<p>Related: <a href="/guides/fastapi-422-unprocessable-entity/">FastAPI 422 Unprocessable Entity</a> · <a href="/guides/pydantic-basesettings-has-been-moved-to-pydantic-settings/">BaseSettings moved to pydantic-settings</a>.</p>
+
+<aside class="cta"><strong>Debugging what an API client sends? Check request and response headers:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Pydantic say Extra inputs are not permitted?</summary><p>The model sets extra=&#x27;forbid&#x27; and the input has a key that is not a field. The key is printed on the line above the message.</p></details>
+<details><summary>Does Pydantic 2 forbid extra fields by default?</summary><p>No. The default, extra=&#x27;ignore&#x27;, silently drops them. Only extra=&#x27;forbid&#x27; raises.</p></details>
+<details><summary>Why do I get extra_forbidden for a field that exists?</summary><p>It has an alias: input must use the alias. Passing the field name gives missing + extra_forbidden unless populate_by_name=True.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Pydantic 2.14.1 and Python 3.14.7 (python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Pydantic are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

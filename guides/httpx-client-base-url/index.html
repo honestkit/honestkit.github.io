@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx base_url: how Client joins paths (and vs urljoin)</title>
+<meta name="description" content="httpx Client base_url tested: &#x27;/users&#x27; and &#x27;users&#x27; both keep the base path, absolute URLs bypass it, UnsupportedProtocol without it, AsyncClient + params.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-client-base-url/">
+<meta property="og:title" content="httpx base_url: how Client joins paths (and vs urljoin)">
+<meta property="og:description" content="httpx Client base_url tested: &#x27;/users&#x27; and &#x27;users&#x27; both keep the base path, absolute URLs bypass it, UnsupportedProtocol without it, AsyncClient + params.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-client-base-url/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does a leading slash drop the httpx base_url path?", "acceptedAnswer": {"@type": "Answer", "text": "No. With base_url \".../api/v1\", both \"/users\" and \"users\" request /api/v1/users. urljoin would give /users and /api/users."}}, {"@type": "Question", "name": "Why do I get UnsupportedProtocol: Request URL is missing an 'http://' or 'https://' protocol?", "acceptedAnswer": {"@type": "Answer", "text": "You passed a relative path without a base_url. Use httpx.Client(base_url=...) or a full URL."}}, {"@type": "Question", "name": "Does requests.Session support base_url?", "acceptedAnswer": {"@type": "Answer", "text": "No. requests 2.32.3 raises MissingSchema for a relative URL; pass full URLs or subclass Session."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx base_url: how Client joins paths (tested)</h1>
+<p class="lead"><code>httpx.Client(base_url="https://host/api/v1")</code> then <code>c.get("users")</code> or <code>c.get("/users")</code>: both request <code>/api/v1/users</code>. Unlike <code>urljoin</code>, a leading slash does not drop the base path.</p>
+<p><code>httpx.Client(base_url=...)</code> prefixes every relative request URL. Its joining rules are not the same as <code>urllib.parse.urljoin</code>, which is where most surprises come from. Measured with httpx 0.28.1 on Python 3.13.5; <code>srv</code> is a local http.server that echoes the path it received.</p>
+<h2 id="join">1. How httpx joins base_url and the path</h2>
+<pre><code>import httpx, srv
+url = srv.start()
+with httpx.Client(base_url=url + &quot;/api/v1&quot;) as c:
+    for path in [&quot;users&quot;, &quot;/users&quot;, &quot;users/42?x=1&quot;, &quot;../health&quot;]:
+        r = c.get(path)
+        print(f&quot;{path!r:16} -&gt; server got {r.text}&quot;)
+    print(&quot;c.base_url =&quot;, c.base_url)</code></pre>
+<p>Output:</p>
+<pre><code>&#x27;users&#x27;          -&gt; server got /api/v1/users
+&#x27;/users&#x27;         -&gt; server got /api/v1/users
+&#x27;users/42?x=1&#x27;   -&gt; server got /api/v1/users/42?x=1
+&#x27;../health&#x27;      -&gt; server got /api/health
+c.base_url = http://127.0.0.1:8964/api/v1/</code></pre>
+<p>httpx adds a trailing slash to the base URL (<code>c.base_url</code> ends in <code>/v1/</code>), then appends the path. A leading slash on the path does <em>not</em> reset to the host root: <code>"/users"</code> and <code>"users"</code> both go to <code>/api/v1/users</code>. Query strings in the path are kept, and <code>..</code> segments are resolved.</p>
+<h2 id="urljoin">2. httpx base_url vs urljoin</h2>
+<pre><code>from urllib.parse import urljoin
+import httpx
+base = &quot;http://127.0.0.1:8964/api/v1&quot;
+for path in [&quot;users&quot;, &quot;/users&quot;]:
+    print(f&quot;{path!r:9} urljoin: {urljoin(base, path):38} httpx: {httpx.Client(base_url=base).build_request(&#x27;GET&#x27;, path).url}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>&#x27;users&#x27;   urljoin: http://127.0.0.1:8964/api/users        httpx: http://127.0.0.1:8964/api/v1/users
+&#x27;/users&#x27;  urljoin: http://127.0.0.1:8964/users            httpx: http://127.0.0.1:8964/api/v1/users</code></pre>
+<p><code>urljoin</code> drops the last path segment of a base without a trailing slash, and treats <code>"/users"</code> as host-absolute. If you are porting code that built URLs with <code>urljoin</code>, the resulting URLs can change.</p>
+<h2 id="absolute">3. Absolute URLs bypass base_url</h2>
+<pre><code>import httpx, srv
+url = srv.start()
+with httpx.Client(base_url=url + &quot;/api/v1&quot;) as c:
+    r = c.get(&quot;http://127.0.0.1:8964/other&quot;)
+    print(&quot;absolute URL -&gt;&quot;, r.url)
+    r = c.get(&quot;&quot;)
+    print(&quot;empty path -&gt;&quot;, r.url)</code></pre>
+<p>Output:</p>
+<pre><code>absolute URL -&gt; http://127.0.0.1:8964/other
+empty path -&gt; http://127.0.0.1:8964/api/v1/</code></pre>
+<p>A full URL with a scheme ignores the base entirely; an empty path requests the base itself.</p>
+<h2 id="missing">4. UnsupportedProtocol: Request URL is missing an 'http://' or 'https://' protocol</h2>
+<pre><code>import httpx
+try:
+    httpx.get(&quot;/users&quot;)
+except Exception as e:
+    print(type(e).__name__ + &quot;:&quot;, e)
+c = httpx.Client()
+try:
+    c.get(&quot;/users&quot;)
+except Exception as e:
+    print(type(e).__name__ + &quot;:&quot;, e)
+c.base_url = &quot;http://127.0.0.1:8964/api/&quot;
+print(&quot;set later:&quot;, c.build_request(&quot;GET&quot;, &quot;users&quot;).url)</code></pre>
+<p>Output:</p>
+<pre><code>UnsupportedProtocol: Request URL is missing an &#x27;http://&#x27; or &#x27;https://&#x27; protocol.
+UnsupportedProtocol: Request URL is missing an &#x27;http://&#x27; or &#x27;https://&#x27; protocol.
+set later: http://127.0.0.1:8964/api/users</code></pre>
+<p>This is the error for a relative path with no <code>base_url</code>, including the module-level <code>httpx.get()</code> which has no base_url option. You can set <code>client.base_url</code> after creating the client; the same join rule applies.</p>
+<h2 id="async">5. AsyncClient base_url with client and request params</h2>
+<pre><code>import asyncio, httpx, srv
+url = srv.start()
+async def main():
+    async with httpx.AsyncClient(base_url=url + &quot;/api/v1/&quot;, params={&quot;key&quot;: &quot;k&quot;}) as c:
+        r = await c.get(&quot;users&quot;, params={&quot;page&quot;: 2})
+        print(r.text)
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>/api/v1/users?key=k&amp;page=2</code></pre>
+<p><code>AsyncClient</code> takes the same <code>base_url</code>. Client-level <code>params</code> are merged with per-request <code>params</code> (a <code>?query</code> written into the path string behaves differently, see <a href="/guides/httpx-params-query-parameters/">httpx params</a>).</p>
+<h2 id="requests">6. requests has no base_url</h2>
+<pre><code>import requests
+try:
+    requests.Session().get(&quot;/users&quot;)
+except Exception as e:
+    print(type(e).__name__ + &quot;:&quot;, e)
+print(&quot;requests.Session has base_url:&quot;, hasattr(requests.Session(), &quot;base_url&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>MissingSchema: Invalid URL &#x27;/users&#x27;: No scheme supplied. Perhaps you meant https:///users?
+requests.Session has base_url: False</code></pre>
+<p>Measured with requests 2.32.3. A <code>requests.Session</code> needs the full URL on every call (or a small subclass overriding <code>request()</code>); <code>base_url</code> is one of the reasons people switch to httpx.</p>
+<p>Related: <a href="/guides/httpx-params-query-parameters/">httpx params and query strings</a>, <a href="/guides/httpx-headers-client-default-response/">httpx client headers</a>, <a href="/guides/httpx-mock-transport-pytest/">httpx MockTransport for tests</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests differences</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does a leading slash drop the httpx base_url path?</summary><p>No. With base_url &quot;.../api/v1&quot;, both &quot;/users&quot; and &quot;users&quot; request /api/v1/users. urljoin would give /users and /api/users.</p></details>
+<details><summary>Why do I get UnsupportedProtocol: Request URL is missing an &#x27;http://&#x27; or &#x27;https://&#x27; protocol?</summary><p>You passed a relative path without a base_url. Use httpx.Client(base_url=...) or a full URL.</p></details>
+<details><summary>Does requests.Session support base_url?</summary><p>No. requests 2.32.3 raises MissingSchema for a relative URL; pass full URLs or subclass Session.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 and requests 2.32.3 on Python 3.13.5 against a local http.server. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

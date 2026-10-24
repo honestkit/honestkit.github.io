@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Selenium StaleElementReferenceException: Fixes (Tested)</title>
+<meta name="description" content="Selenium stale element reference tested in Chrome 156: why re-rendered nodes go stale, clicking through a list, staleness_of, and ignored_exceptions.">
+<link rel="canonical" href="https://honestkit.github.io/guides/selenium-stale-element-reference-exception/">
+<meta property="og:title" content="Selenium StaleElementReferenceException: Fixes (Tested)">
+<meta property="og:description" content="Selenium stale element reference tested in Chrome 156: why re-rendered nodes go stale, clicking through a list, staleness_of, and ignored_exceptions.">
+<meta property="og:url" content="https://honestkit.github.io/guides/selenium-stale-element-reference-exception/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes StaleElementReferenceException in Selenium?", "acceptedAnswer": {"@type": "Answer", "text": "The page replaced or removed the DOM node your WebElement refers to (re-render, innerHTML, refresh, navigation). The handle does not follow the new node, even with the same id."}}, {"@type": "Question", "name": "How do I fix stale element reference in a loop?", "acceptedAnswer": {"@type": "Answer", "text": "Re-find the elements inside the loop (e.g. by index) or collect hrefs/text before clicking, instead of reusing elements collected before the first click."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Selenium StaleElementReferenceException (tested)</h1>
+<p class="lead">Selenium raises <code>StaleElementReferenceException: stale element reference</code> when the DOM node your <code>WebElement</code> pointed to was replaced or removed, typically by a re-render, a reload or a navigation. Find the element again after the page changes; to wait for that change, use <code>EC.staleness_of(old_element)</code>.</p>
+<h2 id="setup">Setup used in every block</h2>
+<p><code>common.py</code> writes a small HTML page to a local file and starts headless Chrome. Exception messages are cut to their first line (Selenium appends the session info and a documentation link).</p>
+<pre><code>import os, pathlib
+from selenium import webdriver
+CHROME = os.path.expanduser(&quot;~/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome&quot;)
+def page(html):
+    p = pathlib.Path(&quot;/tmp/sl383/page.html&quot;); p.write_text(html); return p.as_uri()
+def driver():
+    o = webdriver.ChromeOptions()
+    o.binary_location = CHROME
+    o.add_argument(&quot;--headless=new&quot;); o.add_argument(&quot;--no-sandbox&quot;); o.add_argument(&quot;--window-size=1000,700&quot;)
+    return webdriver.Chrome(options=o)</code></pre>
+<h2 id="repro">1. Reproduce it: the page replaced the element</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+d = driver()
+d.get(page(&#x27;&lt;input id=&quot;q&quot;&gt;&lt;button id=&quot;b&quot; onclick=&quot;document.body.innerHTML=document.body.innerHTML&quot;&gt;re-render&lt;/button&gt;&#x27;))
+q = d.find_element(By.ID, &quot;q&quot;)
+d.find_element(By.ID, &quot;b&quot;).click()          # page code replaces the DOM nodes
+try:
+    q.send_keys(&quot;hello&quot;)
+except Exception as e:
+    print(type(e).__name__ + &quot;:&quot;, e.msg.splitlines()[0])
+q = d.find_element(By.ID, &quot;q&quot;)              # find it again
+q.send_keys(&quot;hello&quot;)
+print(&quot;re-found:&quot;, q.get_attribute(&quot;value&quot;))
+d.refresh()
+try:
+    q.get_attribute(&quot;value&quot;)
+except Exception as e:
+    print(&quot;after refresh():&quot;, type(e).__name__)
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>StaleElementReferenceException: stale element reference: stale element not found in the current frame
+re-found: hello
+after refresh(): StaleElementReferenceException</code></pre>
+<p>A <code>WebElement</code> is a handle to one specific DOM node, not a saved locator. When page code replaces that node (a framework re-render, <code>innerHTML</code>, a reload, a navigation), the handle points to a node that no longer exists and any call on it raises <code>StaleElementReferenceException</code>, even though an identical-looking element with the same id is now on the page. The fix is to call <code>find_element()</code> again after the change. The exact message differs between chromedriver versions; Chrome 156 says <em>stale element not found in the current frame</em>.</p>
+<h2 id="loop">2. The classic: clicking through a list of elements</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+html = &#x27;&#x27;&#x27;&lt;a href=&quot;#a&quot;&gt;A&lt;/a&gt; &lt;a href=&quot;#b&quot;&gt;B&lt;/a&gt; &lt;a href=&quot;#c&quot;&gt;C&lt;/a&gt;
+&lt;script&gt;onhashchange = () =&gt; { document.body.innerHTML = document.body.innerHTML; }&lt;/script&gt;&#x27;&#x27;&#x27;
+d = driver()
+d.get(page(html))
+try:
+    for link in d.find_elements(By.TAG_NAME, &quot;a&quot;):
+        print(&quot;clicking&quot;, link.text)
+        link.click()
+except Exception as e:
+    print(type(e).__name__)
+d.get(page(html))
+for i in range(len(d.find_elements(By.TAG_NAME, &quot;a&quot;))):
+    link = d.find_elements(By.TAG_NAME, &quot;a&quot;)[i]       # re-find on every iteration
+    print(&quot;clicking&quot;, link.text)
+    link.click()
+print(&quot;done&quot;)
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>clicking A
+StaleElementReferenceException
+clicking A
+clicking B
+clicking C
+done</code></pre>
+<p>The first click makes the page re-render, so every other element in the list you collected up front is stale. Re-find the elements inside the loop (by index, as here), or collect what you need first (for links, <code>[a.get_attribute("href") for a in links]</code>) and then visit those URLs with <code>driver.get()</code>.</p>
+<h2 id="wait">3. Wait for the update instead of racing it</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import StaleElementReferenceException
+d = driver()
+d.get(page(&#x27;&#x27;&#x27;&lt;div id=&quot;list&quot;&gt;&lt;p class=&quot;row&quot;&gt;old&lt;/p&gt;&lt;/div&gt;
+&lt;button id=&quot;load&quot; onclick=&quot;setTimeout(() =&gt; document.getElementById(&#x27;list&#x27;).innerHTML = &#x27;&lt;p class=row&gt;new&lt;/p&gt;&#x27;, 1000)&quot;&gt;load&lt;/button&gt;&#x27;&#x27;&#x27;))
+old = d.find_element(By.CLASS_NAME, &quot;row&quot;)
+d.find_element(By.ID, &quot;load&quot;).click()
+print(&quot;text right after click:&quot;, d.find_element(By.CLASS_NAME, &quot;row&quot;).text)
+WebDriverWait(d, 5).until(EC.staleness_of(old))     # wait until the old node is gone
+print(&quot;after staleness_of:&quot;, d.find_element(By.CLASS_NAME, &quot;row&quot;).text)
+wait = WebDriverWait(d, 5, ignored_exceptions=[StaleElementReferenceException])
+print(&quot;ignored_exceptions:&quot;, wait.until(lambda d: d.find_element(By.CLASS_NAME, &quot;row&quot;).text))
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>text right after click: old
+after staleness_of: new
+ignored_exceptions: new</code></pre>
+<p>Right after the click the old content is still there, so reading immediately gives the old text, and a re-render a moment later makes your handle stale. <code>EC.staleness_of(old_element)</code> waits until the old node is detached, which is a reliable "the page has updated" signal; re-find after it. For a polling wait whose lambda calls <code>find_element()</code> fresh each time, <code>ignored_exceptions=[StaleElementReferenceException]</code> makes the wait retry if the node is replaced between the find and the read, instead of failing.</p>
+<h2 id="checklist">4. Checklist</h2>
+<ul><li>Do not keep <code>WebElement</code>s across actions that change the page; keep the locator (<code>(By.ID, "q")</code>) and re-find.</li><li>Loops: re-find per iteration or collect hrefs/text first.</li><li>After a click that loads content: <code>EC.staleness_of(old)</code>, then re-find.</li><li>Avoid wrapping every call in a blind retry: it hides real bugs like clicking before the page finished updating.</li></ul>
+<p>Related: <a href="/guides/selenium-element-not-interactable/">Selenium element not interactable</a>, <a href="/guides/selenium-element-click-intercepted/">Selenium element click intercepted</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers of the page your test loads:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes StaleElementReferenceException in Selenium?</summary><p>The page replaced or removed the DOM node your WebElement refers to (re-render, innerHTML, refresh, navigation). The handle does not follow the new node, even with the same id.</p></details>
+<details><summary>How do I fix stale element reference in a loop?</summary><p>Re-find the elements inside the loop (e.g. by index) or collect hrefs/text before clicking, instead of reusing elements collected before the first click.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Selenium 4.51.0 (Python 3.13.5) and headless Chrome for Testing 156.0.8078.4. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python, Selenium and Chrome are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

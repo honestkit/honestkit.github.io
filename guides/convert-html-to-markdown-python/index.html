@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Convert HTML to Markdown in Python: markdownify vs html2text (Tested on Real Pages)</title>
+<meta name="description" content="Which Python library converts HTML to Markdown best? markdownify and html2text compared on MDN and Wikipedia pages (code blocks, tables, links), plus a ready script that keeps only the article and fixes relative links.">
+<link rel="canonical" href="https://honestkit.github.io/guides/convert-html-to-markdown-python/">
+<meta property="og:title" content="Convert HTML to Markdown in Python: markdownify vs html2text (Tested on Real Pages)">
+<meta property="og:description" content="Which Python library converts HTML to Markdown best? markdownify and html2text compared on MDN and Wikipedia pages (code blocks, tables, links), plus a ready script that keeps only the article and fixes relative links.">
+<meta property="og:url" content="https://honestkit.github.io/guides/convert-html-to-markdown-python/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the best Python library to convert HTML to Markdown?", "acceptedAnswer": {"@type": "Answer", "text": "markdownify for most uses: it keeps fenced code blocks (with a language if you supply a callback), in-page links and GitHub-style tables. html2text is older and also good for prose, but indents code and drops anchor links."}}, {"@type": "Question", "name": "How do I convert an HTML table to Markdown in Python?", "acceptedAnswer": {"@type": "Answer", "text": "markdownify converts <table> to a GitHub-style Markdown table by default. Cells with line breaks or nested lists are flattened, so check complex tables."}}, {"@type": "Question", "name": "Can it handle pages that need JavaScript?", "acceptedAnswer": {"@type": "Answer", "text": "No. Both libraries convert the HTML you give them. Render the page first (for example with Playwright) or copy it from your browser."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to convert HTML to Markdown in Python</h1>
+<p class="lead">Two libraries do most of the work in Python: markdownify and html2text. We ran both on the same real pages; they differ in code blocks, in-page links and tables, and both need help with relative links.</p>
+<h2>1. Install</h2>
+<pre><code>pip install markdownify html2text beautifulsoup4</code></pre>
+<h2>2. The one-liners</h2>
+<pre><code>from markdownify import markdownify
+md = markdownify(html, heading_style='ATX')
+
+import html2text
+h = html2text.HTML2Text(); h.body_width = 0   # 0 = no hard wrapping at 78 columns
+md = h.handle(html)</code></pre>
+<h2>3. What differed on real pages</h2>
+<table><thead><tr><th></th><th>markdownify</th><th>html2text</th></tr></thead><tbody>
+<tr><td>Code blocks (MDN, 23 blocks)</td><td>Fenced <code>```</code>; language via a callback</td><td>Indented 4 spaces, no language</td></tr>
+<tr><td>In-page links (<code>#section</code>)</td><td>Kept (20 on MDN, 72 on Wikipedia)</td><td>Dropped as links: text only</td></tr>
+<tr><td>Tables</td><td>GFM with outer pipes (<code>| --- |</code>)</td><td>Pipes between cells only (<code>---|---</code>), also renders on GitHub</td></tr>
+<tr><td>Link titles</td><td><code>"fetch()"</code></td><td>Escaped: <code>"fetch\(\)"</code></td></tr>
+<tr><td>Line wrapping</td><td>None</td><td>Wraps at 78 columns unless <code>body_width = 0</code></td></tr>
+<tr><td>Relative links (<code>/en-US/docs/...</code>)</td><td colspan="2">Left relative by both (html2text has a <code>baseurl</code> option); they break once the Markdown leaves the site</td></tr>
+</tbody></table>
+<p>For Markdown that goes into docs, notes or an LLM prompt, markdownify's fenced code blocks are the main reason to pick it. html2text is fine for prose-only pages and email bodies.</p>
+<h2>4. A complete script</h2>
+<p>Downloads a page, keeps only the main content (no menus or footers), makes links and images absolute, keeps the code language and writes a <code>.md</code> file. Save as <code>h2md.py</code>:</p>
+<pre><code>import re, sys, urllib.request
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
+from markdownify import markdownify
+
+url = sys.argv[1]
+req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (h2md)'})
+soup = BeautifulSoup(urllib.request.urlopen(req).read(), 'html.parser')
+main = soup.select_one('article, main, [role=main]') or soup.body  # skip menus, headers and footers
+for tag in main.select('script, style, nav, aside, form, button'):
+    tag.decompose()
+for a in main.select('a[href]'):  # relative links would break outside the site
+    if not a['href'].startswith('#'): a['href'] = urljoin(url, a['href'])
+for img in main.select('img[src]'):
+    img['src'] = urljoin(url, img['src'])
+
+def lang(pre):  # 'brush: js', 'language-python', 'highlight-python' -&gt; fence language
+    m = re.search(r'(?:brush:\s*|language-|highlight-)(\w+)', ' '.join(pre.get('class', []) + (pre.code.get('class', []) if pre.code else [])))
+    return m.group(1) if m else ''
+
+md = markdownify(str(main), heading_style='ATX', bullets='-', code_language_callback=lang)
+md = re.sub(r'\n{3,}', '\n\n', md).strip() + '\n'
+open(sys.argv[2], 'w', encoding='utf-8').write(md)
+print(f'{len(md)} chars, {md.count(chr(10))} lines -&gt; {sys.argv[2]}')
+</code></pre>
+<pre><code>python3 h2md.py https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch fetch.md</code></pre>
+<p>Our run: <code>32151 chars, 668 lines -&gt; fetch.md</code>, with all 23 code blocks fenced as <code>```js</code> and every link absolute. The first lines:</p>
+<pre><code># Using the Fetch API
+
+The [Fetch API](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API) provides a JavaScript interface for making HTTP requests and processing the responses.</code></pre>
+<h2>5. Limits</h2>
+<ul><li>Pages built by JavaScript have little or no content in the downloaded HTML. Use a headless browser, or convert the page you already see in your browser (below).</li>
+<li>The <code>article, main</code> selector fits most sites; adjust it if a page puts the text elsewhere.</li>
+<li>Footnote markers and edit links on Wikipedia come through as links (<code>[[1]](#cite_note-1)</code>); strip them with a regex if you do not want them.</li></ul>
+<h2>6. No code</h2>
+<p>To convert pasted HTML, use the free <a href="/tools/html-to-markdown/">HTML to Markdown converter</a> (runs in your browser). To copy the page you are reading as clean Markdown, including pages built by JavaScript, use <a href="/mdgrab/">MDGrab</a>.</p>
+<aside class="cta"><strong>Skip the steps:</strong> <a href="/mdgrab/">MDGrab</a> — Turn any article or selection into clean Markdown for Obsidian, notes or LLM prompts. No signup, no limits, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the best Python library to convert HTML to Markdown?</summary><p>markdownify for most uses: it keeps fenced code blocks (with a language if you supply a callback), in-page links and GitHub-style tables. html2text is older and also good for prose, but indents code and drops anchor links.</p></details>
+<details><summary>How do I convert an HTML table to Markdown in Python?</summary><p>markdownify converts &lt;table&gt; to a GitHub-style Markdown table by default. Cells with line breaks or nested lists are flattened, so check complex tables.</p></details>
+<details><summary>Can it handle pages that need JavaScript?</summary><p>No. Both libraries convert the HTML you give them. Render the page first (for example with Playwright) or copy it from your browser.</p></details>
+</section>
+<p class="note">Written with AI assistance. On 2026-10-01 markdownify 1.2.3 and html2text 2025.4.15 (with BeautifulSoup 4.15) were run on MDN&#x27;s &#x27;Using the Fetch API&#x27; page (23 code blocks) and Wikipedia&#x27;s &#x27;Comma-separated values&#x27; article (tables, footnotes), with Python 3.13. MDGrab is our extension; the other methods are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

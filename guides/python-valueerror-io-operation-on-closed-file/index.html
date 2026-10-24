@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python ValueError: I/O operation on closed file (Fix)</title>
+<meta name="description" content="ValueError: I/O operation on closed file: tested in Python 3.13 with code after a with block, returned file objects, lazy csv.reader, StringIO, and fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-valueerror-io-operation-on-closed-file/">
+<meta property="og:title" content="Python ValueError: I/O operation on closed file (Fix)">
+<meta property="og:description" content="ValueError: I/O operation on closed file: tested in Python 3.13 with code after a with block, returned file objects, lazy csv.reader, StringIO, and fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-valueerror-io-operation-on-closed-file/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why do I get I/O operation on closed file inside a loop?", "acceptedAnswer": {"@type": "Answer", "text": "The loop, or the line inside it, is not indented under the with block, so it runs after the file was closed."}}, {"@type": "Question", "name": "Why does csv.reader raise I/O operation on closed file?", "acceptedAnswer": {"@type": "Answer", "text": "The reader is lazy. Iterate it, or call list(reader), inside the with block."}}, {"@type": "Question", "name": "How do I check whether a file is closed?", "acceptedAnswer": {"@type": "Answer", "text": "Use f.closed, which is True after close() or after the with block ends."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ValueError: I/O operation on closed file (tested fix)</h1>
+<p class="lead"><code>ValueError: I/O operation on closed file.</code> means you read, wrote or iterated a file after it was closed, usually because the code runs after its <code>with</code> block ended. We reproduced 4 causes in Python 3.13 and tested each fix.</p>
+<h2 id="indent">1. Using the file after the with block</h2>
+<p><code>with open(...)</code> closes the file when the indented block ends. A line that is dedented by mistake runs after the close:</p>
+<pre><code>with open(&quot;/tmp/cl/a.txt&quot;, &quot;w&quot;) as f:
+    f.write(&quot;one\n&quot;)
+try:
+    f.write(&quot;two\n&quot;)              # indentation: this line is outside the with block
+except ValueError as e:
+    print(&quot;ValueError:&quot;, e)
+print(f.closed)</code></pre>
+<p>Output:</p>
+<pre><code>ValueError: I/O operation on closed file.
+True</code></pre>
+<p>Fix the indentation so every read and write is inside the block.</p>
+<h2 id="return">2. Returning the file object from a function</h2>
+<pre><code>def lines(path):
+    with open(path) as f:
+        return f                   # the file closes as the function returns
+f = lines(&quot;/tmp/cl/a.txt&quot;)
+try:
+    f.read()
+except ValueError as e:
+    print(&quot;ValueError:&quot;, e)
+def lines(path):
+    with open(path) as f:
+        return f.readlines()       # read inside the block
+print(lines(&quot;/tmp/cl/a.txt&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>ValueError: I/O operation on closed file.
+[&#x27;one\n&#x27;]</code></pre>
+<p>Returning from inside <code>with</code> still closes the file. Return the data, or make the function a generator that yields lines while the file is open.</p>
+<h2 id="csv">3. csv.reader and csv.writer outliving the file</h2>
+<pre><code>import csv
+with open(&quot;/tmp/cl/a.csv&quot;, &quot;w&quot;, newline=&quot;&quot;) as f:
+    w = csv.writer(f)
+try:
+    w.writerow([&quot;x&quot;, 1])           # writer outlives the file
+except ValueError as e:
+    print(&quot;ValueError:&quot;, e)
+with open(&quot;/tmp/cl/a.csv&quot;) as f:
+    rows = csv.reader(f)
+try:
+    list(rows)                     # reader is lazy: it reads only when you iterate
+except ValueError as e:
+    print(&quot;ValueError:&quot;, e)
+with open(&quot;/tmp/cl/a.csv&quot;) as f:
+    rows = list(csv.reader(f))     # materialise inside the block
+print(rows)</code></pre>
+<p>Output:</p>
+<pre><code>ValueError: I/O operation on closed file.
+ValueError: I/O operation on closed file.
+[]</code></pre>
+<p>Both hold a reference to the file but don't keep it open. <code>csv.reader</code> is lazy, so creating it inside the block and iterating outside fails. Call <code>list()</code> inside the block. (The final list is empty only because the failed <code>writerow</code> never wrote anything.)</p>
+<h2 id="other">4. StringIO, iteration and double close</h2>
+<pre><code>import io, sys
+buf = io.StringIO()
+buf.close()
+try:
+    buf.getvalue()
+except ValueError as e:
+    print(&quot;StringIO:&quot;, e)
+f = open(&quot;/tmp/cl/a.txt&quot;)
+f.close()
+f.close()                          # closing twice is fine
+try:
+    for line in f:
+        pass
+except ValueError as e:
+    print(&quot;iterate:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>StringIO: I/O operation on closed file
+iterate: I/O operation on closed file.</code></pre>
+<p><code>io.StringIO</code> uses the same message without the trailing period. Read <code>getvalue()</code> before closing. Calling <code>close()</code> twice is harmless; check <code>f.closed</code> when you aren't sure. Related: <a href="/guides/python-oserror-errno-9-bad-file-descriptor/">OSError: [Errno 9] Bad file descriptor</a>.</p>
+
+<aside class="cta"><strong>Writing API responses to files? Check what headers and content type a URL actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why do I get I/O operation on closed file inside a loop?</summary><p>The loop, or the line inside it, is not indented under the with block, so it runs after the file was closed.</p></details>
+<details><summary>Why does csv.reader raise I/O operation on closed file?</summary><p>The reader is lazy. Iterate it, or call list(reader), inside the with block.</p></details>
+<details><summary>How do I check whether a file is closed?</summary><p>Use f.closed, which is True after close() or after the with block ends.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-22 on Debian with Python 3.13.5: writes after a with block, returning a file from a function, csv.reader/writer used after close, StringIO, iteration and double close. Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

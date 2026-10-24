@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keras ImageDataGenerator Deprecated: What to Use in Keras 3</title>
+<meta name="description" content="ImageDataGenerator in Keras 3: which import fails, which still works, and the image_dataset_from_directory + augmentation layers replacement, tested.">
+<link rel="canonical" href="https://honestkit.github.io/guides/keras-imagedatagenerator-deprecated-image-dataset-from-directory/">
+<meta property="og:title" content="Keras ImageDataGenerator Deprecated: What to Use in Keras 3">
+<meta property="og:description" content="ImageDataGenerator in Keras 3: which import fails, which still works, and the image_dataset_from_directory + augmentation layers replacement, tested.">
+<meta property="og:url" content="https://honestkit.github.io/guides/keras-imagedatagenerator-deprecated-image-dataset-from-directory/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is ImageDataGenerator deprecated?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. In Keras 3 it only exists as a legacy class under tensorflow.keras.preprocessing.image; keras.preprocessing.image no longer has it."}}, {"@type": "Question", "name": "What replaces flow_from_directory?", "acceptedAnswer": {"@type": "Answer", "text": "keras.utils.image_dataset_from_directory, which returns a tf.data.Dataset of (images, labels) batches."}}, {"@type": "Question", "name": "How do I do data augmentation without ImageDataGenerator?", "acceptedAnswer": {"@type": "Answer", "text": "Use preprocessing layers such as Rescaling, RandomFlip, RandomRotation and RandomZoom, mapped over the training dataset or placed at the start of the model."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Keras ImageDataGenerator deprecated: replacement (tested)</h1>
+<p class="lead">In Keras 3, <code>from keras.preprocessing.image import ImageDataGenerator</code> raises ImportError, while <code>tensorflow.keras.preprocessing.image.ImageDataGenerator</code> still works as a legacy class. The replacement is <code>keras.utils.image_dataset_from_directory</code> plus <code>Rescaling</code>/<code>RandomFlip</code> layers. Both are shown running below, with a mapping table for each argument.</p>
+<h2 id="repro">1. What still works in Keras 3</h2>
+<p><code>data/</code> holds 20 PNGs in two class folders (<code>cats/</code>, <code>dogs/</code>). <code>b1.py</code> tries both import paths:</p>
+<pre><code>import warnings
+warnings.simplefilter(&quot;always&quot;)
+
+try:
+    from keras.preprocessing.image import ImageDataGenerator
+except ImportError as e:
+    print(&quot;keras 3:&quot;, str(e).split(&quot; (&quot;)[0])
+
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+gen = ImageDataGenerator(rescale=1 / 255, validation_split=0.2, horizontal_flip=True)
+train = gen.flow_from_directory(&quot;data&quot;, target_size=(64, 48), batch_size=8, subset=&quot;training&quot;)
+x, y = next(train)
+print(type(train).__module__)
+print(x.shape, y.shape, float(x.max()) &lt;= 1.0)</code></pre>
+<pre><code>keras 3: cannot import name &#x27;ImageDataGenerator&#x27; from &#x27;keras.preprocessing.image&#x27;
+Found 16 images belonging to 2 classes.
+keras.src.legacy.preprocessing.image
+(8, 64, 48, 3) (8, 2) True</code></pre>
+<p>With standalone Keras 3, <code>keras.preprocessing.image.ImageDataGenerator</code> is gone (ImportError). The <code>tensorflow.keras</code> path still imports and <code>flow_from_directory</code> still works, with no warning printed, but the class now lives in <code>keras.src.legacy</code>: it is kept for old code and gets no new features. Keras documents it as deprecated in favour of <code>tf.data</code> pipelines.</p>
+<h2 id="fix">2. Replacement: image_dataset_from_directory + preprocessing layers</h2>
+<pre><code>import keras
+from keras import layers
+
+train, val = keras.utils.image_dataset_from_directory(
+    &quot;data&quot;, image_size=(64, 48), batch_size=8,
+    validation_split=0.2, subset=&quot;both&quot;, seed=1,
+    label_mode=&quot;categorical&quot;,  # one-hot, like class_mode=&quot;categorical&quot;
+)
+print(train.class_names)
+
+augment = keras.Sequential([layers.Rescaling(1 / 255), layers.RandomFlip(&quot;horizontal&quot;)])
+train = train.map(lambda x, y: (augment(x, training=True), y))
+val = val.map(lambda x, y: (x / 255, y))
+
+x, y = next(iter(train))
+print(x.shape, y.shape, float(x.numpy().max()) &lt;= 1.0)</code></pre>
+<pre><code>Found 20 files belonging to 2 classes.
+Using 16 files for training.
+Using 4 files for validation.
+[&#x27;cats&#x27;, &#x27;dogs&#x27;]
+(8, 64, 48, 3) (8, 2) True</code></pre>
+<table><thead><tr><th>ImageDataGenerator</th><th>Keras 3 replacement</th></tr></thead><tbody>
+<tr><td><code>flow_from_directory("data", target_size=...)</code></td><td><code>keras.utils.image_dataset_from_directory("data", image_size=...)</code></td></tr>
+<tr><td><code>validation_split=0.2</code> + <code>subset="training"</code>/<code>"validation"</code></td><td><code>validation_split=0.2, subset="both", seed=1</code> (returns both datasets; the seed keeps the split consistent)</td></tr>
+<tr><td><code>class_mode="categorical"</code> / <code>"binary"</code> / <code>"sparse"</code></td><td><code>label_mode="categorical"</code> / <code>"binary"</code> / <code>"int"</code> (default <code>"int"</code>)</td></tr>
+<tr><td><code>rescale=1/255</code></td><td><code>layers.Rescaling(1/255)</code></td></tr>
+<tr><td><code>horizontal_flip=True</code>, <code>rotation_range</code>, <code>zoom_range</code></td><td><code>layers.RandomFlip("horizontal")</code>, <code>layers.RandomRotation</code>, <code>layers.RandomZoom</code></td></tr>
+</tbody></table>
+<p>Note the class order: both APIs sort folder names alphabetically (<code>['cats', 'dogs']</code> above). Apply augmentation only to the training set, as in <code>b2.py</code>; you can also put the augmentation layers at the start of the model, where they are active only during <code>fit</code>.</p>
+<p>Related: <a href="/guides/tensorflow-keras-error-keras-3-imports/">TensorFlow Keras errors after Keras 3</a>, <a href="/guides/tensorflow-resourceexhaustederror-oom-when-allocating-tensor/">TensorFlow ResourceExhaustedError: OOM</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is ImageDataGenerator deprecated?</summary><p>Yes. In Keras 3 it only exists as a legacy class under tensorflow.keras.preprocessing.image; keras.preprocessing.image no longer has it.</p></details>
+<details><summary>What replaces flow_from_directory?</summary><p>keras.utils.image_dataset_from_directory, which returns a tf.data.Dataset of (images, labels) batches.</p></details>
+<details><summary>How do I do data augmentation without ImageDataGenerator?</summary><p>Use preprocessing layers such as Rescaling, RandomFlip, RandomRotation and RandomZoom, mapped over the training dataset or placed at the start of the model.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 with tensorflow-cpu 2.21.0, keras 3.15.1, Pillow 13.0.0 and Python 3.13.5 on Linux. The scripts ran verbatim and the output was pasted unedited (TensorFlow startup log lines filtered). PlainTables is our extension; Keras and TensorFlow are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

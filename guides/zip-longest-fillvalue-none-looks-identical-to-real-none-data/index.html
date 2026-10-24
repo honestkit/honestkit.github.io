@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zip_longest Fillvalue None Looks Identical to Real None Data</title>
+<meta name="description" content="We measured itertools.zip_longest in Python 3.13.5: a real None value and an exhausted-iterable fillvalue both give (x, None), no way to tell them apart.">
+<link rel="canonical" href="https://honestkit.github.io/guides/zip-longest-fillvalue-none-looks-identical-to-real-none-data/">
+<meta property="og:title" content="zip_longest Fillvalue None Looks Identical to Real None Data">
+<meta property="og:description" content="We measured itertools.zip_longest in Python 3.13.5: a real None value and an exhausted-iterable fillvalue both give (x, None), no way to tell them apart.">
+<meta property="og:url" content="https://honestkit.github.io/guides/zip-longest-fillvalue-none-looks-identical-to-real-none-data/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does itertools.zip_longest tell me when an iterable ran out versus a real None value?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured this: both cases produce exactly the fillvalue (None by default) in the output tuple, with no marker distinguishing 'this iterable was exhausted' from 'this data point really is None.'"}}, {"@type": "Question", "name": "How do I tell the difference between a real None and zip_longest's fillvalue?", "acceptedAnswer": {"@type": "Answer", "text": "Pass a unique sentinel object as fillvalue (for example fillvalue=object()) instead of relying on the default None, then check for that sentinel with an is comparison -- it can't collide with real data the way None can."}}, {"@type": "Question", "name": "Is this a bug in itertools.zip_longest?", "acceptedAnswer": {"@type": "Answer", "text": "No -- it's documented, expected behavior: fillvalue is just a value substituted in, with no separate tracking of why it was used. The gotcha is relying on None specifically when your real data might also contain None."}}, {"@type": "Question", "name": "Does this problem get worse with more missing values?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured a case with two real None values followed by one fillvalue None; all three printed identically, so the more None values your real data has, the harder it gets to reason about which ones are genuine without a sentinel."}}, {"@type": "Question", "name": "Does changing fillvalue to something other than None fully fix this?", "acceptedAnswer": {"@type": "Answer", "text": "Only if the chosen fillvalue can never appear as real data -- a fixed value like 0 or an empty string can still collide with legitimate data. A fresh object() instance is the safe choice because it's guaranteed unique."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>zip_longest Fillvalue None Looks Identical to Real None Data (tested)</h1>
+<p class="lead"><code>itertools.zip_longest()</code> fills in missing values from a shorter iterable with <code>None</code> by default. We measured what that output looks like when the data itself legitimately contains <code>None</code>, and the two cases are completely indistinguishable from the result alone.</p>
+<h2 id="repro1">1. A real None value in the data</h2>
+<pre><code>import itertools
+
+a = [1, 2, 3]
+b = [10, None, 30]  # b really does contain None at index 1
+print(list(itertools.zip_longest(a, b)))</code></pre>
+<pre><code>[(1, 10), (2, None), (3, 30)]</code></pre>
+<p><strong>Measured:</strong> the pair <code>(2, None)</code> at index 1 reflects a genuine data value -- <code>b[1]</code> really is <code>None</code>.</p>
+
+<h2 id="repro2">2. b simply ran out of items -- same output shape</h2>
+<pre><code>import itertools
+
+a = [1, 2, 3]
+b = [10]  # b runs out after index 0
+print(list(itertools.zip_longest(a, b)))</code></pre>
+<pre><code>[(1, 10), (2, None), (3, None)]</code></pre>
+<p><strong>Measured:</strong> the pair <code>(2, None)</code> shows up again at index 1 -- but this time it means "there was no second item at all," not "the second item is <code>None</code>." Looking at either tuple in isolation, <code>(2, None)</code> is byte-for-byte identical in both scenarios. There is no way to tell, from the output alone, whether you're looking at real data or the absence of data.</p>
+
+<h2 id="repro3">3. The ambiguity gets worse the more None values the real data has</h2>
+<pre><code>import itertools
+
+a = [1, 2, 3, 4]
+b = [10, None, None]  # b has two REAL Nones, then runs out
+print(list(itertools.zip_longest(a, b)))</code></pre>
+<pre><code>[(1, 10), (2, None), (3, None), (4, None)]</code></pre>
+<p><strong>Measured:</strong> indices 1 and 2 are real <code>None</code> values from <code>b</code>; index 3 is the fillvalue because <code>b</code> ran out. All three <code>None</code>s print identically, and nothing downstream can tell which is which without separately knowing each list's original length.</p>
+
+<h2 id="fix">4. Fix: pick a fillvalue that can't collide with real data, or check lengths yourself</h2>
+<pre><code>import itertools
+
+_MISSING = object()  # a sentinel that can never equal a real data value
+a = [1, 2, 3]
+b = [10]
+for x, y in itertools.zip_longest(a, b, fillvalue=_MISSING):
+    if y is _MISSING:
+        print(x, "-> b ran out here")
+    else:
+        print(x, y)</code></pre>
+<pre><code>1 10
+2 -> b ran out here
+3 -> b ran out here</code></pre>
+<p><strong>Measured:</strong> passing a unique sentinel object as <code>fillvalue</code> instead of relying on the default <code>None</code> makes "ran out" and "real data" distinguishable again with a simple <code>is</code> check -- as long as the sentinel can never legitimately appear in your real data, which an <code>object()</code> instance guarantees.</p>
+<aside class="cta"><strong>Merging two API responses of different lengths? Check the real headers behind each request first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does itertools.zip_longest tell me when an iterable ran out versus a real None value?</summary><p>No -- we measured this: both cases produce exactly the fillvalue (None by default) in the output tuple, with no marker distinguishing &#x27;this iterable was exhausted&#x27; from &#x27;this data point really is None.&#x27;</p></details>
+<details><summary>How do I tell the difference between a real None and zip_longest&#x27;s fillvalue?</summary><p>Pass a unique sentinel object as fillvalue (for example fillvalue=object()) instead of relying on the default None, then check for that sentinel with an is comparison -- it can&#x27;t collide with real data the way None can.</p></details>
+<details><summary>Is this a bug in itertools.zip_longest?</summary><p>No -- it&#x27;s documented, expected behavior: fillvalue is just a value substituted in, with no separate tracking of why it was used. The gotcha is relying on None specifically when your real data might also contain None.</p></details>
+<details><summary>Does this problem get worse with more missing values?</summary><p>Yes -- we measured a case with two real None values followed by one fillvalue None; all three printed identically, so the more None values your real data has, the harder it gets to reason about which ones are genuine without a sentinel.</p></details>
+<details><summary>Does changing fillvalue to something other than None fully fix this?</summary><p>Only if the chosen fillvalue can never appear as real data -- a fixed value like 0 or an empty string can still collide with legitimate data. A fresh object() instance is the safe choice because it&#x27;s guaranteed unique.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in itertools module: ran itertools.zip_longest() on two lists in two separate scenarios -- one where the second list legitimately contains None at a given position, one where the second list is simply shorter and runs out at that same position -- and compared the output tuples. PlainHeaders is our extension; Python&#x27;s itertools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

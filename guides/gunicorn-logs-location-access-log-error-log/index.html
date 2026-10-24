@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gunicorn Logs Location: Access Log Not Showing, Error Log</title>
+<meta name="description" content="Where gunicorn logs go (tested, 26.2): errors to stderr, no access log by default, --access-logfile -, --error-logfile, --capture-output for print().">
+<link rel="canonical" href="https://honestkit.github.io/guides/gunicorn-logs-location-access-log-error-log/">
+<meta property="og:title" content="gunicorn Logs Location: Access Log Not Showing, Error Log">
+<meta property="og:description" content="Where gunicorn logs go (tested, 26.2): errors to stderr, no access log by default, --access-logfile -, --error-logfile, --capture-output for print().">
+<meta property="og:url" content="https://honestkit.github.io/guides/gunicorn-logs-location-access-log-error-log/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Where are gunicorn logs stored?", "acceptedAnswer": {"@type": "Answer", "text": "Nowhere on disk by default: the error log goes to stderr (terminal, journalctl or docker logs) and the access log is off."}}, {"@type": "Question", "name": "Why is the gunicorn access log not showing?", "acceptedAnswer": {"@type": "Answer", "text": "It is disabled by default. Pass --access-logfile - (stdout) or a file path, or set accesslog in gunicorn.conf.py."}}, {"@type": "Question", "name": "How do I get print() output into the gunicorn error log file?", "acceptedAnswer": {"@type": "Answer", "text": "Use --capture-output together with --error-logfile."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>gunicorn logs: where they go, access log, error log (tested)</h1>
+<p class="lead">By default gunicorn writes its error log (including 500 tracebacks) to stderr and writes <strong>no access log at all</strong>. Add <code>--access-logfile -</code> to log requests to stdout, <code>--error-logfile path</code> to write errors to a file, and <code>--capture-output</code> to send <code>print()</code> output from your app there too.</p>
+<h2 id="repro">1. Where each kind of output goes</h2>
+<p><code>app.py</code> prints, logs a warning, and raises on <code>/boom</code>:</p>
+<pre><code>import logging, sys
+log = logging.getLogger(&quot;myapp&quot;)
+
+def app(environ, start_response):
+    print(&quot;print() from the app&quot;)
+    log.warning(&quot;logger.warning from the app&quot;)
+    if environ[&quot;PATH_INFO&quot;] == &quot;/boom&quot;:
+        raise ValueError(&quot;boom&quot;)
+    start_response(&quot;200 OK&quot;, [(&quot;Content-Type&quot;, &quot;text/plain&quot;)])
+    return [b&quot;ok\n&quot;]</code></pre>
+<p><code>run.py</code> starts gunicorn three ways, requests <code>/</code> and <code>/boom</code>, and shows the terminal output and log files (startup lines filtered out):</p>
+<pre><code>import os, subprocess, time, urllib.request
+G = &quot;/tmp/fx384/ve/bin/gunicorn&quot;
+def trial(args):
+    for f in (&quot;error.log&quot;, &quot;access.log&quot;):
+        if os.path.exists(f): os.remove(f)
+    cmd = [G, &quot;-b&quot;, &quot;127.0.0.1:8966&quot;, *args, &quot;app:app&quot;]
+    print(&quot;$ gunicorn&quot;, &quot; &quot;.join(cmd[1:]))
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    time.sleep(1.5)
+    for path in (&quot;/&quot;, &quot;/boom&quot;):
+        try: urllib.request.urlopen(f&quot;http://127.0.0.1:8966{path}&quot;, timeout=10)
+        except Exception as ex: print(f&quot;  (GET {path} -&gt; {ex})&quot;)
+    time.sleep(0.5); p.terminate(); out = p.communicate()[0]
+    print(&quot;  --- terminal ---&quot;)
+    for line in out.splitlines():
+        if any(k in line for k in (&quot;Starting gunicorn&quot;, &quot;Listening&quot;, &quot;Using worker&quot;, &quot;Booting&quot;, &quot;Control socket&quot;, &quot;Handling signal&quot;, &quot;Worker exiting&quot;, &quot;Shutting down&quot;, &quot;  File&quot;, &quot;    &quot;)): continue
+        print(&quot;  &quot; + line)
+    for f in (&quot;error.log&quot;, &quot;access.log&quot;):
+        if os.path.exists(f):
+            print(f&quot;  --- {f} (grep app/GET/Error) ---&quot;)
+            for line in open(f):
+                if any(k in line for k in (&quot;app&quot;, &quot;GET&quot;, &quot;Error&quot;, &quot;boom&quot;)): print(&quot;  &quot; + line.rstrip())
+    print()
+trial([])
+trial([&quot;--access-logfile&quot;, &quot;-&quot;])
+trial([&quot;--access-logfile&quot;, &quot;access.log&quot;, &quot;--error-logfile&quot;, &quot;error.log&quot;, &quot;--capture-output&quot;])</code></pre>
+<p>Output (gunicorn 26.2.0, Python 3.13.5, Linux):</p>
+<pre><code>$ gunicorn -b 127.0.0.1:8966 app:app
+  (GET /boom -&gt; HTTP Error 500: Internal Server Error)
+  --- terminal ---
+  print() from the app
+  logger.warning from the app
+  print() from the app
+  logger.warning from the app
+  [2026-10-23 20:34:21 +0100] [3408698] [ERROR] Error handling request GET /boom
+  Traceback (most recent call last):
+  ValueError: boom
+
+$ gunicorn -b 127.0.0.1:8966 --access-logfile - app:app
+  (GET /boom -&gt; HTTP Error 500: Internal Server Error)
+  --- terminal ---
+  print() from the app
+  logger.warning from the app
+  127.0.0.1 - - [23/Oct/2026:20:34:24 +0100] &quot;GET / HTTP/1.1&quot; 200 3 &quot;-&quot; &quot;Python-urllib/3.13&quot;
+  print() from the app
+  logger.warning from the app
+  [2026-10-23 20:34:24 +0100] [3408701] [ERROR] Error handling request GET /boom
+  Traceback (most recent call last):
+  ValueError: boom
+  127.0.0.1 - - [23/Oct/2026:20:34:24 +0100] &quot;GET /boom HTTP/1.1&quot; 500 0 &quot;-&quot; &quot;-&quot;
+
+$ gunicorn -b 127.0.0.1:8966 --access-logfile access.log --error-logfile error.log --capture-output app:app
+  (GET /boom -&gt; HTTP Error 500: Internal Server Error)
+  --- terminal ---
+  --- error.log (grep app/GET/Error) ---
+  print() from the app
+  logger.warning from the app
+  print() from the app
+  logger.warning from the app
+  [2026-10-23 20:34:26 +0100] [3408704] [ERROR] Error handling request GET /boom
+    File &quot;/tmp/gl405/app.py&quot;, line 8, in app
+      raise ValueError(&quot;boom&quot;)
+  ValueError: boom
+  --- access.log (grep app/GET/Error) ---
+  127.0.0.1 - - [23/Oct/2026:20:34:26 +0100] &quot;GET / HTTP/1.1&quot; 200 3 &quot;-&quot; &quot;Python-urllib/3.13&quot;
+  127.0.0.1 - - [23/Oct/2026:20:34:26 +0100] &quot;GET /boom HTTP/1.1&quot; 500 0 &quot;-&quot; &quot;-&quot;</code></pre>
+<h2 id="what">2. What this shows</h2>
+<ul><li><strong>Default:</strong> the error log goes to stderr (your terminal, or <code>journalctl -u yourservice</code> under systemd, or <code>docker logs</code> in a container). The 500 traceback (<code>[ERROR] Error handling request GET /boom</code>) is there. There is <strong>no access log</strong>: the two GET requests left no line.</li>
+<li><code>--access-logfile -</code> turns the access log on and sends it to stdout: one line per request with status (200, 500).</li>
+<li><code>--error-logfile error.log --access-logfile access.log --capture-output</code> sends everything to files and nothing to the terminal; <code>--capture-output</code> is what put the app's <code>print()</code> and logger output into <code>error.log</code>.</li>
+<li>A 500 from an unhandled exception is logged at <code>[ERROR]</code> with the full traceback, and the frame in your code (<code>app.py, line 8</code>) shows the cause.</li></ul>
+<p>In <code>gunicorn.conf.py</code> the same settings are <code>accesslog = "-"</code>, <code>errorlog = "error.log"</code>, <code>capture_output = True</code>.</p>
+<p>Related: <a href="/guides/gunicorn-access-log-format-examples/">gunicorn access log format examples</a>, <a href="/guides/gunicorn-500-internal-server-error/">gunicorn 500 Internal Server Error</a>, <a href="/guides/gunicorn-error-unrecognized-arguments/">gunicorn unrecognized arguments</a>, <a href="/guides/gunicorn-critical-worker-timeout/">gunicorn [CRITICAL] WORKER TIMEOUT</a>.</p>
+
+<aside class="cta"><strong>See the status code and headers a server really returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Where are gunicorn logs stored?</summary><p>Nowhere on disk by default: the error log goes to stderr (terminal, journalctl or docker logs) and the access log is off.</p></details>
+<details><summary>Why is the gunicorn access log not showing?</summary><p>It is disabled by default. Pass --access-logfile - (stdout) or a file path, or set accesslog in gunicorn.conf.py.</p></details>
+<details><summary>How do I get print() output into the gunicorn error log file?</summary><p>Use --capture-output together with --error-logfile.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with gunicorn 26.2.0 and Python 3.13.5 on Linux. The script ran verbatim and the output was pasted unedited. PlainHeaders is our extension; gunicorn is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

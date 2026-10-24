@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bash Syntax Error Near Unexpected Token: Cause and Fix, Tested</title>
+<meta name="description" content="We reproduced bash syntax error near unexpected token from missing fi/done/esac and from Windows CRLF line endings, and tested the fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/bash-syntax-error-unexpected-token/">
+<meta property="og:title" content="Bash Syntax Error Near Unexpected Token: Cause and Fix, Tested">
+<meta property="og:description" content="We reproduced bash syntax error near unexpected token from missing fi/done/esac and from Windows CRLF line endings, and tested the fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/bash-syntax-error-unexpected-token/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does a missing fi sometimes say \"unexpected end of file\" and sometimes \"unexpected token\"?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed both: if the missing fi/done/esac is the last thing in the file, bash just keeps waiting for the block to close until it hits real end-of-file, and reports 'unexpected end of file'. If there's more code after the point of confusion \u2014 e.g. a function's closing } right after an unclosed if, or another line after a case block missing esac \u2014 bash names that specific token instead. Same root cause, different message depending on what comes after."}}, {"@type": "Question", "name": "What does $'\\r': command not found actually mean?", "acceptedAnswer": {"@type": "Answer", "text": "It means the script has Windows-style CRLF line endings, and a line that looks blank is actually just a lone carriage return, which bash tries to run as a command and fails. We reproduced this exactly with a CRLF file containing a blank line between two echo commands \u2014 the script kept running afterward, it just failed that one line."}}, {"@type": "Question", "name": "How do I tell a CRLF problem from a genuinely missing fi/done/esac?", "acceptedAnswer": {"@type": "Answer", "text": "Check the error text and the file itself. We confirmed CRLF errors either say $'\\r': command not found, or show a token with a visible \\r glued to it in the error message, like unexpected token `$'in\\r''. Also run file script.sh \u2014 it will say 'with CRLF line terminators' if that's the issue. A genuinely missing fi/done/esac shows none of that; it's just 'unexpected end of file' or a plain keyword name."}}, {"@type": "Question", "name": "What's the fastest fix for a CRLF script?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed both of these work: sed -i 's/\\r$//' script.sh or tr -d '\\r' < script.sh > fixed.sh. Re-run file script.sh afterward to confirm it now says plain ASCII text with no CRLF mention before retrying the script."}}, {"@type": "Question", "name": "How can I check a script's syntax without actually running it?", "acceptedAnswer": {"@type": "Answer", "text": "bash -n script.sh parses the file and reports syntax errors without executing anything. We used it alongside the direct runs in this guide and got identical error text, so it's a safe way to test a suspected missing fi/done/esac, unclosed quote, or CRLF fix before running a script that has real side effects."}}, {"@type": "Question", "name": "Why does bash report a line number that doesn't have the actual mistake on it?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed this for an unclosed quote: everything after the opening quote, including lines that look like separate commands, is swallowed into one string, so the error only surfaces at the real end of the file \u2014 which can be many lines after the actual open quote. The same thing happens for a missing fi/done/esac: bash keeps reading hoping to find the closer and only reports a line once it hits true end of file."}}, {"@type": "Question", "name": "Is a heredoc missing its closing delimiter a fatal error?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured this directly: it's only a warning (\"here-document delimited by end-of-file\"), the script still runs to completion, and the exit code was 0 in our test. The heredoc just captures everything up to the real end of file as its content instead of stopping where expected, which can silently swallow trailing lines."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Bash: Syntax Error Near Unexpected Token (tested)</h1>
+<p class="lead"><code>bash: syntax error near unexpected token</code> (exit code 2) means the parser got confused about the script's structure &mdash; usually a block that never closed, or a line ending the parser didn't expect. We reproduced both of the two most common real causes: a missing <code>fi</code>/<code>done</code>/<code>esac</code>, and Windows-style CRLF line endings.</p>
+<h2>1. Reproduced: a missing fi, done, or esac at the very end of a script</h2>
+<pre><code>$ cat missingfi.sh
+#!/bin/bash
+if [ "$1" = "x" ]; then
+  echo "yes"
+$ bash missingfi.sh
+missingfi.sh: line 4: syntax error: unexpected end of file</code></pre>
+<p>We got the identical "unexpected end of file" message for a missing <code>done</code> closing a <code>for</code> loop and a missing <code>esac</code> closing a <code>case</code> &mdash; when the missing keyword is the very last thing in the file, bash just keeps reading, waiting for the block to close, until it runs out of file. Exit code was 2 in every case.</p>
+
+<h2>2. Reproduced: the same mistake, but now it really does say "unexpected token"</h2>
+<p>The slug of this guide is the literal message, so here's exactly when you get it instead of "unexpected end of file": when there's more file left to parse <em>after</em> the point where bash gives up. We left <code>esac</code> out of a <code>case</code> block and added one more line after it:</p>
+<pre><code>$ cat missingesac2.sh
+#!/bin/bash
+case "$1" in
+  x) echo "x" ;;
+echo "after case"
+$ bash missingesac2.sh
+missingesac2.sh: line 4: syntax error near unexpected token `"after case"'
+missingesac2.sh: line 4: `echo "after case"'</code></pre>
+<p>case/esac has stricter grammar than if/for: after a pattern's <code>;;</code>, bash expects either another pattern or <code>esac</code>, not an arbitrary command &mdash; so it names the bad token immediately instead of reading to EOF.</p>
+<p>The same thing happens with an unclosed <code>if</code> or <code>for</code> <em>inside a function</em>, because the function's own closing <code>}</code> is what bash trips over:</p>
+<pre><code>$ cat missingfi3.sh
+myfunc() {
+  if [ "$1" = "x" ]; then
+    echo "yes"
+}
+$ bash missingfi3.sh
+missingfi3.sh: line 5: syntax error near unexpected token `}'
+missingfi3.sh: line 5: `}'</code></pre>
+<p>And a stray <em>extra</em> <code>fi</code> (one too many) names itself directly:</p>
+<pre><code>$ printf 'if [ "$1" = x ]; then\n echo yes\nfi\nfi\n' | bash
+bash: line 4: syntax error near unexpected token `fi'</code></pre>
+
+<h2>3. Reproduced: Windows CRLF line endings, variant 1 &mdash; a stray $'\r' command</h2>
+<p>A script edited on Windows (or downloaded/copied without conversion) has <code>\r\n</code> line endings instead of bash's expected <code>\n</code>. <code>file</code> and <code>cat -A</code> show it instantly &mdash; <code>^M</code> is the carriage return:</p>
+<pre><code>$ file crlfblank.sh
+crlfblank.sh: ASCII text, with CRLF line terminators
+$ cat -A crlfblank.sh
+echo one^M$
+^M$
+echo two^M$</code></pre>
+<p>Running it is revealing: a blank-looking line (just the stray <code>\r</code>) gets executed as its own "command":</p>
+<pre><code>$ bash crlfblank.sh
+one
+crlfblank.sh: line 2: $'\r': command not found
+two</code></pre>
+<p>The script didn't stop &mdash; that line just failed on its own and bash moved on. This is the single most common tell of a CRLF file: an error mentioning literal <code>$'\r'</code>.</p>
+
+<h2>4. Reproduced: CRLF, variant 2 &mdash; a real "unexpected token"</h2>
+<p>The more disruptive case: a <code>\r</code> glued directly onto a keyword like <code>then</code>, <code>in</code>, or <code>{</code> makes that keyword unrecognizable to the parser &mdash; <code>then\r</code> is a different token than <code>then</code>. We built a file with CRLF endings around a <code>case</code> block:</p>
+<pre><code>$ cat -A t3.sh
+case "$1" in^M$
+  x) echo x ;;^M$
+esac^M$
+echo done^M$
+$ bash t3.sh
+t3.sh: line 1: syntax error near unexpected token `$'in\r''
+t3.sh: line 1: `case "$1" in'</code></pre>
+<p>Same result on a function definition, where <code>{\r</code> isn't recognized as opening the function body:</p>
+<pre><code>$ bash t4.sh
+t4.sh: line 1: syntax error near unexpected token `$'{\r''</code></pre>
+<p>The <code>$'...\r'</code> quoting in the error message is the giveaway &mdash; bash is showing you that the token it choked on has an invisible carriage return stuck to the end of it. If you see <code>$'...\r'</code> anywhere in a syntax error, the file has CRLF endings; stop looking for a missing <code>fi</code> and fix the line endings instead.</p>
+
+<h2>5. Fixing CRLF, confirmed</h2>
+<p>Either of these strips the <code>\r</code> and leaves the script byte-identical otherwise. We confirmed both on the broken files above and reran them successfully afterward:</p>
+<pre><code>$ sed -i 's/\r$//' script.sh
+$ tr -d '\r' &lt; script.sh &gt; fixed.sh</code></pre>
+<p><code>dos2unix script.sh</code> does the same if it's installed (we didn't have it on this box, so we didn't measure it &mdash; but it's a standard, widely documented tool for exactly this). After stripping, re-check with <code>file script.sh</code>; it should say "ASCII text" with no mention of CRLF.</p>
+
+<h2>6. Reproduced: an unclosed quote, several lines before the error</h2>
+<p>A different, sneakier cause of the same family of errors: a quote that never closes. We opened a double quote on line 3 and never closed it:</p>
+<pre><code>$ cat -n quotesneaky.sh
+     1  #!/bin/bash
+     2  # config
+     3  name="deploy-bot
+     4  log() {
+     5    echo "[$name] $1"
+     6  }
+     7  log "starting deploy"
+     8  log "step 1 done"
+     9  log "step 2 done"
+    10  log "finished"
+$ bash quotesneaky.sh
+quotesneaky.sh: line 10: unexpected EOF while looking for matching `"'</code></pre>
+<p>The unclosed quote is on line 3. Bash reports line 10 &mdash; the real last line of the file, 7 lines away &mdash; because once bash sees the opening <code>"</code>, everything after it (including what look like other commands, other quotes, even the function's closing <code>}</code>) is swallowed as plain text inside that one unterminated string, all the way to true end of file. The message is also worded differently from the missing-<code>fi</code> case above: <code>unexpected EOF while looking for matching `"'</code> instead of <code>syntax error: unexpected end of file</code> &mdash; both mean bash ran out of file before a construct closed, just phrased differently depending on whether it was waiting for a keyword or a quote character.</p>
+<p>To find the real line instead of guessing from the EOF line, count quotes (an odd total confirms one is unmatched) and then bisect:</p>
+<pre><code>$ grep -o '"' quotesneaky.sh | wc -l
+11
+$ head -n 3 quotesneaky.sh > bisect3.sh && bash -n bisect3.sh
+bisect3.sh: line 3: unexpected EOF while looking for matching `"'
+$ head -n 2 quotesneaky.sh > bisect2.sh && bash -n bisect2.sh
+$ echo $?
+0</code></pre>
+<p>Line 2 parses clean, line 3 doesn't &mdash; confirming the unclosed quote's exact location directly instead of guessing. This same truncate-and-check trick works for a missing <code>fi</code>/<code>done</code>/<code>esac</code> too: shrink the file with <code>head -n N</code> right after the suspect block and see if <code>bash -n</code> still complains.</p>
+
+<h2>7. A heredoc missing its closing delimiter is only a warning, not a hard error</h2>
+<p>This one behaves differently from every case above. We wrote a heredoc with no closing <code>EOF</code>:</p>
+<pre><code>$ cat heredocbad.sh
+#!/bin/bash
+echo "start"
+cat <<EOF
+some text
+more text
+$ bash heredocbad.sh
+start
+heredocbad.sh: line 5: warning: here-document at line 3 delimited by end-of-file (wanted `EOF')
+some text
+more text
+$ echo $?
+0</code></pre>
+<p>Only a <strong>warning</strong> &mdash; the script still ran to completion and exited <code>0</code>. Bash treats "ran out of file before the heredoc's closing delimiter" as recoverable: it just closes the heredoc at real end-of-file and keeps going. If a script is silently swallowing trailing lines into a heredoc instead of crashing outright, this easy-to-miss warning on stderr is usually why.</p>
+
+<h2>8. Checklist</h2>
+<ul>
+<li><strong>"unexpected end of file":</strong> count your <code>if</code>/<code>fi</code>, <code>for</code>&amp;<code>while</code>/<code>done</code>, and <code>case</code>/<code>esac</code> pairs &mdash; one of them isn't closed, usually the last one before the error line.</li>
+<li><strong>"unexpected token `}'" inside a function:</strong> same missing-keyword problem, just caught by the function's closing brace instead of true end-of-file.</li>
+<li><strong>"unexpected token" naming a quoted string or command right after a case block:</strong> missing <code>esac</code>.</li>
+<li><strong>"unexpected EOF while looking for matching `"' (or `'')"</strong>: an unclosed quote, possibly many lines before the reported line. Count quotes with <code>grep -o '"' script.sh | wc -l</code> (odd = unclosed), then bisect with <code>head -n N</code> + <code>bash -n</code> to find the exact line.</li>
+<li><strong>A "here-document delimited by end-of-file" warning:</strong> a heredoc's closing delimiter is missing or misspelled. Unlike the others this doesn't stop the script, so check output carefully for swallowed trailing lines.</li>
+<li><strong>Error mentions <code>$'\r'</code> anywhere, or <code>file yourscript.sh</code> says "CRLF":</strong> Windows line endings. Run <code>sed -i 's/\r$//' script.sh</code> and retry before touching anything else.</li>
+<li>Run <code>bash -n script.sh</code> to check syntax without actually running the script &mdash; useful for testing any of the fixes above quickly and safely, even on scripts with real side effects.</li>
+</ul>
+<p>If the script runs but dies on a different error about a variable, see <a href="/guides/bash-unbound-variable/">Bash: Unbound Variable</a>. If the problem is the command itself rather than the script's structure, see <a href="/guides/bash-command-not-found/">Bash: Command Not Found</a>.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does a missing fi sometimes say &quot;unexpected end of file&quot; and sometimes &quot;unexpected token&quot;?</summary><p>We confirmed both: if the missing fi/done/esac is the last thing in the file, bash just keeps waiting for the block to close until it hits real end-of-file, and reports &#x27;unexpected end of file&#x27;. If there&#x27;s more code after the point of confusion — e.g. a function&#x27;s closing } right after an unclosed if, or another line after a case block missing esac — bash names that specific token instead. Same root cause, different message depending on what comes after.</p></details>
+<details><summary>What does $&#x27;\r&#x27;: command not found actually mean?</summary><p>It means the script has Windows-style CRLF line endings, and a line that looks blank is actually just a lone carriage return, which bash tries to run as a command and fails. We reproduced this exactly with a CRLF file containing a blank line between two echo commands — the script kept running afterward, it just failed that one line.</p></details>
+<details><summary>How do I tell a CRLF problem from a genuinely missing fi/done/esac?</summary><p>Check the error text and the file itself. We confirmed CRLF errors either say $&#x27;\r&#x27;: command not found, or show a token with a visible \r glued to it in the error message, like unexpected token `$&#x27;in\r&#x27;&#x27;. Also run file script.sh — it will say &#x27;with CRLF line terminators&#x27; if that&#x27;s the issue. A genuinely missing fi/done/esac shows none of that; it&#x27;s just &#x27;unexpected end of file&#x27; or a plain keyword name.</p></details>
+<details><summary>What&#x27;s the fastest fix for a CRLF script?</summary><p>We confirmed both of these work: sed -i &#x27;s/\r$//&#x27; script.sh or tr -d &#x27;\r&#x27; &lt; script.sh &gt; fixed.sh. Re-run file script.sh afterward to confirm it now says plain ASCII text with no CRLF mention before retrying the script.</p></details>
+<details><summary>How can I check a script&#x27;s syntax without actually running it?</summary><p>bash -n script.sh parses the file and reports syntax errors without executing anything. We used it alongside the direct runs in this guide and got identical error text, so it&#x27;s a safe way to test a suspected missing fi/done/esac, unclosed quote, or CRLF fix before running a script that has real side effects.</p></details>
+<details><summary>Why does bash report a line number that doesn&#x27;t have the actual mistake on it?</summary><p>We confirmed this for an unclosed quote: everything after the opening quote, including lines that look like separate commands, is swallowed into one string, so the error only surfaces at the real end of the file — which can be many lines after the actual open quote. The same thing happens for a missing fi/done/esac: bash keeps reading hoping to find the closer and only reports a line once it hits true end of file.</p></details>
+<details><summary>Is a heredoc missing its closing delimiter a fatal error?</summary><p>No — we measured this directly: it&#x27;s only a warning (&quot;here-document delimited by end-of-file&quot;), the script still runs to completion, and the exit code was 0 in our test. The heredoc just captures everything up to the real end of file as its content instead of stopping where expected, which can silently swallow trailing lines.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with GNU bash (Debian) on a real Linux box. Every error message and exit code below is copy-pasted output, not paraphrased. PlainHeaders is our extension; bash is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

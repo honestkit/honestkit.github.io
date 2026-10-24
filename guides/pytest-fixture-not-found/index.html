@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pytest fixture &#x27;x&#x27; not found: 6 Causes and Fixes (Tested)</title>
+<meta name="description" content="Fix pytest fixture not found: typos, fixtures in another test file, conftest.py in the wrong folder, missing plugins like mocker, self, unittest.TestCase.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pytest-fixture-not-found/">
+<meta property="og:title" content="pytest fixture &#x27;x&#x27; not found: 6 Causes and Fixes (Tested)">
+<meta property="og:description" content="Fix pytest fixture not found: typos, fixtures in another test file, conftest.py in the wrong folder, missing plugins like mocker, self, unittest.TestCase.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pytest-fixture-not-found/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is my fixture not found from another test file?", "acceptedAnswer": {"@type": "Answer", "text": "Fixtures defined in a test module are only visible in that module. Move shared fixtures to conftest.py in the same or a parent directory."}}, {"@type": "Question", "name": "Why does pytest say fixture 'mocker' not found?", "acceptedAnswer": {"@type": "Answer", "text": "mocker comes from the pytest-mock plugin. Install it with python -m pip install pytest-mock in the environment that runs pytest."}}, {"@type": "Question", "name": "What does fixture 'self' not found mean?", "acceptedAnswer": {"@type": "Answer", "text": "A test function outside a class has a self parameter. Remove self or move the function into a Test class."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pytest fixture not found (tested)</h1>
+<p class="lead"><code>fixture 'x' not found</code> means no fixture with that name is visible to the test. Shared fixtures must live in a <code>conftest.py</code> in the test's directory or a parent (not in another test file or a sibling folder), and plugin fixtures like <code>mocker</code> need the plugin installed in the same interpreter.</p>
+<p>pytest matches each test argument to a fixture <em>by name</em>, looking only in the test's own module, the <code>conftest.py</code> files in its directory and parent directories, and installed plugins. Anything else gives <code>fixture 'x' not found</code> as an ERROR at setup. Each cause below was reproduced on pytest 9.1.1 in a clean virtualenv.</p>
+<h2 id="typo">1. A typo: read the "available fixtures" list</h2>
+<pre><code>$ cat test_a.py
+import pytest
+
+@pytest.fixture
+def client():
+    return &quot;c&quot;
+
+def test_get(clinet):
+    assert clinet
+$ pytest -q | sed -n &quot;3,9p&quot;
+__________________________ ERROR at setup of test_get __________________________
+file /tmp/fx384/a/test_a.py, line 7
+  def test_get(clinet):
+E       fixture &#x27;clinet&#x27; not found
+&gt;       available fixtures: cache, capfd, capfdbinary, caplog, capsys, capsysbinary, capteesys, client, doctest_namespace, monkeypatch, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, subtests, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory
+&gt;       use &#x27;pytest --fixtures [testpath]&#x27; for help on them.</code></pre>
+<p>The error lists every fixture visible to that test. If yours is there under a slightly different name (<code>client</code> vs <code>clinet</code>), it is a typo. If it is missing from the list, pytest cannot see it: one of the causes below.</p>
+<h2 id="other-file">2. Fixture defined in another test file</h2>
+<pre><code>$ find tests -name &quot;*.py&quot; | sort
+tests/test_one.py
+tests/test_two.py
+$ cat tests/test_two.py
+def test_two(db):
+    assert db == {}
+$ pytest -q | tail -3
+=========================== short test summary info ============================
+ERROR tests/test_two.py::test_two
+1 passed, 1 error in 0.01s</code></pre>
+<p>A fixture defined in <code>test_one.py</code> is only visible inside <code>test_one.py</code>. Importing it with <code>from test_one import db</code> happens to work but is fragile: linters see the import as unused or redefined, and <code>from test_one import *</code> also imports <code>test_one</code>'s tests, so they run twice (3 passed instead of 2 in our run). Move shared fixtures to <code>conftest.py</code>; pytest loads it automatically, no import needed:</p>
+<pre><code>$ find tests -name &quot;*.py&quot; | sort
+tests/conftest.py
+tests/test_one.py
+tests/test_two.py
+$ cat tests/conftest.py
+import pytest
+
+@pytest.fixture
+def db():
+    return {}
+$ pytest -q | tail -1
+2 passed in 0.01s</code></pre>
+<h2 id="conftest-location">3. conftest.py in the wrong directory</h2>
+<pre><code>$ find tests -name &quot;*.py&quot; | sort
+tests/api/conftest.py
+tests/ui/test_ui.py
+$ pytest -q | grep &quot;not found&quot;
+E       fixture &#x27;token&#x27; not found</code></pre>
+<p>A <code>conftest.py</code> applies to its own directory and everything below it, never to sibling directories. <code>tests/api/conftest.py</code> is invisible to <code>tests/ui/</code>. Move it up to the common parent:</p>
+<pre><code>$ find tests -name &quot;*.py&quot; | sort
+tests/api/test_api.py
+tests/conftest.py
+tests/ui/test_ui.py
+$ pytest -q | tail -1
+2 passed in 0.01s</code></pre>
+<p>To check what a given path can see, run <code>pytest --fixtures</code> on it; it also prints where each fixture is defined:</p>
+<pre><code>$ pytest --fixtures -q tests/ui | grep -c &quot;^token&quot;
+0
+$ pytest --fixtures -q tests/api | grep -A1 &quot;^token&quot;
+token -- tests/api/conftest.py:4
+    no docstring available</code></pre>
+<h2 id="plugin">4. Fixture from a plugin that is not installed (mocker, client, event_loop...)</h2>
+<pre><code>$ cat test_d.py
+def test_m(mocker):
+    mocker.patch(&quot;os.getcwd&quot;, return_value=&quot;/x&quot;)
+$ pytest -q | grep &quot;not found&quot;
+E       fixture &#x27;mocker&#x27; not found
+$ pip install -q pytest-mock 2&gt;/dev/null; echo installed
+installed
+$ pytest -q | tail -1
+1 passed in 0.00s</code></pre>
+<p><code>mocker</code> comes from <code>pytest-mock</code>, <code>benchmark</code> from <code>pytest-benchmark</code>, Django's <code>client</code>/<code>db</code> from <code>pytest-django</code>, Flask's <code>client</code> from <code>pytest-flask</code> or your own conftest. Install the plugin in the <strong>same interpreter that runs pytest</strong> (<code>python -m pip install ...</code> then <code>python -m pytest</code>); a plugin installed in another virtualenv gives exactly this error.</p>
+<h2 id="self">5. fixture 'self' not found</h2>
+<pre><code>$ cat test_f.py
+def test_total(self):
+    assert 1 + 1 == 2
+$ pytest -q | grep &quot;not found&quot;
+E       fixture &#x27;self&#x27; not found</code></pre>
+<p>A module-level function with a <code>self</code> parameter: pytest treats <code>self</code> as a fixture name. Either remove <code>self</code> or put the function inside a <code>class Test...:</code>.</p>
+<h2 id="unittest">6. unittest.TestCase methods cannot take fixtures</h2>
+<pre><code>$ cat test_e.py
+import unittest, pytest
+
+@pytest.fixture
+def num():
+    return 1
+
+class T(unittest.TestCase):
+    def test_x(self, num):
+        assert num == 1
+$ pytest -q | grep &quot;^E &quot;; pytest -q | tail -1
+E       TypeError: T.test_x() missing 1 required positional argument: &#x27;num&#x27;
+1 failed in 0.04s</code></pre>
+<p>Inside a <code>unittest.TestCase</code> subclass pytest does not inject fixture arguments, so the error is a <code>TypeError: missing 1 required positional argument</code> rather than "fixture not found". Use <code>@pytest.mark.usefixtures</code> (or an autouse fixture) and pass data through <code>request.cls</code>, or convert the class to a plain pytest class:</p>
+<pre><code>$ cat test_e.py
+import unittest, pytest
+
+@pytest.fixture
+def num(request):
+    request.cls.num = 1
+
+@pytest.mark.usefixtures(&quot;num&quot;)
+class T(unittest.TestCase):
+    def test_x(self):
+        assert self.num == 1
+$ pytest -q | tail -1
+1 passed in 0.00s</code></pre>
+<h2 id="checklist">Checklist</h2>
+<ul><li>Is the name in the "available fixtures" list? If yes, typo.</li><li>Is the fixture in <code>conftest.py</code> in the test's directory or a parent, not in another test file or a sibling folder?</li><li>Does it come from a plugin? <code>python -m pip show pytest-mock</code> (etc.) in the interpreter running pytest.</li><li>Run <code>pytest --fixtures path/to/test_file.py</code> to see exactly what that file can use.</li></ul>
+<p>Related: <a href="/guides/pytest-error-vs-failure-error-at-setup-teardown/">pytest error vs failure (ERROR at setup)</a>, <a href="/guides/pytest-exit-codes-discovery-failed-exit-code-2-4/">pytest exit codes</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is my fixture not found from another test file?</summary><p>Fixtures defined in a test module are only visible in that module. Move shared fixtures to conftest.py in the same or a parent directory.</p></details>
+<details><summary>Why does pytest say fixture &#x27;mocker&#x27; not found?</summary><p>mocker comes from the pytest-mock plugin. Install it with python -m pip install pytest-mock in the environment that runs pytest.</p></details>
+<details><summary>What does fixture &#x27;self&#x27; not found mean?</summary><p>A test function outside a class has a self parameter. Remove self or move the function into a Test class.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with pytest 9.1.1 (and pytest-mock for block 4) on Python 3.13.5 in a clean virtualenv. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and pytest are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TypeError: Cannot Read Properties of Undefined (Tested)</title>
+<meta name="description" content="We reproduced &#x27;Cannot read properties of undefined (reading X)&#x27; in Node 24 and Chromium 153, and tested the optional-chaining and destructuring fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/cannot-read-properties-of-undefined/">
+<meta property="og:title" content="TypeError: Cannot Read Properties of Undefined (Tested)">
+<meta property="og:description" content="We reproduced &#x27;Cannot read properties of undefined (reading X)&#x27; in Node 24 and Chromium 153, and tested the optional-chaining and destructuring fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/cannot-read-properties-of-undefined/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does 'reading X' mean in the error message?", "acceptedAnswer": {"@type": "Answer", "text": "X is the property name your code tried to access. In 'Cannot read properties of undefined (reading \\'foo\\')' the code did something like value.foo where value was undefined. We confirmed this in Node 24.21.0 and Chromium 153."}}, {"@type": "Question", "name": "Why did I see 'Cannot read property X of undefined' instead?", "acceptedAnswer": {"@type": "Answer", "text": "That is the older V8 wording, used before V8 7.4 / Node.js 12 (per the V8 changelog, not measured on this box). The current wording is 'Cannot read properties of undefined (reading X)'. Functionally they mean the same thing."}}, {"@type": "Question", "name": "Does optional chaining always fix this error?", "acceptedAnswer": {"@type": "Answer", "text": "It stops the crash on that line by returning undefined instead, which we verified with obj?.foo. It does not fix why the value is undefined in the first place, so check whether undefined is actually an acceptable result."}}, {"@type": "Question", "name": "Does forgetting await cause this error?", "acceptedAnswer": {"@type": "Answer", "text": "Not directly, as we measured: an un-awaited async call returns a Promise object, and reading a missing property off a Promise returns undefined without throwing. The error appears once you await and the resolved value itself is undefined."}}, {"@type": "Question", "name": "Is the error the same in the browser as in Node.js?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We tested identical code in Node.js v24.21.0 and headless Chromium 153 and got byte-for-byte the same message in every case, since both run on the V8 engine."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Cannot Read Properties of Undefined (tested)</h1>
+<p class="lead"><code>TypeError: Cannot read properties of undefined (reading 'X')</code> means your code tried to access property <code>X</code> on a value that is <code>undefined</code>. We reproduced the exact wording in current Node.js and headless Chromium, and tested the three most common causes and their fixes.</p>
+<h2>1. The exact error</h2>
+<p>We ran this in Node.js v24.21.0:</p>
+<pre><code>const obj = undefined;
+console.log(obj.foo);</code></pre>
+<p>Result, copied verbatim from the thrown error's <code>.message</code>:</p>
+<pre><code>TypeError: Cannot read properties of undefined (reading 'foo')</code></pre>
+<p>The property name you tried to read is interpolated into the message in single quotes. Accessing a missing nested property gives the same shape:</p>
+<pre><code>const obj = {};
+console.log(obj.foo.bar);
+// TypeError: Cannot read properties of undefined (reading 'bar')</code></pre>
+<p>Here <code>obj.foo</code> is <code>undefined</code> (object has no <code>foo</code>), so reading <code>.bar</code> off it throws. The message always names the property being read, not the variable.</p>
+
+<h2>2. Old wording vs current wording</h2>
+<p>Older V8/Node versions phrased this differently: <code>TypeError: Cannot read property 'foo' of undefined</code> (singular "property", "of undefined" at the end). The current phrasing is <code>Cannot read properties of undefined (reading 'foo')</code> (plural "properties", property name moved into a trailing parenthetical). Per the V8 changelog this reword shipped in V8 7.4 / Node.js 12 (2019) to also cover cases where multiple properties are accessed in one expression. We did not have an old Node build on this box to reproduce the legacy string, so that date is not measured here &mdash; if you see the old wording, you are on Node &lt;12 or an old browser engine.</p>
+
+<h2>3. What we measured, side by side</h2>
+<table>
+<tr><th>Environment</th><th>Code</th><th>Exact message</th></tr>
+<tr><td>Node.js v24.21.0</td><td><code>undefined.foo</code></td><td>Cannot read properties of undefined (reading 'foo')</td></tr>
+<tr><td>Node.js v24.21.0</td><td><code>{}.foo.bar</code></td><td>Cannot read properties of undefined (reading 'bar')</td></tr>
+<tr><td>Node.js v24.21.0</td><td>destructure missing nested key</td><td>Cannot read properties of undefined (reading 'items')</td></tr>
+<tr><td>Chromium 153 (page.evaluate)</td><td><code>undefined.foo</code></td><td>Cannot read properties of undefined (reading 'foo')</td></tr>
+<tr><td>Chromium 153 (page.evaluate)</td><td><code>{}.foo.bar</code></td><td>Cannot read properties of undefined (reading 'bar')</td></tr>
+</table>
+<p>Wording was identical between Node 24 and Chromium 153 in every case we tried. Both run on V8, so this is expected: the message comes from the engine, not from either host.</p>
+
+<h2>4. Fix 1: optional chaining</h2>
+<p>Optional chaining (<code>?.</code>) returns <code>undefined</code> instead of throwing when the left side is <code>null</code> or <code>undefined</code>. We tested it directly against the same throwing case:</p>
+<pre><code>const obj = undefined;
+console.log(obj?.foo);   // undefined, no throw</code></pre>
+<p>This is the right fix when a missing value is expected and <code>undefined</code> is an acceptable result downstream. It does not fix the underlying reason the value is missing &mdash; it only stops the crash at that line.</p>
+
+<h2>5. Fix 2: guard a destructure</h2>
+<p>Destructuring a property that does not exist throws the same error, because the destructure itself reads a property off <code>undefined</code>:</p>
+<pre><code>const resp = { data: undefined };
+const { data: { items } } = resp;
+// TypeError: Cannot read properties of undefined (reading 'items')</code></pre>
+<p>We confirmed the message is identical to a plain property read: the engine does not distinguish destructuring syntax from dot access when reporting the error. Give the nested value a default to fix it:</p>
+<pre><code>const { data: { items } = {} } = resp;
+console.log(items); // undefined, no throw</code></pre>
+
+<h2>6. Fix 3 (and a gotcha): async functions and a missing await</h2>
+<p>We tested the common claim that "forgetting <code>await</code>" causes this error, and it is only half true. An un-awaited async function call returns a <strong>Promise object</strong>, not <code>undefined</code>. Reading a property that a Promise does not have just silently returns <code>undefined</code> &mdash; it does not throw:</p>
+<pre><code>async function getUser() { return undefined; }
+const user = getUser();      // forgot await: user is a Promise
+console.log(user.name);      // undefined, NO throw (Promise has no .name)</code></pre>
+<p>The error only fires once you <code>await</code> and the resolved value itself is <code>undefined</code> &mdash; for example a DB lookup or <code>fetch</code> that found nothing:</p>
+<pre><code>const user = await getUser(); // resolves to undefined
+console.log(user.name);
+// TypeError: Cannot read properties of undefined (reading 'name')</code></pre>
+<p>So a missing <code>await</code> usually produces quiet wrong behaviour (reading properties off a Promise, getting <code>undefined</code> back with no crash), while the loud crash comes from code that does <code>await</code> correctly but gets back <code>undefined</code> anyway, e.g. an API call that failed and returned nothing. Fix it by checking the resolved value before use, or giving the function a real fallback return.</p>
+
+<h2>7. Quick checklist</h2>
+<ul>
+<li>Read the property name out of the message &mdash; it tells you exactly which access failed, even in a long chain like <code>a.b.c.d</code>.</li>
+<li>If <code>undefined</code> is a normal, expected case: use <code>?.</code> or a destructure default.</li>
+<li>If it is not expected: the bug is upstream &mdash; a function returned early, a fetch failed, or an <code>await</code> is missing somewhere before this line, not necessarily on this line.</li>
+<li>For API responses, check <code>response.ok</code> or the actual payload shape before destructuring it; a failed request returning <code>undefined</code> is the single most common real-world trigger we see.</li>
+</ul>
+<p>If the type error is instead a compile-time TypeScript complaint rather than a runtime crash, see <a href="/guides/typescript-is-not-assignable-to-type/">TypeScript: is not assignable to type</a>.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &#x27;reading X&#x27; mean in the error message?</summary><p>X is the property name your code tried to access. In &#x27;Cannot read properties of undefined (reading \&#x27;foo\&#x27;)&#x27; the code did something like value.foo where value was undefined. We confirmed this in Node 24.21.0 and Chromium 153.</p></details>
+<details><summary>Why did I see &#x27;Cannot read property X of undefined&#x27; instead?</summary><p>That is the older V8 wording, used before V8 7.4 / Node.js 12 (per the V8 changelog, not measured on this box). The current wording is &#x27;Cannot read properties of undefined (reading X)&#x27;. Functionally they mean the same thing.</p></details>
+<details><summary>Does optional chaining always fix this error?</summary><p>It stops the crash on that line by returning undefined instead, which we verified with obj?.foo. It does not fix why the value is undefined in the first place, so check whether undefined is actually an acceptable result.</p></details>
+<details><summary>Does forgetting await cause this error?</summary><p>Not directly, as we measured: an un-awaited async call returns a Promise object, and reading a missing property off a Promise returns undefined without throwing. The error appears once you await and the resolved value itself is undefined.</p></details>
+<details><summary>Is the error the same in the browser as in Node.js?</summary><p>Yes. We tested identical code in Node.js v24.21.0 and headless Chromium 153 and got byte-for-byte the same message in every case, since both run on the V8 engine.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js v24.21.0 (native, no transpiler) and headless Chromium 153.0.8010.12 via Playwright 1.63 on Linux. The history of the old V8 wording is per the Node.js/V8 changelogs, not measured. PlainHeaders is our extension; curl, Python, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>heapq.merge() Gives Wrong Output on Unsorted Input, No Error</title>
+<meta name="description" content="We measured Python 3.13.5: heapq.merge() assumes every input is already sorted. An unsorted input gives wrong, non-sorted output -- no exception, no warning.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-heapq-merge-silently-wrong-on-unsorted-input/">
+<meta property="og:title" content="heapq.merge() Gives Wrong Output on Unsorted Input, No Error">
+<meta property="og:description" content="We measured Python 3.13.5: heapq.merge() assumes every input is already sorted. An unsorted input gives wrong, non-sorted output -- no exception, no warning.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-heapq-merge-silently-wrong-on-unsorted-input/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does heapq.merge() sort its inputs for you?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it assuming every input iterable is already individually sorted (or sorted descending with reverse=True, or sorted by the key= function). It does a streaming merge, not a sort, and never checks the precondition."}}, {"@type": "Question", "name": "What happens if you call heapq.merge() on an unsorted list?", "acceptedAnswer": {"@type": "Answer", "text": "It runs without error and returns a list that looks plausible but isn't actually sorted -- we measured a concrete case where [1, 5, 2, 8] merged with a sorted [3, 4, 9] produced [1, 3, 4, 5, 2, 8, 9], which is not in order."}}, {"@type": "Question", "name": "Does heapq.merge() raise a warning if an input isn't sorted?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured zero warnings and no exception using Python's warnings module in catch-all mode around a call with deliberately unsorted input."}}, {"@type": "Question", "name": "Is heapq.merge() always correct to use instead of sorted(itertools.chain(...))?", "acceptedAnswer": {"@type": "Answer", "text": "Only when you're certain every input is already sorted (and, if used, sorted consistently with any key= or reverse= you pass). We measured sorted(itertools.chain(*iterables)) giving the correct result regardless of input order, while heapq.merge() gave a silently wrong one on the same unsorted input."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>heapq.merge() Silently Returns Wrong Results on Unsorted Input (tested)</h1>
+<p class="lead"><code>heapq.merge()</code> looks like a drop-in replacement for <code>sorted(itertools.chain(*iterables))</code> that's faster because it does a streaming k-way merge instead of a full sort. That speed comes from a hidden assumption: each input iterable must already be sorted. We measured what happens when that assumption is silently violated.</p>
+<h2 id="repro1">1. One unsorted input is enough to break the output -- with no error</h2>
+<pre><code>import heapq
+
+a = [1, 5, 2, 8]   # NOT sorted
+b = [3, 4, 9]      # sorted
+
+result = list(heapq.merge(a, b))
+print(result)
+print("is it sorted?", result == sorted(result))</code></pre>
+<pre><code>[1, 3, 4, 5, 2, 8, 9]
+is it sorted? False</code></pre>
+<p><strong>Measured:</strong> <code>heapq.merge()</code> ran to completion and returned a list that looks almost sorted -- but isn't. It compares the current front element of each input stream and repeatedly takes the smaller one, which only produces a globally sorted result if each stream was individually non-decreasing to begin with. Here <code>a</code> wasn't, so the <code>2</code> buried after the <code>5</code> and <code>8</code> in <code>a</code> surfaces out of order in the output. There's no exception and no warning -- the bad merge looks exactly like a successful call.</p>
+
+<h2 id="repro2">2. sorted(itertools.chain(...)) doesn't have this problem</h2>
+<pre><code>import heapq, itertools
+
+a = [1, 5, 2, 8]
+b = [3, 4, 9]
+
+print("heapq.merge:   ", list(heapq.merge(a, b)))
+print("sorted(chain): ", sorted(itertools.chain(a, b)))</code></pre>
+<pre><code>heapq.merge:    [1, 3, 4, 5, 2, 8, 9]
+sorted(chain):  [1, 2, 3, 4, 5, 8, 9]</code></pre>
+<p><strong>Measured:</strong> <code>sorted(itertools.chain(a, b))</code> gives the correct answer regardless of whether <code>a</code> and <code>b</code> were pre-sorted, because it sorts everything from scratch. <code>heapq.merge()</code> only beats that approach when its precondition actually holds -- if there's any doubt about whether an input is sorted, the "faster" function is the one that silently gives the wrong answer.</p>
+
+<h2 id="repro3">3. reverse= and key= have the exact same precondition, just rephrased</h2>
+<pre><code>import heapq
+
+# reverse=True needs each input sorted *descending*
+c = [8, 5, 1, 2]   # NOT sorted descending
+d = [9, 4, 3]       # sorted descending
+print(list(heapq.merge(c, d, reverse=True)))
+
+# key=len needs each input sorted BY that key already
+e = ["bb", "a", "ccc"]   # NOT sorted by len
+f = ["dddd", "z"]         # sorted by len
+print(list(heapq.merge(e, f, key=len)))</code></pre>
+<pre><code>[9, 8, 5, 4, 3, 1, 2]
+['bb', 'a', 'ccc', 'dddd', 'z']
+</code></pre>
+<p><strong>Measured:</strong> both calls complete and return plausible-looking lists that are not actually sorted (by the relevant order). <code>reverse=True</code> doesn't sort descending for you -- it still just assumes each input stream is already arranged that way. <code>key=len</code> doesn't sort each input by length first either -- it assumes that's already true. In both cases we checked: no exception, no warning, just a wrong result that passes a casual glance.</p>
+<aside class="cta"><strong>Merging a few lists with heapq.merge() and not 100% sure they&#x27;re each already sorted? Check the output first -- it won&#x27;t raise an error if they aren&#x27;t:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does heapq.merge() sort its inputs for you?</summary><p>No -- we measured it assuming every input iterable is already individually sorted (or sorted descending with reverse=True, or sorted by the key= function). It does a streaming merge, not a sort, and never checks the precondition.</p></details>
+<details><summary>What happens if you call heapq.merge() on an unsorted list?</summary><p>It runs without error and returns a list that looks plausible but isn&#x27;t actually sorted -- we measured a concrete case where [1, 5, 2, 8] merged with a sorted [3, 4, 9] produced [1, 3, 4, 5, 2, 8, 9], which is not in order.</p></details>
+<details><summary>Does heapq.merge() raise a warning if an input isn&#x27;t sorted?</summary><p>No -- we measured zero warnings and no exception using Python&#x27;s warnings module in catch-all mode around a call with deliberately unsorted input.</p></details>
+<details><summary>Is heapq.merge() always correct to use instead of sorted(itertools.chain(...))?</summary><p>Only when you&#x27;re certain every input is already sorted (and, if used, sorted consistently with any key= or reverse= you pass). We measured sorted(itertools.chain(*iterables)) giving the correct result regardless of input order, while heapq.merge() gave a silently wrong one on the same unsorted input.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in heapq module: called merge() on inputs that weren&#x27;t individually sorted, with and without key= and reverse=, and checked for any exception or warning. PlainHeaders is our extension; Python&#x27;s heapq module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

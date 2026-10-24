@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLite &#x27;UNIQUE Constraint Failed&#x27; — Tested</title>
+<meta name="description" content="We reproduced sqlite3&#x27;s UNIQUE error, measured that NULL is exempt (two NULLs insert fine), and confirmed the ON CONFLICT upsert fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite-unique-constraint-failed/">
+<meta property="og:title" content="SQLite &#x27;UNIQUE Constraint Failed&#x27; — Tested">
+<meta property="og:description" content="We reproduced sqlite3&#x27;s UNIQUE error, measured that NULL is exempt (two NULLs insert fine), and confirmed the ON CONFLICT upsert fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite-unique-constraint-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can a UNIQUE column hold multiple NULL values?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we measured this directly: two separate NULL inserts into the same UNIQUE column both succeeded with zero error. NULL is never considered equal to another NULL for uniqueness, which is standard SQL behavior, not specific to SQLite."}}, {"@type": "Question", "name": "How is a composite UNIQUE constraint's error different from a single-column one?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed the error lists every column in the composite key together (e.g. 't2.a, t2.b'), not just one \u2014 it's the combination of values across those columns that must be unique, and either column alone can repeat."}}, {"@type": "Question", "name": "What's the non-error way to handle a UNIQUE conflict instead of catching the exception?", "acceptedAnswer": {"@type": "Answer", "text": "SQLite's ON CONFLICT upsert syntax \u2014 we tested INSERT ... ON CONFLICT(column) DO UPDATE SET ... and it updated the existing row with zero exception raised, in a single statement instead of insert-then-catch-then-update."}}, {"@type": "Question", "name": "If I need to prevent more than one NULL, does UNIQUE do that?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed UNIQUE alone allows unlimited NULLs in that column. Enforcing 'at most one NULL' needs separate application logic or a partial unique index filtering out NULLs, not covered by a plain UNIQUE constraint."}}, {"@type": "Question", "name": "Is this the same exception class as NOT NULL or CHECK violations?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we confirmed sqlite3 raises IntegrityError for all three (UNIQUE, NOT NULL, and CHECK violations), distinct from the OperationalError class most other sqlite3 errors in this series raise."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLite: UNIQUE constraint failed (tested)</h1>
+<p class="lead"><code>sqlite3.IntegrityError: UNIQUE constraint failed: table.column</code> fires when an insert or update would create a duplicate value in a column (or column combination) marked UNIQUE. We measured one standard-SQL exemption that surprises people, and the real non-erroring fix.</p>
+<h2 id="repro1">1. The basic case, and the exact column named</h2>
+<pre><code>con.execute("CREATE TABLE t (id INTEGER, email TEXT UNIQUE)")
+con.execute('INSERT INTO t (id, email) VALUES (1, "a@x.com")')
+con.execute('INSERT INTO t (id, email) VALUES (2, "a@x.com")')
+sqlite3.IntegrityError: UNIQUE constraint failed: t.email</code></pre>
+
+<h2 id="repro2">2. NULL is exempt &mdash; you can insert it repeatedly</h2>
+<p>Using the same UNIQUE <code>email</code> column, we inserted NULL twice:</p>
+<pre><code>con.execute("INSERT INTO t (id, email) VALUES (3, NULL)")
+con.execute("INSERT INTO t (id, email) VALUES (4, NULL)")
+# both succeeded &mdash; no error</code></pre>
+<p><strong>Measured:</strong> this is standard SQL semantics, not an SQLite quirk &mdash; NULL is never considered equal to another NULL for uniqueness purposes, so a UNIQUE column can hold any number of NULLs. If you actually need "at most one row with no email," UNIQUE alone doesn't enforce that; you'd need application logic or a partial index.</p>
+
+<h2 id="repro3">3. Composite UNIQUE names every column involved</h2>
+<pre><code>con.execute("CREATE TABLE t2 (a INTEGER, b INTEGER, UNIQUE(a,b))")
+con.execute("INSERT INTO t2 VALUES (1,1)")
+con.execute("INSERT INTO t2 VALUES (1,2)")   # different combination: OK
+con.execute("INSERT INTO t2 VALUES (1,1)")   # exact combo repeated
+sqlite3.IntegrityError: UNIQUE constraint failed: t2.a, t2.b</code></pre>
+<p>The error lists both columns in the composite key, confirming it's the (a, b) pair that must be unique together, not either column individually.</p>
+
+<h2 id="fix">4. The fix: ON CONFLICT upsert instead of insert-then-catch</h2>
+<p>Rather than catching the exception and issuing a separate UPDATE, we confirmed SQLite's upsert syntax handles both cases in one statement:</p>
+<pre><code>con.execute(\'\'\'INSERT INTO t (id, email) VALUES (5, "a@x.com")
+    ON CONFLICT(email) DO UPDATE SET id=excluded.id\'\'\')
+# succeeded with no error, row updated to id=5</code></pre>
+<p>This is the same syntax as PostgreSQL's (SQLite added it in 3.24+), so it's worth knowing even if you primarily work in Postgres.</p>
+
+<aside class="cta"><strong>Debugging an app that talks to an API instead of a database? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can a UNIQUE column hold multiple NULL values?</summary><p>Yes — we measured this directly: two separate NULL inserts into the same UNIQUE column both succeeded with zero error. NULL is never considered equal to another NULL for uniqueness, which is standard SQL behavior, not specific to SQLite.</p></details>
+<details><summary>How is a composite UNIQUE constraint&#x27;s error different from a single-column one?</summary><p>We confirmed the error lists every column in the composite key together (e.g. &#x27;t2.a, t2.b&#x27;), not just one — it&#x27;s the combination of values across those columns that must be unique, and either column alone can repeat.</p></details>
+<details><summary>What&#x27;s the non-error way to handle a UNIQUE conflict instead of catching the exception?</summary><p>SQLite&#x27;s ON CONFLICT upsert syntax — we tested INSERT ... ON CONFLICT(column) DO UPDATE SET ... and it updated the existing row with zero exception raised, in a single statement instead of insert-then-catch-then-update.</p></details>
+<details><summary>If I need to prevent more than one NULL, does UNIQUE do that?</summary><p>No — we confirmed UNIQUE alone allows unlimited NULLs in that column. Enforcing &#x27;at most one NULL&#x27; needs separate application logic or a partial unique index filtering out NULLs, not covered by a plain UNIQUE constraint.</p></details>
+<details><summary>Is this the same exception class as NOT NULL or CHECK violations?</summary><p>Yes — we confirmed sqlite3 raises IntegrityError for all three (UNIQUE, NOT NULL, and CHECK violations), distinct from the OperationalError class most other sqlite3 errors in this series raise.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in sqlite3 module, using a single-column UNIQUE, a composite two-column UNIQUE, repeated NULL inserts against a UNIQUE column, and an ON CONFLICT upsert. Every error string and result row below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s sqlite3 is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

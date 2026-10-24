@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server-Timing Header: What Chromium Exposes, Malformed Values and Timing-Allow-Origin</title>
+<meta name="description" content="What Chromium 153 returned in performance serverTiming for dur, desc, multiple metrics, two header lines, malformed entries and cross-origin fetches with and without Timing-Allow-Origin. Node and nginx examples.">
+<link rel="canonical" href="https://honestkit.github.io/guides/server-timing-header/">
+<meta property="og:title" content="Server-Timing Header: What Chromium Exposes, Malformed Values and Timing-Allow-Origin">
+<meta property="og:description" content="What Chromium 153 returned in performance serverTiming for dur, desc, multiple metrics, two header lines, malformed entries and cross-origin fetches with and without Timing-Allow-Origin. Node and nginx examples.">
+<meta property="og:url" content="https://honestkit.github.io/guides/server-timing-header/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does the Server-Timing header do?", "acceptedAnswer": {"@type": "Answer", "text": "It lets the server report its own timings, like db;dur=53.2, which the browser exposes in performance.getEntriesByType('navigation')[0].serverTiming as name, duration (ms) and description. Chromium 153 returned db, 53.2 for that header."}}, {"@type": "Question", "name": "Why is serverTiming empty for my cross-origin request?", "acceptedAnswer": {"@type": "Answer", "text": "The resource must send Timing-Allow-Origin with * or the page origin. In Chromium 153, CORS alone gave an empty list; CORS plus Timing-Allow-Origin exposed it. A cross-origin image without crossorigin and a no-cors fetch stayed empty even with Timing-Allow-Origin: *."}}, {"@type": "Question", "name": "What happens with a malformed Server-Timing value?", "acceptedAnswer": {"@type": "Answer", "text": "In Chromium 153, dur=abc became duration 0 but kept the metric. An entry with no name (;dur=5) stopped parsing, so valid metrics after it were lost. An unquoted description was cut at the first space."}}, {"@type": "Question", "name": "Can I send Server-Timing as several header lines?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Two separate Server-Timing lines (db;dur=10 and app;dur=20) both appeared in serverTiming in Chromium 153, in order."}}, {"@type": "Question", "name": "Does Server-Timing work on http://localhost?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. On http://localhost and http://127.0.0.1, isSecureContext was true and serverTiming was filled. On plain HTTP with a real domain it is expected to be empty because it is limited to secure contexts (doc-based, not tested)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Server-Timing header (tested in Chromium 153)</h1>
+<p class="lead">Server-Timing lets your server attach its own timings (database, cache, app logic) to a response, and the browser exposes them to JavaScript through the Performance API. We sent several variants from a Node server to Chromium 153 and recorded what serverTiming contained.</p>
+<h2>1. The results (navigation response)</h2>
+<p>Read with <code>performance.getEntriesByType('navigation')[0].serverTiming</code>, which gives a list of objects with <code>name</code>, <code>duration</code> (milliseconds, a number) and <code>description</code>.</p>
+<table><thead><tr><th>Header sent</th><th>serverTiming in Chromium 153 (name, duration, description)</th></tr></thead><tbody>
+<tr><td><code>Server-Timing: db;dur=53.2</code></td><td>db, 53.2, ""</td></tr>
+<tr><td><code>Server-Timing: db;dur=53, app;dur=47.2;desc="App logic"</code></td><td>db, 53, "" and app, 47.2, "App logic"</td></tr>
+<tr><td><code>Server-Timing: cache;desc="HIT"</code> (no dur)</td><td>cache, 0, "HIT"</td></tr>
+<tr><td>Two header lines: <code>db;dur=10</code> and <code>app;dur=20</code></td><td>db, 10, "" and app, 20, ""</td></tr>
+<tr><td><code>Server-Timing: db;dur=abc, ;dur=5, ok;dur=7</code></td><td>db, 0, "" only</td></tr>
+<tr><td><code>Server-Timing: a;desc=no quotes, b;dur=1;dur=2</code></td><td>a, 0, "no" and b, 1, ""</td></tr>
+</tbody></table>
+<p>Things worth knowing from this:</p>
+<ul><li>A missing <code>dur</code> becomes 0 and a missing <code>desc</code> becomes an empty string. You cannot tell "0 ms" from "no duration" in JavaScript.</li>
+<li>Two separate Server-Timing header lines were combined; both metrics showed up, in order.</li>
+<li>A non-numeric <code>dur=abc</code> did not drop the metric; it kept the name with duration 0.</li>
+<li>An entry with no name (<code>;dur=5</code>) did not just get skipped: everything after it was lost too, including the valid <code>ok;dur=7</code>. One bad entry can hide the rest of the header.</li>
+<li>An unquoted description with a space (<code>desc=no quotes</code>) was cut at the space, giving "no". Quote descriptions.</li>
+<li>When <code>dur</code> appeared twice, the first value (1) was used.</li></ul>
+<h2>2. Cross-origin subresources need Timing-Allow-Origin</h2>
+<p>Page on <code>http://localhost:8973</code>, resource on <code>http://127.0.0.1:8974</code> (different origin), header <code>db;dur=53, app;dur=47.2;desc="App logic"</code>. Read with <code>performance.getEntriesByName(url)[0].serverTiming</code>.</p>
+<table><thead><tr><th>Request</th><th>Response headers</th><th>serverTiming</th></tr></thead><tbody>
+<tr><td>Same-origin fetch</td><td>(none extra)</td><td>both metrics</td></tr>
+<tr><td>Cross-origin fetch</td><td><code>Access-Control-Allow-Origin: *</code>, no Timing-Allow-Origin</td><td>empty list</td></tr>
+<tr><td>Cross-origin fetch</td><td>ACAO <code>*</code> + <code>Timing-Allow-Origin: *</code></td><td>both metrics</td></tr>
+<tr><td>Cross-origin fetch</td><td>ACAO <code>*</code> + <code>Timing-Allow-Origin: http://localhost:8973</code> (exact origin)</td><td>both metrics</td></tr>
+<tr><td>Cross-origin fetch</td><td>ACAO <code>*</code> + <code>Timing-Allow-Origin: http://example.com</code></td><td>empty list</td></tr>
+<tr><td>Cross-origin <code>&lt;img&gt;</code> (no crossorigin attribute)</td><td>no Timing-Allow-Origin</td><td>empty list</td></tr>
+<tr><td>Cross-origin <code>&lt;img&gt;</code> (no crossorigin attribute)</td><td><code>Timing-Allow-Origin: *</code></td><td>empty list</td></tr>
+<tr><td>Cross-origin <code>fetch(url, {mode:'no-cors'})</code></td><td><code>Timing-Allow-Origin: *</code></td><td>empty list</td></tr>
+</tbody></table>
+<p>CORS alone was not enough, and a wrong origin in Timing-Allow-Origin counted as absent. The surprise: for a non-CORS cross-origin image and a no-cors fetch, <code>Timing-Allow-Origin: *</code> was <em>not</em> enough in Chromium 153; serverTiming stayed empty. In our test, the cross-origin cases that exposed it were CORS fetches that also sent a matching Timing-Allow-Origin. We did not test images with <code>crossorigin="anonymous"</code>. In every case the resource entry itself existed; only the list was empty, with no error.</p>
+<h2>3. Plain HTTP on localhost and 127.0.0.1</h2>
+<p>Both <code>http://localhost</code> and <code>http://127.0.0.1</code> gave identical results, and <code>isSecureContext</code> was true on both, since browsers treat loopback as secure. We did not test plain HTTP on a real hostname. Per the spec, serverTiming is limited to secure contexts, so expect an empty list over plain HTTP on a public domain (doc-based, not measured).</p>
+<h2>4. Sending it from Node / Express</h2>
+<pre><code>// Node http (what we ran) or Express (same setHeader call)
+const t0 = performance.now();
+const rows = await db.query(...);
+const dbMs = performance.now() - t0;
+res.setHeader('Server-Timing', [
+  `db;dur=${dbMs.toFixed(1)}`,
+  'cache;desc="MISS"',
+]);   // an array becomes separate header lines, which Chromium merged</code></pre>
+<p>Headers must be set before the body is sent, so time the work first. To expose it to a page on another origin, also send <code>Timing-Allow-Origin</code> (the page origin, or <code>*</code>) and make the request a CORS request.</p>
+<h2>5. nginx (not executed here)</h2>
+<pre><code>add_header Server-Timing 'app;desc="nginx"' always;
+# doc-based options, not tested:
+# add_header Server-Timing 'total;dur=$request_time';            # seconds, not ms
+# add_header Server-Timing 'upstream;dur=$upstream_response_time';</code></pre>
+<p>Doc-based caveats: <code>$request_time</code> and <code>$upstream_response_time</code> are in seconds with millisecond resolution (for example 0.053), while <code>dur</code> is read as milliseconds, so the browser would show 0.053 ms. With nginx alone you would need to scale it, for example in njs or Lua. <code>$upstream_response_time</code> can also be a comma-separated list if several upstreams were tried, which would break the header format. <code>add_header</code> without <code>always</code> only applies to 2xx/3xx responses.</p>
+<h2>6. Viewing it</h2>
+<p>Doc-based, not checked in this test: Chrome DevTools shows Server-Timing metrics under Network, select a request, Timing tab, in a "Server Timing" section. From the command line, <code>curl -sI URL | grep -i server-timing</code> shows the raw header.</p>
+<h2>7. Do not leak too much</h2>
+<p>The header is visible to anyone who can load the URL. Timings and descriptions such as cache hits, database names or hostnames can help an attacker. Many sites only send it to logged-in staff or in non-production.</p>
+<p>See the response headers of any URL, including Server-Timing and Timing-Allow-Origin, with <code>curl -sI</code> or the free <a href="/tools/http-headers/">HTTP headers tool</a>.</p>
+<aside class="cta"><strong>Check whether a URL sends Server-Timing and Timing-Allow-Origin:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does the Server-Timing header do?</summary><p>It lets the server report its own timings, like db;dur=53.2, which the browser exposes in performance.getEntriesByType(&#x27;navigation&#x27;)[0].serverTiming as name, duration (ms) and description. Chromium 153 returned db, 53.2 for that header.</p></details>
+<details><summary>Why is serverTiming empty for my cross-origin request?</summary><p>The resource must send Timing-Allow-Origin with * or the page origin. In Chromium 153, CORS alone gave an empty list; CORS plus Timing-Allow-Origin exposed it. A cross-origin image without crossorigin and a no-cors fetch stayed empty even with Timing-Allow-Origin: *.</p></details>
+<details><summary>What happens with a malformed Server-Timing value?</summary><p>In Chromium 153, dur=abc became duration 0 but kept the metric. An entry with no name (;dur=5) stopped parsing, so valid metrics after it were lost. An unquoted description was cut at the first space.</p></details>
+<details><summary>Can I send Server-Timing as several header lines?</summary><p>Yes. Two separate Server-Timing lines (db;dur=10 and app;dur=20) both appeared in serverTiming in Chromium 153, in order.</p></details>
+<details><summary>Does Server-Timing work on http://localhost?</summary><p>Yes. On http://localhost and http://127.0.0.1, isSecureContext was true and serverTiming was filled. On plain HTTP with a real domain it is expected to be empty because it is limited to secure contexts (doc-based, not tested).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 in Chromium 153.0.8010.12 (Playwright, full chromium channel) against a small Node http server on localhost and 127.0.0.1, reading performance.getEntriesByType(&#x27;navigation&#x27;) and getEntriesByName() for subresources. nginx snippet not executed. PlainHeaders is our extension; the other methods are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unittest Discovery Error: ImportError Wrapped in _FailedTest (Tested)</title>
+<meta name="description" content="We broke a test file&#x27;s import and measured that unittest discover hides the real traceback inside a fake _FailedTest case instead of showing it directly.">
+<link rel="canonical" href="https://honestkit.github.io/guides/unittest-discovery-importerror-failedtest/">
+<meta property="og:title" content="Unittest Discovery Error: ImportError Wrapped in _FailedTest (Tested)">
+<meta property="og:description" content="We broke a test file&#x27;s import and measured that unittest discover hides the real traceback inside a fake _FailedTest case instead of showing it directly.">
+<meta property="og:url" content="https://honestkit.github.io/guides/unittest-discovery-importerror-failedtest/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does unittest.loader._FailedTest mean?", "acceptedAnswer": {"@type": "Answer", "text": "It's not a real test \u2014 it's the loader's placeholder, substituted for every test in a module that failed to import. We reproduced this with a single bad top-level import: the module had one real test, but the loader reported one _FailedTest instead, carrying the import error inside it."}}, {"@type": "Question", "name": "Why does the error look like a test named FailedTest failed?", "acceptedAnswer": {"@type": "Answer", "text": "Because unittest reports it exactly like any other test result (an ERROR line with a dotted test name), just with the loader's internal class name instead of a real one. We measured that the actual ModuleNotFoundError is present in the traceback, but several loader frames appear before it."}}, {"@type": "Question", "name": "Does running a specific module instead of discover avoid this?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed python -m unittest <module_name> goes through the same loader and wraps the import error identically. The wrapping happens regardless of how you invoke unittest."}}, {"@type": "Question", "name": "What's the fastest way to see the real traceback?", "acceptedAnswer": {"@type": "Answer", "text": "Import the broken module directly with plain Python \u2014 python -c \"import your_test_module\" (with the right sys.path) \u2014 which we confirmed shows only the real traceback, with no loader frames and no misleading test name in front of it."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Unittest discovery ImportError / _FailedTest (tested)</h1>
+<p class="lead">If a test file fails to import &mdash; a typo'd import, a missing dependency, a syntax error &mdash; <code>unittest discover</code> doesn't show you a normal traceback. It reports a fake passing-looking test named <code>_FailedTest</code> that actually failed, which hides what really broke. We reproduced it directly.</p>
+<h2 id="repro">1. The exact error, from a single bad import</h2>
+<p>We added one bad top-level import to an otherwise-valid test file:</p>
+<pre><code>import nonexistent_module
+
+import unittest
+class T(unittest.TestCase):
+    def test_x(self):
+        self.assertTrue(True)</code></pre>
+<p>Running <code>python -m unittest discover</code> gave:</p>
+<pre><code>E
+======================================================================
+ERROR: test_broken (unittest.loader._FailedTest.test_broken)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_broken
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/unittest/loader.py", line 396, in _find_test_path
+    module = self._get_module_from_name(name)
+  ...
+  File "tests/test_broken.py", line 1, in &lt;module&gt;
+    import nonexistent_module
+ModuleNotFoundError: No module named 'nonexistent_module'
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)</code></pre>
+<p><strong>Why this is confusing:</strong> <code>unittest.loader._FailedTest.test_broken</code> looks like a real test case named "FailedTest" failed &mdash; it's actually the loader's own placeholder, substituted in place of every real test in the module because the module itself couldn't be imported. The real traceback is in there (scroll past the loader's own frames to find it), but the top line reads like a test assertion failure, not a module-level import error.</p>
+
+<h2 id="running-directly">2. Running the module directly doesn't give a clean traceback either</h2>
+<p>We expected <code>python -m unittest test_broken</code> (naming the module instead of using discovery) to show a plain traceback. It still wraps it the same way:</p>
+<pre><code>$ python -m unittest test_broken
+ERROR: test_broken (unittest.loader._FailedTest.test_broken)
+ImportError: Failed to import test module: test_broken
+...</code></pre>
+<p>Both discovery and direct module invocation go through the same loader, so both get the same <code>_FailedTest</code> wrapping.</p>
+
+<h2 id="fix">3. The fix: import the module directly to see the real error</h2>
+<p>We confirmed the only way to get the unwrapped traceback is bypassing unittest's loader entirely and importing the module yourself:</p>
+<pre><code>$ python -c "import sys; sys.path.insert(0,'tests'); import test_broken"
+Traceback (most recent call last):
+  File "&lt;string&gt;", line 1, in &lt;module&gt;
+  File "tests/test_broken.py", line 1, in &lt;module&gt;
+    import nonexistent_module
+ModuleNotFoundError: No module named 'nonexistent_module'</code></pre>
+<p>Same root cause, but now it's the first and only traceback, with no loader frames and no misleading "test" name in front of it. Once the import itself works, discovery goes back to a normal pass:</p>
+<pre><code>$ python -m unittest discover -s tests
+.
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+OK</code></pre>
+
+<aside class="cta"><strong>Debugging a test suite that talks to an API? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does unittest.loader._FailedTest mean?</summary><p>It&#x27;s not a real test — it&#x27;s the loader&#x27;s placeholder, substituted for every test in a module that failed to import. We reproduced this with a single bad top-level import: the module had one real test, but the loader reported one _FailedTest instead, carrying the import error inside it.</p></details>
+<details><summary>Why does the error look like a test named FailedTest failed?</summary><p>Because unittest reports it exactly like any other test result (an ERROR line with a dotted test name), just with the loader&#x27;s internal class name instead of a real one. We measured that the actual ModuleNotFoundError is present in the traceback, but several loader frames appear before it.</p></details>
+<details><summary>Does running a specific module instead of discover avoid this?</summary><p>No — we confirmed python -m unittest &lt;module_name&gt; goes through the same loader and wraps the import error identically. The wrapping happens regardless of how you invoke unittest.</p></details>
+<details><summary>What&#x27;s the fastest way to see the real traceback?</summary><p>Import the broken module directly with plain Python — python -c &quot;import your_test_module&quot; (with the right sys.path) — which we confirmed shows only the real traceback, with no loader frames and no misleading test name in front of it.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in unittest module, using a test file with a top-level import of a nonexistent module, run via python -m unittest discover, python -m unittest &lt;module&gt;, and a direct import. Every message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s unittest is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

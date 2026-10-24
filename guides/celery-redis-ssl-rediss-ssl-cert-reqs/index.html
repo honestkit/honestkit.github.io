@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Celery rediss:// URL must have parameter ssl_cert_reqs (tested)</title>
+<meta name="description" content="Celery with Redis over TLS: fix &#x27;A rediss:// URL must have parameter ssl_cert_reqs&#x27;, and why a bad certificate shows up as &#x27;Retry limit exceeded&#x27;.">
+<link rel="canonical" href="https://honestkit.github.io/guides/celery-redis-ssl-rediss-ssl-cert-reqs/">
+<meta property="og:title" content="Celery rediss:// URL must have parameter ssl_cert_reqs (tested)">
+<meta property="og:description" content="Celery with Redis over TLS: fix &#x27;A rediss:// URL must have parameter ssl_cert_reqs&#x27;, and why a bad certificate shows up as &#x27;Retry limit exceeded&#x27;.">
+<meta property="og:url" content="https://honestkit.github.io/guides/celery-redis-ssl-rediss-ssl-cert-reqs/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I fix 'A rediss:// URL must have parameter ssl_cert_reqs'?", "acceptedAnswer": {"@type": "Answer", "text": "Append ?ssl_cert_reqs=required (or CERT_REQUIRED, optional, none) to the rediss:// broker and result backend URLs."}}, {"@type": "Question", "name": "Why does Celery say Retry limit exceeded with Redis SSL?", "acceptedAnswer": {"@type": "Answer", "text": "In the test, a certificate that failed verification produced only that RuntimeError after about 19 seconds. Connecting with redis-py directly shows the real CERTIFICATE_VERIFY_FAILED error."}}, {"@type": "Question", "name": "Is ssl_cert_reqs=CERT_NONE safe?", "acceptedAnswer": {"@type": "Answer", "text": "It still encrypts, but accepts any certificate, so it does not protect against a man in the middle. Prefer required with ssl_ca_certs pointing at your CA."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Celery Redis SSL: rediss:// URL must have parameter ssl_cert_reqs (tested)</h1>
+<p class="lead">Add <code>?ssl_cert_reqs=required</code> to both the broker and backend <code>rediss://</code> URLs (with <code>&amp;ssl_ca_certs=/abs/path/ca.crt</code> for a private CA). If the certificate can't be verified, Celery hides the cause: after about 19 seconds it raises <code>RuntimeError: Retry limit exceeded while trying to reconnect to the Celery result store backend</code>.</p>
+<p>Using Redis over TLS (<code>rediss://</code>, as on most managed Redis services) with Celery needs an explicit <code>ssl_cert_reqs</code> in the URL, and a certificate problem shows up as a misleading "Retry limit exceeded" error. Measured with Celery 5.6.3 and redis-py 8.1.0 on Python 3.13.5 against Redis 7 with TLS only and a self-signed certificate, used as both broker and result backend.</p>
+<h2 id="missing">1. rediss:// without ssl_cert_reqs: ValueError</h2>
+<pre><code>$ cat tasks.py call3.py
+import os
+from celery import Celery
+url = os.environ[&quot;URL&quot;]
+app = Celery(&quot;tasks&quot;, broker=url, backend=url)
+
+@app.task
+def add(x, y):
+    return x + y
+import time
+from tasks import add
+t = time.time()
+try:
+    r = add.delay(2, 2)
+    print(&quot;result:&quot;, r.get(timeout=5))
+    del r
+except Exception as e:
+    print(f&quot;after {time.time()-t:.0f}s:&quot;, type(e).__name__, str(e).strip())
+$ URL=&#x27;rediss://127.0.0.1:8966/0&#x27; python call3.py 2&gt;&amp;1 | tail -2
+after 0s: ValueError A rediss:// URL must have parameter ssl_cert_reqs and this must be set to CERT_REQUIRED, CERT_OPTIONAL, or CERT_NONE</code></pre>
+<p>Celery refuses the URL immediately. Add <code>?ssl_cert_reqs=required</code> (or <code>CERT_REQUIRED</code>; also <code>optional</code> / <code>none</code>) to both the broker and the backend URL.</p>
+<h2 id="hidden">2. Certificate not trusted: "Retry limit exceeded" after 19 seconds</h2>
+<pre><code>$ URL=&#x27;rediss://127.0.0.1:8966/0?ssl_cert_reqs=required&#x27; python call3.py 2&gt;/dev/null
+after 19s: RuntimeError Retry limit exceeded while trying to reconnect to the Celery result store
+backend. The Celery application must be restarted.
+$ cat rp.py
+import redis
+r = redis.Redis.from_url(&quot;rediss://127.0.0.1:8966/0?ssl_cert_reqs=required&quot;)
+try:
+    r.ping()
+except Exception as e:
+    print(type(e).__name__, str(e)[:160])
+$ python rp.py
+ConnectionError Error 1 connecting to 127.0.0.1:8966. [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1029).</code></pre>
+<p>With <code>ssl_cert_reqs=required</code> and a certificate the client cannot verify, Celery retries silently for about 19 seconds and then raises <code>RuntimeError: Retry limit exceeded while trying to reconnect to the Celery result store backend</code>. The real cause is invisible there; connecting with redis-py directly (same URL) shows it at once: <code>CERTIFICATE_VERIFY_FAILED ... self-signed certificate</code>. Run that two-line check whenever Celery reports retry-limit errors against a TLS Redis.</p>
+<h2 id="fix">3. Working configurations</h2>
+<pre><code>$ URL=&#x27;rediss://127.0.0.1:8966/0?ssl_cert_reqs=CERT_NONE&#x27; celery -A tasks worker -n w1@example -c 1 &gt; worker.log 2&gt;&amp;1 &amp;
+$ URL=&#x27;rediss://127.0.0.1:8966/0?ssl_cert_reqs=CERT_NONE&#x27; python call3.py
+result: 4
+$ URL=&#x27;rediss://127.0.0.1:8966/0?ssl_cert_reqs=required&amp;ssl_ca_certs=/tmp/rs388/tls/redis.crt&#x27; python call3.py
+result: 4</code></pre>
+<p>Both work. Prefer <code>ssl_cert_reqs=required&amp;ssl_ca_certs=/path/to/ca.crt</code> (use an absolute path) so the connection is still verified; <code>ssl_cert_reqs=CERT_NONE</code> encrypts but accepts any certificate, so use it only on trusted networks. Managed services with a public CA certificate usually work with plain <code>ssl_cert_reqs=required</code>.</p>
+<p>Related: <a href="/guides/redis-connection-refused-econnrefused/">Redis connection refused</a>, <a href="/guides/celery-error-111-connection-refused/">Celery Error 111 connection refused</a>, <a href="/guides/celery-logging-configuration/">Celery logging configuration</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I fix &#x27;A rediss:// URL must have parameter ssl_cert_reqs&#x27;?</summary><p>Append ?ssl_cert_reqs=required (or CERT_REQUIRED, optional, none) to the rediss:// broker and result backend URLs.</p></details>
+<details><summary>Why does Celery say Retry limit exceeded with Redis SSL?</summary><p>In the test, a certificate that failed verification produced only that RuntimeError after about 19 seconds. Connecting with redis-py directly shows the real CERTIFICATE_VERIFY_FAILED error.</p></details>
+<details><summary>Is ssl_cert_reqs=CERT_NONE safe?</summary><p>It still encrypts, but accepts any certificate, so it does not protect against a man in the middle. Prefer required with ssl_ca_certs pointing at your CA.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Celery 5.6.3, kombu 5.6.2 and redis-py 8.1.0 on Python 3.13.5, one worker, Redis 7 (Docker) with TLS only and a self-signed certificate. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Celery and Redis are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

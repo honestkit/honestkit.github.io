@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ERR_NAME_NOT_RESOLVED and ENOTFOUND: Causes and Fixes (Tested)</title>
+<meta name="description" content="We looked up typo, .invalid, TXT-only, underscore and 64-char hostnames in Chromium 153, Node 24, curl and Python. Exact errors per client and how to fix each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-name-not-resolved/">
+<meta property="og:title" content="ERR_NAME_NOT_RESOLVED and ENOTFOUND: Causes and Fixes (Tested)">
+<meta property="og:description" content="We looked up typo, .invalid, TXT-only, underscore and 64-char hostnames in Chromium 153, Node 24, curl and Python. Exact errors per client and how to fix each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-name-not-resolved/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is ERR_NAME_NOT_RESOLVED a server problem?", "acceptedAnswer": {"@type": "Answer", "text": "No. The request never left the client. DNS gave no IP address for the hostname, so the server was never contacted. Check the hostname and its DNS records."}}, {"@type": "Question", "name": "What is the difference between ENOTFOUND and EAI_AGAIN?", "acceptedAnswer": {"@type": "Answer", "text": "ENOTFOUND: the resolver answered that there is no address for the name. EAI_AGAIN: the resolver itself failed or timed out (per the Node.js docs). Retry EAI_AGAIN; fix the name or record for ENOTFOUND."}}, {"@type": "Question", "name": "Why does fetch only say 'Failed to fetch'?", "acceptedAnswer": {"@type": "Answer", "text": "Browsers hide network details from JavaScript. In Chromium 153 a DNS failure gave TypeError: Failed to fetch, and the real cause, net::ERR_NAME_NOT_RESOLVED, was only in the console and DevTools."}}, {"@type": "Question", "name": "My domain has a record but I still get ENOTFOUND. Why?", "acceptedAnswer": {"@type": "Answer", "text": "Check the record type. We tested a name with only a TXT record: Chromium, Node.js fetch and curl all failed as if it did not exist. Browsers and HTTP clients need an A or AAAA record."}}, {"@type": "Question", "name": "Does curl exit code 6 always mean DNS?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, exit 6 is 'Could not resolve host'. Exit 5 is the same failure for the proxy host. Exit 3 means the URL itself was rejected, as we saw with a space in the hostname."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ERR_NAME_NOT_RESOLVED / ENOTFOUND (tested)</h1>
+<p class="lead"><code>net::ERR_NAME_NOT_RESOLVED</code> (Chrome), <code>getaddrinfo ENOTFOUND</code> (Node.js), <code>curl: (6) Could not resolve host</code> and Python's <code>gaierror</code> all mean the same thing: DNS gave no IP address for the hostname. No connection was ever tried. We fed the same bad hostnames to four clients and wrote down exactly what each one reports.</p>
+<h2>1. What the error means</h2>
+<p>Before a client can connect, it turns the hostname into an IP address. If that step returns nothing, the request stops there. The server never sees it, so server logs, CORS settings and firewall rules are not involved.</p>
+<p>There are two DNS answers that lead here. <strong>NXDOMAIN</strong>: the name does not exist. <strong>NODATA</strong>: the name exists but has no A or AAAA record (for example only a TXT record). Every client we tested reports both the same way, except Python, which tells them apart.</p>
+<p>Compare <a href="/guides/err-connection-refused-econnrefused/">ERR_CONNECTION_REFUSED / ECONNREFUSED</a>: there the name resolved and the IP answered, but nothing was listening on the port.</p>
+
+<h2>2. Exact errors per client</h2>
+<p>Hostname <code>nonexistent-xyz.invalid</code>. <code>dig</code> returned <code>status: NXDOMAIN</code>. Every client failed in under 50 ms because the answer was immediate.</p>
+<table>
+<tr><th>Client</th><th>What you see</th></tr>
+<tr><td>Chromium page navigation</td><td><code>net::ERR_NAME_NOT_RESOLVED</code>; the tab shows <code>chrome-error://chromewebdata/</code></td></tr>
+<tr><td>Chromium <code>fetch()</code></td><td><code>TypeError: Failed to fetch</code>; console: "Failed to load resource: net::ERR_NAME_NOT_RESOLVED"</td></tr>
+<tr><td>Chromium XHR / &lt;img&gt;</td><td>XHR <code>onerror</code> with <code>status=0</code>, <code>readyState=4</code>; image fires a plain <code>error</code> event</td></tr>
+<tr><td>Node.js 24 <code>fetch()</code></td><td><code>TypeError: fetch failed</code>, <code>err.cause.code</code> = <code>ENOTFOUND</code>, <code>cause.syscall</code> = <code>getaddrinfo</code>, <code>cause.hostname</code> = the host</td></tr>
+<tr><td>Node.js <code>dns.lookup()</code></td><td><code>getaddrinfo ENOTFOUND nonexistent-xyz.invalid</code>, errno -3008</td></tr>
+<tr><td>Node.js <code>dns.resolve4()</code></td><td><code>queryA ENOTFOUND nonexistent-xyz.invalid</code></td></tr>
+<tr><td>curl</td><td><code>curl: (6) Could not resolve host: nonexistent-xyz.invalid</code>, exit 6, <code>%{http_code}</code> = 000</td></tr>
+<tr><td>Python <code>socket.getaddrinfo</code></td><td><code>socket.gaierror: [Errno -2] Name or service not known</code> (EAI_NONAME)</td></tr>
+<tr><td>Python urllib</td><td><code>URLError(gaierror(-2, 'Name or service not known'))</code></td></tr>
+<tr><td>Python requests</td><td><code>ConnectionError ... NameResolutionError ... Failed to resolve 'nonexistent-xyz.invalid' ([Errno -2] Name or service not known)</code></td></tr>
+</table>
+<p>In the browser, JavaScript only gets <code>TypeError: Failed to fetch</code>. The DNS detail is only in DevTools. That same message also covers CORS and refused connections; see <a href="/guides/typeerror-failed-to-fetch/">TypeError: Failed to fetch</a> for how to tell them apart.</p>
+<pre><code>$ curl -sS http://nonexistent-xyz.invalid/
+curl: (6) Could not resolve host: nonexistent-xyz.invalid
+$ echo $?
+6</code></pre>
+
+<h2>3. Edge cases we tested</h2>
+<table>
+<tr><th>Hostname</th><th>DNS</th><th>Chromium</th><th>Node.js</th><th>curl</th><th>Python getaddrinfo</th></tr>
+<tr><td><code>gooogle-typo-xyz123.com</code> (typo)</td><td>NXDOMAIN</td><td>ERR_NAME_NOT_RESOLVED</td><td>ENOTFOUND</td><td>exit 6</td><td>-2 Name or service not known</td></tr>
+<tr><td><code>_dmarc.google.com</code> (TXT only, no A/AAAA)</td><td>NOERROR, no address</td><td>ERR_NAME_NOT_RESOLVED</td><td>ENOTFOUND (errno -3007); <code>resolve4</code>: ENODATA</td><td>exit 6</td><td>-5 No address associated with hostname</td></tr>
+<tr><td><code>ipv6.google.com</code> (AAAA only)</td><td>AAAA only</td><td>200</td><td>200</td><td>200</td><td>OK (IPv6)</td></tr>
+<tr><td><code>example.com.</code> (trailing dot)</td><td>OK</td><td>200</td><td>OK</td><td>200</td><td>OK</td></tr>
+<tr><td><code>my_host.invalid</code> (underscore)</td><td>NXDOMAIN</td><td>ERR_NAME_NOT_RESOLVED</td><td>ENOTFOUND</td><td>exit 6</td><td>-2</td></tr>
+<tr><td><code>bad host.com</code> (space)</td><td>-</td><td>sent as <code>bad%20host.com</code>, ERR_NAME_NOT_RESOLVED</td><td>fetch: "Failed to parse URL", cause ERR_INVALID_URL</td><td>exit 3 "URL rejected: Malformed input to a URL function"</td><td>-2</td></tr>
+<tr><td>64-character label + <code>.com</code></td><td>-</td><td>ERR_NAME_NOT_RESOLVED</td><td>ENOTFOUND</td><td>exit 6</td><td><code>UnicodeEncodeError ... label too long</code></td></tr>
+<tr><td><code>bücher.de</code> (IDN)</td><td>OK as <code>xn--bcher-kva.de</code></td><td>converted to punycode, loaded</td><td>OK</td><td>converted to punycode, loaded</td><td>OK</td></tr>
+</table>
+<p>What this shows:</p>
+<ul>
+<li><strong>A name that exists but has no address still fails.</strong> A TXT-only name gives the same ERR_NAME_NOT_RESOLVED, ENOTFOUND and curl exit 6 as a typo. Only Python (EAI_NODATA, -5) and Node's <code>dns.resolve4</code> (ENODATA) say "the name exists, no address". Node's <code>err.cause.errno</code> also differs (-3007 vs -3008) while <code>code</code> stays ENOTFOUND.</li>
+<li><strong>AAAA-only names work</strong> on this box because it has IPv6. On a network without IPv6 they will resolve but fail at connect, which is a different error.</li>
+<li><strong>Underscores are not rejected</strong> by any client. They go to DNS and fail only if the record is missing.</li>
+<li><strong>A space is a URL error in Node and curl</strong>, not a DNS error. Chromium percent-encodes it and then fails DNS.</li>
+<li><strong>Labels over 63 characters</strong> are not caught by Chromium, Node or curl. They all report a plain DNS failure. Only Python's IDNA codec refuses them before DNS.</li>
+<li><strong>A trailing dot is fine.</strong> It just means "fully qualified".</li>
+</ul>
+
+<h2>4. ENOTFOUND vs EAI_AGAIN vs ESERVFAIL</h2>
+<p>ENOTFOUND means the resolver gave a definite answer: no address. A broken or unreachable resolver is different. We pointed a Node <code>dns.Resolver</code> at two fake DNS servers on 127.0.0.1 (system settings untouched):</p>
+<ul>
+<li>Server that answers SERVFAIL: <code>queryA ESERVFAIL example.com</code> after 52 ms.</li>
+<li>Server that never answers (timeout 1000 ms, 1 try): <code>queryA ETIMEOUT example.com</code> after 1001 ms.</li>
+</ul>
+<p>For <code>dns.lookup()</code>, <code>fetch()</code> and most HTTP clients (they use getaddrinfo), a temporary resolver failure shows up as <code>getaddrinfo EAI_AGAIN host</code> (per the Node.js and glibc docs, not measured; we did not break the system resolver). EAI_AGAIN is worth a retry. ENOTFOUND usually is not: fix the name or the record.</p>
+
+<h2>5. How to fix it</h2>
+<ol>
+<li><strong>Copy the exact hostname from the error</strong> and check it with dig. NXDOMAIN means the name does not exist. NOERROR with no answer means a record is missing.
+<pre><code>$ dig +short nonexistent-xyz.invalid A        # empty
+$ dig nonexistent-xyz.invalid A | grep status
+;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: NXDOMAIN
+$ nslookup nonexistent-xyz.invalid
+** server can't find nonexistent-xyz.invalid: NXDOMAIN
+$ dig +short _dmarc.google.com A               # empty, but TXT exists
+$ dig +short _dmarc.google.com TXT
+"v=DMARC1; p=reject; ..."</code></pre></li>
+<li><strong>Check environment variables and config.</strong> An unset variable becomes the literal host <code>undefined</code>. We measured <code>fetch(`http://${process.env.API_HOST}/`)</code> with the variable unset: <code>getaddrinfo ENOTFOUND undefined</code>. A Docker service name used outside its compose network gives the same thing: <code>getaddrinfo ENOTFOUND db</code>.</li>
+<li><strong>Check for a proxy.</strong> If the proxy hostname is wrong, curl says <code>curl: (5) Could not resolve proxy: myproxy-typo.invalid</code> (exit 5, not 6). Check <code>HTTP_PROXY</code> / <code>HTTPS_PROXY</code>.</li>
+<li><strong>New domain or changed record?</strong> Resolvers cache answers, including negative ones, for the TTL. Query the authoritative server directly: <code>dig @ns1.yourdns.com name A</code>. If it answers there but not via your resolver, wait for the TTL.</li>
+<li><strong>Browser cache.</strong> Chrome keeps its own host cache. Per Chrome's docs (not measured), <code>chrome://net-internals/#dns</code> has a "Clear host cache" button.</li>
+<li><strong>Test without DNS</strong> to prove the server is fine. curl: <code>--resolve host:port:ip</code>. Chromium: <code>--host-resolver-rules</code>. We mapped <code>nonexistent-xyz.invalid</code> to a local server on 127.0.0.1:8983 this way and got 200, with <code>Host: nonexistent-xyz.invalid</code> sent as usual.
+<pre><code>curl --resolve nonexistent-xyz.invalid:8983:127.0.0.1 http://nonexistent-xyz.invalid:8983/
+chromium --host-resolver-rules="MAP nonexistent-xyz.invalid 127.0.0.1:8983"</code></pre></li>
+</ol>
+<p>Once the name resolves, the next errors are usually about the connection: <a href="/guides/err-connection-refused-econnrefused/">ECONNREFUSED</a> or <a href="/guides/err-connection-reset-econnreset/">ECONNRESET</a>.</p>
+<aside class="cta"><strong>Once the name resolves, check the status and headers the server sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is ERR_NAME_NOT_RESOLVED a server problem?</summary><p>No. The request never left the client. DNS gave no IP address for the hostname, so the server was never contacted. Check the hostname and its DNS records.</p></details>
+<details><summary>What is the difference between ENOTFOUND and EAI_AGAIN?</summary><p>ENOTFOUND: the resolver answered that there is no address for the name. EAI_AGAIN: the resolver itself failed or timed out (per the Node.js docs). Retry EAI_AGAIN; fix the name or record for ENOTFOUND.</p></details>
+<details><summary>Why does fetch only say &#x27;Failed to fetch&#x27;?</summary><p>Browsers hide network details from JavaScript. In Chromium 153 a DNS failure gave TypeError: Failed to fetch, and the real cause, net::ERR_NAME_NOT_RESOLVED, was only in the console and DevTools.</p></details>
+<details><summary>My domain has a record but I still get ENOTFOUND. Why?</summary><p>Check the record type. We tested a name with only a TXT record: Chromium, Node.js fetch and curl all failed as if it did not exist. Browsers and HTTP clients need an A or AAAA record.</p></details>
+<details><summary>Does curl exit code 6 always mean DNS?</summary><p>Yes, exit 6 is &#x27;Could not resolve host&#x27;. Exit 5 is the same failure for the proxy host. Exit 3 means the URL itself was rejected, as we saw with a space in the hostname.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright), Node.js 24.21.0, curl 8.14.1, Python 3.13.5 (requests 2.32.3) and dig 9.20 on Debian 13, using the box&#x27;s normal resolver. No system DNS settings were changed. EAI_AGAIN from getaddrinfo is from the Node.js and glibc docs, not measured. PlainHeaders is our extension; dig, curl, Python, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

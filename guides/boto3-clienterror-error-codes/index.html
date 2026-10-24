@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>boto3 ClientError: Error Codes and How to Handle Them</title>
+<meta name="description" content="boto3 ClientError tested on 1.43: read e.response[&#x27;Error&#x27;][&#x27;Code&#x27;], HeadObject&#x27;s bare 404, s3.exceptions.NoSuchKey, re-raising, and Stubber for tests.">
+<link rel="canonical" href="https://honestkit.github.io/guides/boto3-clienterror-error-codes/">
+<meta property="og:title" content="boto3 ClientError: Error Codes and How to Handle Them">
+<meta property="og:description" content="boto3 ClientError tested on 1.43: read e.response[&#x27;Error&#x27;][&#x27;Code&#x27;], HeadObject&#x27;s bare 404, s3.exceptions.NoSuchKey, re-raising, and Stubber for tests.">
+<meta property="og:url" content="https://honestkit.github.io/guides/boto3-clienterror-error-codes/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I get the error code from a boto3 ClientError?", "acceptedAnswer": {"@type": "Answer", "text": "Use e.response['Error']['Code']; the HTTP status is in e.response['ResponseMetadata']['HTTPStatusCode']."}}, {"@type": "Question", "name": "Why does head_object return 404 instead of NoSuchKey?", "acceptedAnswer": {"@type": "Answer", "text": "HEAD responses have no body, so S3 cannot send a named error code; boto3 reports the status code '404' as the code."}}, {"@type": "Question", "name": "How do I catch NoSuchKey in boto3?", "acceptedAnswer": {"@type": "Answer", "text": "except s3.exceptions.NoSuchKey: on the client you used. It is a subclass of ClientError, so put it before a general except ClientError."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>boto3 ClientError error codes and handling (tested)</h1>
+<p class="lead">boto3 raises <code>botocore.exceptions.ClientError</code> for every AWS service error. Branch on <code>e.response["Error"]["Code"]</code> (e.g. <code>NoSuchKey</code>, <code>AccessDenied</code>) or catch the client's modeled classes like <code>s3.exceptions.NoSuchKey</code>, and re-raise what you don't expect.</p>
+<h2 id="code">1. Read the error code, not the message</h2>
+<pre><code>import boto3
+from botocore.exceptions import ClientError
+from botocore.stub import Stubber
+s3 = boto3.client(&quot;s3&quot;, region_name=&quot;us-east-1&quot;, aws_access_key_id=&quot;x&quot;, aws_secret_access_key=&quot;x&quot;)
+stub = Stubber(s3)
+stub.add_client_error(&quot;head_object&quot;, service_error_code=&quot;404&quot;, service_message=&quot;Not Found&quot;, http_status_code=404)
+stub.add_client_error(&quot;get_object&quot;, service_error_code=&quot;NoSuchKey&quot;, service_message=&quot;The specified key does not exist.&quot;, http_status_code=404)
+stub.add_client_error(&quot;list_objects_v2&quot;, service_error_code=&quot;AccessDenied&quot;, service_message=&quot;Access Denied&quot;, http_status_code=403)
+with stub:
+    for call in (lambda: s3.head_object(Bucket=&quot;b&quot;, Key=&quot;k&quot;),
+                 lambda: s3.get_object(Bucket=&quot;b&quot;, Key=&quot;k&quot;),
+                 lambda: s3.list_objects_v2(Bucket=&quot;b&quot;)):
+        try:
+            call()
+        except ClientError as e:
+            err = e.response[&quot;Error&quot;]
+            print(f&quot;{err[&#x27;Code&#x27;]:13} HTTP {e.response[&#x27;ResponseMetadata&#x27;][&#x27;HTTPStatusCode&#x27;]} | {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>404           HTTP 404 | An error occurred (404) when calling the HeadObject operation: Not Found
+NoSuchKey     HTTP 404 | An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist.
+AccessDenied  HTTP 403 | An error occurred (AccessDenied) when calling the ListObjectsV2 operation: Access Denied</code></pre>
+<p>Every AWS service error reaches boto3 as <code>botocore.exceptions.ClientError</code>. The machine-readable parts are in <code>e.response["Error"]["Code"]</code> and <code>e.response["ResponseMetadata"]["HTTPStatusCode"]</code>; the printed text <code>An error occurred (Code) when calling the X operation: message</code> is built from them. Branch on the code, never on the message text.</p>
+<p>Watch out for <code>HeadObject</code>: a HEAD response has no body, so S3 cannot send a named code and you get the bare status (<code>"404"</code>, <code>"403"</code>) instead of <code>NoSuchKey</code>. Code that checks <code>== "NoSuchKey"</code> after <code>head_object</code> never matches; check for <code>"404"</code> there.</p>
+<h2 id="classes">2. Catch modeled exceptions, re-raise the rest</h2>
+<pre><code>import boto3
+from botocore.exceptions import ClientError
+from botocore.stub import Stubber
+s3 = boto3.client(&quot;s3&quot;, region_name=&quot;us-east-1&quot;, aws_access_key_id=&quot;x&quot;, aws_secret_access_key=&quot;x&quot;)
+stub = Stubber(s3)
+stub.add_client_error(&quot;get_object&quot;, service_error_code=&quot;NoSuchKey&quot;, http_status_code=404)
+stub.add_client_error(&quot;get_object&quot;, service_error_code=&quot;AccessDenied&quot;, http_status_code=403)
+def read(key):
+    try:
+        return s3.get_object(Bucket=&quot;b&quot;, Key=key)[&quot;Body&quot;].read()
+    except s3.exceptions.NoSuchKey:            # modeled exception class
+        return None
+    except ClientError as e:
+        if e.response[&quot;Error&quot;][&quot;Code&quot;] == &quot;AccessDenied&quot;:
+            print(&quot;re-raising:&quot;, e.response[&quot;Error&quot;][&quot;Code&quot;])
+        raise
+with stub:
+    print(&quot;missing key -&gt;&quot;, read(&quot;a&quot;))
+    print(&quot;NoSuchKey is a ClientError:&quot;, issubclass(s3.exceptions.NoSuchKey, ClientError))
+    try:
+        read(&quot;b&quot;)
+    except ClientError as e:
+        print(&quot;caller got&quot;, type(e).__name__)</code></pre>
+<p>Output:</p>
+<pre><code>missing key -&gt; None
+NoSuchKey is a ClientError: True
+re-raising: AccessDenied
+caller got AccessDenied</code></pre>
+<p>Errors that a service declares in its API model are exposed as classes on the client, e.g. <code>s3.exceptions.NoSuchKey</code>. They are subclasses of <code>ClientError</code>, so catch the specific one first and a general <code>ClientError</code> after it. In the last line the class name follows the error code (<code>AccessDenied</code>) but it is still a <code>ClientError</code>. Re-raise anything you do not expect rather than swallowing it: an <code>AccessDenied</code> is a permissions bug to fix, not a missing file.</p>
+<h2 id="codes">Common codes</h2>
+<ul><li><code>AccessDenied</code> / <code>403</code>: the IAM policy (or bucket policy, or KMS key) does not allow the action. With S3, listing permission is needed to get 404 instead of 403 for a missing key.</li><li><code>NoSuchKey</code>, <code>NoSuchBucket</code>, <code>ResourceNotFoundException</code> (DynamoDB, Lambda): wrong name or wrong region.</li><li><code>ThrottlingException</code>, <code>SlowDown</code>, <code>ProvisionedThroughputExceededException</code>: retry with backoff (botocore's retry config: <code>Config(retries={"mode": "adaptive"})</code>).</li><li><code>ExpiredToken</code>, <code>InvalidClientTokenId</code>, <code>SignatureDoesNotMatch</code>: credentials problem; see <a href="/guides/boto3-nocredentialserror-unable-to-locate-credentials/">boto3 Unable to locate credentials</a>.</li></ul>
+<h2 id="test">Testing error paths without AWS</h2>
+<p>Both blocks use <code>botocore.stub.Stubber</code>, which makes the client return a canned error with the code and status you choose; no network or account needed. That is the easiest way to unit-test your except branches.</p>
+
+<aside class="cta"><strong>Inspect the status and headers an HTTP endpoint really returns, right in the browser:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I get the error code from a boto3 ClientError?</summary><p>Use e.response[&#x27;Error&#x27;][&#x27;Code&#x27;]; the HTTP status is in e.response[&#x27;ResponseMetadata&#x27;][&#x27;HTTPStatusCode&#x27;].</p></details>
+<details><summary>Why does head_object return 404 instead of NoSuchKey?</summary><p>HEAD responses have no body, so S3 cannot send a named error code; boto3 reports the status code &#x27;404&#x27; as the code.</p></details>
+<details><summary>How do I catch NoSuchKey in boto3?</summary><p>except s3.exceptions.NoSuchKey: on the client you used. It is a subclass of ClientError, so put it before a general except ClientError.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with boto3/botocore 1.43.118 and Python 3.14.7 (python:3-alpine in Docker). Errors are canned with botocore Stubber (no AWS calls); each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and boto3 are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

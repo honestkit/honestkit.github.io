@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jenkins-jobs: No jjb.cli.subcommands extensions found (fix)</title>
+<meta name="description" content="Jenkins Job Builder 6.5.0 imports pkg_resources, so on setuptools 82+ jenkins-jobs fails with NoMatches. Tested fix: pin setuptools&lt;81.">
+<link rel="canonical" href="https://honestkit.github.io/guides/jenkins-job-builder-no-module-named-pkg-resources/">
+<meta property="og:title" content="jenkins-jobs: No jjb.cli.subcommands extensions found (fix)">
+<meta property="og:description" content="Jenkins Job Builder 6.5.0 imports pkg_resources, so on setuptools 82+ jenkins-jobs fails with NoMatches. Tested fix: pin setuptools&lt;81.">
+<meta property="og:url" content="https://honestkit.github.io/guides/jenkins-job-builder-no-module-named-pkg-resources/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is there a Jenkins Job Builder version without pkg_resources?", "acceptedAnswer": {"@type": "Answer", "text": "Not yet: 6.5.0 (2026-05-23) is the latest release and the opendev master branch still imports pkg_resources in registry.py (checked 2026-10-24)."}}, {"@type": "Question", "name": "Why does the error say no extensions found instead of pkg_resources?", "acceptedAnswer": {"@type": "Answer", "text": "stevedore catches the ImportError for each subcommand plugin, logs it as an ERROR line, and then raises NoMatches because none of the subcommands loaded."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>jenkins-jobs: No jjb.cli.subcommands extensions found (fix)</h1>
+<p class="lead">On setuptools 82 or newer, <code>jenkins-jobs</code> (Jenkins Job Builder 6.5.0, the latest) fails with <code>stevedore.exception.NoMatches: No jjb.cli.subcommands extensions found</code>. The cause is <code>No module named 'pkg_resources'</code> in <code>jenkins_jobs/registry.py</code>. Tested fix: <code>pip install "setuptools&lt;81"</code>.</p>
+<h2 id="repro">1. The error: jenkins-jobs 6.5.0 with setuptools 84</h2>
+<p><code>pip install jenkins-job-builder==6.5.0</code> (the latest release, 2026-05-23) into a Python 3.11.17 venv, then setuptools 84.2.1:</p>
+<pre><code>$ jenkins-jobs --version
+ERROR:stevedore.extension:Could not load &#x27;delete&#x27;: No module named &#x27;pkg_resources&#x27;
+ERROR:stevedore.extension:Could not load &#x27;delete-all&#x27;: No module named &#x27;pkg_resources&#x27;
+ERROR:stevedore.extension:Could not load &#x27;get-plugins-info&#x27;: No module named &#x27;pkg_resources&#x27;
+ERROR:stevedore.extension:Could not load &#x27;list&#x27;: No module named &#x27;pkg_resources&#x27;
+ERROR:stevedore.extension:Could not load &#x27;test&#x27;: No module named &#x27;pkg_resources&#x27;
+ERROR:stevedore.extension:Could not load &#x27;update&#x27;: No module named &#x27;pkg_resources&#x27;
+Traceback (most recent call last):
+  File &quot;/path/to/venv/bin/jenkins-jobs&quot;, line 10, in &lt;module&gt;
+    sys.exit(main())
+             ^^^^^^
+  File &quot;jenkins_jobs/cli/entry.py&quot;, line 177, in main
+    jjb = JenkinsJobs(argv)
+          ^^^^^^^^^^^^^^^^^
+  File &quot;jenkins_jobs/cli/entry.py&quot;, line 60, in __init__
+    self.parser = create_parser()
+                  ^^^^^^^^^^^^^^^
+  File &quot;jenkins_jobs/cli/parser.py&quot;, line 112, in create_parser
+    extension_manager.map(parse_subcommand_args, subparser)
+  File &quot;stevedore/extension.py&quot;, line 377, in map
+    raise NoMatches(f&#x27;No {self.namespace} extensions found&#x27;)
+stevedore.exception.NoMatches: No jjb.cli.subcommands extensions found</code></pre>
+<p>The real cause is in the first lines, not the last one. Every <code>jenkins-jobs</code> subcommand (<code>test</code>, <code>update</code>, <code>delete</code>, …) is a stevedore plugin, and each one imports <code>jenkins_jobs/registry.py</code>, whose line 22 is a plain <code>import pkg_resources</code>. setuptools 82.0.0 removed that module, so stevedore logs <code>Could not load '…': No module named 'pkg_resources'</code> for every subcommand and then fails with <code>NoMatches: No jjb.cli.subcommands extensions found</code>. <code>jenkins-jobs test jobs/</code> fails the same way. <code>jenkins_jobs/xml_config.py</code> line 19 imports it too.</p>
+<h2 id="fix">2. Fix: pin setuptools below 81 in the JJB environment (tested)</h2>
+<pre><code>$ pip install &quot;setuptools&lt;81&quot;    # gave 80.10.2
+$ jenkins-jobs --version
+jenkins_jobs/registry.py:22: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools&lt;81.
+  import pkg_resources
+Jenkins Job Builder version: 6.5.0</code></pre>
+<p>With a one-job YAML file (<code>- job: {name: hello, builders: [shell: echo hello]}</code>), <code>jenkins-jobs test jobs/</code> then printed the job XML and exited 0. There is no newer JJB release to upgrade to: 6.5.0 is the latest on PyPI, and on the opendev <code>master</code> branch <code>registry.py</code> still has <code>import pkg_resources</code> on line 22 (checked 2026-10-24). JJB lists <code>setuptools</code> as a dependency with no upper bound, so a plain <code>pip install -U</code> can pull in setuptools 82+ again: put <code>setuptools&lt;81</code> in your requirements or constraints file next to <code>jenkins-job-builder</code>.</p>
+<h2 id="warning">3. Hide the deprecation warning</h2>
+<p>On setuptools 80.x every run prints the <a href="/guides/pkg-resources-is-deprecated-as-an-api/">pkg_resources is deprecated as an API</a> warning. It is harmless; in CI you can silence it:</p>
+<pre><code>$ PYTHONWARNINGS=&quot;ignore:pkg_resources is deprecated as an API&quot; jenkins-jobs test jobs/</code></pre>
+<p>In our run that removed the warning and the job XML was still printed. If JJB runs in its own Docker image or tox env, set the pin and the variable there, not on the Jenkins controller.</p>
+<p>Related: <a href="/guides/python-modulenotfounderror-no-module-named-pkg-resources/">No module named 'pkg_resources' (general fix)</a> · <a href="/guides/ansible-no-module-named-pkg-resources/">Ansible pip module</a> · <a href="/guides/supervisor-no-module-named-pkg-resources/">supervisord</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is there a Jenkins Job Builder version without pkg_resources?</summary><p>Not yet: 6.5.0 (2026-05-23) is the latest release and the opendev master branch still imports pkg_resources in registry.py (checked 2026-10-24).</p></details>
+<details><summary>Why does the error say no extensions found instead of pkg_resources?</summary><p>stevedore catches the ImportError for each subcommand plugin, logs it as an ERROR line, and then raises NoMatches because none of the subcommands loaded.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux with jenkins-job-builder 6.5.0, stevedore from the same install, CPython 3.11.17, setuptools 80.10.2 and 84.2.1. Output pasted unedited except shortened paths. PlainTables is our extension; Jenkins Job Builder is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

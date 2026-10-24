@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Django CSRF Verification Failed: CSRF Cookie Not Set (Tested)</title>
+<meta name="description" content="Django CSRF verification failed (403) tested on 6.1.2: cookie not set, token missing or incorrect, X-CSRFToken, Origin checking failed, CSRF_TRUSTED_ORIGINS.">
+<link rel="canonical" href="https://honestkit.github.io/guides/django-csrf-verification-failed-cookie-not-set/">
+<meta property="og:title" content="Django CSRF Verification Failed: CSRF Cookie Not Set (Tested)">
+<meta property="og:description" content="Django CSRF verification failed (403) tested on 6.1.2: cookie not set, token missing or incorrect, X-CSRFToken, Origin checking failed, CSRF_TRUSTED_ORIGINS.">
+<meta property="og:url" content="https://honestkit.github.io/guides/django-csrf-verification-failed-cookie-not-set/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I fix 'CSRF cookie not set' in Django?", "acceptedAnswer": {"@type": "Answer", "text": "Render the form page through Django with {% csrf_token %} so the csrftoken cookie is issued, and make sure the browser keeps and sends it (CSRF_COOKIE_SECURE on HTTP, cross-origin fetch needs credentials)."}}, {"@type": "Question", "name": "What does 'Origin checking failed - does not match any trusted origins' mean?", "acceptedAnswer": {"@type": "Answer", "text": "On HTTPS the Origin header differs from the host Django sees. Add the full origin with scheme, like https://app.example.com, to CSRF_TRUSTED_ORIGINS."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Django CSRF verification failed (tested)</h1>
+<p class="lead">Django's 403 <code>CSRF verification failed</code> page has one of a few reasons: <code>CSRF cookie not set</code>, <code>CSRF token missing</code>, <code>token incorrect</code>, or over HTTPS <code>Origin checking failed</code>. Here is each one reproduced, with its fix.</p>
+<h2 id="setup">Setup</h2>
+<p>A single-file Django app with <code>CsrfViewMiddleware</code>, a <code>/form/</code> view that issues the <code>csrftoken</code> cookie, and a <code>/submit/</code> view that accepts POSTs. The test client normally skips CSRF checks, so <code>enforce_csrf_checks=True</code> turns them on. The <code>log:</code> lines are Django's own <code>django.security.csrf</code> warnings, which carry the exact reason shown on the 403 page.</p>
+<pre><code>import logging, sys
+import django
+from django.conf import settings
+settings.configure(ROOT_URLCONF=__name__, SECRET_KEY=&#x27;dev&#x27;, ALLOWED_HOSTS=[&#x27;*&#x27;],
+    MIDDLEWARE=[&#x27;django.middleware.csrf.CsrfViewMiddleware&#x27;])
+django.setup()
+logging.basicConfig(stream=sys.stdout, format=&#x27;log: %(levelname)s %(message)s&#x27;)
+from django.urls import path
+from django.http import HttpResponse
+from django.middleware.csrf import get_token
+def form(request): get_token(request); return HttpResponse(&#x27;form&#x27;)   # sets csrftoken cookie
+def submit(request): return HttpResponse(&#x27;saved&#x27;)
+urlpatterns = [path(&#x27;form/&#x27;, form), path(&#x27;submit/&#x27;, submit)]
+from django.test import Client</code></pre>
+<h2 id="repro">1. The token reasons: cookie not set, token missing, incorrect</h2>
+<pre><code>from common import *
+c = Client(enforce_csrf_checks=True)
+print(1, c.post(&#x27;/submit/&#x27;, {&#x27;x&#x27;: 1}).status_code)                 # no cookie at all
+c.get(&#x27;/form/&#x27;)                                                     # now has csrftoken cookie
+token = c.cookies[&#x27;csrftoken&#x27;].value
+print(2, c.post(&#x27;/submit/&#x27;, {&#x27;x&#x27;: 1}).status_code)                 # cookie, no token
+print(3, c.post(&#x27;/submit/&#x27;, {&#x27;x&#x27;: 1, &#x27;csrfmiddlewaretoken&#x27;: &#x27;x&#x27; * 32}).status_code)
+print(4, c.post(&#x27;/submit/&#x27;, {&#x27;x&#x27;: 1, &#x27;csrfmiddlewaretoken&#x27;: token}).status_code)
+print(5, c.post(&#x27;/submit/&#x27;, {&#x27;x&#x27;: 1}, headers={&#x27;X-CSRFToken&#x27;: token}).status_code)  # AJAX header</code></pre>
+<p>Output:</p>
+<pre><code>log: WARNING Forbidden (CSRF cookie not set.): /submit/
+1 403
+log: WARNING Forbidden (CSRF token missing.): /submit/
+2 403
+log: WARNING Forbidden (CSRF token from POST incorrect.): /submit/
+3 403
+4 200
+5 200</code></pre>
+<ul>
+<li><strong>CSRF cookie not set</strong>: the browser never got (or did not send) the <code>csrftoken</code> cookie. The page with the form must be rendered by Django with <code>{% csrf_token %}</code> (or call <code>get_token()</code>), and the cookie must survive: check <code>CSRF_COOKIE_SECURE</code> on plain HTTP, the cookie domain, and that a frontend on another port sends cookies (<code>credentials: 'include'</code>).</li>
+<li><strong>CSRF token missing</strong>: the cookie is there but the request has no <code>csrfmiddlewaretoken</code> field and no <code>X-CSRFToken</code> header. Add <code>{% csrf_token %}</code> inside the <code>&lt;form&gt;</code>, or send the header from JavaScript (case 5).</li>
+<li><strong>CSRF token from POST incorrect</strong>: a token was sent but does not match the cookie, e.g. a cached page with an old token, or a hard-coded value.</li>
+</ul>
+<h2 id="origin">2. HTTPS: Origin checking failed - does not match any trusted origins</h2>
+<pre><code>from common import *
+c = Client(enforce_csrf_checks=True)
+c.get(&#x27;/form/&#x27;, secure=True); token = c.cookies[&#x27;csrftoken&#x27;].value
+for origin in [&#x27;https://testserver&#x27;, &#x27;https://app.example.com&#x27;, &#x27;http://testserver&#x27;]:
+    r = c.post(&#x27;/submit/&#x27;, {&#x27;csrfmiddlewaretoken&#x27;: token}, secure=True, headers={&#x27;Origin&#x27;: origin})
+    print(origin, r.status_code)
+settings.CSRF_TRUSTED_ORIGINS = [&#x27;https://app.example.com&#x27;]          # scheme required
+c = Client(enforce_csrf_checks=True)       # new client: middleware caches the list at first use
+c.get(&#x27;/form/&#x27;, secure=True); token = c.cookies[&#x27;csrftoken&#x27;].value
+r = c.post(&#x27;/submit/&#x27;, {&#x27;csrfmiddlewaretoken&#x27;: token}, secure=True, headers={&#x27;Origin&#x27;: &#x27;https://app.example.com&#x27;})
+print(&#x27;trusted&#x27;, r.status_code)</code></pre>
+<p>Output:</p>
+<pre><code>https://testserver 200
+log: WARNING Forbidden (Origin checking failed - https://app.example.com does not match any trusted origins.): /submit/
+https://app.example.com 403
+log: WARNING Forbidden (Origin checking failed - http://testserver does not match any trusted origins.): /submit/
+http://testserver 403
+trusted 200</code></pre>
+<p>Over HTTPS, Django also compares the <code>Origin</code> header with the request's own host. A form posted from another domain, or a proxy that terminates TLS so Django sees a different scheme or host, fails here even with a valid token. Add the full origin, <strong>including the scheme</strong>, to <code>CSRF_TRUSTED_ORIGINS</code>, e.g. <code>['https://app.example.com']</code>. Behind a proxy, also make Django see the real scheme (<code>SECURE_PROXY_SSL_HEADER</code>) and host (<code>USE_X_FORWARDED_HOST</code>) only if your proxy sets those headers. Restart the server after changing the setting: as the block shows, a client whose middleware is already loaded kept rejecting the origin until a new one was created.</p>
+<h2 id="dont">Don't just add @csrf_exempt</h2>
+<p><code>@csrf_exempt</code> removes the protection for that view. It is only appropriate for endpoints that do not use cookie-based sessions (e.g. a webhook verified by a signature or a token-authenticated API).</p>
+<p>Related: <a href="/guides/django-noreversematch/">Django NoReverseMatch</a>, <a href="/guides/flask-cors-error-localhost/">Flask CORS error on localhost</a>.</p>
+
+<aside class="cta"><strong>See the Set-Cookie, Origin and other headers your browser actually exchanges:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I fix &#x27;CSRF cookie not set&#x27; in Django?</summary><p>Render the form page through Django with {% csrf_token %} so the csrftoken cookie is issued, and make sure the browser keeps and sends it (CSRF_COOKIE_SECURE on HTTP, cross-origin fetch needs credentials).</p></details>
+<details><summary>What does &#x27;Origin checking failed - does not match any trusted origins&#x27; mean?</summary><p>On HTTPS the Origin header differs from the host Django sees. Add the full origin with scheme, like https://app.example.com, to CSRF_TRUSTED_ORIGINS.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Django 6.1.2 and Python 3.14.7 (python:3-alpine in Docker, Django test client). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Django are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

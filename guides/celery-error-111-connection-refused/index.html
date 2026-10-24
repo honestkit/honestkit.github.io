@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Celery Error 111 Connection Refused: Fixes (Tested)</title>
+<meta name="description" content="Celery Error 111 connecting to localhost:6379 on Celery 5.6: broker down, fail-fast retry_policy, and amqp 5672 when the CELERY_ broker setting is ignored.">
+<link rel="canonical" href="https://honestkit.github.io/guides/celery-error-111-connection-refused/">
+<meta property="og:title" content="Celery Error 111 Connection Refused: Fixes (Tested)">
+<meta property="og:description" content="Celery Error 111 connecting to localhost:6379 on Celery 5.6: broker down, fail-fast retry_policy, and amqp 5672 when the CELERY_ broker setting is ignored.">
+<meta property="og:url" content="https://honestkit.github.io/guides/celery-error-111-connection-refused/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Celery Error 111 Connection refused mean?", "acceptedAnswer": {"@type": "Answer", "text": "The broker (Redis or RabbitMQ) is not accepting connections at the configured host and port, so delay() cannot publish the task."}}, {"@type": "Question", "name": "Why does Celery connect to amqp://localhost:5672 when I use Redis?", "acceptedAnswer": {"@type": "Answer", "text": "Your broker setting was not read, e.g. BROKER_URL instead of CELERY_BROKER_URL with namespace='CELERY', so Celery uses its default RabbitMQ URL."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Celery Error 111 Connection refused (tested)</h1>
+<p class="lead">Celery raises <code>kombu.exceptions.OperationalError: Error 111 ... Connection refused</code> when <code>delay()</code> cannot reach the broker. Either Redis/RabbitMQ is not running at that address, or Celery is using its default <code>amqp://localhost:5672</code> broker because your setting was not read.</p>
+<h2 id="repro">1. Reproduce it: delay() with the broker down</h2>
+<pre><code>import time
+from celery import Celery
+app = Celery(&#x27;tasks&#x27;, broker=&#x27;redis://localhost:6379/0&#x27;)
+@app.task
+def add(x, y):
+    return x + y
+t = time.monotonic()
+try:
+    add.delay(2, 3)
+except Exception as e:
+    print(f&#x27;{type(e).__module__}.{type(e).__name__}: {e}&#x27;)
+print(f&#x27;after {time.monotonic() - t:.1f}s&#x27;)</code></pre>
+<p>Output:</p>
+<pre><code>kombu.exceptions.OperationalError: Error 111 connecting to localhost:6379. Connection refused.
+after 0.9s</code></pre>
+<p>No Redis is listening on <code>localhost:6379</code>, so <code>delay()</code> retries the publish and then raises <code>kombu.exceptions.OperationalError: Error 111 connecting to localhost:6379. Connection refused.</code> Errno 111 is the OS-level <code>ECONNREFUSED</code>: the host answered, but nothing accepts connections on that port. The task never reaches a worker.</p>
+<h2 id="fast">2. Fail fast instead of retrying</h2>
+<pre><code>import time
+from celery import Celery
+app = Celery(&#x27;tasks&#x27;, broker=&#x27;redis://localhost:6379/0&#x27;)
+@app.task
+def add(x, y):
+    return x + y
+t = time.monotonic()
+try:
+    add.apply_async((2, 3), retry_policy={&#x27;max_retries&#x27;: 1, &#x27;interval_start&#x27;: 0})
+except Exception as e:
+    print(f&#x27;{type(e).__name__}: {e}&#x27;)
+print(f&#x27;after {time.monotonic() - t:.1f}s&#x27;)</code></pre>
+<p>Output:</p>
+<pre><code>OperationalError: Error 111 connecting to localhost:6379. Connection refused.
+after 0.1s</code></pre>
+<p><code>retry_policy</code> on <code>apply_async()</code> controls the publish retries (here 0.9 s by default, 0.1 s with one retry and no wait). Catch <code>kombu.exceptions.OperationalError</code> around <code>delay()</code> in a web view if a broker outage should not turn into a 500 for the user.</p>
+<h2 id="amqp">3. "[Errno 111]" on port 5672: Celery is not reading your broker setting</h2>
+<pre><code>from celery import Celery
+class settings:                       # stands in for Django settings
+    BROKER_URL = &#x27;redis://localhost:6379/0&#x27;          # wrong name for namespace=&#x27;CELERY&#x27;
+app = Celery(&#x27;proj&#x27;)
+app.config_from_object(settings, namespace=&#x27;CELERY&#x27;)
+print(&#x27;broker used:&#x27;, app.connection_for_write().as_uri())
+@app.task
+def add(x, y):
+    return x + y
+try:
+    add.apply_async((2, 3), retry_policy={&#x27;max_retries&#x27;: 0})
+except Exception as e:
+    print(f&#x27;{type(e).__name__}: {e}&#x27;)
+class settings:
+    CELERY_BROKER_URL = &#x27;redis://localhost:6379/0&#x27;   # matches the namespace
+app2 = Celery(&#x27;proj&#x27;)
+app2.config_from_object(settings, namespace=&#x27;CELERY&#x27;)
+print(&#x27;broker used:&#x27;, app2.connection_for_write().as_uri())</code></pre>
+<p>Output:</p>
+<pre><code>broker used: amqp://guest:**@localhost:5672//
+OperationalError: [Errno 111] Connection refused
+broker used: redis://localhost:6379/0</code></pre>
+<p>If the error mentions <code>amqp://guest@localhost:5672</code> even though you use Redis, Celery fell back to its default RabbitMQ broker because your setting was never read. With <code>app.config_from_object('django.conf:settings', namespace='CELERY')</code>, every setting needs the <code>CELERY_</code> prefix: <code>CELERY_BROKER_URL</code>, not <code>BROKER_URL</code>. Print <code>app.connection_for_write().as_uri()</code> to see which broker the app actually uses.</p>
+<h2 id="checklist">4. Checklist</h2>
+<ul><li>Is the broker running? <code>redis-cli -h HOST ping</code> should answer <code>PONG</code>.</li><li>In Docker Compose, <code>localhost</code> is the container itself: use the service name, e.g. <code>redis://redis:6379/0</code>.</li><li>Is the setting read? Check the URI printed as in block 3.</li></ul>
+<p>Related: <a href="/guides/redis-connection-refused-econnrefused/">Redis connection refused</a>, <a href="/guides/python-connectionrefusederror-errno-111-connection-refused/">Python ConnectionRefusedError Errno 111</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers your app returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Celery Error 111 Connection refused mean?</summary><p>The broker (Redis or RabbitMQ) is not accepting connections at the configured host and port, so delay() cannot publish the task.</p></details>
+<details><summary>Why does Celery connect to amqp://localhost:5672 when I use Redis?</summary><p>Your broker setting was not read, e.g. BROKER_URL instead of CELERY_BROKER_URL with namespace=&#x27;CELERY&#x27;, so Celery uses its default RabbitMQ URL.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Celery 5.6.3, kombu 5.6.2 and Python 3.14.7 (python:3-alpine in Docker, no broker running). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Celery are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

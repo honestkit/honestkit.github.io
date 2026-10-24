@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pytest ScopeMismatch: function scoped fixture with session scope</title>
+<meta name="description" content="Fix pytest ScopeMismatch: a session/module fixture requesting a function-scoped fixture, tmp_path or monkeypatch. Use tmp_path_factory or MonkeyPatch.context().">
+<link rel="canonical" href="https://honestkit.github.io/guides/pytest-scopemismatch-function-scoped-fixture/">
+<meta property="og:title" content="pytest ScopeMismatch: function scoped fixture with session scope">
+<meta property="og:description" content="Fix pytest ScopeMismatch: a session/module fixture requesting a function-scoped fixture, tmp_path or monkeypatch. Use tmp_path_factory or MonkeyPatch.context().">
+<meta property="og:url" content="https://honestkit.github.io/guides/pytest-scopemismatch-function-scoped-fixture/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes pytest ScopeMismatch?", "acceptedAnswer": {"@type": "Answer", "text": "A fixture with module or session scope requests a fixture with a narrower scope, usually function scope (the default)."}}, {"@type": "Question", "name": "How do I use tmp_path in a session fixture?", "acceptedAnswer": {"@type": "Answer", "text": "You cannot; use tmp_path_factory.mktemp('name'), which is session-scoped."}}, {"@type": "Question", "name": "How do I use monkeypatch in a module-scoped fixture?", "acceptedAnswer": {"@type": "Answer", "text": "Use with pytest.MonkeyPatch.context() as mp: inside the fixture and yield; changes are undone when the fixture is torn down."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pytest ScopeMismatch: function scoped fixture (tested)</h1>
+<p class="lead"><code>ScopeMismatch: You tried to access the function scoped fixture X with a session scoped request object</code> means a wider-scoped fixture depends on a narrower one. Widen the dependency's scope, narrow the consumer, or use <code>tmp_path_factory</code> / <code>pytest.MonkeyPatch.context()</code> for the built-ins.</p>
+<p>A fixture can only use fixtures with the <strong>same or wider</strong> scope (function &lt; class &lt; module &lt; package &lt; session). A session fixture is created once, so it cannot depend on something that is recreated for every test. Measured on pytest 9.1.1.</p>
+<h2 id="own">1. A session fixture using your function-scoped fixture</h2>
+<pre><code>$ cat test_a.py
+import pytest
+
+@pytest.fixture
+def db_url():
+    return &quot;sqlite://&quot;
+
+@pytest.fixture(scope=&quot;session&quot;)
+def engine(db_url):
+    return {&quot;url&quot;: db_url}
+
+def test_x(engine):
+    assert engine
+$ pytest -q -p no:cacheprovider | grep -E &quot;^ScopeMismatch|^ERROR&quot;
+ScopeMismatch: You tried to access the function scoped fixture db_url with a session scoped request object. Requesting fixture stack:
+ERROR test_a.py::test_x - Failed: ScopeMismatch: You tried to access the func...</code></pre>
+<p>The error names the narrower fixture (<code>db_url</code>, function scope) and the scope that asked for it (session). The test is reported as ERROR at setup.</p>
+<h2 id="fix-own">Fix: widen the dependency (or narrow the consumer)</h2>
+<pre><code>$ cat test_b.py
+import pytest
+
+@pytest.fixture(scope=&quot;session&quot;)
+def db_url():
+    return &quot;sqlite://&quot;
+
+@pytest.fixture(scope=&quot;session&quot;)
+def engine(db_url):
+    return {&quot;url&quot;: db_url}
+
+@pytest.fixture(scope=&quot;session&quot;)
+def data_dir(tmp_path_factory):
+    return tmp_path_factory.mktemp(&quot;data&quot;)
+
+def test_x(engine, data_dir):
+    assert engine and data_dir.exists()
+$ pytest -q -p no:cacheprovider | tail -1
+1 passed in 0.00s</code></pre>
+<p>Give <code>db_url</code> session scope too, or make <code>engine</code> function-scoped if it is cheap. For temporary directories in session fixtures use <code>tmp_path_factory.mktemp()</code>, the session-scoped counterpart of <code>tmp_path</code>, as <code>data_dir</code> does here.</p>
+<h2 id="builtin">2. Built-in fixtures: tmp_path and monkeypatch are function-scoped</h2>
+<pre><code>$ cat test_c.py
+import pytest
+
+@pytest.fixture(scope=&quot;session&quot;)
+def data_dir(tmp_path):
+    return tmp_path
+
+@pytest.fixture(scope=&quot;module&quot;)
+def patched(monkeypatch):
+    monkeypatch.setenv(&quot;X&quot;, &quot;1&quot;)
+
+def test_x(data_dir):
+    pass
+
+def test_y(patched):
+    pass
+$ pytest -q -p no:cacheprovider | grep -E &quot;^ScopeMismatch&quot;
+ScopeMismatch: You tried to access the function scoped fixture tmp_path with a session scoped request object. Requesting fixture stack:
+ScopeMismatch: You tried to access the function scoped fixture monkeypatch with a module scoped request object. Requesting fixture stack:</code></pre>
+<p><code>tmp_path</code>, <code>tmpdir</code>, <code>monkeypatch</code>, <code>capsys</code> and <code>caplog</code> are function-scoped, so a module or session fixture cannot request them. For <code>monkeypatch</code>, use <code>pytest.MonkeyPatch.context()</code> inside the wider fixture; changes are undone when the fixture finishes (here, at the end of the module):</p>
+<pre><code>$ cat test_c.py
+import os, pytest
+
+@pytest.fixture(scope=&quot;module&quot;)
+def patched():
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(&quot;X&quot;, &quot;1&quot;)
+        yield
+
+def test_y(patched):
+    assert os.environ[&quot;X&quot;] == &quot;1&quot;
+$ pytest -q -p no:cacheprovider | tail -1
+1 passed in 0.00s</code></pre>
+<p>Related: <a href="/guides/pytest-fixture-not-found/">pytest fixture not found</a>, <a href="/guides/pytest-error-vs-failure-error-at-setup-teardown/">pytest ERROR at setup</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes pytest ScopeMismatch?</summary><p>A fixture with module or session scope requests a fixture with a narrower scope, usually function scope (the default).</p></details>
+<details><summary>How do I use tmp_path in a session fixture?</summary><p>You cannot; use tmp_path_factory.mktemp(&#x27;name&#x27;), which is session-scoped.</p></details>
+<details><summary>How do I use monkeypatch in a module-scoped fixture?</summary><p>Use with pytest.MonkeyPatch.context() as mp: inside the fixture and yield; changes are undone when the fixture is torn down.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with pytest 9.1.1 on Python 3.13.5 in a clean virtualenv. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and pytest are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

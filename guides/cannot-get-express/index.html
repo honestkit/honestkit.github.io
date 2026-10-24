@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Express &quot;Cannot GET /&quot;: Every Cause and Fix (Tested)</title>
+<meta name="description" content="&quot;Cannot GET /&quot; is Express&#x27;s default 404. We reproduced each cause in Express 5 and 4: missing route, router prefix, static path, SPA refresh, &#x27;*&#x27; crash.">
+<link rel="canonical" href="https://honestkit.github.io/guides/cannot-get-express/">
+<meta property="og:title" content="Express &quot;Cannot GET /&quot;: Every Cause and Fix (Tested)">
+<meta property="og:description" content="&quot;Cannot GET /&quot; is Express&#x27;s default 404. We reproduced each cause in Express 5 and 4: missing route, router prefix, static path, SPA refresh, &#x27;*&#x27; crash.">
+<meta property="og:url" content="https://honestkit.github.io/guides/cannot-get-express/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does \"Cannot GET /\" mean in Express?", "acceptedAnswer": {"@type": "Answer", "text": "It is Express's built-in 404. No route or middleware handled a GET request for /. The server is running; it just has nothing for that path. We saw the same 139-byte HTML page in Express 5.2.1 and 4.22.3."}}, {"@type": "Question", "name": "Why does app.get('*') crash in Express 5?", "acceptedAnswer": {"@type": "Answer", "text": "Express 5 uses path-to-regexp 8, where wildcards must have a name. app.get('*') threw \"Missing parameter name at index 1: *\" at startup. Use app.get('/{*splat}', ...) instead; the braces make it also match /."}}, {"@type": "Question", "name": "Why do I get Cannot GET when I refresh my React app?", "acceptedAnswer": {"@type": "Answer", "text": "The browser asks the server for the client-side route, and Express has no file or route for it. Add a catch-all after express.static that sends index.html: '/{*splat}' in Express 5, '*' in Express 4."}}, {"@type": "Question", "name": "Why does express.static return Cannot GET /?", "acceptedAnswer": {"@type": "Answer", "text": "A relative folder is resolved against the working directory, not your file. Started from another folder, our app gave Cannot GET /. Use path.join(__dirname, 'public'). Express gives no warning for a missing folder."}}, {"@type": "Question", "name": "Why do I get \"Cannot POST\" instead of 405?", "acceptedAnswer": {"@type": "Answer", "text": "Express answers an unmatched method with a 404 and \"Cannot POST /path\", even if a GET route exists for that path. Add the POST route, or send a 405 with an Allow header yourself."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Express &quot;Cannot GET /&quot; (tested)</h1>
+<p class="lead"><code>Cannot GET /</code> is the default 404 page of Express. It means no route and no middleware answered that method and path. It does not mean the server is down. We reproduced every common cause in Express 5.2.1 and 4.22.3 and recorded the exact response.</p>
+<h2>1. What the response looks like</h2>
+<p>When nothing handles a request, Express's final handler sends this. Byte for byte the same in Express 5.2.1 and 4.22.3:</p>
+<pre><code>HTTP/1.1 404 Not Found
+Content-Security-Policy: default-src 'none'
+X-Content-Type-Options: nosniff
+Content-Type: text/html; charset=utf-8
+Content-Length: 139
+
+&lt;!DOCTYPE html&gt;
+&lt;html lang="en"&gt;
+&lt;head&gt;
+&lt;meta charset="utf-8"&gt;
+&lt;title&gt;Error&lt;/title&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;pre&gt;Cannot GET /&lt;/pre&gt;
+&lt;/body&gt;
+&lt;/html&gt;</code></pre>
+<p>The text is always <code>Cannot &lt;METHOD&gt; &lt;path&gt;</code>. The query string is dropped: <code>/nope?x=1</code> gave <code>Cannot GET /nope</code>. The path is shown as sent, still percent-encoded (<code>/%3Cscript%3E</code> stayed encoded). The <code>Content-Security-Policy: default-src 'none'</code> and <code>nosniff</code> headers appear only on this built-in 404. Our own routes did not get them. If you see those two headers on a 404, Express itself answered, not nginx or your code.</p>
+
+<h2>2. Cause and fix table</h2>
+<table>
+<tr><th>Cause</th><th>What we saw</th><th>Fix</th></tr>
+<tr><td>No route for <code>/</code> (only <code>/api</code> defined)</td><td>404 <code>Cannot GET /</code></td><td>Add <code>app.get('/', ...)</code> or serve an <code>index.html</code> with <code>express.static</code></td></tr>
+<tr><td>Router mounted at <code>/api</code>, URL without prefix</td><td><code>GET /users</code> 404, <code>GET /api/users</code> 200</td><td>Call the full path, or change the mount point</td></tr>
+<tr><td>Prefix written twice (<code>app.use('/api', r)</code> + <code>r.get('/api/users')</code>)</td><td><code>/api/users</code> 404, <code>/api/api/users</code> 200</td><td>Inside the router use <code>r.get('/users')</code></td></tr>
+<tr><td><code>express.static('public')</code> started from another folder</td><td><code>Cannot GET /</code> and <code>Cannot GET /index.html</code></td><td><code>express.static(path.join(__dirname, 'public'))</code></td></tr>
+<tr><td>Static folder does not exist</td><td>404 <code>Cannot GET /</code>, no startup error</td><td>Check the path; Express does not warn</td></tr>
+<tr><td>SPA refresh on a client-side route</td><td><code>Cannot GET /dashboard/settings</code></td><td>Catch-all that sends <code>index.html</code> (section 5)</td></tr>
+<tr><td><code>app.get('*')</code> in Express 5</td><td>App crashes at startup: <code>Missing parameter name at index 1: *</code></td><td>Use <code>'/{*splat}'</code></td></tr>
+<tr><td><code>strict routing</code> on, URL has trailing slash</td><td><code>Cannot GET /about/</code></td><td>Turn it off (default) or add both routes</td></tr>
+<tr><td><code>case sensitive routing</code> on, wrong case</td><td><code>Cannot GET /about</code> for route <code>/About</code></td><td>Turn it off (default) or fix the link</td></tr>
+<tr><td>Wrong method (form POSTs to a GET-only route)</td><td>404 <code>Cannot POST /login</code></td><td>Add <code>app.post('/login', ...)</code></td></tr>
+</table>
+
+<h2>3. Router prefixes, trailing slashes and case</h2>
+<p>A router mounted with <code>app.use('/api', router)</code> only sees paths below <code>/api</code>. Its routes are relative to the mount point. Repeating the prefix inside the router is a common slip: it makes the real URL <code>/api/api/users</code>.</p>
+<pre><code>const r = express.Router();
+r.get('/users', listUsers);   // not '/api/users'
+app.use('/api', r);           // GET /api/users -&gt; 200</code></pre>
+<p>With the router's own <code>r.get('/')</code>, both <code>/api</code> and <code>/api/</code> returned 200.</p>
+<p>By default Express ignores one trailing slash and ignores case. In both versions, route <code>/about</code> answered <code>/about/</code>, and route <code>/About</code> answered <code>/about</code>. Only when we turned on <code>app.set('strict routing', true)</code> did <code>/about/</code> return <code>Cannot GET /about/</code>. With <code>app.set('case sensitive routing', true)</code>, <code>/about</code> returned <code>Cannot GET /about</code>. If you get these 404s, check for those settings.</p>
+
+<h2>4. express.static: relative paths and __dirname</h2>
+<p>A relative path in <code>express.static('public')</code> is resolved against the current working directory, not the file it is written in. We started the same app from <code>/tmp</code> instead of the project folder. Both <code>/</code> and <code>/index.html</code> gave <code>Cannot GET</code>. There was no warning at startup, and a folder that does not exist at all behaved the same.</p>
+<pre><code>const path = require('path');
+app.use(express.static(path.join(__dirname, 'public')));</code></pre>
+<p>With the absolute path, <code>GET /</code> returned 200 with <code>public/index.html</code>, whatever folder the process ran from. In ES modules, <code>__dirname</code> does not exist; use <code>import.meta.dirname</code> (per the Node.js docs, not measured). A missing file inside a correct folder still gives <code>Cannot GET /missing.css</code>; static passes it on rather than sending its own 404.</p>
+
+<h2>5. SPA refresh and the catch-all route</h2>
+<p>A React, Vue or Angular app changes the URL in the browser without asking the server. Reload on <code>/dashboard/settings</code> and the browser asks Express for that path. With only <code>express.static('dist')</code>, we got <code>Cannot GET /dashboard/settings</code>. The fix is a catch-all after static that sends <code>index.html</code>.</p>
+<p><strong>Express 5:</strong> the old <code>'*'</code> no longer works. Express 5 uses path-to-regexp 8, and every wildcard needs a name. This line crashes the app at startup, before it listens:</p>
+<pre><code>app.get('*', sendIndex);
+// TypeError: Missing parameter name at index 1: *; visit https://git.new/pathToRegexpError for info</code></pre>
+<p>The thrown object is a <code>PathError</code> whose <code>name</code> is <code>TypeError</code>. <code>'/*'</code> and <code>'/api/*'</code> failed the same way, at index 2 and 6. The Express 4 regex style <code>'(.*)'</code> failed with <code>Unexpected ( at index 0: (.*)</code>, and <code>'/:path(.*)'</code> with <code>Unexpected ( at index 6</code>.</p>
+<p>The working Express 5 form wraps a named wildcard in braces, which makes it optional so it also matches <code>/</code>:</p>
+<pre><code>app.use(express.static(path.join(__dirname, 'dist')));
+app.get('/{*splat}', (req, res) =&gt;
+  res.sendFile(path.join(__dirname, 'dist', 'index.html')));</code></pre>
+<p>Results in Express 5.2.1: <code>/</code> 200, <code>/dashboard/settings</code> 200, <code>POST /dashboard</code> still <code>Cannot POST /dashboard</code>. Without braces, <code>'/*splat'</code> matched <code>/a/b</code> (<code>req.params.splat</code> was <code>["a","b"]</code>, an array) but not <code>/</code>. A regex, <code>app.get(/.*/, ...)</code>, worked in both versions.</p>
+<p><strong>Express 4:</strong> <code>app.get('*', ...)</code> works and served <code>index.html</code> for <code>/dashboard/settings</code>. The Express 5 syntax does <em>not</em> work in 4.22.3: <code>'/{*splat}'</code> gave <code>Cannot GET /dashboard/settings</code>, and no error was thrown. So copy the syntax that matches your installed version.</p>
+<p>One catch: the catch-all also answered <code>/api/missing</code> with 200 and the HTML page. That hides broken API calls and leads to JSON parse errors in the client (see <a href="/guides/unexpected-end-of-json-input/">Unexpected end of JSON input</a>). Put an API 404 before the catch-all:</p>
+<pre><code>app.use('/api', apiRouter);
+app.use('/api', (req, res) =&gt; res.status(404).json({ error: 'Not found' }));
+app.get('/{*splat}', sendIndex);</code></pre>
+<p>A plain <code>app.use(sendIndex)</code> fallback also works in both versions, but it answered <code>POST /x</code> with 200 and the page too. <code>app.get</code> is safer.</p>
+
+<h2>6. Cannot POST, PUT, DELETE: wrong method</h2>
+<p>With only <code>app.get('/login')</code>, other methods got a 404, not a 405:</p>
+<table>
+<tr><th>Request</th><th>Express 5.2.1</th><th>Express 4.22.3</th></tr>
+<tr><td>POST /login</td><td>404 <code>Cannot POST /login</code></td><td>same</td></tr>
+<tr><td>PUT /login</td><td>404 <code>Cannot PUT /login</code></td><td>same</td></tr>
+<tr><td>DELETE /login</td><td>404 <code>Cannot DELETE /login</code></td><td>same</td></tr>
+<tr><td>HEAD /login</td><td>200, handled by the GET route, empty body</td><td>same</td></tr>
+<tr><td>OPTIONS /login</td><td>200, <code>Allow: GET, HEAD</code>, text/plain</td><td>200, <code>Allow: GET,HEAD</code>, text/html</td></tr>
+</table>
+<p>So <code>Cannot POST</code> usually means the form's <code>method</code> or <code>action</code> does not match a route, or the POST route is on a router mounted somewhere else. If you want a proper 405 with an <code>Allow</code> header, add it yourself with <code>router.route('/login').get(...).all(...)</code>; see <a href="/guides/405-method-not-allowed/">405 Method Not Allowed</a>.</p>
+
+<h2>7. Replace the default 404 page</h2>
+<p>Add a middleware after all routes. It runs only when nothing else answered:</p>
+<pre><code>app.use((req, res) =&gt; {
+  res.status(404).json({ error: 'Not found', path: req.originalUrl });
+});</code></pre>
+<p>We got <code>404</code> with <code>{"error":"Not found","path":"/"}</code> and <code>application/json</code>. Note that the default <code>default-src 'none'</code> and <code>nosniff</code> headers are gone then; add them with your normal security headers if you need them (see <a href="/guides/x-content-type-options-nosniff/">X-Content-Type-Options: nosniff</a>). If a page is removed for good, 410 may fit better than 404: <a href="/guides/410-gone-vs-404/">410 Gone vs 404</a>.</p>
+
+<h2>8. Debug checklist</h2>
+<ul>
+<li>Look at the method and path in the message. That is exactly what Express received, minus the query string.</li>
+<li>Check the two headers. <code>default-src 'none'</code> plus <code>nosniff</code> means the request reached Express and fell through every route.</li>
+<li>Run <code>DEBUG=express:* node app.js</code> to log routing. (Per the Express docs, not measured here.)</li>
+<li>Check route order. Middleware runs top to bottom; the catch-all and the 404 handler must be last.</li>
+<li>Check <code>npm ls express</code>. Wildcard syntax differs between 4 and 5.</li>
+</ul>
+<aside class="cta"><strong>Check the status and headers your Express app actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &quot;Cannot GET /&quot; mean in Express?</summary><p>It is Express&#x27;s built-in 404. No route or middleware handled a GET request for /. The server is running; it just has nothing for that path. We saw the same 139-byte HTML page in Express 5.2.1 and 4.22.3.</p></details>
+<details><summary>Why does app.get(&#x27;*&#x27;) crash in Express 5?</summary><p>Express 5 uses path-to-regexp 8, where wildcards must have a name. app.get(&#x27;*&#x27;) threw &quot;Missing parameter name at index 1: *&quot; at startup. Use app.get(&#x27;/{*splat}&#x27;, ...) instead; the braces make it also match /.</p></details>
+<details><summary>Why do I get Cannot GET when I refresh my React app?</summary><p>The browser asks the server for the client-side route, and Express has no file or route for it. Add a catch-all after express.static that sends index.html: &#x27;/{*splat}&#x27; in Express 5, &#x27;*&#x27; in Express 4.</p></details>
+<details><summary>Why does express.static return Cannot GET /?</summary><p>A relative folder is resolved against the working directory, not your file. Started from another folder, our app gave Cannot GET /. Use path.join(__dirname, &#x27;public&#x27;). Express gives no warning for a missing folder.</p></details>
+<details><summary>Why do I get &quot;Cannot POST&quot; instead of 405?</summary><p>Express answers an unmatched method with a 404 and &quot;Cannot POST /path&quot;, even if a GET route exists for that path. Add the POST route, or send a 405 with an Allow header yourself.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Express 5.2.1 (router 2.2.0, path-to-regexp 8.4.2, finalhandler 2.1.1) and Express 4.22.3 (path-to-regexp 0.1.13, finalhandler 1.3.2) on Node.js 24.21.0. Requests were made with Node&#x27;s http module; we read the raw status, headers and body. PlainHeaders is our extension; Express and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

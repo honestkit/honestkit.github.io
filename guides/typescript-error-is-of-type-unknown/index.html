@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TS18046: &#x27;e&#x27; Is of Type &#x27;Unknown&#x27; in catch (Tested Fix)</title>
+<meta name="description" content="Reproduced TS18046 on a plain catch(e) block in TypeScript 7. Exact error text, the instanceof Error fix, the unsafe cast, and the tsconfig opt-out.">
+<link rel="canonical" href="https://honestkit.github.io/guides/typescript-error-is-of-type-unknown/">
+<meta property="og:title" content="TS18046: &#x27;e&#x27; Is of Type &#x27;Unknown&#x27; in catch (Tested Fix)">
+<meta property="og:description" content="Reproduced TS18046 on a plain catch(e) block in TypeScript 7. Exact error text, the instanceof Error fix, the unsafe cast, and the tsconfig opt-out.">
+<meta property="og:url" content="https://honestkit.github.io/guides/typescript-error-is-of-type-unknown/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why did this start happening after I upgraded TypeScript?", "acceptedAnswer": {"@type": "Answer", "text": "Since TypeScript 4.4, catch block variables are typed unknown by default under strict mode (the useUnknownInCatchVariables option), replacing the old any default. On TypeScript 7.0.2 we measured this firing even with no strict flag and no tsconfig.json at all, so an upgrade can surface it even in projects that never enabled strict mode."}}, {"@type": "Question", "name": "Is TS18046 the same error as TS2339?", "acceptedAnswer": {"@type": "Answer", "text": "No. TS2339 (\"property does not exist on type\") fires for typos and union types with a declared type. TS18046 (\"is of type 'unknown'\") is specific to unknown-typed values, including catch variables, and is what you'll actually see here."}}, {"@type": "Question", "name": "Do I have to use instanceof Error specifically?", "acceptedAnswer": {"@type": "Answer", "text": "You need some narrowing check before using the value, and instanceof Error is the standard one because almost everything thrown in practice is an Error. If your code might throw strings or plain objects too, add typeof or property checks for those cases before accessing fields."}}, {"@type": "Question", "name": "Does this affect JavaScript files, or only .ts?", "acceptedAnswer": {"@type": "Answer", "text": "Only files TypeScript type-checks: .ts, .tsx, and .js files with checkJs enabled. Plain JavaScript without type checking never sees TS18046, since there's no compiler enforcing the catch variable's type."}}, {"@type": "Question", "name": "Does turning off strict mode fix TS18046 on TypeScript 7?", "acceptedAnswer": {"@type": "Answer", "text": "Not by omission. We measured that leaving strict unset (no flag, no tsconfig key) still produces TS18046 on TypeScript 7.0.2. You need to explicitly pass --strict false or --useUnknownInCatchVariables false; there's no longer an implicit off state."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TS18046 &#x27;e&#x27; is of type &#x27;unknown&#x27; (tested)</h1>
+<p class="lead"><code>error TS18046: 'e' is of type 'unknown'</code> fires when you access a property like <code>.message</code> directly on a <code>catch</code> variable. Since TypeScript 4.4, <code>catch (e) {}</code> types <code>e</code> as <code>unknown</code> by default under <code>strict</code> mode, instead of the old <code>any</code>. We reproduced the error in a real TypeScript 7 project, confirmed the two standard fixes, and confirmed the tsconfig flag that restores the old behaviour.</p>
+<h2>1. The exact error</h2>
+<p>This is the plain, common case: a <code>try/catch</code> that reads <code>.message</code> straight off the caught value.</p>
+<pre><code>function f() {
+  try {
+    JSON.parse("{");
+  } catch (e) {
+    console.log(e.message);
+  }
+}</code></pre>
+<p>Compiled with <code>tsc --strict</code>, this printed:</p>
+<pre><code>c1.ts(5,17): error TS18046: 'e' is of type 'unknown'.</code></pre>
+<p>tsc exited with code 1. This is not a bug in your code's logic &mdash; it's TypeScript refusing to let you call a method on a value it cannot prove has that method. <code>unknown</code> accepts any value coming in, but blocks every operation on it until you narrow the type. <strong>Why this changed:</strong> since TypeScript 4.4, the compiler option <code>useUnknownInCatchVariables</code> defaults to <code>true</code> whenever <code>strict</code> is on, so a bare <code>catch (e)</code> gets type <code>unknown</code> instead of the old <code>any</code> (per the TypeScript 4.4 release notes, not independently measured &mdash; the behaviour itself we did measure above).</p>
+
+<h2>2. The standard fix: narrow with instanceof Error</h2>
+<p>Add a runtime check before touching any property. This is the type-safe fix and needs no cast:</p>
+<pre><code>function f() {
+  try {
+    JSON.parse("{");
+  } catch (e) {
+    if (e instanceof Error) {
+      console.log(e.message);
+    }
+  }
+}</code></pre>
+<p>Compiled with <code>tsc --strict</code>: no output, exit code 0. Inside the <code>if</code> block, TypeScript narrows <code>e</code> to <code>Error</code>, so <code>.message</code> is valid. This also protects you at runtime: JavaScript lets you <code>throw</code> any value &mdash; a string, a number, a plain object &mdash; not just an <code>Error</code>. The <code>instanceof</code> check only runs <code>.message</code> when the thrown value really is an <code>Error</code> instance.</p>
+
+<h2>3. The unsafe shortcut: (e as Error).message</h2>
+<p>Some code casts the catch variable instead of checking it:</p>
+<pre><code>function f() {
+  try {
+    JSON.parse("{");
+  } catch (e) {
+    console.log((e as Error).message);
+  }
+}</code></pre>
+<p>Compiled with <code>tsc --strict</code>: no output, exit code 0 &mdash; tsc accepts it, same as the <code>instanceof</code> version. The difference is at runtime, not compile time. A cast is just a promise to the compiler; it adds no actual check. If something throws a plain string or a custom non-Error object, <code>(e as Error).message</code> compiles fine but returns <code>undefined</code> at runtime instead of raising a type error, which can silently swallow useful error data. Prefer <code>instanceof Error</code> narrowing (section 2) unless you have already verified, elsewhere, that only <code>Error</code> objects can reach this <code>catch</code>.</p>
+
+<h2>4. Opting back into the old `any` behaviour</h2>
+<p>If a large codebase isn't ready to add <code>instanceof</code> checks everywhere, you can turn off the specific flag that changed in TypeScript 4.4, in <code>tsconfig.json</code>:</p>
+<pre><code>{
+  "compilerOptions": {
+    "strict": true,
+    "useUnknownInCatchVariables": false
+  }
+}</code></pre>
+<p>We compiled the original plain <code>e.message</code> file (section 1) with <code>--strict --useUnknownInCatchVariables false</code> on the command line: no output, exit code 0. With the flag off, <code>catch (e)</code> is typed <code>any</code> again, so <code>e.message</code> compiles without narrowing &mdash; and without the runtime safety <code>instanceof</code> gives you.</p>
+<p>Turning off <code>strict</code> entirely has the same side effect, but it also disables every other strict check (null checks, implicit <code>any</code> on parameters, and more). We don't recommend that route just to silence this one error &mdash; set <code>useUnknownInCatchVariables: false</code> specifically instead, if you need the old behaviour.</p>
+
+<h2>5. On TypeScript 7, this also fires with NO strict flag at all</h2>
+<p>Every test above used <code>tsc --strict</code> on purpose, to match the documented TypeScript 4.4+ behaviour (<code>useUnknownInCatchVariables</code> defaults to <code>true</code> only when <code>strict</code> is on). We then tested the plain <code>e.message</code> file from section 1 with <strong>no flags and no tsconfig.json at all</strong>:</p>
+<pre><code>$ tsc --noEmit c1.ts
+c1.ts(5,17): error TS18046: 'e' is of type 'unknown'.</code></pre>
+<p>Same error, same exit code 1 &mdash; with nothing that should turn on <code>strict</code>. We also tried a <code>tsconfig.json</code> with an empty <code>compilerOptions</code> (no <code>strict</code> key at all, which should mean <code>strict: false</code> by documented default):</p>
+<pre><code>{ "compilerOptions": { "noEmit": true } }</code></pre>
+<pre><code>$ tsc -p .
+c1.ts(5,17): error TS18046: 'e' is of type 'unknown'.</code></pre>
+<p>Still TS18046. On TypeScript 7.0.2 (the current native compiler), only explicitly passing <code>--strict false</code> or <code>--useUnknownInCatchVariables false</code> restores the old <code>any</code> behaviour &mdash; there is no longer an implicit "off" state. This contradicts the TypeScript 4.4-era release notes (which tie this purely to <code>strict</code>) and is worth knowing if you hit TS18046 on a project you were sure had <code>strict</code> disabled: check for the explicit flag, don't assume the absence of <code>"strict": true</code> protects you.</p>
+
+<h2>Summary</h2>
+<table><tr><th>Approach</th><th>Compiles under --strict</th><th>Compiles with no flags (TS 7.0.2)</th><th>Runtime-safe</th></tr>
+<tr><td><code>e.message</code> directly</td><td>No &mdash; TS18046</td><td>No &mdash; TS18046</td><td>&mdash;</td></tr>
+<tr><td><code>if (e instanceof Error)</code></td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+<tr><td><code>(e as Error).message</code></td><td>Yes</td><td>Yes</td><td>No &mdash; unchecked cast</td></tr>
+<tr><td><code>useUnknownInCatchVariables: false</code> (explicit)</td><td>Yes (whole project)</td><td>Yes</td><td>No &mdash; back to <code>any</code></td></tr>
+</table>
+<p>Related: if you're chasing a property-access error on a type generally, see <a href="/guides/typescript-property-does-not-exist-on-type/">TS2339 property does not exist on type</a>. For assignment mismatches, see <a href="/guides/typescript-is-not-assignable-to-type/">type is not assignable to type</a>. For import resolution errors, see <a href="/guides/typescript-cannot-find-module/">cannot find module</a>.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why did this start happening after I upgraded TypeScript?</summary><p>Since TypeScript 4.4, catch block variables are typed unknown by default under strict mode (the useUnknownInCatchVariables option), replacing the old any default. On TypeScript 7.0.2 we measured this firing even with no strict flag and no tsconfig.json at all, so an upgrade can surface it even in projects that never enabled strict mode.</p></details>
+<details><summary>Is TS18046 the same error as TS2339?</summary><p>No. TS2339 (&quot;property does not exist on type&quot;) fires for typos and union types with a declared type. TS18046 (&quot;is of type &#x27;unknown&#x27;&quot;) is specific to unknown-typed values, including catch variables, and is what you&#x27;ll actually see here.</p></details>
+<details><summary>Do I have to use instanceof Error specifically?</summary><p>You need some narrowing check before using the value, and instanceof Error is the standard one because almost everything thrown in practice is an Error. If your code might throw strings or plain objects too, add typeof or property checks for those cases before accessing fields.</p></details>
+<details><summary>Does this affect JavaScript files, or only .ts?</summary><p>Only files TypeScript type-checks: .ts, .tsx, and .js files with checkJs enabled. Plain JavaScript without type checking never sees TS18046, since there&#x27;s no compiler enforcing the catch variable&#x27;s type.</p></details>
+<details><summary>Does turning off strict mode fix TS18046 on TypeScript 7?</summary><p>Not by omission. We measured that leaving strict unset (no flag, no tsconfig key) still produces TS18046 on TypeScript 7.0.2. You need to explicitly pass --strict false or --useUnknownInCatchVariables false; there&#x27;s no longer an implicit off state.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with TypeScript 7.0.2 (local npm install, via npx tsc), Node.js 24.21.0 on Linux. Each scenario is its own minimal .ts file; most are compiled with `tsc --strict`, and section 5 specifically tests with no strict flag and no tsconfig.json. All error text and exit codes below are copy-pasted from real tsc runs. PlainHeaders is our extension; curl and TypeScript are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>422 Unprocessable Content (Unprocessable Entity) Explained (Tested)</title>
+<meta name="description" content="We sent missing fields, wrong types, extra fields, bad JSON and form bodies to FastAPI and Express. Here is what returns 422, what returns 400, the exact error JSON, and how to read it with fetch.">
+<link rel="canonical" href="https://honestkit.github.io/guides/422-unprocessable-entity/">
+<meta property="og:title" content="422 Unprocessable Content (Unprocessable Entity) Explained (Tested)">
+<meta property="og:description" content="We sent missing fields, wrong types, extra fields, bad JSON and form bodies to FastAPI and Express. Here is what returns 422, what returns 400, the exact error JSON, and how to read it with fetch.">
+<meta property="og:url" content="https://honestkit.github.io/guides/422-unprocessable-entity/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is 422 Unprocessable Entity the same as 422 Unprocessable Content?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. RFC 9110 renamed it to Unprocessable Content. The code is the same. In our test uvicorn sent the new phrase and Node.js sent the old one."}}, {"@type": "Question", "name": "Why does FastAPI return 422 for malformed JSON instead of 400?", "acceptedAnswer": {"@type": "Answer", "text": "FastAPI reports every request validation error, including JSON decode errors, as 422 with type json_invalid. We measured this with FastAPI 0.142.2. Add a custom RequestValidationError handler if you want 400."}}, {"@type": "Question", "name": "Should I use 400 or 422 for validation errors?", "acceptedAnswer": {"@type": "Answer", "text": "Use 400 when the body cannot be parsed, 415 when the Content-Type is wrong, and 422 when it parses but the values break your rules. Express follows this by default for broken JSON (400)."}}, {"@type": "Question", "name": "Why do I get 422 when I post a form to FastAPI?", "acceptedAnswer": {"@type": "Answer", "text": "A pydantic model parameter expects a JSON object. A form body or a missing Content-Type gave 422 with type model_attributes_type and loc [\"body\"]. Send Content-Type: application/json, or use Form() fields."}}, {"@type": "Question", "name": "Does fetch throw on a 422 response?", "acceptedAnswer": {"@type": "Answer", "text": "No. fetch resolved with ok false and status 422. Check r.ok and call r.json() to read the error details."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>422 Unprocessable Content (tested)</h1>
+<p class="lead"><code>422 Unprocessable Content</code> means the server understood the request format but the content failed its rules: a required field is missing, a value has the wrong type, or a business check failed. The old name was <code>Unprocessable Entity</code>. We tested where frameworks send 422 and where they send 400 instead.</p>
+<h2>1. What 422 means</h2>
+<p>The request is well formed enough to read, but the data inside is not acceptable. Fixing it means changing the data, not the syntax or the headers. RFC 9110 moved 422 from WebDAV into core HTTP and renamed it <strong>Unprocessable Content</strong>. Both names refer to the same code.</p>
+<p>You will see both reason phrases in the wild. In our run, uvicorn sent <code>HTTP/1.1 422 Unprocessable Content</code>. Node.js (Express) sent <code>HTTP/1.1 422 Unprocessable Entity</code>. Clients should check the number, never the phrase.</p>
+
+<h2>2. FastAPI: almost every bad body is a 422</h2>
+<p>We used a pydantic model with <code>name: str</code>, <code>qty: int</code> and <code>extra="forbid"</code>:</p>
+<pre><code>class Item(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    qty: int
+
+@app.post("/items")
+def items(i: Item): return {"ok": True}</code></pre>
+<table>
+<tr><th>Request to /items</th><th>Status</th><th><code>type</code> / <code>loc</code></th></tr>
+<tr><td>JSON missing <code>qty</code></td><td>422</td><td><code>missing</code> / <code>["body","qty"]</code></td></tr>
+<tr><td><code>"qty":"lots"</code></td><td>422</td><td><code>int_parsing</code> / <code>["body","qty"]</code></td></tr>
+<tr><td><code>"qty":"5"</code> (numeric string)</td><td>200</td><td>coerced to 5 (lax mode)</td></tr>
+<tr><td>Extra field <code>"x":2</code> with <code>extra="forbid"</code></td><td>422</td><td><code>extra_forbidden</code> / <code>["body","x"]</code></td></tr>
+<tr><td>Extra field, default model</td><td>200</td><td>field silently dropped</td></tr>
+<tr><td>Malformed JSON <code>{bad</code></td><td>422</td><td><code>json_invalid</code> / <code>["body",1]</code></td></tr>
+<tr><td>No Content-Type header</td><td>422</td><td><code>model_attributes_type</code> / <code>["body"]</code></td></tr>
+<tr><td>Form body (<code>x-www-form-urlencoded</code>)</td><td>422</td><td><code>model_attributes_type</code> / <code>["body"]</code></td></tr>
+<tr><td><code>text/plain</code> with JSON text</td><td>422</td><td><code>model_attributes_type</code> / <code>["body"]</code></td></tr>
+<tr><td>Empty POST, no body</td><td>422</td><td><code>missing</code> / <code>["body"]</code></td></tr>
+<tr><td>GET <code>/q?limit=ten</code> (<code>limit: int</code>)</td><td>422</td><td><code>int_parsing</code> / <code>["query","limit"]</code></td></tr>
+</table>
+<p>The body is always <code>{"detail": [...]}</code> with <code>Content-Type: application/json</code>. Each item has <code>type</code>, <code>loc</code>, <code>msg</code> and <code>input</code>. The missing-field case returned exactly:</p>
+<pre><code>{"detail":[{"type":"missing","loc":["body","qty"],
+  "msg":"Field required","input":{"name":"a"}}]}</code></pre>
+<p>Malformed JSON adds a <code>ctx</code> object:</p>
+<pre><code>{"detail":[{"type":"json_invalid","loc":["body",1],"msg":"JSON decode error",
+  "input":{},"ctx":{"error":"Expecting property name enclosed in double quotes"}}]}</code></pre>
+<p>Two surprises. FastAPI returned 422, not 400, for broken JSON. It also returned 422, not 415, for a missing or wrong Content-Type. If you want 400 or 415 there, add your own exception handler or a Content-Type check. Note that <code>curl -d</code> without <code>-H</code> sends <code>application/x-www-form-urlencoded</code>, so it hits the form row, not a JSON row.</p>
+
+<h2>3. Express: 400 for bad JSON, 422 is up to you</h2>
+<p><code>express.json()</code> rejects broken JSON before your route runs. Our error handler printed what it got:</p>
+<pre><code>$ curl -i -H 'Content-Type: application/json' -d '{bad' :8987/users
+HTTP/1.1 400 Bad Request
+{"error":"entity.parse.failed","message":"Expected property name or '}' in JSON at position 1 (line 1 column 2)"}</code></pre>
+<p>Express never sends 422 by itself. For valid JSON that fails your rules, return it yourself. We used a problem+json body:</p>
+<pre><code>app.use(express.json());
+app.post('/users', (req, res) =&gt; {
+  const b = req.body || {}; const errors = [];
+  if (typeof b.email !== 'string' || !b.email.includes('@'))
+    errors.push({ pointer: '#/email', detail: 'must be an email address' });
+  if (!Number.isInteger(b.age))
+    errors.push({ pointer: '#/age', detail: 'must be an integer' });
+  if (errors.length) return res.status(422).type('application/problem+json').json({
+    type: 'about:blank', title: 'Unprocessable Content', status: 422,
+    detail: 'Validation failed', errors });
+  res.status(201).json({ ok: true });
+});</code></pre>
+<pre><code>$ curl -i -H 'Content-Type: application/json' -d '{"email":"nope","age":"x"}' :8987/users
+HTTP/1.1 422 Unprocessable Entity
+Content-Type: application/problem+json; charset=utf-8
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"Validation failed",
+ "errors":[{"pointer":"#/email","detail":"must be an email address"},{"pointer":"#/age","detail":"must be an integer"}]}</code></pre>
+<p>A trap: with <code>Content-Type: text/plain</code>, <code>express.json()</code> skipped the body, <code>req.body</code> was undefined, and our route answered 422 with both fields "invalid". The real problem was the media type. Check <code>req.is('application/json')</code> first and send 415. See <a href="/guides/415-unsupported-media-type/">415 Unsupported Media Type</a>. Express added <code>; charset=utf-8</code> on its own; see <a href="/guides/content-type-charset-utf-8/">Content-Type charset=utf-8</a>.</p>
+
+<h2>4. 400 vs 415 vs 422</h2>
+<table>
+<tr><th>Problem</th><th>Best code</th><th>What we measured</th></tr>
+<tr><td>Body is not parseable (broken JSON)</td><td>400</td><td>Express 400; FastAPI 422 (<code>json_invalid</code>)</td></tr>
+<tr><td>Wrong or missing Content-Type</td><td>415</td><td>FastAPI 422 (<code>model_attributes_type</code>); Express route saw no body</td></tr>
+<tr><td>Parses, but field missing or wrong type</td><td>422</td><td>FastAPI 422; Express 422 from our code</td></tr>
+<tr><td>Valid data that clashes with current state (duplicate, version)</td><td>409</td><td>not tested here; see <a href="/guides/409-conflict/">409 Conflict</a></td></tr>
+</table>
+<p>Rule of thumb: 400 when you cannot read it, 415 when you will not read that format, 422 when you read it and the values are wrong.</p>
+
+<h2>5. Clients: fetch does not throw on 422</h2>
+<p>In Node.js 24, <code>fetch</code> resolved normally with <code>ok: false</code> and <code>status: 422</code>. You must check it and read the body:</p>
+<pre><code>const r = await fetch(url, { method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ name: 'a' }) });
+if (!r.ok) {
+  const err = await r.json();
+  // FastAPI: err.detail[i].loc / msg
+  console.log(r.status, err.detail.map(e =&gt; e.loc.join('.') + ': ' + e.msg).join('; '));
+}
+// printed: 422 body.qty: Field required</code></pre>
+<p>Python's <code>urllib.request.urlopen</code> is different: it raised <code>HTTPError</code> with code 422. Read <code>e.read()</code> for the JSON. Check the response Content-Type before parsing: ours were <code>application/json</code> (FastAPI) and <code>application/problem+json</code> (Express).</p>
+
+<h2>6. Who else uses 422 (from their docs, not measured)</h2>
+<p>Rails scaffolds return <code>:unprocessable_entity</code> (422) when a model fails validation. Laravel returns 422 with a JSON <code>errors</code> object when a JSON request fails validation. The GitHub REST API returns 422 with <code>"message": "Validation Failed"</code> and an <code>errors</code> array.</p>
+<aside class="cta"><strong>See the exact status line and Content-Type your API sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is 422 Unprocessable Entity the same as 422 Unprocessable Content?</summary><p>Yes. RFC 9110 renamed it to Unprocessable Content. The code is the same. In our test uvicorn sent the new phrase and Node.js sent the old one.</p></details>
+<details><summary>Why does FastAPI return 422 for malformed JSON instead of 400?</summary><p>FastAPI reports every request validation error, including JSON decode errors, as 422 with type json_invalid. We measured this with FastAPI 0.142.2. Add a custom RequestValidationError handler if you want 400.</p></details>
+<details><summary>Should I use 400 or 422 for validation errors?</summary><p>Use 400 when the body cannot be parsed, 415 when the Content-Type is wrong, and 422 when it parses but the values break your rules. Express follows this by default for broken JSON (400).</p></details>
+<details><summary>Why do I get 422 when I post a form to FastAPI?</summary><p>A pydantic model parameter expects a JSON object. A form body or a missing Content-Type gave 422 with type model_attributes_type and loc [&quot;body&quot;]. Send Content-Type: application/json, or use Form() fields.</p></details>
+<details><summary>Does fetch throw on a 422 response?</summary><p>No. fetch resolved with ok false and status 422. Check r.ok and call r.json() to read the error details.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with curl 8.14.1, Node.js 24.21.0 and Python 3.13.5: FastAPI 0.142.2 (pydantic 2.13.5, uvicorn 0.54.0) on 127.0.0.1:8986 and Express 5.2.1 with express.json() on 127.0.0.1:8987. Every status code and body below is copied from those runs. PlainHeaders is our extension; curl, Node.js, Python, FastAPI and Express are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

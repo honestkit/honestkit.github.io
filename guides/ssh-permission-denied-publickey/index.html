@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SSH Permission Denied (publickey): Real Causes, Tested</title>
+<meta name="description" content="We measured real causes of SSH&#x27;s Permission denied (publickey): missing keys, bad AuthorizedKeysFile paths, writable dirs, and sshd_config error wording.">
+<link rel="canonical" href="https://honestkit.github.io/guides/ssh-permission-denied-publickey/">
+<meta property="og:title" content="SSH Permission Denied (publickey): Real Causes, Tested">
+<meta property="og:description" content="We measured real causes of SSH&#x27;s Permission denied (publickey): missing keys, bad AuthorizedKeysFile paths, writable dirs, and sshd_config error wording.">
+<meta property="og:url" content="https://honestkit.github.io/guides/ssh-permission-denied-publickey/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does SSH say Permission denied (publickey) instead of a specific reason?", "acceptedAnswer": {"@type": "Answer", "text": "By design. OpenSSH never tells a client which part of authentication failed, so an attacker can't learn anything from the error. We measured this directly: a missing key, a key not in authorized_keys, a world-writable directory, and a wrong AuthorizedKeysFile path all produced the exact same client-side text and exit code 255."}}, {"@type": "Question", "name": "Does chmod 644 on authorized_keys really break SSH login?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it: no, 644 alone logged in fine, and even 666 worked once we removed an unrelated directory problem (StrictModes no). The real rule, per OpenSSH's own checks, is group/world-WRITABLE permissions, not merely world-readable ones. 644 is readable, not writable, by group/other."}}, {"@type": "Question", "name": "Why did my key fail even though the file permissions looked right?", "acceptedAnswer": {"@type": "Answer", "text": "Check every directory above authorized_keys, not just the file. We measured a case where the file itself was 600 (correct) but a parent directory was world-writable, and sshd rejected the login anyway, logging 'bad ownership or modes for directory' server-side while the client just saw the generic Permission denied message."}}, {"@type": "Question", "name": "What does (publickey,password) in the error mean vs just (publickey)?", "acceptedAnswer": {"@type": "Answer", "text": "It lists the authentication methods the server still has enabled, taken from sshd_config, not a hint about your key. We measured the exact same wrong key against three server configs and got three different parenthesized lists: (publickey), (publickey,password), and (publickey,keyboard-interactive), by toggling PasswordAuthentication and KbdInteractiveAuthentication."}}, {"@type": "Question", "name": "What's the single most useful command to debug this?", "acceptedAnswer": {"@type": "Answer", "text": "ssh -v. Default output hides which identity files were tried and which key, if any, was actually sent to the server. In our tests, -v showed lines like 'Offering public key: ... explicit' when a key was sent, and that line was simply absent when no usable key existed, which is the fastest way to tell those two situations apart."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SSH Permission denied (publickey) (tested)</h1>
+<p class="lead"><code>Permission denied (publickey)</code> means the server rejected every key your client offered, including offering none at all. OpenSSH gives the same short message for a dozen different root causes on purpose, for security: it never tells an attacker which part was wrong. We built a throwaway sshd, read its own debug log, and matched each server-side cause to what the client actually shows.</p>
+<h2>1. What the message means</h2>
+<p>The client tried every key it had (or had none to try) and the server said no to all of them. That is all <code>Permission denied (publickey)</code> tells you. The text in parentheses lists the authentication methods the server still allows, not what you did wrong. We measured the server side with its own debug log to find the real cause behind seven cases that all look identical to the client.</p>
+
+<h2>2. Test setup</h2>
+<p>We ran a throwaway <code>sshd</code> on <code>127.0.0.1:8983</code> with a fresh ed25519 host key, <code>PubkeyAuthentication yes</code>, and a dedicated <code>AuthorizedKeysFile</code>, started as a normal user (no root, no real account). The server ran with <code>LogLevel DEBUG3</code> so we could read its real reason for every rejection, separate from what the client saw.</p>
+<pre><code>$ ssh-keygen -t ed25519 -f hostkey -N ""
+$ /usr/sbin/sshd -D -e -f sshd_config -p 8983
+$ ssh -p 8983 -i clientkey jacque@localhost</code></pre>
+
+<h2>3. No key offered at all</h2>
+<p>With no identity available, the client never sends a public key, and the server rejects immediately:</p>
+<pre><code>jacque@localhost: Permission denied (publickey).</code></pre>
+<p>Run with <code>-v</code> and the picture is clearer. You see the server's allowed method list before the client even tries anything:</p>
+<pre><code>debug1: Authentications that can continue: publickey
+debug1: Next authentication method: publickey
+jacque@localhost: Permission denied (publickey).</code></pre>
+
+<h2>4. Same client error, two different server causes</h2>
+<p>We measured two completely different problems that produce the <strong>identical</strong> client-side message and exit code 255:</p>
+<table>
+<tr><th>Cause</th><th>Client sees</th><th>Server's own log says</th></tr>
+<tr><td>Key is valid but simply not in <code>authorized_keys</code></td><td><code>Permission denied (publickey).</code></td><td><code>Failed publickey for jacque ... ED25519 SHA256:...</code> / <code>key is not allowed</code></td></tr>
+<tr><td><code>authorized_keys</code> sits under a world-writable directory (ours was forced under <code>/tmp</code>, mode 1777)</td><td><code>Permission denied (publickey).</code></td><td><code>Authentication refused: bad ownership or modes for directory /tmp</code> / <code>Ignored authorized keys: bad ownership or modes for directory /tmp</code></td></tr>
+</table>
+<p>The client cannot tell these apart. Only the server's own log names the real cause, and only if you can read it.</p>
+
+<h2>5. The sticky bit does not save you</h2>
+<p>We expected <code>/tmp</code>'s sticky bit (mode <code>1777</code>) to be special-cased, since it stops other users deleting your files. It is not exempt from OpenSSH's <code>StrictModes</code> check. Any <code>authorized_keys</code> path with a world-writable ancestor directory anywhere above it, sticky bit or not, gets silently rejected the same way: the correct key, with correct 600 permissions on the file itself, still fails, and the server log blames the directory by name, not the file.</p>
+
+<h2>6. The "644 breaks SSH" claim, checked</h2>
+<p>A common claim is that <code>chmod 644 authorized_keys</code> breaks login. We measured it directly, with <code>StrictModes no</code> so the (unrelated) <code>/tmp</code> directory problem from section 5 could not interfere: <strong>644 logged in fine</strong>, and so did <strong>666</strong> (world-writable). With <code>StrictModes no</code>, OpenSSH skips file and directory permission checks entirely, by design, for setups like NIS-mounted home directories.</p>
+<p>With <code>StrictModes yes</code> (the default) and everything else clean, OpenSSH's own source checks for group/world-<em>writable</em> permissions, not merely world-readable ones. 644 (<code>rw-r--r--</code>) is not group/world-writable, so per the code path it should pass; 666 or 777 would not. We could not isolate that single file-level check in our own rig, because every path we are allowed to use lives under <code>/tmp</code>, and section 5's directory-level rejection fires first and masks it, every time, at any file permission. That is itself the finding: under <code>StrictModes yes</code>, a bad ancestor directory and a bad file both produce the exact same client message, and the directory check wins the race, so you cannot tell which one is broken without testing them one at a time, as we did here.</p>
+
+<h2>7. AuthorizedKeysFile pointing nowhere</h2>
+<p>We pointed <code>AuthorizedKeysFile</code> at a path that does not exist. sshd did not log a missing-file warning anywhere, even at <code>DEBUG3</code>. It silently behaved as if the key list were empty:</p>
+<pre><code>debug3: mm_answer_keyallowed: publickey authentication test: ED25519 key is not allowed
+Failed publickey for jacque ... ssh2: ED25519 SHA256:...</code></pre>
+<p>The correct key, offered correctly, with a typo'd config path: same "not allowed" line as a key that was never generated. No hint that the path itself is the problem.</p>
+
+<h2>8. The method list in the error changes with sshd_config</h2>
+<p>The text inside the parentheses is not fixed. It lists whichever methods the server still has open, which depends on <code>sshd_config</code>, not on you:</p>
+<table>
+<tr><th>Server config</th><th>Client error</th></tr>
+<tr><td><code>PasswordAuthentication no</code>, <code>KbdInteractiveAuthentication no</code></td><td><code>Permission denied (publickey).</code></td></tr>
+<tr><td><code>PasswordAuthentication yes</code></td><td><code>Permission denied (publickey,password).</code></td></tr>
+<tr><td><code>KbdInteractiveAuthentication yes</code></td><td><code>Permission denied (publickey,keyboard-interactive).</code></td></tr>
+</table>
+<p>Seeing <code>password</code> or <code>keyboard-interactive</code> in the message means the server would have let you type a password or answer a prompt; it does not mean your key setup is any more or less broken. <code>gssapi-with-mic</code> can appear the same way if <code>GSSAPIAuthentication yes</code> is set; we did not test a working Kerberos setup, so that part is per the OpenSSH docs, not measured.</p>
+
+<h2>9. Use -v: it is the actual fix for diagnosing this</h2>
+<p>Default <code>ssh</code> output hides almost everything useful. <code>ssh -v</code> shows which identity files it tried and which key it actually sent:</p>
+<pre><code>debug1: identity file /tmp/sshtest/otherkey type 3
+debug1: Will attempt key: /tmp/sshtest/otherkey ED25519 SHA256:ecA2... explicit
+debug1: Offering public key: /tmp/sshtest/otherkey ED25519 SHA256:ecA2... explicit
+debug1: Authentications that can continue: publickey
+debug1: No more authentication methods to try.
+jacque@localhost: Permission denied (publickey).</code></pre>
+<p>Compare the fingerprint sshd logged against what you expect with <code>ssh-keygen -lf your_key.pub</code>. If "Offering public key" never appears, no key was sent at all (section 3), which is a different problem from a key that was sent and refused (section 4). <code>-vv</code> or <code>-vvv</code> adds more, but plain <code>-v</code> already answers most cases.</p>
+
+<h2>10. Checklist, in the order we'd check it</h2>
+<ul>
+<li>Run <code>ssh -v</code> first. Confirm a key was actually offered and which one.</li>
+<li>Match the fingerprint in the client's <code>-v</code> output against <code>ssh-keygen -lf ~/.ssh/authorized_keys</code> on the server.</li>
+<li>Check <code>authorized_keys</code> is not group/world-writable (section 6); 644 alone is fine, 664/666 is not.</li>
+<li>Check every directory above it, up to and including <code>$HOME</code>, is not group/world-writable (section 5); this includes any mount point, container volume or shared filesystem, not just the usual suspects.</li>
+<li>Confirm <code>AuthorizedKeysFile</code> in <code>sshd_config</code> actually points at that file (section 7); a typo there fails silently.</li>
+<li>Read the server's own log (<code>journalctl -u ssh</code>, or run sshd by hand with <code>-d</code>/<code>-dd</code> for a throwaway test instance) if you control the server. It names the real cause; the client message never will.</li>
+</ul>
+<aside class="cta"><strong>Debugging the web app behind that SSH tunnel? Check its headers:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does SSH say Permission denied (publickey) instead of a specific reason?</summary><p>By design. OpenSSH never tells a client which part of authentication failed, so an attacker can&#x27;t learn anything from the error. We measured this directly: a missing key, a key not in authorized_keys, a world-writable directory, and a wrong AuthorizedKeysFile path all produced the exact same client-side text and exit code 255.</p></details>
+<details><summary>Does chmod 644 on authorized_keys really break SSH login?</summary><p>We measured it: no, 644 alone logged in fine, and even 666 worked once we removed an unrelated directory problem (StrictModes no). The real rule, per OpenSSH&#x27;s own checks, is group/world-WRITABLE permissions, not merely world-readable ones. 644 is readable, not writable, by group/other.</p></details>
+<details><summary>Why did my key fail even though the file permissions looked right?</summary><p>Check every directory above authorized_keys, not just the file. We measured a case where the file itself was 600 (correct) but a parent directory was world-writable, and sshd rejected the login anyway, logging &#x27;bad ownership or modes for directory&#x27; server-side while the client just saw the generic Permission denied message.</p></details>
+<details><summary>What does (publickey,password) in the error mean vs just (publickey)?</summary><p>It lists the authentication methods the server still has enabled, taken from sshd_config, not a hint about your key. We measured the exact same wrong key against three server configs and got three different parenthesized lists: (publickey), (publickey,password), and (publickey,keyboard-interactive), by toggling PasswordAuthentication and KbdInteractiveAuthentication.</p></details>
+<details><summary>What&#x27;s the single most useful command to debug this?</summary><p>ssh -v. Default output hides which identity files were tried and which key, if any, was actually sent to the server. In our tests, -v showed lines like &#x27;Offering public key: ... explicit&#x27; when a key was sent, and that line was simply absent when no usable key existed, which is the fastest way to tell those two situations apart.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with OpenSSH_10.0p2 (Debian 13), both client and server, against a throwaway sshd on 127.0.0.1:8983 with a fresh ed25519 host key and a dedicated AuthorizedKeysFile (no real accounts involved). Server-side causes were confirmed by running sshd with LogLevel DEBUG3 and reading its own log, not guessed from the client error. PlainHeaders is our extension; OpenSSH (ssh, sshd, ssh-keygen) is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

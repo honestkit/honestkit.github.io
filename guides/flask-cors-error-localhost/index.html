@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flask CORS Error on Localhost: flask-cors Fixes (Tested)</title>
+<meta name="description" content="Flask CORS error on localhost tested with flask-cors 6.0.5: no headers by default, exact origin matching, 127.0.0.1 vs localhost, redirects, and credentials.">
+<link rel="canonical" href="https://honestkit.github.io/guides/flask-cors-error-localhost/">
+<meta property="og:title" content="Flask CORS Error on Localhost: flask-cors Fixes (Tested)">
+<meta property="og:description" content="Flask CORS error on localhost tested with flask-cors 6.0.5: no headers by default, exact origin matching, 127.0.0.1 vs localhost, redirects, and credentials.">
+<meta property="og:url" content="https://honestkit.github.io/guides/flask-cors-error-localhost/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Flask return 200 but the browser shows a CORS error?", "acceptedAnswer": {"@type": "Answer", "text": "Flask served the request but sent no Access-Control-Allow-Origin header, so the browser blocks the page from reading it. Install flask-cors and allow your frontend's origin."}}, {"@type": "Question", "name": "Is localhost the same origin as 127.0.0.1 for CORS?", "acceptedAnswer": {"@type": "Answer", "text": "No. flask-cors allowed http://localhost:5173 but sent no CORS headers to http://127.0.0.1:5173; scheme, host and port must all match."}}, {"@type": "Question", "name": "How do I allow cookies with flask-cors?", "acceptedAnswer": {"@type": "Answer", "text": "Use CORS(app, origins=[...], supports_credentials=True) and fetch with credentials: 'include'. Avoid the default '*' origin with credentials."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Flask CORS error on localhost (tested)</h1>
+<p class="lead">Flask sends no CORS headers on its own, so a frontend on another port (say Vite on <code>localhost:5173</code>) is blocked even though Flask logs a 200. Add <code>flask-cors</code> with the exact origin; most remaining errors are an origin mismatch, a redirect, or cookies with <code>*</code>.</p>
+<h2 id="none">1. Plain Flask sends no CORS headers</h2>
+<pre><code>from flask import Flask
+app = Flask(__name__)
+@app.post(&quot;/api/items&quot;)
+def items():
+    return {&quot;ok&quot;: True}
+c = app.test_client()
+H = {&quot;Origin&quot;: &quot;http://localhost:5173&quot;}
+r = c.post(&quot;/api/items&quot;, json={}, headers=H)
+print(&quot;POST&quot;, r.status_code, &quot;ACAO:&quot;, r.headers.get(&quot;Access-Control-Allow-Origin&quot;))
+r = c.options(&quot;/api/items&quot;, headers={**H, &quot;Access-Control-Request-Method&quot;: &quot;POST&quot;,
+                                     &quot;Access-Control-Request-Headers&quot;: &quot;content-type&quot;})
+print(&quot;OPTIONS&quot;, r.status_code, &quot;Allow:&quot;, r.headers.get(&quot;Allow&quot;), &quot;| ACAO:&quot;, r.headers.get(&quot;Access-Control-Allow-Origin&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>POST 200 ACAO: None
+OPTIONS 200 Allow: POST, OPTIONS | ACAO: None</code></pre>
+<p>Flask answers the request fine (200) and even answers the <code>OPTIONS</code> preflight itself with an <code>Allow</code> header, but it sends no <code>Access-Control-Allow-Origin</code>. The browser therefore blocks your frontend from reading the response: the server log shows 200 while the browser console says "blocked by CORS policy". Unlike FastAPI (which returns 405 to a preflight without middleware), nothing in Flask's log hints at the problem.</p>
+<h2 id="flask-cors">2. flask-cors: the origin must match exactly</h2>
+<pre><code>from flask import Flask
+from flask_cors import CORS
+app = Flask(__name__)
+app.logger.disabled = True   # keep the 500 traceback out of this output
+CORS(app, origins=[&quot;http://localhost:5173&quot;])
+@app.post(&quot;/api/items&quot;)
+def items():
+    return {&quot;ok&quot;: True}
+@app.get(&quot;/api/boom&quot;)
+def boom():
+    return 1 / 0
+@app.get(&quot;/api/folder/&quot;)
+def folder():
+    return {&quot;ok&quot;: True}
+c = app.test_client()
+pre = {&quot;Access-Control-Request-Method&quot;: &quot;POST&quot;, &quot;Access-Control-Request-Headers&quot;: &quot;content-type&quot;}
+for origin in (&quot;http://localhost:5173&quot;, &quot;http://127.0.0.1:5173&quot;, &quot;http://localhost:3000&quot;):
+    r = c.options(&quot;/api/items&quot;, headers={&quot;Origin&quot;: origin, **pre})
+    print(origin, &quot;-&gt;&quot;, r.status_code, &quot;ACAO:&quot;, r.headers.get(&quot;Access-Control-Allow-Origin&quot;),
+          &quot;| ACAH:&quot;, r.headers.get(&quot;Access-Control-Allow-Headers&quot;))
+O = {&quot;Origin&quot;: &quot;http://localhost:5173&quot;}
+r = c.get(&quot;/api/boom&quot;, headers=O)
+print(&quot;500 response ACAO:&quot;, r.status_code, r.headers.get(&quot;Access-Control-Allow-Origin&quot;))
+r = c.get(&quot;/api/folder&quot;, headers=O)
+print(&quot;no trailing slash:&quot;, r.status_code, r.headers.get(&quot;Location&quot;), &quot;ACAO:&quot;, r.headers.get(&quot;Access-Control-Allow-Origin&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>http://localhost:5173 -&gt; 200 ACAO: http://localhost:5173 | ACAH: content-type
+http://127.0.0.1:5173 -&gt; 200 ACAO: None | ACAH: None
+http://localhost:3000 -&gt; 200 ACAO: None | ACAH: None
+500 response ACAO: 500 http://localhost:5173
+no trailing slash: 308 http://localhost/api/folder/ ACAO: http://localhost:5173</code></pre>
+<p>With <code>CORS(app, origins=[...])</code> the allowed origin gets <code>Access-Control-Allow-Origin</code> and the requested headers echoed back. Any other origin still gets a 200 but <strong>no CORS headers</strong>, so the browser blocks it. The usual localhost mismatches: <code>127.0.0.1</code> vs <code>localhost</code>, a different port (Vite 5173 vs CRA 3000), or <code>https</code> vs <code>http</code>. An origin is scheme + host + port, with no path and no trailing slash.</p>
+<p>Two more lines from the same run: with flask-cors 6.0.5, an unhandled 500 still carried the CORS header, so if the browser reports CORS on a request that failed, check the status code first. And a route declared with a trailing slash answers the slashless URL with a <strong>308 redirect</strong>. A preflight that gets a redirect fails in the browser (the Fetch spec requires a 2xx preflight response), so call the exact URL.</p>
+<h2 id="credentials">3. Cookies: supports_credentials with the default "*"</h2>
+<pre><code>from flask import Flask
+from flask_cors import CORS
+app = Flask(__name__)
+CORS(app, supports_credentials=True)          # origins defaults to &quot;*&quot;
+@app.get(&quot;/api/me&quot;)
+def me():
+    return {&quot;user&quot;: &quot;ann&quot;}
+r = app.test_client().get(&quot;/api/me&quot;, headers={&quot;Origin&quot;: &quot;http://localhost:5173&quot;})
+print(&quot;ACAO:&quot;, r.headers.get(&quot;Access-Control-Allow-Origin&quot;))
+print(&quot;ACAC:&quot;, r.headers.get(&quot;Access-Control-Allow-Credentials&quot;))
+print(&quot;Vary:&quot;, r.headers.get(&quot;Vary&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>ACAO: http://localhost:5173
+ACAC: true
+Vary: Origin</code></pre>
+<p>Browsers reject <code>Access-Control-Allow-Origin: *</code> on credentialed requests. With <code>supports_credentials=True</code>, flask-cors echoes the request's origin instead of <code>*</code> and adds <code>Vary: Origin</code>, so cookies work, but that also means <em>any</em> site can make credentialed requests. Pass an explicit <code>origins=[...]</code> list whenever you enable credentials.</p>
+<h2 id="checklist">Checklist</h2>
+<ul><li>Install and enable it: <code>pip install flask-cors</code>, <code>CORS(app, origins=["http://localhost:5173"])</code>.</li><li>Copy the origin exactly from the browser's address bar (scheme, host, port), no trailing slash.</li><li>Check the actual status code in the Network tab: a 500 or 404 can be reported as a CORS error.</li><li>Avoid redirects on API URLs (trailing slashes, http to https).</li><li>Using cookies? <code>supports_credentials=True</code> plus an explicit origin list, and <code>credentials: "include"</code> on the fetch.</li></ul>
+<p>Related: <a href="/guides/fastapi-cors-error-localhost/">FastAPI CORS error on localhost</a>, <a href="/guides/cors-preflight-request-options/">CORS preflight (OPTIONS) explained</a>, <a href="/guides/cors-error-messages-explained/">CORS error messages explained</a>.</p>
+
+<aside class="cta"><strong>See the CORS headers a URL really returns, right in the browser:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Flask return 200 but the browser shows a CORS error?</summary><p>Flask served the request but sent no Access-Control-Allow-Origin header, so the browser blocks the page from reading it. Install flask-cors and allow your frontend&#x27;s origin.</p></details>
+<details><summary>Is localhost the same origin as 127.0.0.1 for CORS?</summary><p>No. flask-cors allowed http://localhost:5173 but sent no CORS headers to http://127.0.0.1:5173; scheme, host and port must all match.</p></details>
+<details><summary>How do I allow cookies with flask-cors?</summary><p>Use CORS(app, origins=[...], supports_credentials=True) and fetch with credentials: &#x27;include&#x27;. Avoid the default &#x27;*&#x27; origin with credentials.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Flask 3.1.3, flask-cors 6.0.5 and Python 3.14.7 (Flask test client, python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python, Flask and flask-cors are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

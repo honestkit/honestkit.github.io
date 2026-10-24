@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jupyter &quot;Error Unpacking User From Cookie&quot; Explained (Tested)</title>
+<meta name="description" content="Jupyter logs &quot;Error unpacking user from cookie&quot; or &quot;Clearing invalid/expired login cookie&quot; for a stale login cookie. Both reproduced, with the fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/jupyter-error-unpacking-user-from-cookie/">
+<meta property="og:title" content="Jupyter &quot;Error Unpacking User From Cookie&quot; Explained (Tested)">
+<meta property="og:description" content="Jupyter logs &quot;Error unpacking user from cookie&quot; or &quot;Clearing invalid/expired login cookie&quot; for a stale login cookie. Both reproduced, with the fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/jupyter-error-unpacking-user-from-cookie/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does \"Error unpacking user from cookie\" mean in Jupyter?", "acceptedAnswer": {"@type": "Answer", "text": "The login cookie had a valid signature but was not the JSON user record jupyter_server expects, typically an old-format cookie. The server ignores it and treats the request as logged out."}}, {"@type": "Question", "name": "How do I fix \"Clearing invalid/expired login cookie\" in Jupyter?", "acceptedAnswer": {"@type": "Answer", "text": "Log in again with the token URL from jupyter server list. It appears after the cookie secret changed, e.g. a restart with a new jupyter_cookie_secret file."}}, {"@type": "Question", "name": "Is \"Error unpacking user from cookie\" harmful?", "acceptedAnswer": {"@type": "Answer", "text": "No. The server clears the cookie and asks for login (the API returns 403); after logging in again it stops."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Jupyter &quot;Error unpacking user from cookie&quot; and &quot;Clearing invalid/expired login cookie&quot; (tested)</h1>
+<p class="lead"><code>Error unpacking user from cookie</code> in the Jupyter server log means the browser sent a login cookie the server can't use: its signature was valid but its contents were in another format. The more common sibling, <code>Clearing invalid/expired login cookie</code>, means the signature no longer matches. Both are reproduced below; logging in again fixes both.</p>
+<h2 id="repro">1. Reproduce: a stale login cookie, two ways</h2>
+<p><code>run.py</code> logs in to a Jupyter server with its token, restarts it with a new cookie secret, and reuses the old cookie. Then it sends a cookie that is correctly signed for the new server but holds a plain user id instead of the JSON user record current jupyter_server writes (the old format):</p>
+<pre><code>import os, subprocess, sys, time, urllib.request, urllib.error, http.cookiejar
+# a stale login cookie: log in, restart the server with a new cookie secret, reuse the cookie
+env = dict(os.environ, JUPYTER_DATA_DIR=&#x27;/tmp/j410c/data&#x27;, JUPYTER_RUNTIME_DIR=&#x27;/tmp/j410c/rt&#x27;, JUPYTER_CONFIG_DIR=&#x27;/tmp/j410c/cfg&#x27;)
+os.makedirs(&#x27;/tmp/j410c/root&#x27;, exist_ok=True)
+B = &#x27;http://127.0.0.1:8963&#x27;
+def start(n):
+    log = open(f&#x27;/tmp/j410c/server{n}.log&#x27;, &#x27;w&#x27;)
+    p = subprocess.Popen([sys.executable, &#x27;-m&#x27;, &#x27;jupyter_server&#x27;, &#x27;--port=8963&#x27;, &#x27;--no-browser&#x27;,
+                          &#x27;--IdentityProvider.token=abc123&#x27;, &#x27;--ServerApp.root_dir=/tmp/j410c/root&#x27;],
+                         env=env, stdout=subprocess.DEVNULL, stderr=log)
+    for _ in range(100):
+        try: urllib.request.urlopen(B + &#x27;/api&#x27;, timeout=1); break
+        except Exception: time.sleep(0.2)
+    return p
+jar = http.cookiejar.CookieJar()
+op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+def get(label, path):
+    try: print(label, op.open(B + path, timeout=10).status)
+    except urllib.error.HTTPError as e: print(label, e.code)
+
+s = start(1)
+get(&#x27;server 1, token in URL:&#x27;, &#x27;/api/status?token=abc123&#x27;)
+get(&#x27;server 1, cookie only: &#x27;, &#x27;/api/contents&#x27;)
+s.terminate(); s.wait()
+# the cookie secret file lives in the runtime dir; deleting it = a new secret on next start
+os.remove(&#x27;/tmp/j410c/rt/jupyter_cookie_secret&#x27;)
+s = start(2)
+get(&#x27;server 2, old cookie:  &#x27;, &#x27;/api/contents&#x27;)
+# a cookie signed with the CURRENT secret but holding a plain user id, the format
+# classic Notebook (&lt; 7) used, instead of the JSON user model jupyter_server expects
+from tornado.web import create_signed_value
+import uuid
+import hmac, hashlib
+key = open(&#x27;/tmp/j410c/rt/jupyter_cookie_secret&#x27;, &#x27;rb&#x27;).read()
+secret = hmac.new(key, digestmod=hashlib.sha256).digest()  # how jupyter_server derives it (no password set)
+old = create_signed_value(secret, &#x27;username-127-0-0-1-8963&#x27;, uuid.uuid4().hex).decode()
+req = urllib.request.Request(B + &#x27;/api/contents&#x27;, headers={&#x27;Cookie&#x27;: &#x27;username-127-0-0-1-8963=&#x27; + old})
+try: print(&#x27;server 2, old-format cookie:&#x27;, urllib.request.urlopen(req, timeout=10).status)
+except urllib.error.HTTPError as e: print(&#x27;server 2, old-format cookie:&#x27;, e.code)
+s.terminate(); s.wait()
+print(&#x27;--- server 2 log:&#x27;)
+for line in open(&#x27;/tmp/j410c/server2.log&#x27;):
+    if &#x27;cookie&#x27; in line.lower() or &#x27; 403 &#x27; in line: print(line.rstrip()[:150])</code></pre>
+<p>Output (jupyter_server 2.21.1, Python 3.13 on Linux):</p>
+<pre><code>server 1, token in URL: 200
+server 1, cookie only:  200
+server 2, old cookie:   403
+server 2, old-format cookie: 403
+--- server 2 log:
+[I 2026-10-23 22:27:00.643 ServerApp] Writing Jupyter server cookie secret to /tmp/j410c/rt/jupyter_cookie_secret
+[W 2026-10-23 22:27:00.786 ServerApp] Clearing invalid/expired login cookie username-127-0-0-1-8963
+[W 2026-10-23 22:27:00.788 ServerApp] 403 GET /api/contents (@127.0.0.1) 2.50ms referer=None
+[E 2026-10-23 22:27:00.843 ServerApp] Error unpacking user from cookie: Expecting value: line 1 column 1 (char 0)
+[W 2026-10-23 22:27:00.843 ServerApp] Clearing invalid/expired login cookie username-127-0-0-1-8963
+[W 2026-10-23 22:27:00.843 ServerApp] 403 GET /api/contents (@127.0.0.1) 0.74ms referer=None</code></pre>
+<h2 id="meaning">2. What the two log messages mean</h2>
+<ul><li><code>Clearing invalid/expired login cookie</code> (warning): the cookie's signature doesn't match the server's cookie secret any more, so it is ignored and deleted. Here that happened because the secret file <code>jupyter_cookie_secret</code> in the runtime directory was gone and the server wrote a new one; in jupyter_server's source, changing the password also changes the secret.</li>
+<li><code>Error unpacking user from cookie: Expecting value: line 1 column 1 (char 0)</code> (error): the signature was valid, but the value was not the JSON user record jupyter_server expects (<code>json.loads</code> failed). That is what an old-format cookie from an earlier Notebook/Jupyter version, or from a different Jupyter app on the same host and port with the same secret, looks like.</li></ul>
+<p>In both cases the server just treats the request as not logged in: the API answered 403 and the cookie was cleared. Nothing is broken on the server.</p>
+<h2 id="fix">3. Fix</h2>
+<ul><li>Log in again: open the URL with <code>?token=...</code> from <code>jupyter server list</code> (or <code>jupyter lab list</code>). The new login cookie replaces the bad one, and the message stops.</li>
+<li>If it keeps coming back, clear the cookies for that host and port in the browser. The cookie name includes them (<code>username-127-0-0-1-8963</code> above), so two Jupyter servers on different ports don't clash, but an old server run on the same port can.</li>
+<li>To keep logins valid across restarts, keep <code>jupyter_cookie_secret</code> in place (don't wipe the runtime directory) or set <code>ServerApp.cookie_secret_file</code> to a stable path.</li></ul>
+<p>Related: <a href="/guides/jupyter-error-403-forbidden-xsrf-argument-missing/">Jupyter 403 Forbidden / _xsrf argument missing</a>, <a href="/guides/jupyter-notebook-kernel-not-found-nosuchkernel/">Jupyter kernel not found</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &quot;Error unpacking user from cookie&quot; mean in Jupyter?</summary><p>The login cookie had a valid signature but was not the JSON user record jupyter_server expects, typically an old-format cookie. The server ignores it and treats the request as logged out.</p></details>
+<details><summary>How do I fix &quot;Clearing invalid/expired login cookie&quot; in Jupyter?</summary><p>Log in again with the token URL from jupyter server list. It appears after the cookie secret changed, e.g. a restart with a new jupyter_cookie_secret file.</p></details>
+<details><summary>Is &quot;Error unpacking user from cookie&quot; harmful?</summary><p>No. The server clears the cookie and asks for login (the API returns 403); after logging in again it stops.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with jupyter_server 2.21.1 and Python 3.13 on Linux. The script ran verbatim and the output was pasted unedited. PlainTables is our extension; Jupyter is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

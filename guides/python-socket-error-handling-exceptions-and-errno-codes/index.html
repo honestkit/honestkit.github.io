@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python Socket Error Handling: Exceptions and Errno Codes</title>
+<meta name="description" content="We caused 6 socket failures in Python 3.13 and logged what each raises: timeouts have errno None, EADDRINUSE has no subclass, and gaierror -2 is not ENOENT.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-socket-error-handling-exceptions-and-errno-codes/">
+<meta property="og:title" content="Python Socket Error Handling: Exceptions and Errno Codes">
+<meta property="og:description" content="We caused 6 socket failures in Python 3.13 and logged what each raises: timeouts have errno None, EADDRINUSE has no subclass, and gaierror -2 is not ENOENT.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-socket-error-handling-exceptions-and-errno-codes/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What exceptions does a Python socket raise?", "acceptedAnswer": {"@type": "Answer", "text": "Everything is an OSError. The useful subclasses are ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError and BrokenPipeError (all ConnectionError), TimeoutError (socket.timeout) and socket.gaierror for DNS failures."}}, {"@type": "Question", "name": "Is socket.error still used?", "acceptedAnswer": {"@type": "Answer", "text": "socket.error is an alias of OSError. Use except OSError, or a more specific subclass."}}, {"@type": "Question", "name": "Why is e.errno None on a socket timeout?", "acceptedAnswer": {"@type": "Answer", "text": "socket timeouts raise TimeoutError(\"timed out\") with no errno. Check isinstance(e, TimeoutError) instead of the errno."}}, {"@type": "Question", "name": "How do I catch \"Address already in use\" in Python?", "acceptedAnswer": {"@type": "Answer", "text": "It is a plain OSError with errno 98 (errno.EADDRINUSE) on Linux. Catch OSError and compare e.errno with errno.EADDRINUSE."}}, {"@type": "Question", "name": "What does socket.gaierror [Errno -2] mean?", "acceptedAnswer": {"@type": "Answer", "text": "Name or service not known: the hostname could not be resolved. -2 is socket.EAI_NONAME, a resolver code, not an errno value."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python socket error handling: every exception and errno (tested)</h1>
+<p class="lead">Every Python socket error is an <code>OSError</code>, but they don't all carry useful errnos and they don't share the subclasses you'd expect. We caused the six failures people search for most (refused, DNS, timeout, reset, address in use, closed socket), logged exactly what Python raised, and built a handler that sorts them correctly.</p>
+<h2 id="hierarchy">1. The socket exception hierarchy</h2>
+<p><code>socket.error</code> is just an old name for <code>OSError</code>, and <code>socket.timeout</code> has been an alias of the built-in <code>TimeoutError</code> since Python 3.10. So everything a socket raises is an <code>OSError</code>:</p>
+<pre><code>import socket
+for name in [&quot;error&quot;, &quot;timeout&quot;, &quot;gaierror&quot;, &quot;herror&quot;]:
+    cls = getattr(socket, name)
+    print(f&quot;socket.{name:9} -&gt; {cls.__name__:13} mro: {&#x27; &gt; &#x27;.join(c.__name__ for c in cls.__mro__[:-2])}&quot;)
+for cls in [ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError]:
+    print(f&quot;{cls.__name__:23} mro: {&#x27; &gt; &#x27;.join(c.__name__ for c in cls.__mro__[:-2])}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>socket.error     -&gt; OSError       mro: OSError &gt; Exception
+socket.timeout   -&gt; TimeoutError  mro: TimeoutError &gt; OSError &gt; Exception
+socket.gaierror  -&gt; gaierror      mro: gaierror &gt; OSError &gt; Exception
+socket.herror    -&gt; herror        mro: herror &gt; OSError &gt; Exception
+ConnectionRefusedError  mro: ConnectionRefusedError &gt; ConnectionError &gt; OSError &gt; Exception
+ConnectionResetError    mro: ConnectionResetError &gt; ConnectionError &gt; OSError &gt; Exception
+ConnectionAbortedError  mro: ConnectionAbortedError &gt; ConnectionError &gt; OSError &gt; Exception
+BrokenPipeError         mro: BrokenPipeError &gt; ConnectionError &gt; OSError &gt; Exception</code></pre>
+<p>The four <code>ConnectionError</code> subclasses are the "the other side went away" family. DNS failures (<code>gaierror</code>) and timeouts are <strong>not</strong> <code>ConnectionError</code>s, so <code>except ConnectionError</code> on its own misses both.</p>
+<h2 id="causes">2. What each common failure actually raises</h2>
+<p>We caused six common socket failures against local sockets and printed exactly what Python raised:</p>
+<pre><code>import socket, struct, threading, time
+
+def show(label, fn):
+    try:
+        fn()
+        print(f&quot;{label:28} no exception&quot;)
+    except Exception as e:
+        print(f&quot;{label:28} {type(e).__name__}: errno={getattr(e, &#x27;errno&#x27;, None)} {e}&quot;)
+
+# 1. nothing listening on the port
+def refused():
+    s = socket.socket(); s.bind((&quot;127.0.0.1&quot;, 0)); port = s.getsockname()[1]; s.close()
+    socket.create_connection((&quot;127.0.0.1&quot;, port), timeout=2)
+show(&quot;connect, nothing listening&quot;, refused)
+
+# 2. hostname that cannot resolve
+show(&quot;connect, bad hostname&quot;, lambda: socket.create_connection((&quot;no-such-host.invalid&quot;, 80), timeout=2))
+
+# 3. server accepts but never sends
+srv = socket.create_server((&quot;127.0.0.1&quot;, 0)); port = srv.getsockname()[1]
+def silent():
+    c = socket.create_connection((&quot;127.0.0.1&quot;, port), timeout=0.5)
+    c.recv(1024)
+show(&quot;recv, server silent&quot;, silent)
+
+# 4. server aborts the connection (SO_LINGER 0 -&gt; RST)
+def rst_server():
+    conn, _ = srv.accept(); conn.recv(1)   # drain the silent client&#x27;s connection
+    conn, _ = srv.accept()
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack(&quot;ii&quot;, 1, 0))
+    conn.close()
+threading.Thread(target=rst_server, daemon=True).start()
+def reset():
+    c = socket.create_connection((&quot;127.0.0.1&quot;, port), timeout=2)
+    time.sleep(0.3)
+    c.recv(1024)
+show(&quot;recv, server sent RST&quot;, reset)
+
+# 5. port already bound
+def in_use():
+    a = socket.socket(); a.bind((&quot;127.0.0.1&quot;, 0)); a.listen()
+    b = socket.socket(); b.bind(a.getsockname())
+show(&quot;bind, port in use&quot;, in_use)
+
+# 6. using a socket after close()
+def closed():
+    s = socket.socket(); s.close(); s.send(b&quot;x&quot;)
+show(&quot;send after close()&quot;, closed)</code></pre>
+<p>Output:</p>
+<pre><code>connect, nothing listening   ConnectionRefusedError: errno=111 [Errno 111] Connection refused
+connect, bad hostname        gaierror: errno=-2 [Errno -2] Name or service not known
+recv, server silent          TimeoutError: errno=None timed out
+recv, server sent RST        ConnectionResetError: errno=104 [Errno 104] Connection reset by peer
+bind, port in use            OSError: errno=98 [Errno 98] Address already in use
+send after close()           OSError: errno=9 [Errno 9] Bad file descriptor</code></pre>
+<p>Things to notice:</p>
+<ul>
+<li><strong>Timeouts have <code>errno=None</code>.</strong> Code that branches on <code>e.errno</code> gets <code>None</code> for a timeout, so check <code>isinstance(e, TimeoutError)</code> instead.</li>
+<li><strong>"Address already in use" is a plain <code>OSError</code></strong> with errno 98 (<code>EADDRINUSE</code>). It has no subclass, so you can only catch it by checking the errno. See our <a href="/guides/eaddrinuse-address-already-in-use/">EADDRINUSE guide</a> for finding the process holding the port.</li>
+<li>Using a socket after <code>close()</code> gives <code>[Errno 9] Bad file descriptor</code>. That is a bug in your code, not a network problem (<a href="/guides/python-oserror-errno-9-bad-file-descriptor/">errno 9 guide</a>).</li>
+<li>On Windows the same exception classes appear with Winsock codes instead, for example <code>[WinError 10061]</code> for refused and <code>[WinError 10054]</code> for reset. Catch the classes, not the numbers, and your code works on both.</li>
+</ul>
+<p>Deep dives: <a href="/guides/python-connectionrefusederror-errno-111-connection-refused/">ConnectionRefusedError errno 111</a>, <a href="/guides/python-brokenpipeerror-errno-32-broken-pipe/">BrokenPipeError errno 32</a>, <a href="/guides/python-blockingioerror-errno-11-resource-temporarily-unavailable/">BlockingIOError errno 11</a>, <a href="/guides/python-oserror-errno-codes-list/">the OSError errno list</a>.</p>
+<h2 id="handler">3. A handler that sorts them correctly (and the gaierror errno trap)</h2>
+<p>Order matters: the specific classes first, then the errno checks for the plain <code>OSError</code>s:</p>
+<pre><code>import errno, socket
+
+def classify(e):
+    if isinstance(e, socket.gaierror):
+        return f&quot;DNS failure ({e.errno}: {e.strerror})&quot;
+    if isinstance(e, TimeoutError):
+        return &quot;timed out&quot;
+    if isinstance(e, ConnectionError):
+        return f&quot;connection problem: {type(e).__name__}&quot;
+    if e.errno == errno.EADDRINUSE:
+        return &quot;port already in use&quot;
+    return f&quot;other OSError {errno.errorcode.get(e.errno, e.errno)}&quot;
+
+errs = [socket.gaierror(-2, &quot;Name or service not known&quot;),
+        TimeoutError(&quot;timed out&quot;),
+        ConnectionRefusedError(111, &quot;Connection refused&quot;),
+        OSError(98, &quot;Address already in use&quot;),
+        OSError(9, &quot;Bad file descriptor&quot;)]
+for e in errs:
+    print(f&quot;{type(e).__name__:24} -&gt; {classify(e)}&quot;)
+
+print()
+print(&quot;gaierror -2 in errno.errorcode:&quot;, -2 in errno.errorcode)
+print(&quot;gaierror -2 == socket.EAI_NONAME:&quot;, -2 == socket.EAI_NONAME)
+print(&quot;errno.errorcode[2] is&quot;, errno.errorcode[2], &quot;(a different error)&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>gaierror                 -&gt; DNS failure (-2: Name or service not known)
+TimeoutError             -&gt; timed out
+ConnectionRefusedError   -&gt; connection problem: ConnectionRefusedError
+OSError                  -&gt; port already in use
+OSError                  -&gt; other OSError EBADF
+
+gaierror -2 in errno.errorcode: False
+gaierror -2 == socket.EAI_NONAME: True
+errno.errorcode[2] is ENOENT (a different error)</code></pre>
+<p>The trap: <strong><code>gaierror</code> errnos are negative <code>EAI_*</code> codes from the resolver, not <code>errno</code> values.</strong> <code>-2</code> is <code>socket.EAI_NONAME</code> and is not in <code>errno.errorcode</code> at all. Writing <code>abs(e.errno)</code> or a lookup table that mixes the two gives you <code>ENOENT</code>, a file error that has nothing to do with DNS. Compare <code>gaierror</code> codes against <code>socket.EAI_*</code> constants and keep them apart from the others.</p>
+<h2 id="peer-close">4. When the other side closes: no exception, then BrokenPipeError</h2>
+<p>A peer that closes normally does <strong>not</strong> raise anything on your side, and your first write after that still succeeds:</p>
+<pre><code>import socket, time
+srv = socket.create_server((&quot;127.0.0.1&quot;, 0))
+cli = socket.create_connection(srv.getsockname())
+conn, _ = srv.accept()
+
+conn.close()                      # peer closes normally (FIN)
+time.sleep(0.1)
+print(&quot;recv after peer close:&quot;, cli.recv(1024))   # no exception
+for i in range(1, 4):
+    try:
+        n = cli.send(b&quot;hello&quot;)
+        print(f&quot;send #{i}: sent {n} bytes, no error&quot;)
+    except OSError as e:
+        print(f&quot;send #{i}: {type(e).__name__}: {e}&quot;)
+    time.sleep(0.1)</code></pre>
+<p>Output:</p>
+<pre><code>recv after peer close: b&#x27;&#x27;
+send #1: sent 5 bytes, no error
+send #2: BrokenPipeError: [Errno 32] Broken pipe
+send #3: BrokenPipeError: [Errno 32] Broken pipe</code></pre>
+<p><code>recv()</code> returning <code>b&quot;&quot;</code> is how a socket says "the other side closed cleanly". A loop like <code>while True: data = s.recv(1024)</code> that never checks for empty bytes will spin forever. The first <code>send()</code> after the close still "worked" (it went into the kernel buffer, and the peer answered with a reset), so the error only appeared on the second send. That is why a write failure often shows up one call later than the real problem. Check <code>if not data: break</code> after every <code>recv()</code>, and treat <code>BrokenPipeError</code> and <code>ConnectionResetError</code> on writes as "peer is gone".</p>
+
+<aside class="cta"><strong>Debugging a connection that fails at the HTTP layer? Check what the server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What exceptions does a Python socket raise?</summary><p>Everything is an OSError. The useful subclasses are ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError and BrokenPipeError (all ConnectionError), TimeoutError (socket.timeout) and socket.gaierror for DNS failures.</p></details>
+<details><summary>Is socket.error still used?</summary><p>socket.error is an alias of OSError. Use except OSError, or a more specific subclass.</p></details>
+<details><summary>Why is e.errno None on a socket timeout?</summary><p>socket timeouts raise TimeoutError(&quot;timed out&quot;) with no errno. Check isinstance(e, TimeoutError) instead of the errno.</p></details>
+<details><summary>How do I catch &quot;Address already in use&quot; in Python?</summary><p>It is a plain OSError with errno 98 (errno.EADDRINUSE) on Linux. Catch OSError and compare e.errno with errno.EADDRINUSE.</p></details>
+<details><summary>What does socket.gaierror [Errno -2] mean?</summary><p>Name or service not known: the hostname could not be resolved. -2 is socket.EAI_NONAME, a resolver code, not an errno value.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-22 on Debian with Python 3.13.5, using local sockets only: connecting to a closed port, resolving a .invalid hostname, reading from a silent server, a server that closes with SO_LINGER 0, binding a port twice, using a closed socket, and writing after the peer closed. Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python http.client Timeout: Default, TimeoutError, Total Limit</title>
+<meta name="description" content="Measured in Python 3.13.5: HTTPConnection has no timeout by default, timeout= is per read (a trickling server ran 4.8s on timeout=1), plus a total deadline.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-http-client-timeout-httpconnection/">
+<meta property="og:title" content="Python http.client Timeout: Default, TimeoutError, Total Limit">
+<meta property="og:description" content="Measured in Python 3.13.5: HTTPConnection has no timeout by default, timeout= is per read (a trickling server ran 4.8s on timeout=1), plus a total deadline.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-http-client-timeout-httpconnection/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the default timeout for http.client.HTTPConnection?", "acceptedAnswer": {"@type": "Answer", "text": "None (no timeout) unless you changed socket.setdefaulttimeout(). We measured the default being socket._GLOBAL_DEFAULT_TIMEOUT with the socket default None, and the request waiting for a stalled server."}}, {"@type": "Question", "name": "What exception does http.client raise on timeout?", "acceptedAnswer": {"@type": "Answer", "text": "TimeoutError: timed out (socket.timeout is the same class since Python 3.10). We measured it on a stalled read and on a connect to an unroutable host."}}, {"@type": "Question", "name": "Why doesn't my http.client timeout stop a slow download?", "acceptedAnswer": {"@type": "Answer", "text": "The timeout applies to each socket operation. We measured a server sending one byte every 0.8s finishing in 4.8s with timeout=1. Use a total deadline checked between chunks."}}, {"@type": "Question", "name": "How do I set a total timeout for an http.client request?", "acceptedAnswer": {"@type": "Answer", "text": "Track a deadline with time.monotonic() and check it between read1() chunks, with a small per-operation timeout. We measured it stopping after 2.4s for a 2s budget."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>http.client timeout in Python: defaults and per-read limits (tested)</h1>
+<p class="lead"><code>http.client.HTTPConnection</code> waits forever unless you pass <code>timeout=</code>, and even then the timeout isn't what most people expect. We measured the default, the <code>TimeoutError</code> you get, and a slow server that never trips the timeout.</p>
+<h2 id="default">1. No timeout by default, and where it triggers</h2>
+<pre><code>import http.client, socket, threading, time
+
+# slow server: accepts, sends headers, then stalls 3s before the body
+srv = socket.create_server((&quot;127.0.0.1&quot;, 8965))
+def slow():
+    for _ in range(3):
+        c, _ = srv.accept(); c.recv(4096)
+        c.sendall(b&quot;HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n&quot;)
+        time.sleep(3); c.sendall(b&quot;hello&quot;); c.close()
+threading.Thread(target=slow, daemon=True).start()
+
+print(&quot;default timeout is socket._GLOBAL_DEFAULT_TIMEOUT:&quot;,
+      http.client.HTTPConnection(&quot;127.0.0.1&quot;, 8965).timeout is socket._GLOBAL_DEFAULT_TIMEOUT,
+      &quot;| socket default:&quot;, socket.getdefaulttimeout())
+for t in (None, 1):
+    conn = http.client.HTTPConnection(&quot;127.0.0.1&quot;, 8965, timeout=t)
+    t0 = time.monotonic()
+    try:
+        conn.request(&quot;GET&quot;, &quot;/&quot;)
+        r = conn.getresponse()                     # headers arrive at once
+        print(f&quot;timeout={t}: status {r.status} after {time.monotonic()-t0:.1f}s&quot;, end=&quot;; &quot;)
+        print(f&quot;body {r.read()!r} after {time.monotonic()-t0:.1f}s&quot;)
+    except Exception as e:
+        print(f&quot;{type(e).__module__}.{type(e).__name__}: {e} after {time.monotonic()-t0:.1f}s&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>default timeout is socket._GLOBAL_DEFAULT_TIMEOUT: True | socket default: None
+timeout=None: status 200 after 0.0s; body b&#x27;hello&#x27; after 3.0s
+timeout=1: status 200 after 0.0s; builtins.TimeoutError: timed out after 1.0s</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> <code>HTTPConnection</code> without <code>timeout=</code> uses the global socket default, which is <code>None</code>: <strong>no timeout at all</strong>. Against a server that stalled for 3 seconds before the body, the call simply waited 3 seconds; a server that never answers would hang your program forever. With <code>timeout=1</code>, the status line arrived immediately and the stalled <code>read()</code> raised <code>TimeoutError: timed out</code> after 1.0s. Since Python 3.10, <code>socket.timeout</code> is the same class as the built-in <code>TimeoutError</code>, so either name catches it.</p>
+
+<h2 id="per-op">2. The timeout is per socket operation, not for the whole request</h2>
+<pre><code>import http.client, socket, threading, time
+
+# trickling server: one body byte every 0.8s, 6 bytes total
+def trickle(port):
+    srv = socket.create_server((&quot;127.0.0.1&quot;, port))
+    def run():
+        c, _ = srv.accept(); c.recv(4096)
+        c.sendall(b&quot;HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n&quot;)
+        try:
+            for ch in b&quot;abcdef&quot;:
+                time.sleep(0.8); c.sendall(bytes([ch]))
+        except BrokenPipeError:
+            pass                                   # client gave up
+        c.close()
+    threading.Thread(target=run, daemon=True).start()
+
+trickle(8966)
+
+conn = http.client.HTTPConnection(&quot;127.0.0.1&quot;, 8966, timeout=1)
+t0 = time.monotonic()
+conn.request(&quot;GET&quot;, &quot;/&quot;)
+body = conn.getresponse().read()
+print(f&quot;timeout=1 but read() took {time.monotonic()-t0:.1f}s and returned {body!r}&quot;)
+
+# a total deadline: check the clock between chunks
+def get_with_deadline(host, port, path, total):
+    deadline = time.monotonic() + total
+    conn = http.client.HTTPConnection(host, port, timeout=min(total, 1))
+    conn.request(&quot;GET&quot;, path)
+    r = conn.getresponse()
+    chunks = []
+    while chunk := r.read1(65536):
+        chunks.append(chunk)
+        if time.monotonic() &gt; deadline:
+            conn.close()
+            raise TimeoutError(f&quot;took longer than {total}s in total&quot;)
+    return b&quot;&quot;.join(chunks)
+
+trickle(8967)
+t0 = time.monotonic()
+try:
+    get_with_deadline(&quot;127.0.0.1&quot;, 8967, &quot;/&quot;, total=2)
+except TimeoutError as e:
+    print(f&quot;deadline version: TimeoutError: {e} after {time.monotonic()-t0:.1f}s&quot;)
+
+t0 = time.monotonic()
+try:
+    http.client.HTTPConnection(&quot;10.255.255.1&quot;, 80, timeout=2).request(&quot;GET&quot;, &quot;/&quot;)
+except TimeoutError as e:
+    print(f&quot;connect to unroutable host: TimeoutError: {e} after {time.monotonic()-t0:.1f}s&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>timeout=1 but read() took 4.8s and returned b&#x27;abcdef&#x27;
+deadline version: TimeoutError: took longer than 2s in total after 2.4s
+connect to unroutable host: TimeoutError: timed out after 2.0s</code></pre>
+<p><strong>Measured:</strong> a server that sent one byte every 0.8 seconds never tripped <code>timeout=1</code>, because each wait was under 1 second; the read took 4.8s in total. The timeout limits each blocking socket call (connect, each recv), not the whole request. For a real total limit, check a deadline between chunks as in <code>get_with_deadline()</code>, which gave up after 2.4s for a 2s budget (the overshoot is up to one chunk wait). A connect to an unroutable address raised <code>TimeoutError</code> after the same 2s timeout. <code>HTTPSConnection</code> takes the same <code>timeout=</code> argument.</p>
+<p>For <code>urllib.request.urlopen(url, timeout=...)</code>, see our <a href="/guides/python-urllib-error-urlerror-urlopen-error/">URLError guide</a> for how urllib wraps (or doesn't wrap) these timeouts.</p>
+
+<aside class="cta"><strong>Debugging a slow endpoint? Check the real status and headers it returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the default timeout for http.client.HTTPConnection?</summary><p>None (no timeout) unless you changed socket.setdefaulttimeout(). We measured the default being socket._GLOBAL_DEFAULT_TIMEOUT with the socket default None, and the request waiting for a stalled server.</p></details>
+<details><summary>What exception does http.client raise on timeout?</summary><p>TimeoutError: timed out (socket.timeout is the same class since Python 3.10). We measured it on a stalled read and on a connect to an unroutable host.</p></details>
+<details><summary>Why doesn&#x27;t my http.client timeout stop a slow download?</summary><p>The timeout applies to each socket operation. We measured a server sending one byte every 0.8s finishing in 4.8s with timeout=1. Use a total deadline checked between chunks.</p></details>
+<details><summary>How do I set a total timeout for an http.client request?</summary><p>Track a deadline with time.monotonic() and check it between read1() chunks, with a small per-operation timeout. We measured it stopping after 2.4s for a 2s budget.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 on Debian with Python 3.13.5&#x27;s http.client against local scripted servers: the default timeout, a server stalling 3s, a server trickling one byte every 0.8s, a total-deadline helper, and a connect to an unroutable address. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; Python&#x27;s http.client is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

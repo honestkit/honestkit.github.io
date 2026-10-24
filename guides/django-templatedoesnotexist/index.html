@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Django TemplateDoesNotExist: Causes and Fixes (Tested)</title>
+<meta name="description" content="Django TemplateDoesNotExist tested on 6.1.2: read the loader postmortem, DIRS vs APP_DIRS, app/template.html namespacing, INSTALLED_APPS, and extends.">
+<link rel="canonical" href="https://honestkit.github.io/guides/django-templatedoesnotexist/">
+<meta property="og:title" content="Django TemplateDoesNotExist: Causes and Fixes (Tested)">
+<meta property="og:description" content="Django TemplateDoesNotExist tested on 6.1.2: read the loader postmortem, DIRS vs APP_DIRS, app/template.html namespacing, INSTALLED_APPS, and extends.">
+<meta property="og:url" content="https://honestkit.github.io/guides/django-templatedoesnotexist/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Django not find my templates folder?", "acceptedAnswer": {"@type": "Answer", "text": "A project-level templates/ folder is only searched if it is in TEMPLATES['DIRS'], e.g. BASE_DIR / 'templates'. APP_DIRS only covers <app>/templates/ of installed apps."}}, {"@type": "Question", "name": "Why does TemplateDoesNotExist name base.html?", "acceptedAnswer": {"@type": "Answer", "text": "The template you rendered extends or includes base.html, and that file is not on any loader path."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Django TemplateDoesNotExist (tested)</h1>
+<p class="lead">Django raises <code>TemplateDoesNotExist</code> when no template loader finds the name you asked for. The exception lists every path it tried; usually the project <code>templates/</code> folder is missing from <code>DIRS</code>, or an app template needs its <code>app/</code> prefix.</p>
+<h2 id="setup">Setup</h2>
+<p>A minimal project, rendered with <code>settings.configure()</code> so every block is runnable on its own:</p>
+<pre><code>proj/
+  blog/__init__.py
+  blog/templates/blog/post.html   # app template, namespaced
+  templates/home.html             # project-level template
+  templates/page.html             # {% extends &quot;base.html&quot; %} (base.html missing)
+common.py                         # sys.path.insert(0, &quot;/w/proj&quot;); BASE = Path(&quot;/w/proj&quot;)</code></pre>
+<h2 id="repro">1. Reproduce it: DIRS empty, app template not namespaced</h2>
+<pre><code>from common import *
+settings.configure(
+    INSTALLED_APPS=[&#x27;blog&#x27;],
+    TEMPLATES=[{&#x27;BACKEND&#x27;: &#x27;django.template.backends.django.DjangoTemplates&#x27;,
+                &#x27;DIRS&#x27;: [],            # project templates/ not listed
+                &#x27;APP_DIRS&#x27;: True}])
+django.setup()
+from django.template.loader import render_to_string
+from django.template import TemplateDoesNotExist
+
+for name in [&#x27;post.html&#x27;, &#x27;home.html&#x27;, &#x27;blog/post.html&#x27;]:
+    try:
+        print(name, &#x27;-&gt;&#x27;, render_to_string(name, {&#x27;n&#x27;: 1}).strip())
+    except TemplateDoesNotExist as e:
+        print(name, &#x27;-&gt;&#x27;, type(e).__name__ + &#x27;:&#x27;, e)
+        for origin, status in e.chain[0].tried:
+            print(&#x27;   tried&#x27;, origin.name, &#x27;|&#x27;, status)</code></pre>
+<p>Output:</p>
+<pre><code>post.html -&gt; TemplateDoesNotExist: post.html
+   tried /w/proj/blog/templates/post.html | Source does not exist
+home.html -&gt; TemplateDoesNotExist: home.html
+   tried /w/proj/blog/templates/home.html | Source does not exist
+blog/post.html -&gt; Post 1</code></pre>
+<p>Three things to read from this:</p>
+<ul>
+<li>The exception's <code>chain[0].tried</code> list (the same data as the debug page's <strong>Template-loader postmortem</strong>) shows every path Django checked. If your file is not under one of those directories, Django never looked there.</li>
+<li>With <code>APP_DIRS: True</code> Django searches <code>&lt;app&gt;/templates/</code>, so a file at <code>blog/templates/blog/post.html</code> is named <code>blog/post.html</code>, not <code>post.html</code>. The inner <code>blog/</code> folder is the namespace that keeps two apps' <code>post.html</code> from clashing.</li>
+<li>A project-level <code>templates/</code> folder is not searched at all unless it is listed in <code>DIRS</code>.</li>
+</ul>
+<h2 id="fix">2. Fix: add the project folder to DIRS</h2>
+<pre><code>from common import *
+settings.configure(
+    INSTALLED_APPS=[&#x27;blog&#x27;],
+    TEMPLATES=[{&#x27;BACKEND&#x27;: &#x27;django.template.backends.django.DjangoTemplates&#x27;,
+                &#x27;DIRS&#x27;: [BASE / &#x27;templates&#x27;],     # the fix
+                &#x27;APP_DIRS&#x27;: True}])
+django.setup()
+from django.template.loader import render_to_string
+for name in [&#x27;home.html&#x27;, &#x27;blog/post.html&#x27;]:
+    print(name, &#x27;-&gt;&#x27;, render_to_string(name, {&#x27;n&#x27;: 1}).strip())</code></pre>
+<p>Output:</p>
+<pre><code>home.html -&gt; Home
+blog/post.html -&gt; Post 1</code></pre>
+<p>In a real <code>settings.py</code> this is <code>'DIRS': [BASE_DIR / 'templates']</code>. Use an absolute path built from <code>BASE_DIR</code>; a relative string depends on the directory you start the server from.</p>
+<h2 id="other">3. Two other causes: app not installed, and a missing parent template</h2>
+<pre><code>from common import *
+settings.configure(
+    INSTALLED_APPS=[],                 # &#x27;blog&#x27; forgotten
+    TEMPLATES=[{&#x27;BACKEND&#x27;: &#x27;django.template.backends.django.DjangoTemplates&#x27;,
+                &#x27;DIRS&#x27;: [BASE / &#x27;templates&#x27;], &#x27;APP_DIRS&#x27;: True}])
+django.setup()
+from django.template.loader import render_to_string
+from django.template import TemplateDoesNotExist
+for name in [&#x27;blog/post.html&#x27;, &#x27;page.html&#x27;]:
+    try:
+        print(name, &#x27;-&gt;&#x27;, render_to_string(name).strip())
+    except TemplateDoesNotExist as e:
+        print(name, &#x27;-&gt;&#x27;, type(e).__name__ + &#x27;:&#x27;, e)</code></pre>
+<p>Output:</p>
+<pre><code>blog/post.html -&gt; TemplateDoesNotExist: blog/post.html
+page.html -&gt; TemplateDoesNotExist: base.html</code></pre>
+<p>App templates are only found for apps listed in <code>INSTALLED_APPS</code>, so a new app you forgot to add gives <code>TemplateDoesNotExist</code> even though the file is in the right place. And when the error names a template you never rendered directly (here <code>base.html</code> while rendering <code>page.html</code>), it comes from an <code>{% extends %}</code> or <code>{% include %}</code> inside the template: fix that path.</p>
+<h2 id="checklist">Checklist</h2>
+<ol>
+<li>Read the postmortem / <code>tried</code> list: is your file's directory in it?</li>
+<li>App template: is the app in <code>INSTALLED_APPS</code>, <code>APP_DIRS</code> True, and is the name you pass <code>app/file.html</code>?</li>
+<li>Project template: is <code>BASE_DIR / 'templates'</code> in <code>DIRS</code>?</li>
+<li>Spelling and case: Linux filesystems are case-sensitive.</li>
+<li>Error names a different template? Check <code>extends</code>/<code>include</code> tags.</li>
+</ol>
+<p>Related: <a href="/guides/flask-templatenotfound/">Flask TemplateNotFound</a>.</p>
+
+<aside class="cta"><strong>Once the page renders, check the status and headers your Django app actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Django not find my templates folder?</summary><p>A project-level templates/ folder is only searched if it is in TEMPLATES[&#x27;DIRS&#x27;], e.g. BASE_DIR / &#x27;templates&#x27;. APP_DIRS only covers &lt;app&gt;/templates/ of installed apps.</p></details>
+<details><summary>Why does TemplateDoesNotExist name base.html?</summary><p>The template you rendered extends or includes base.html, and that file is not on any loader path.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Django 6.1.2 and Python 3.14.7 (python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Django are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

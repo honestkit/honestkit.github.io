@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx cookies: keep and set cookies with a Client (tested)</title>
+<meta name="description" content="httpx.get() forgets cookies; a Client jar stores Set-Cookie and sends it back. client.cookies.set(), per-request cookies= deprecated, CookieConflict fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-cookies-client-set-cookies/">
+<meta property="og:title" content="httpx cookies: keep and set cookies with a Client (tested)">
+<meta property="og:description" content="httpx.get() forgets cookies; a Client jar stores Set-Cookie and sends it back. client.cookies.set(), per-request cookies= deprecated, CookieConflict fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-cookies-client-set-cookies/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I keep cookies between requests in httpx?", "acceptedAnswer": {"@type": "Answer", "text": "Use a single httpx.Client or AsyncClient. Module-level httpx.get() does not remember cookies between calls."}}, {"@type": "Question", "name": "How do I set a cookie in httpx?", "acceptedAnswer": {"@type": "Answer", "text": "httpx.Client(cookies={'name': 'value'}) or client.cookies.set('name', 'value'). Per-request cookies= is deprecated in httpx 0.28.1 and is not stored in the jar."}}, {"@type": "Question", "name": "What is httpx.CookieConflict?", "acceptedAnswer": {"@type": "Answer", "text": "It is raised by client.cookies['name'] when several cookies share that name on different domains or paths; use client.cookies.get(name, domain=...)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx cookies: client cookies, set cookies, CookieConflict (tested)</h1>
+<p class="lead">Use one <code>httpx.Client</code> (or <code>AsyncClient</code>): its <code>client.cookies</code> jar stores cookies from <code>Set-Cookie</code> and sends them on later requests. Set your own with <code>client.cookies.set("name", "value")</code>; per-request <code>cookies=</code> is deprecated.</p>
+<p>httpx keeps cookies only inside a <code>Client</code> / <code>AsyncClient</code>: its <code>client.cookies</code> jar stores <code>Set-Cookie</code> values and sends them back. Measured with httpx 0.28.1 on Python 3.13.5 against a local <code>http.server</code> (<code>srv.py</code>) where <code>/login</code> sets <code>session</code> and <code>theme</code> cookies and every path echoes the <code>Cookie</code> header it received.</p>
+<h2 id="response">1. Response cookies, and why they are not sent back</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+r = httpx.get(base + &quot;/login&quot;)
+print(&quot;response cookies:&quot;, dict(r.cookies))
+# module-level httpx.get() has no memory between calls
+print(&quot;next call sends: &quot;, httpx.get(base + &quot;/me&quot;).json())</code></pre>
+<p>Output:</p>
+<pre><code>response cookies: {&#x27;session&#x27;: &#x27;abc&#x27;, &#x27;theme&#x27;: &#x27;dark&#x27;}
+next call sends:  {&#x27;cookie_header&#x27;: None}</code></pre>
+<p><code>r.cookies</code> holds the cookies one response set. The module-level <code>httpx.get()</code> uses a throwaway client each time, so nothing is remembered between calls.</p>
+<h2 id="client">2. httpx client cookies: a session that remembers</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+with httpx.Client(base_url=base) as client:
+    client.get(&quot;/login&quot;)
+    print(&quot;jar:&quot;, dict(client.cookies))
+    print(&quot;sent:&quot;, client.get(&quot;/me&quot;).json())</code></pre>
+<p>Output:</p>
+<pre><code>jar: {&#x27;session&#x27;: &#x27;abc&#x27;, &#x27;theme&#x27;: &#x27;dark&#x27;}
+sent: {&#x27;cookie_header&#x27;: &#x27;session=abc; theme=dark&#x27;}</code></pre>
+<h2 id="set">3. httpx set cookies on the client</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+with httpx.Client(base_url=base, cookies={&quot;consent&quot;: &quot;yes&quot;}) as client:
+    print(client.get(&quot;/me&quot;).json())
+    client.cookies.set(&quot;lang&quot;, &quot;en&quot;)
+    print(client.get(&quot;/me&quot;).json())
+    client.cookies.delete(&quot;lang&quot;)
+    print(client.get(&quot;/me&quot;).json())</code></pre>
+<p>Output:</p>
+<pre><code>{&#x27;cookie_header&#x27;: &#x27;consent=yes&#x27;}
+{&#x27;cookie_header&#x27;: &#x27;consent=yes; lang=en&#x27;}
+{&#x27;cookie_header&#x27;: &#x27;consent=yes&#x27;}</code></pre>
+<p>Pass <code>cookies=</code> to the constructor for starting values, then use <code>client.cookies.set()</code> / <code>.delete()</code> to change the jar.</p>
+<h2 id="perrequest">4. Per-request cookies= is deprecated and not stored</h2>
+<pre><code>import warnings, httpx
+from srv import start
+base = start()
+warnings.simplefilter(&quot;always&quot;)
+
+with httpx.Client(base_url=base) as client:
+    r = client.get(&quot;/me&quot;, cookies={&quot;one&quot;: &quot;off&quot;})
+    print(r.json())
+    print(&quot;jar after:&quot;, dict(client.cookies))</code></pre>
+<p>Output:</p>
+<pre><code>/tmp/fx384/ve/lib/python3.13/site-packages/httpx/_client.py:1053: DeprecationWarning: Setting per-request cookies=&lt;...&gt; is being deprecated, because the expected behaviour on cookie persistence is ambiguous. Set cookies directly on the client instance instead.
+  return self.request(
+{&#x27;cookie_header&#x27;: &#x27;one=off&#x27;}
+jar after: {}</code></pre>
+<p><code>client.get(url, cookies=...)</code> still sends the cookie in httpx 0.28.1, but emits a <code>DeprecationWarning</code> (shown here because the block enables warnings) and does not add it to the jar. Set it on <code>client.cookies</code> instead.</p>
+<h2 id="conflict">5. CookieConflict: same name on two domains</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+with httpx.Client(base_url=base) as client:
+    client.get(&quot;/login&quot;)
+    client.cookies.set(&quot;session&quot;, &quot;other&quot;, domain=&quot;example.com&quot;)
+    try:
+        print(client.cookies[&quot;session&quot;])
+    except httpx.CookieConflict as e:
+        print(&quot;CookieConflict:&quot;, e)
+    print(client.cookies.get(&quot;session&quot;, domain=&quot;127.0.0.1&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>CookieConflict: Multiple cookies exist with name=session
+abc</code></pre>
+<p><code>client.cookies["name"]</code> raises <code>httpx.CookieConflict</code> when several cookies share the name (different domain or path). Use <code>client.cookies.get(name, domain=...)</code>.</p>
+<p>Related: <a href="/guides/httpx-headers-client-default-response/">httpx headers</a>, <a href="/guides/httpx-auth-basic-bearer-token/">httpx auth</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests differences</a>, <a href="/guides/httpx-follow-redirects/">httpx follow redirects</a>.</p>
+
+<aside class="cta"><strong>See the Set-Cookie and other headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I keep cookies between requests in httpx?</summary><p>Use a single httpx.Client or AsyncClient. Module-level httpx.get() does not remember cookies between calls.</p></details>
+<details><summary>How do I set a cookie in httpx?</summary><p>httpx.Client(cookies={&#x27;name&#x27;: &#x27;value&#x27;}) or client.cookies.set(&#x27;name&#x27;, &#x27;value&#x27;). Per-request cookies= is deprecated in httpx 0.28.1 and is not stored in the jar.</p></details>
+<details><summary>What is httpx.CookieConflict?</summary><p>It is raised by client.cookies[&#x27;name&#x27;] when several cookies share that name on different domains or paths; use client.cookies.get(name, domain=...).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5 against a local http.server that sets cookies and echoes the Cookie header. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

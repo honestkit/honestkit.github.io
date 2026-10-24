@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pydantic &quot;Field required [type=missing]&quot;: Causes and Fixes</title>
+<meta name="description" content="Pydantic v2 Field required [type=missing] on 2.14: Optional without a default is still required, aliases, nested loc paths, and FastAPI 422 body vs query.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pydantic-field-required-type-missing/">
+<meta property="og:title" content="Pydantic &quot;Field required [type=missing]&quot;: Causes and Fixes">
+<meta property="og:description" content="Pydantic v2 Field required [type=missing] on 2.14: Optional without a default is still required, aliases, nested loc paths, and FastAPI 422 body vs query.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pydantic-field-required-type-missing/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is my Optional field required in Pydantic v2?", "acceptedAnswer": {"@type": "Answer", "text": "In Pydantic v2 Optional[str] only allows None; without a default the field is still required. Write x: str | None = None."}}, {"@type": "Question", "name": "Why does Pydantic say a field is missing when I sent it?", "acceptedAnswer": {"@type": "Answer", "text": "The field probably has an alias, and Pydantic validates by alias. The error location shows the alias; send that key or set populate_by_name=True."}}, {"@type": "Question", "name": "How do I see which field is missing in FastAPI?", "acceptedAnswer": {"@type": "Answer", "text": "The 422 response detail has loc, e.g. ['body', 'price'] or ['query', 'q']; the first element says where FastAPI looked."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Pydantic Field required [type=missing] (tested)</h1>
+<p class="lead">Pydantic raises <code>Field required [type=missing]</code> when a field with no default is absent from the input. In v2 the usual causes are an <code>Optional[...]</code> field without <code>= None</code>, a field alias you did not send, or (in FastAPI) a parameter it expected in the query rather than the body.</p>
+<h2 id="optional">1. Optional[str] is still required in Pydantic v2</h2>
+<pre><code>from typing import Optional
+from pydantic import BaseModel, ValidationError
+class User(BaseModel):
+    name: str
+    nickname: Optional[str]          # no default -&gt; still required in v2
+    email: str | None = None         # default -&gt; optional
+for data in ({&quot;name&quot;: &quot;Ann&quot;}, {&quot;name&quot;: &quot;Ann&quot;, &quot;nickname&quot;: None}):
+    try:
+        print(&quot;ok:&quot;, repr(User(**data)))
+    except ValidationError as e:
+        print(e)</code></pre>
+<p>Output:</p>
+<pre><code>1 validation error for User
+nickname
+  Field required [type=missing, input_value={&#x27;name&#x27;: &#x27;Ann&#x27;}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.14/v/missing
+ok: User(name=&#x27;Ann&#x27;, nickname=None, email=None)</code></pre>
+<p>This is the most common surprise after upgrading from Pydantic v1. In v2, <code>Optional[str]</code> only means "may be <code>None</code>"; it does <strong>not</strong> give the field a default. A field with no default is required, so leaving the key out raises <code>Field required [type=missing]</code>, while sending <code>"nickname": null</code> passes. To make a field truly optional, give it a default: <code>nickname: str | None = None</code>.</p>
+<h2 id="alias">2. The key matches the field name, but the field has an alias</h2>
+<pre><code>from pydantic import BaseModel, Field, ValidationError
+class Item(BaseModel):
+    item_id: int = Field(alias=&quot;itemId&quot;)
+for data in ({&quot;item_id&quot;: 1}, {&quot;itemId&quot;: 1}):
+    try:
+        print(&quot;ok:&quot;, repr(Item(**data)))
+    except ValidationError as e:
+        print(e)
+class Item2(BaseModel):
+    model_config = {&quot;populate_by_name&quot;: True}
+    item_id: int = Field(alias=&quot;itemId&quot;)
+print(&quot;populate_by_name:&quot;, repr(Item2(item_id=1)))</code></pre>
+<p>Output:</p>
+<pre><code>1 validation error for Item
+itemId
+  Field required [type=missing, input_value={&#x27;item_id&#x27;: 1}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.14/v/missing
+ok: Item(item_id=1)
+populate_by_name: Item2(item_id=1)</code></pre>
+<p>When a field has an <code>alias</code>, Pydantic validates against the alias by default, so <code>{"item_id": 1}</code> reports <code>itemId</code> as missing, even though your code calls it <code>item_id</code>. The error's location names the alias, which is the clue. Send the alias, or set <code>populate_by_name</code> so both names work.</p>
+<h2 id="nested">3. Find which nested field is missing</h2>
+<pre><code>from pydantic import BaseModel, ValidationError
+class Address(BaseModel):
+    city: str
+class Order(BaseModel):
+    id: int
+    ship_to: Address
+try:
+    Order.model_validate({&quot;id&quot;: 7, &quot;ship_to&quot;: {}})
+except ValidationError as e:
+    print(e)
+    print(e.errors(include_url=False))</code></pre>
+<p>Output:</p>
+<pre><code>1 validation error for Order
+ship_to.city
+  Field required [type=missing, input_value={}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.14/v/missing
+[{&#x27;type&#x27;: &#x27;missing&#x27;, &#x27;loc&#x27;: (&#x27;ship_to&#x27;, &#x27;city&#x27;), &#x27;msg&#x27;: &#x27;Field required&#x27;, &#x27;input&#x27;: {}}]</code></pre>
+<p>For nested models the location is a dotted path (<code>ship_to.city</code>). In code, <code>e.errors()</code> gives the same thing as a tuple in <code>loc</code>, which is easier to log or return to a client than the printed message.</p>
+<h2 id="fastapi">4. "Field required" in a FastAPI 422 response</h2>
+<pre><code>import warnings; warnings.simplefilter(&quot;ignore&quot;)
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+app = FastAPI()
+class Item(BaseModel):
+    name: str
+    price: float
+@app.post(&quot;/items&quot;)
+def create(item: Item):
+    return item
+@app.get(&quot;/search&quot;)
+def search(q: str):
+    return {&quot;q&quot;: q}
+c = TestClient(app)
+print(c.post(&quot;/items&quot;, json={&quot;name&quot;: &quot;pen&quot;}).json())
+print(c.get(&quot;/search&quot;).json())
+print(c.post(&quot;/items&quot;, data={&quot;name&quot;: &quot;pen&quot;, &quot;price&quot;: &quot;1&quot;}).json())</code></pre>
+<p>Output:</p>
+<pre><code>{&#x27;detail&#x27;: [{&#x27;type&#x27;: &#x27;missing&#x27;, &#x27;loc&#x27;: [&#x27;body&#x27;, &#x27;price&#x27;], &#x27;msg&#x27;: &#x27;Field required&#x27;, &#x27;input&#x27;: {&#x27;name&#x27;: &#x27;pen&#x27;}}]}
+{&#x27;detail&#x27;: [{&#x27;type&#x27;: &#x27;missing&#x27;, &#x27;loc&#x27;: [&#x27;query&#x27;, &#x27;q&#x27;], &#x27;msg&#x27;: &#x27;Field required&#x27;, &#x27;input&#x27;: None}]}
+{&#x27;detail&#x27;: [{&#x27;type&#x27;: &#x27;model_attributes_type&#x27;, &#x27;loc&#x27;: [&#x27;body&#x27;], &#x27;msg&#x27;: &#x27;Input should be a valid dictionary or object to extract fields from&#x27;, &#x27;input&#x27;: &#x27;name=pen&amp;price=1&#x27;}]}</code></pre>
+<p>FastAPI returns Pydantic's errors as a 422 response. The first element of <code>loc</code> tells you where FastAPI looked: <code>body</code> (a JSON field is missing), <code>query</code> (a function parameter without a default became a required query parameter), <code>path</code> or <code>header</code>. The third call shows a different error: form data sent to a JSON-body route fails as a whole, not field by field. More causes in <a href="/guides/fastapi-422-unprocessable-entity/">FastAPI 422 Unprocessable Entity</a>.</p>
+<h2 id="checklist">Checklist</h2>
+<ul><li>Read the location line under the error: it names the exact missing field (dotted for nested ones).</li><li>Optional field? Give it a default: <code>x: str | None = None</code>. <code>Optional[...]</code> alone is not enough in v2.</li><li>Location shows a name you did not send? It's an alias: send that name or enable <code>populate_by_name</code>.</li><li>FastAPI: check <code>loc[0]</code> (body / query / path / header) to see where it expected the value.</li></ul>
+<p>Related: <a href="/guides/pydantic-extra-inputs-are-not-permitted/">Pydantic "Extra inputs are not permitted"</a>, <a href="/guides/pydantic-basesettings-has-been-moved-to-pydantic-settings/">BaseSettings has been moved to pydantic-settings</a>.</p>
+
+<aside class="cta"><strong>Check the request your client really sends, headers included, right in the browser:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is my Optional field required in Pydantic v2?</summary><p>In Pydantic v2 Optional[str] only allows None; without a default the field is still required. Write x: str | None = None.</p></details>
+<details><summary>Why does Pydantic say a field is missing when I sent it?</summary><p>The field probably has an alias, and Pydantic validates by alias. The error location shows the alias; send that key or set populate_by_name=True.</p></details>
+<details><summary>How do I see which field is missing in FastAPI?</summary><p>The 422 response detail has loc, e.g. [&#x27;body&#x27;, &#x27;price&#x27;] or [&#x27;query&#x27;, &#x27;q&#x27;]; the first element says where FastAPI looked.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Pydantic 2.14.1, FastAPI 0.161.1 and Python 3.14.7 (python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Pydantic are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

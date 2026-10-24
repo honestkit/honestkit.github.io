@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Celery task stuck PENDING: routed to a queue no worker reads</title>
+<meta name="description" content="Celery task_routes sends a task to a queue the worker doesn&#x27;t consume: get() times out, state PENDING, message waits in Redis. Fix with worker -Q.">
+<link rel="canonical" href="https://honestkit.github.io/guides/celery-task-stuck-pending-queue-routing/">
+<meta property="og:title" content="Celery task stuck PENDING: routed to a queue no worker reads">
+<meta property="og:description" content="Celery task_routes sends a task to a queue the worker doesn&#x27;t consume: get() times out, state PENDING, message waits in Redis. Fix with worker -Q.">
+<meta property="og:url" content="https://honestkit.github.io/guides/celery-task-stuck-pending-queue-routing/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is my Celery task always PENDING?", "acceptedAnswer": {"@type": "Answer", "text": "No worker consumes the queue the task was sent to (check task_routes and the worker's -Q), no worker is running, or client and worker use different brokers."}}, {"@type": "Question", "name": "How do I make a Celery worker consume a specific queue?", "acceptedAnswer": {"@type": "Answer", "text": "Start it with -Q, e.g. celery -A proj worker -Q celery,images. The banner's [queues] section lists what it consumes."}}, {"@type": "Question", "name": "Is the message lost if no worker consumes the queue?", "acceptedAnswer": {"@type": "Answer", "text": "No. With Redis the message stayed in the queue's list until a worker consuming that queue started."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Celery task stuck in PENDING: queue routing (tested)</h1>
+<p class="lead">If a Celery task stays PENDING forever, check the worker's <code>[queues]</code> banner. A task routed to <code>images</code> by <code>task_routes</code> is never picked up by a worker that only consumes <code>celery</code>. Start the worker with <code>-Q celery,images</code>.</p>
+<p>A Celery worker consumes only the queues listed under <code>[queues]</code> in its startup banner; by default that is just <code>celery</code>. If <code>task_routes</code> (or <code>apply_async(queue=...)</code>) sends a task to another queue, the message waits in the broker and the task stays PENDING with no error anywhere. Measured with Celery 5.6.3 and Redis 7.</p>
+<h2 id="repro">1. Routed to a queue nobody consumes</h2>
+<pre><code>$ cat celery_app.py
+from celery import Celery
+app = Celery(&quot;proj&quot;, broker=&quot;redis://127.0.0.1:8964/0&quot;, backend=&quot;redis://127.0.0.1:8964/1&quot;)
+app.conf.task_routes = {&quot;celery_app.resize&quot;: {&quot;queue&quot;: &quot;images&quot;}}
+
+@app.task
+def resize(n):
+    return f&quot;resized {n}&quot;
+$ celery -A celery_app worker -c 1 --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ timeout 30 python send.py
+caller: TimeoutError The operation timed out. | state: PENDING
+$ grep -A1 &quot;\[queues\]&quot; worker.log | sed -E &quot;s/ +exchange=.*//&quot;
+ -------------- [queues]
+                .&gt; celery
+$ python -c &quot;import redis; print(&#x27;images queue length:&#x27;, redis.Redis(port=8964).llen(&#x27;images&#x27;))&quot;
+images queue length: 1</code></pre>
+<p>The worker listens on <code>celery</code> only. The task went to <code>images</code>, so <code>get()</code> timed out, the state is PENDING (Celery also reports PENDING for unknown task ids), and the message is still sitting in the Redis list <code>images</code>.</p>
+<h2 id="fix">2. Fix: tell the worker which queues to consume</h2>
+<pre><code>$ celery -A celery_app worker -c 1 -Q celery,images --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ timeout 30 python send.py
+result: resized 1
+$ grep -A2 &quot;\[queues\]&quot; worker.log | sed -E &quot;s/ +exchange=.*//&quot;
+ -------------- [queues]
+                .&gt; celery
+                .&gt; images</code></pre>
+<p>With <code>-Q celery,images</code> the banner lists both queues and the task runs. You can also run a dedicated worker per queue (<code>-Q images</code>). The message already waiting from step 1 was not lost: Redis kept it until a consumer appeared.</p>
+<p>Other reasons a task stays PENDING: no worker running at all, the worker and client use different broker URLs or Redis database numbers, or no result backend is configured. Related: <a href="/guides/celery-received-unregistered-task-of-type-keyerror/">Celery Received unregistered task</a>, <a href="/guides/celery-beat-vs-celery-worker/">celery beat vs worker</a>, <a href="/guides/celery-error-111-connection-refused/">Celery Error 111</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is my Celery task always PENDING?</summary><p>No worker consumes the queue the task was sent to (check task_routes and the worker&#x27;s -Q), no worker is running, or client and worker use different brokers.</p></details>
+<details><summary>How do I make a Celery worker consume a specific queue?</summary><p>Start it with -Q, e.g. celery -A proj worker -Q celery,images. The banner&#x27;s [queues] section lists what it consumes.</p></details>
+<details><summary>Is the message lost if no worker consumes the queue?</summary><p>No. With Redis the message stayed in the queue&#x27;s list until a worker consuming that queue started.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Celery 5.6.3 (kombu 5.6.2, redis-py 8.1.0) on Python 3.13.5, Redis 7 (Docker) as broker and backend. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Celery and Redis are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

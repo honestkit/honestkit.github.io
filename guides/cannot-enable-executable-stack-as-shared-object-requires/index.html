@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cannot enable executable stack as shared object requires (fix)</title>
+<meta name="description" content="ImportError: cannot enable executable stack as shared object requires: Invalid argument after a glibc 2.41 upgrade. Reproduced with torch 1.10, 3 tested fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/cannot-enable-executable-stack-as-shared-object-requires/">
+<meta property="og:title" content="cannot enable executable stack as shared object requires (fix)">
+<meta property="og:description" content="ImportError: cannot enable executable stack as shared object requires: Invalid argument after a glibc 2.41 upgrade. Reproduced with torch 1.10, 3 tested fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/cannot-enable-executable-stack-as-shared-object-requires/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why did this start after an OS upgrade?", "acceptedAnswer": {"@type": "Answer", "text": "glibc 2.41 stopped letting dlopen enable an executable stack. Libraries marked as needing one now fail to load instead of silently weakening the process."}}, {"@type": "Question", "name": "Is patchelf --clear-execstack safe?", "acceptedAnswer": {"@type": "Answer", "text": "For prebuilt wheels like torch the flag is a build leftover, and the library worked normally after clearing it here. Code that really runs on the stack would crash, so test after patching."}}, {"@type": "Question", "name": "Does it only affect torch?", "acceptedAnswer": {"@type": "Answer", "text": "No. Any old .so with an executable-stack flag fails the same way; the scan script finds them in any package directory."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>cannot enable executable stack as shared object requires: Invalid argument (fix)</h1>
+<p class="lead"><code>ImportError: libtorch_cpu.so: cannot enable executable stack as shared object requires: Invalid argument</code> appears when an old compiled library is loaded on glibc 2.41 or newer. We reproduced it with torch 1.10.2 on Debian 13 and tested three fixes, including one that needs no root.</p>
+<h2 id="error">1. The error</h2>
+<pre><code>import torch
+print(&quot;torch&quot;, torch.__version__)
+print(torch.ones(2) + 1)</code></pre>
+<p>torch 1.10.2+cpu on Debian 13 (glibc 2.41):</p>
+<pre><code>.../site-packages/torch/torch_version.py:3: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools&lt;81.
+  from pkg_resources import packaging  # type: ignore[attr-defined]
+Traceback (most recent call last):
+  File &quot;b1.py&quot;, line 1, in &lt;module&gt;
+    import torch
+  File &quot;.../site-packages/torch/__init__.py&quot;, line 197, in &lt;module&gt;
+    from torch._C import *  # noqa: F403
+ImportError: libtorch_cpu.so: cannot enable executable stack as shared object requires: Invalid argument</code></pre>
+<p>The pkg_resources warning on top is unrelated (old torch imports it; with setuptools 81+ removed it becomes <a href="/guides/python-modulenotfounderror-no-module-named-pkg-resources/">No module named pkg_resources</a>). The ImportError is the real failure: the shared library is marked as needing an executable stack (its <code>PT_GNU_STACK</code> program header has the execute flag), and glibc 2.41 no longer lets <code>dlopen</code> turn on an executable stack for a library loaded at runtime. Python extension modules are always loaded with <code>dlopen</code>, so any old wheel built with that flag fails this way on new distros (Debian 13, Fedora 42, Arch, Ubuntu 25.04+ ship glibc 2.41 or newer).</p>
+<h2 id="find">2. Find which libraries carry the flag</h2>
+<p>The error names one library, but there can be several. This stdlib-only script reads each <code>.so</code> file&#x27;s program headers:</p>
+<pre><code>import glob, os, struct, sys
+
+PT_GNU_STACK = 0x6474E551
+PF_X = 1
+
+def needs_execstack(path):
+    with open(path, &quot;rb&quot;) as f:
+        hdr = f.read(64)
+        if hdr[:4] != b&quot;\x7fELF&quot; or hdr[4] != 2:  # 64-bit ELF only
+            return None
+        phoff, = struct.unpack_from(&quot;&lt;Q&quot;, hdr, 0x20)
+        phentsize, phnum = struct.unpack_from(&quot;&lt;HH&quot;, hdr, 0x36)
+        for i in range(phnum):
+            f.seek(phoff + i * phentsize)
+            p_type, p_flags = struct.unpack(&quot;&lt;II&quot;, f.read(8))
+            if p_type == PT_GNU_STACK:
+                return bool(p_flags &amp; PF_X)
+    return None
+
+root = sys.argv[1]
+for so in sorted(glob.glob(os.path.join(root, &quot;**&quot;, &quot;*.so*&quot;), recursive=True)):
+    if needs_execstack(so):
+        print(&quot;needs executable stack:&quot;, os.path.relpath(so, root))
+print(&quot;scan done&quot;)</code></pre>
+<p><code>python b2.py .../site-packages/torch</code> on torch 1.10.2:</p>
+<pre><code>needs executable stack: lib/libtorch_cpu.so
+scan done</code></pre>
+<p>Same scan on torch 2.9.0+cpu:</p>
+<pre><code>scan done</code></pre>
+<p>(<code>readelf -lW file.so | grep GNU_STACK</code> shows the same thing: <code>RWE</code> means executable stack, <code>RW</code> means not.)</p>
+<h2 id="fix">3. Fix A: upgrade the package</h2>
+<p>Current releases are built without the flag (torch 2.9.0 has none, above), so if you can move to a newer version, do that. If you have to keep the old one, use B or C.</p>
+<h2 id="patchelf">4. Fix B: clear the flag with patchelf (no root)</h2>
+<p><code>pip install patchelf</code> gives you the binary inside the venv. Then, for each library the scan listed:</p>
+<pre><code>SP=$(python -c &quot;import sysconfig; print(sysconfig.get_paths()[&#x27;purelib&#x27;])&quot;)
+patchelf --version
+patchelf --clear-execstack &quot;$SP/torch/lib/libtorch_cpu.so&quot;
+echo &quot;patched&quot;</code></pre>
+<pre><code>patchelf 0.19.1
+patched</code></pre>
+<p>Scan and import again:</p>
+<pre><code>scan done</code></pre>
+<pre><code>.../site-packages/torch/torch_version.py:3: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools&lt;81.
+  from pkg_resources import packaging  # type: ignore[attr-defined]
+torch 1.10.2+cpu
+tensor([2., 2.])</code></pre>
+<p>The flag is almost always a build leftover (an assembly file without a <code>.note.GNU-stack</code> section), not something the code needs, which is why clearing it works. Reinstalling the package brings the flag back, so re-run the patch after every reinstall.</p>
+<h2 id="tunable">5. Fix C: the glibc tunable (no file changes)</h2>
+<p>With the original, unpatched library:</p>
+<pre><code>GLIBC_TUNABLES=glibc.rtld.execstack=2 python b1.py</code></pre>
+<pre><code>.../site-packages/torch/torch_version.py:3: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools&lt;81.
+  from pkg_resources import packaging  # type: ignore[attr-defined]
+torch 1.10.2+cpu
+tensor([2., 2.])</code></pre>
+<p>This worked on Debian&#x27;s glibc 2.41. It allows an executable stack for the whole process, which is the protection glibc just turned on, so prefer A or B and keep C for a quick check.</p>
+<p>Related: <a href="/guides/onnxruntime-cannot-enable-executable-stack/">onnxruntime version of this error</a> · <a href="/guides/python-modulenotfounderror-no-module-named-pkg-resources/">No module named pkg_resources</a> · <a href="/guides/torchaudio-libtorchaudio-so-undefined-symbol/">libtorchaudio.so undefined symbol</a> · <a href="/guides/runtimeerror-operator-torchvision-nms-does-not-exist/">operator torchvision::nms does not exist</a></p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why did this start after an OS upgrade?</summary><p>glibc 2.41 stopped letting dlopen enable an executable stack. Libraries marked as needing one now fail to load instead of silently weakening the process.</p></details>
+<details><summary>Is patchelf --clear-execstack safe?</summary><p>For prebuilt wheels like torch the flag is a build leftover, and the library worked normally after clearing it here. Code that really runs on the stack would crash, so test after patching.</p></details>
+<details><summary>Does it only affect torch?</summary><p>No. Any old .so with an executable-stack flag fails the same way; the scan script finds them in any package directory.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Debian 13 (glibc 2.41-12+deb13u4): torch 1.10.2+cpu (CPython 3.9), torch 2.9.0+cpu (CPython 3.11.17), patchelf 0.19.1. Output pasted unedited except shortened paths. PlainTables is our extension; patchelf and torch are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

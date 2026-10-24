@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BufferedWriter Hangs Forever on write()==0 (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: a raw stream&#x27;s write() returning 0 for non-empty data makes BufferedWriter spin forever at 100% CPU -- no error, no output.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-io-bufferedwriter-write-returns-zero-infinite-loop/">
+<meta property="og:title" content="BufferedWriter Hangs Forever on write()==0 (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: a raw stream&#x27;s write() returning 0 for non-empty data makes BufferedWriter spin forever at 100% CPU -- no error, no output.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-io-bufferedwriter-write-returns-zero-infinite-loop/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is returning 0 from a RawIOBase.write() actually forbidden?", "acceptedAnswer": {"@type": "Answer", "text": "The documentation doesn't explicitly list 0 as invalid for non-empty input, but we measured that io.BufferedWriter only has special-case handling for None -- any other value, including 0, is treated as a (tiny) amount of real progress and retried, with no loop limit or timeout."}}, {"@type": "Question", "name": "How is this different from the None case, which is also a kind of 'nothing written'?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that None triggers a specific check in BufferedWriter's C implementation that immediately raises BlockingIOError. 0 doesn't hit that check at all -- it's treated the same as returning any other small integer, which is assumed to mean the write is making slow but real progress."}}, {"@type": "Question", "name": "Would a real-world raw stream realistically return 0 like this?", "acceptedAnswer": {"@type": "Answer", "text": "It's a plausible bug rather than a deliberate design -- someone implementing a custom RawIOBase around a non-blocking socket or pipe, thinking of 0 the way read() uses 0 to mean EOF, could easily return 0 for 'nothing accepted yet' instead of the actually-documented None, and the failure mode (a silent hang) gives no hint that the mistake is in the write() return value."}}, {"@type": "Question", "name": "Does this affect built-in raw streams like FileIO or sockets?", "acceptedAnswer": {"@type": "Answer", "text": "We only measured a custom RawIOBase subclass -- the built-in raw streams shipped with Python follow the documented contract and don't return 0 for non-empty writes, so this specifically affects custom/third-party RawIOBase implementations, not the stdlib's own."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>io.BufferedWriter Infinite-Loops on write() Returning 0 (tested)</h1>
+<p class="lead">A raw IO stream's documented non-blocking signal for "nothing written right now" is returning <code>None</code> -- <code>io.BufferedWriter</code> handles that correctly, raising a clean <code>BlockingIOError</code>. But a raw stream that instead returns <code>0</code> for a non-empty buffer -- an easy mistake if you're writing a custom <code>RawIOBase</code> subclass and think of <code>0</code> as "wrote nothing, try again" the way <code>0</code> means EOF on the read side -- isn't handled at all. <code>BufferedWriter</code> retries the write in a tight loop expecting eventual progress, and since <code>0</code> looks like a tiny bit of forward motion rather than a stop signal, it never gives up: the process pins one CPU core at 100% forever, with no exception, no output, and no indication anything is wrong.</p>
+<h2 id="repro1">1. write() returning None is handled correctly</h2>
+<pre><code>import io
+
+class NoneRaw(io.RawIOBase):
+    def writable(self):
+        return True
+    def write(self, b):
+        return None   # documented non-blocking "nothing written" signal
+
+raw = NoneRaw()
+bw = io.BufferedWriter(raw, buffer_size=4096)
+bw.write(b"hello")
+try:
+    bw.flush()
+except BlockingIOError as e:
+    print("None ->", e)</code></pre>
+<pre><code>None -> [Errno 0] write could not complete without blocking</code></pre>
+<p><strong>Measured:</strong> this is the correct, documented behavior -- <code>None</code> is the one case <code>BufferedWriter</code> actually checks for, and it raises a clean, catchable error.</p>
+
+<h2 id="repro2">2. write() returning 0 for non-empty data spins forever instead</h2>
+<pre><code>class ZeroRaw(io.RawIOBase):
+    def __init__(self):
+        self.calls = 0
+    def writable(self):
+        return True
+    def write(self, b):
+        self.calls += 1
+        return 0   # claims to accept nothing, every single call
+
+raw = ZeroRaw()
+bw = io.BufferedWriter(raw, buffer_size=4096)
+bw.write(b"hello")
+
+import signal
+def handler(sig, frame):
+    print("calls in 1 second:", raw.calls)
+    raise SystemExit(0)
+signal.signal(signal.SIGALRM, handler)
+signal.alarm(1)
+bw.flush()   # never returns</code></pre>
+<pre><code>calls in 1 second: 5170118</code></pre>
+<p><strong>Measured:</strong> over five million calls to <code>write()</code> in a single second, each one accepted via the exact same tight retry loop -- a genuine CPU-pinning infinite loop, not a slow operation. No exception is ever raised, and nothing is printed; the process would hang until killed from outside.</p>
+
+<h2 id="repro3">3. The same hang hits writes large enough to bypass buffering too</h2>
+<pre><code>raw2 = ZeroRaw()
+bw2 = io.BufferedWriter(raw2, buffer_size=4096)
+signal.alarm(1)
+bw2.write(b"x" * 10000)   # larger than buffer_size, goes straight to raw.write()</code></pre>
+<pre><code>calls in 1 second: 4984435</code></pre>
+<p><strong>Measured:</strong> the hang isn't specific to <code>flush()</code> -- any write large enough to exceed the internal buffer calls straight into the same unguarded retry loop, so even a single oversized <code>write()</code> call, with no explicit <code>flush()</code> anywhere in the caller's code, can hang the process.</p>
+
+<h2 id="repro4">4. The fix: a custom raw stream must return None, never 0, when it accepts nothing</h2>
+<pre><code>class FixedRaw(io.RawIOBase):
+    def writable(self):
+        return True
+    def write(self, b):
+        if not getattr(self, "_ready", True):
+            return None   # signal "try again later", not 0
+        return len(b)      # accept everything once actually ready
+
+raw3 = FixedRaw()
+bw3 = io.BufferedWriter(raw3, buffer_size=4096)
+bw3.write(b"hello")
+bw3.flush()
+print("flush completed normally")</code></pre>
+<pre><code>flush completed normally</code></pre>
+<p><strong>Measured:</strong> once the raw stream follows the documented contract -- returning either a positive byte count or <code>None</code>, never <code>0</code> for non-empty input -- <code>flush()</code> and large <code>write()</code> calls both complete normally. If you're wrapping something where zero genuinely means "try again," translate that to <code>None</code> before returning it from <code>write()</code>.</p>
+<aside class="cta"><strong>A custom raw stream whose write() returns 0 for non-empty data -- instead of None or a real count -- makes io.BufferedWriter spin forever at 100% CPU, with no error and no output:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is returning 0 from a RawIOBase.write() actually forbidden?</summary><p>The documentation doesn&#x27;t explicitly list 0 as invalid for non-empty input, but we measured that io.BufferedWriter only has special-case handling for None -- any other value, including 0, is treated as a (tiny) amount of real progress and retried, with no loop limit or timeout.</p></details>
+<details><summary>How is this different from the None case, which is also a kind of &#x27;nothing written&#x27;?</summary><p>We measured that None triggers a specific check in BufferedWriter&#x27;s C implementation that immediately raises BlockingIOError. 0 doesn&#x27;t hit that check at all -- it&#x27;s treated the same as returning any other small integer, which is assumed to mean the write is making slow but real progress.</p></details>
+<details><summary>Would a real-world raw stream realistically return 0 like this?</summary><p>It&#x27;s a plausible bug rather than a deliberate design -- someone implementing a custom RawIOBase around a non-blocking socket or pipe, thinking of 0 the way read() uses 0 to mean EOF, could easily return 0 for &#x27;nothing accepted yet&#x27; instead of the actually-documented None, and the failure mode (a silent hang) gives no hint that the mistake is in the write() return value.</p></details>
+<details><summary>Does this affect built-in raw streams like FileIO or sockets?</summary><p>We only measured a custom RawIOBase subclass -- the built-in raw streams shipped with Python follow the documented contract and don&#x27;t return 0 for non-empty writes, so this specifically affects custom/third-party RawIOBase implementations, not the stdlib&#x27;s own.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in io.BufferedWriter wrapping a custom io.RawIOBase subclass, counting raw write() calls via a SIGALRM handler to measure the spin rate without waiting for a hang to resolve on its own (it doesn&#x27;t). PlainHeaders is our extension; Python&#x27;s io module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pandas 3.0 Breaking Changes: What Breaks After Upgrading</title>
+<meta name="description" content="pandas 3 vs 2.3, same code run on both: str dtype, Copy-on-Write, datetime64[us], removed applymap/fillna(method), and the changes that fail silently.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pandas-3-breaking-changes/">
+<meta property="og:title" content="pandas 3.0 Breaking Changes: What Breaks After Upgrading">
+<meta property="og:description" content="pandas 3 vs 2.3, same code run on both: str dtype, Copy-on-Write, datetime64[us], removed applymap/fillna(method), and the changes that fail silently.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pandas-3-breaking-changes/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What are the biggest breaking changes in pandas 3.0?", "acceptedAnswer": {"@type": "Answer", "text": "String columns default to the new str dtype, Copy-on-Write is always on (chained assignment no longer modifies the original), datetimes parse to microsecond resolution, and methods deprecated in 2.x such as applymap, swapaxes and fillna(method=) are removed."}}, {"@type": "Question", "name": "Why does my chained assignment not work in pandas 3?", "acceptedAnswer": {"@type": "Answer", "text": "Under Copy-on-Write, df[mask]['col'] = x and s = df['col']; s[0] = x modify a copy. Use df.loc[mask, 'col'] = x. In our test, pandas 3.1.0 gave no warning for the s[0] case."}}, {"@type": "Question", "name": "How do I prepare code for pandas 3?", "acceptedAnswer": {"@type": "Answer", "text": "Upgrade to pandas 2.3 first and fix every FutureWarning; most of the hard errors in 3.0 are warnings there. Silent changes (groupby, concat dtypes, Copy-on-Write) need output checks."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pandas 3.0 breaking changes, measured against pandas 2.3</h1>
+<p class="lead">The pandas 3.0 changes that break existing code, each shown by running the same script on pandas 2.3.3 and 3.1.0: the new <code>str</code> dtype, Copy-on-Write (chained assignment silently does nothing), <code>datetime64[us]</code>, frequency aliases like <code>'H'</code> raising, and removed methods such as <code>applymap</code> and <code>fillna(method=)</code>.</p>
+<h2 id="str">1. Strings are a new "str" dtype, not object</h2>
+<pre><code>import pandas as pd
+s = pd.Series([&quot;a&quot;, &quot;b&quot;, None])
+print(s.dtype, repr(s[2]))
+df = pd.DataFrame({&quot;x&quot;: [&quot;1&quot;, &quot;2&quot;]})
+print(df.dtypes.to_dict())
+print(df.select_dtypes(include=&quot;object&quot;).columns.tolist())
+try:
+    s[0] = 5
+    print(&quot;assign int ok:&quot;, s.tolist())
+except Exception as e:
+    print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>pandas 2.3.3:</p>
+<pre><code>object None
+{&#x27;x&#x27;: dtype(&#x27;O&#x27;)}
+[&#x27;x&#x27;]
+assign int ok: [5, &#x27;b&#x27;, None]</code></pre>
+<p>pandas 3.1.0:</p>
+<pre><code>/w/b1.py:6: Pandas4Warning: For backward compatibility, &#x27;str&#x27; dtypes are included by select_dtypes when &#x27;object&#x27; dtype is specified. This behavior is deprecated and will be removed in a future version. Explicitly pass &#x27;str&#x27; to `include` to select them, or to `exclude` to remove them and silence this warning.
+See https://pandas.pydata.org/docs/dev/user_guide/migration.html#string-migration-select-dtypes for details on how to write code that works with pandas 2 and 3.
+  print(df.select_dtypes(include=&quot;object&quot;).columns.tolist())
+str nan
+{&#x27;x&#x27;: &lt;StringDtype(storage=&#x27;python&#x27;, na_value=nan)&gt;}
+[&#x27;x&#x27;]
+TypeError: Invalid value &#x27;5&#x27; for dtype &#x27;str&#x27;. Value should be a string or missing value, got &#x27;int&#x27; instead.</code></pre>
+<p>Text columns now get <code>dtype: str</code> (a <code>StringDtype</code> with NaN as the missing value), so a <code>None</code> in a string column reads back as <code>nan</code>, and putting an int into a string column raises <code>TypeError: Invalid value '5' for dtype 'str'</code> instead of silently making a mixed object column. <code>select_dtypes(include="object")</code> still picks up str columns but emits a <code>Pandas4Warning</code>; pass <code>"str"</code> explicitly. Error messages change too: KeyErrors now print <code>dtype='str'</code> (see <a href="/guides/pandas-keyerror-not-in-index/">KeyError: not in index</a>).</p>
+<h2 id="cow">2. Copy-on-Write: chained assignment silently does nothing</h2>
+<pre><code>import pandas as pd
+df = pd.DataFrame({&quot;a&quot;: [1, 2, 3], &quot;b&quot;: [10, 20, 30]})
+sub = df[df[&quot;a&quot;] &gt; 1]
+sub[&quot;b&quot;] = 0
+print(df[&quot;b&quot;].tolist())
+s = df[&quot;a&quot;]
+s[0] = 99
+print(df[&quot;a&quot;].tolist())</code></pre>
+<p>pandas 2.3.3:</p>
+<pre><code>/w/b2.py:4: SettingWithCopyWarning: 
+A value is trying to be set on a copy of a slice from a DataFrame.
+Try using .loc[row_indexer,col_indexer] = value instead
+
+See the caveats in the documentation: https://pandas.pydata.org/pandas-docs/stable/user_guide/indexing.html#returning-a-view-versus-a-copy
+  sub[&quot;b&quot;] = 0
+[10, 20, 30]
+[99, 2, 3]</code></pre>
+<p>pandas 3.1.0:</p>
+<pre><code>[10, 20, 30]
+[1, 2, 3]</code></pre>
+<p>Under Copy-on-Write every indexing result behaves like a copy. The <code>SettingWithCopyWarning</code> is gone, and so is the old behaviour where <code>s = df["a"]; s[0] = 99</code> also changed <code>df</code>: on 3.1.0 <code>df</code> stays <code>[1, 2, 3]</code> with no message at all. Write through the frame instead: <code>df.loc[df["a"] &gt; 1, "b"] = 0</code>. Details: <a href="/guides/pandas-settingwithcopywarning/">SettingWithCopyWarning in pandas 2 vs 3</a>.</p>
+<h2 id="datetime">3. Datetimes default to microseconds; old frequency aliases are errors</h2>
+<pre><code>import pandas as pd
+t = pd.to_datetime([&quot;2026-10-23 01:02:03&quot;])
+print(t.dtype)
+print(pd.Timestamp(&quot;2026-10-23&quot;).unit)
+for alias in [&quot;H&quot;, &quot;T&quot;, &quot;S&quot;, &quot;M&quot;, &quot;ME&quot;, &quot;Y&quot;, &quot;YE&quot;, &quot;h&quot;]:
+    try:
+        r = pd.date_range(&quot;2026-01-01&quot;, periods=2, freq=alias)
+        print(alias, &quot;ok&quot;, r.freqstr)
+    except Exception as e:
+        print(alias, type(e).__name__ + &quot;:&quot;, str(e)[:22])</code></pre>
+<p>pandas 2.3.3:</p>
+<pre><code>/w/b3.py:7: FutureWarning: &#x27;H&#x27; is deprecated and will be removed in a future version, please use &#x27;h&#x27; instead.
+  r = pd.date_range(&quot;2026-01-01&quot;, periods=2, freq=alias)
+/w/b3.py:7: FutureWarning: &#x27;T&#x27; is deprecated and will be removed in a future version, please use &#x27;min&#x27; instead.
+  r = pd.date_range(&quot;2026-01-01&quot;, periods=2, freq=alias)
+/w/b3.py:7: FutureWarning: &#x27;S&#x27; is deprecated and will be removed in a future version, please use &#x27;s&#x27; instead.
+  r = pd.date_range(&quot;2026-01-01&quot;, periods=2, freq=alias)
+/w/b3.py:7: FutureWarning: &#x27;M&#x27; is deprecated and will be removed in a future version, please use &#x27;ME&#x27; instead.
+  r = pd.date_range(&quot;2026-01-01&quot;, periods=2, freq=alias)
+/w/b3.py:7: FutureWarning: &#x27;Y&#x27; is deprecated and will be removed in a future version, please use &#x27;YE&#x27; instead.
+  r = pd.date_range(&quot;2026-01-01&quot;, periods=2, freq=alias)
+datetime64[ns]
+s
+H ok h
+T ok min
+S ok s
+M ok ME
+ME ok ME
+Y ok YE-DEC
+YE ok YE-DEC
+h ok h</code></pre>
+<p>pandas 3.1.0:</p>
+<pre><code>datetime64[us]
+us
+H ValueError: Invalid frequency: H. 
+T ValueError: Invalid frequency: T. 
+S ValueError: Invalid frequency: S. 
+M ValueError: Invalid frequency: M. 
+ME ok ME
+Y ValueError: Invalid frequency: Y. 
+YE ok YE-DEC
+h ok h</code></pre>
+<p>Parsed strings now give <code>datetime64[us]</code> instead of <code>datetime64[ns]</code>, which matters if you convert to integers (<code>.astype("int64")</code> is now microseconds since the epoch) or compare dtypes. The aliases <code>H</code>, <code>T</code>, <code>S</code>, <code>M</code> and <code>Y</code> that warned in 2.x now raise <code>ValueError: Invalid frequency</code>; use <code>h</code>, <code>min</code>, <code>s</code>, <code>ME</code> and <code>YE</code>. <code>errors="ignore"</code> in <code>to_datetime</code> is also gone: <a href="/guides/pandas-to-datetime-errors-ignore-deprecated/">to_datetime errors='ignore'</a>.</p>
+<h2 id="removed">4. Deprecated methods and arguments now fail</h2>
+<pre><code>import warnings
+import pandas as pd
+warnings.simplefilter(&quot;always&quot;)
+df = pd.DataFrame({&quot;a&quot;: [1.0, None]})
+for name, f in [(&quot;inplace on column&quot;, lambda: df[&quot;a&quot;].fillna(0, inplace=True)),
+                (&quot;swapaxes&quot;, lambda: df.swapaxes(0, 1)),
+                (&quot;applymap&quot;, lambda: df.applymap(str)),
+                (&quot;DataFrame.append&quot;, lambda: df.append(df)),
+                (&quot;fillna(method=)&quot;, lambda: df.fillna(method=&quot;ffill&quot;)),
+                (&quot;groupby axis=1&quot;, lambda: df.groupby([0], axis=1))]:
+    with warnings.catch_warnings(record=True) as w:
+        try:
+            f()
+            msg = (type(w[0].message).__name__ + &quot;: &quot; + str(w[0].message)[:60]) if w else &quot;ok, no warning&quot;
+        except Exception as e:
+            msg = type(e).__name__ + &quot;: &quot; + str(e)[:60]
+    print(f&quot;{name}: {msg}&quot;)
+print(&quot;after inplace:&quot;, df[&quot;a&quot;].tolist())</code></pre>
+<p>pandas 2.3.3:</p>
+<pre><code>inplace on column: ok, no warning
+swapaxes: FutureWarning: &#x27;DataFrame.swapaxes&#x27; is deprecated and will be removed in a 
+applymap: FutureWarning: DataFrame.applymap has been deprecated. Use DataFrame.map in
+DataFrame.append: AttributeError: &#x27;DataFrame&#x27; object has no attribute &#x27;append&#x27;
+fillna(method=): FutureWarning: DataFrame.fillna with &#x27;method&#x27; is deprecated and will raise 
+groupby axis=1: FutureWarning: DataFrame.groupby with axis=1 is deprecated. Do `frame.T.gro
+after inplace: [1.0, 0.0]</code></pre>
+<p>pandas 3.1.0:</p>
+<pre><code>inplace on column: ChainedAssignmentError: A value is being set on a copy of a DataFrame or Series thro
+swapaxes: AttributeError: &#x27;DataFrame&#x27; object has no attribute &#x27;swapaxes&#x27;
+applymap: AttributeError: &#x27;DataFrame&#x27; object has no attribute &#x27;applymap&#x27;
+DataFrame.append: AttributeError: &#x27;DataFrame&#x27; object has no attribute &#x27;append&#x27;
+fillna(method=): TypeError: NDFrame.fillna() got an unexpected keyword argument &#x27;method&#x27;
+groupby axis=1: TypeError: DataFrame.groupby() got an unexpected keyword argument &#x27;axis
+after inplace: [1.0, nan]</code></pre>
+<p>Everything that raised a <code>FutureWarning</code> on 2.3.3 is an <code>AttributeError</code> or <code>TypeError</code> on 3.1.0: <code>applymap</code> (use <code>DataFrame.map</code>), <code>swapaxes</code> (use <code>.T</code>), <code>fillna(method=...)</code> (use <code>.ffill()</code>/<code>.bfill()</code>), <code>groupby(axis=1)</code> (transpose first). <code>DataFrame.append</code> was already removed in 2.0; use <code>pd.concat</code>. Note the first line: <code>df["a"].fillna(0, inplace=True)</code> worked silently on 2.3.3 but on 3.1.0 emits <code>ChainedAssignmentError</code> (a <code>Warning</code> subclass, not an exception) and leaves the NaN in place. Use <code>df["a"] = df["a"].fillna(0)</code>.</p>
+<h2 id="silent">5. Changes with no error at all</h2>
+<p>These are the dangerous ones, each measured in its own guide:</p>
+<ul>
+<li><a href="/guides/pandas-groupby-futurewarning/">groupby</a>: <code>apply</code> drops the grouping columns and <code>observed=True</code> is the default, so empty categories vanish from results.</li>
+<li><a href="/guides/pandas-futurewarning-concat-empty-or-all-na-entries/">concat with empty or all-NA frames</a>: the result dtype can change from float64 to object.</li>
+<li><a href="/guides/pandas-futurewarning-downcasting-object-dtype-arrays-on-fillna/">fillna/replace downcasting</a>: no longer downcasts object columns; the opt-in option is itself deprecated.</li>
+<li><a href="/guides/pandas-suppress-warnings/">warning filters</a>: <code>Pandas4Warning</code> is a <code>DeprecationWarning</code> subclass, so filters written for 2.x FutureWarnings may not match.</li>
+<li><a href="/guides/pandas-read-excel-missing-optional-dependency-openpyxl/">read_excel</a>: the missing-dependency message changed and <code>.xls</code> now wants python-calamine.</li>
+</ul>
+<h2 id="upgrade">How to upgrade safely</h2>
+<p>Upgrade to pandas 2.3.x first and run your code with warnings visible (<code>python -W always::FutureWarning</code>): almost every hard error in sections 3 and 4 shows up there as a <code>FutureWarning</code> first. The silent changes in sections 2 and 5 don't warn, so check outputs, not just exit codes. If numpy 2 is also part of the upgrade, see <a href="/guides/pandas-attributeerror-array-api-not-found-numpy-2/">_ARRAY_API not found / numpy 2 mismatch</a>.</p>
+<p>More pandas errors: <a href="/guides/pandas-keyerror-column-exists/">KeyError on a column that exists</a> · <a href="/guides/pandas-merge-keyerror-and-not-matching/">merge KeyError</a> · <a href="/guides/pandas-typeerror-unhashable-type-dict/">unhashable type: 'dict'</a> · <a href="/guides/pandas-numpy-memoryerror-unable-to-allocate-gib/">MemoryError: unable to allocate</a> · <a href="/guides/numpy-valueerror-assignment-destination-is-read-only/">to_numpy() read-only: assignment destination is read-only</a>.</p>
+
+<aside class="cta"><strong>Pulling a table off a web page into pandas? Copy it as CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What are the biggest breaking changes in pandas 3.0?</summary><p>String columns default to the new str dtype, Copy-on-Write is always on (chained assignment no longer modifies the original), datetimes parse to microsecond resolution, and methods deprecated in 2.x such as applymap, swapaxes and fillna(method=) are removed.</p></details>
+<details><summary>Why does my chained assignment not work in pandas 3?</summary><p>Under Copy-on-Write, df[mask][&#x27;col&#x27;] = x and s = df[&#x27;col&#x27;]; s[0] = x modify a copy. Use df.loc[mask, &#x27;col&#x27;] = x. In our test, pandas 3.1.0 gave no warning for the s[0] case.</p></details>
+<details><summary>How do I prepare code for pandas 3?</summary><p>Upgrade to pandas 2.3 first and fix every FutureWarning; most of the hard errors in 3.0 are warnings there. Silent changes (groupby, concat dtypes, Copy-on-Write) need output checks.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 in the python:3-alpine Docker image (Python 3.14.7) with pandas 2.3.3 and pandas 3.1.0, same script on both. Outputs pasted unedited. PlainTables is our extension; Python and pandas are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

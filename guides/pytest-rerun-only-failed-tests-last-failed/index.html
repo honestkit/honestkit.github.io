@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pytest Rerun Only Failed Tests: --lf, --ff, -x, --sw (Tested)</title>
+<meta name="description" content="Rerun only the last failed pytest tests with --lf, run failures first with --ff, stop at the first failure with -x or --sw, and why --lf can run everything.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pytest-rerun-only-failed-tests-last-failed/">
+<meta property="og:title" content="pytest Rerun Only Failed Tests: --lf, --ff, -x, --sw (Tested)">
+<meta property="og:description" content="Rerun only the last failed pytest tests with --lf, run failures first with --ff, stop at the first failure with -x or --sw, and why --lf can run everything.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pytest-rerun-only-failed-tests-last-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I rerun only failed tests in pytest?", "acceptedAnswer": {"@type": "Answer", "text": "pytest --lf (--last-failed). It reads the failures recorded in .pytest_cache/v/cache/lastfailed from the previous run."}}, {"@type": "Question", "name": "Why does pytest --lf run all tests?", "acceptedAnswer": {"@type": "Answer", "text": "No failures are recorded: the last run passed, .pytest_cache was deleted, or it is a fresh CI checkout. Use --lfnf none to run nothing in that case."}}, {"@type": "Question", "name": "What is the difference between -x and --sw?", "acceptedAnswer": {"@type": "Answer", "text": "-x stops at the first failure. --sw also stops there but the next run resumes from that failing test instead of starting over."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pytest rerun only failed tests: --lf, --ff, -x, --sw (tested)</h1>
+<p class="lead">Run <code>pytest --lf</code> to rerun only the tests that failed last time (stored in <code>.pytest_cache</code>), <code>pytest --ff</code> to run them first and then the rest, <code>-x</code> to stop at the first failure, and <code>--sw</code> to step through failures one per run.</p>
+<p>pytest remembers which tests failed in <code>.pytest_cache</code> (the built-in <code>cacheprovider</code> plugin), so you can rerun just those, run them first, or stop at the first failure. The test file below has two tests that fail until an environment variable "fixes" them; every command was run in order in the same directory on pytest 9.1.1.</p>
+<h2 id="setup">The example: 2 of 4 tests fail</h2>
+<pre><code>$ cat test_x.py
+import os
+
+def test_a():
+    pass
+
+def test_b():
+    assert os.environ.get(&quot;FIXED_B&quot;)
+
+def test_c():
+    pass
+
+def test_d():
+    assert os.environ.get(&quot;FIXED_D&quot;)
+$ pytest -q | tail -3
+FAILED test_x.py::test_b - AssertionError: assert None
+FAILED test_x.py::test_d - AssertionError: assert None
+2 failed, 2 passed in 0.02s</code></pre>
+<h2 id="lf">1. Rerun only the failed tests: --lf (--last-failed)</h2>
+<pre><code>$ pytest --lf | grep -E &quot;run-last|passed|failed&quot;
+run-last-failure: rerun previous 2 failures
+============================== 2 failed in 0.02s ===============================</code></pre>
+<p>The header line <code>run-last-failure: rerun previous 2 failures</code> confirms the cache was used; the two passing tests are not collected.</p>
+<h2 id="cache">2. Fixed tests drop out of the list</h2>
+<pre><code>$ FIXED_B=1 pytest -q --lf | tail -1
+1 failed, 1 passed in 0.01s
+$ pytest -q --lf | tail -1
+1 failed in 0.01s
+$ cat .pytest_cache/v/cache/lastfailed
+{
+  &quot;test_x.py::test_d&quot;: true
+}</code></pre>
+<p>After <code>test_b</code> passes, it is removed from <code>.pytest_cache/v/cache/lastfailed</code>, so the next <code>--lf</code> runs only <code>test_d</code>. Fix tests one by one and keep running <code>pytest --lf</code> until it is empty.</p>
+<h2 id="none-failed">3. When nothing failed, --lf runs everything (unless --lfnf none)</h2>
+<pre><code>$ FIXED_B=1 FIXED_D=1 pytest -q | tail -1
+4 passed in 0.00s
+$ FIXED_B=1 FIXED_D=1 pytest --lf | grep -E &quot;run-last|passed&quot;
+run-last-failure: no previously failed tests, not deselecting items.
+============================== 4 passed in 0.01s ===============================
+$ FIXED_B=1 FIXED_D=1 pytest --lf --lfnf none | grep -E &quot;run-last|deselected&quot;; echo &quot;exit code: ${PIPESTATUS[0]}&quot;
+collected 4 items / 4 deselected / 0 selected
+run-last-failure: no previously failed tests, deselecting all items.
+============================ 4 deselected in 0.01s =============================
+exit code: 5</code></pre>
+<p>With no recorded failures <code>--lf</code> runs the full suite. Add <code>--lfnf none</code> (<code>--last-failed-no-failures none</code>) to run nothing instead; note that this exits with code 5 (<a href="/guides/pytest-no-tests-ran-exit-code-5/">no tests collected</a>), which fails a CI step.</p>
+<h2 id="ff">4. Run failed tests first, then the rest: --ff (--failed-first)</h2>
+<pre><code>$ pytest -q &gt;/dev/null; pytest --ff -v | grep -E &quot;^test_x.py::&quot;
+test_x.py::test_b FAILED                                                 [ 25%]
+test_x.py::test_d FAILED                                                 [ 50%]
+test_x.py::test_a PASSED                                                 [ 75%]
+test_x.py::test_c PASSED                                                 [100%]</code></pre>
+<p><code>--ff</code> still runs the whole suite, but you see the previously failing tests within the first seconds.</p>
+<h2 id="x">5. Stop at the first failure: -x and --maxfail</h2>
+<pre><code>$ pytest -q -x | tail -2
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 1 passed in 0.01s
+$ pytest -q --maxfail=2 | tail -1
+2 failed, 2 passed in 0.01s</code></pre>
+<p><code>-x</code> is <code>--maxfail=1</code>. Combine with <code>--lf</code> (<code>pytest --lf -x</code>) to work through failures one at a time.</p>
+<h2 id="sw">6. Fix failures one by one: --sw (--stepwise)</h2>
+<pre><code>$ pytest -q --sw | tail -2
+!!!!!!!! Interrupted: Test failed, continuing from this test next run. !!!!!!!!!
+1 failed, 1 passed in 0.08s
+$ FIXED_B=1 pytest -q --sw | tail -2
+!!!!!!!! Interrupted: Test failed, continuing from this test next run. !!!!!!!!!
+1 failed, 2 passed, 1 deselected in 0.07s</code></pre>
+<p><code>--sw</code> stops at the first failure and, next run, starts from that test (the already-passing <code>test_a</code> was deselected). Each run moves forward to the next failure.</p>
+<h2 id="no-cache">7. "unrecognized arguments: --lf"</h2>
+<pre><code>$ pytest -q -p no:cacheprovider --lf 2&gt;&amp;1 | head -2
+ERROR: usage: pytest [options] [file_or_dir] [file_or_dir] [...]
+pytest: error: unrecognized arguments: --lf</code></pre>
+<p><code>--lf</code>, <code>--ff</code>, <code>--sw</code> and <code>--cache-clear</code> all come from the cache plugin. If it is disabled with <code>-p no:cacheprovider</code> (sometimes set in <code>addopts</code> for read-only CI checkouts), the options do not exist. In CI, <code>--lf</code> also only helps if <code>.pytest_cache</code> is kept between runs; on a fresh checkout it has no failures to replay and runs everything. <code>pytest --cache-clear</code> deletes the stored results.</p>
+<p>Related: <a href="/guides/pytest-exit-codes-discovery-failed-exit-code-2-4/">pytest exit codes</a>, <a href="/guides/pytest-error-unrecognized-arguments/">pytest error: unrecognized arguments</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I rerun only failed tests in pytest?</summary><p>pytest --lf (--last-failed). It reads the failures recorded in .pytest_cache/v/cache/lastfailed from the previous run.</p></details>
+<details><summary>Why does pytest --lf run all tests?</summary><p>No failures are recorded: the last run passed, .pytest_cache was deleted, or it is a fresh CI checkout. Use --lfnf none to run nothing in that case.</p></details>
+<details><summary>What is the difference between -x and --sw?</summary><p>-x stops at the first failure. --sw also stops there but the next run resumes from that failing test instead of starting over.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with pytest 9.1.1 on Python 3.13.5 in a clean virtualenv. Each block was run verbatim, in order, and the output pasted unedited. PlainHeaders is our extension; Python and pytest are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

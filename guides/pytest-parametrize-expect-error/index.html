@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pytest parametrize: expect an error in some cases (tested)</title>
+<meta name="description" content="Parametrize valid and invalid inputs in one pytest test: pass pytest.raises or nullcontext as a parameter. Plus the xfail(raises=...) alternative.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pytest-parametrize-expect-error/">
+<meta property="og:title" content="pytest parametrize: expect an error in some cases (tested)">
+<meta property="og:description" content="Parametrize valid and invalid inputs in one pytest test: pass pytest.raises or nullcontext as a parameter. Plus the xfail(raises=...) alternative.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pytest-parametrize-expect-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I expect an exception in only some pytest parametrize cases?", "acceptedAnswer": {"@type": "Answer", "text": "Add a parameter holding pytest.raises(SomeError) for failing cases and contextlib.nullcontext() for passing ones, and run the code inside with expectation:."}}, {"@type": "Question", "name": "What is does_not_raise in pytest?", "acceptedAnswer": {"@type": "Answer", "text": "Not a pytest function: it is contextlib.nullcontext imported under that name, a context manager that does nothing, so any exception inside it fails the test."}}, {"@type": "Question", "name": "Can I use xfail for expected errors in parametrize?", "acceptedAnswer": {"@type": "Answer", "text": "pytest.param(..., marks=pytest.mark.xfail(raises=ValueError, strict=True)) works, but it reports XFAIL and cannot check the message; pytest.raises is the clearer choice for intended errors."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pytest parametrize: expect an error in some cases (tested)</h1>
+<p class="lead">Pass the expectation as a parameter: <code>pytest.raises(ValueError, match=...)</code> for inputs that must fail and <code>contextlib.nullcontext()</code> (imported as <code>does_not_raise</code>) for inputs that must not, then call the code under <code>with expectation:</code>. A wrong case fails with <code>DID NOT RAISE</code> or the real exception.</p>
+<p>To test valid and invalid inputs in one parametrized test, put the <em>expectation</em> itself in the parameters: <code>pytest.raises(...)</code> for cases that must raise and <code>contextlib.nullcontext()</code> for cases that must not, then run the code inside <code>with expectation:</code>. Measured with pytest 9.1.1 on Python 3.13.5.</p>
+<h2 id="pattern">1. The pattern: pytest.raises or nullcontext per case</h2>
+<pre><code>$ cat test_pe.py
+from contextlib import nullcontext as does_not_raise
+import pytest
+
+def parse_age(s):
+    n = int(s)
+    if n &lt; 0:
+        raise ValueError(f&quot;age must be &gt;= 0, got {n}&quot;)
+    return n
+
+@pytest.mark.parametrize(&quot;value, expectation, expected&quot;, [
+    (&quot;42&quot;, does_not_raise(), 42),
+    (&quot;-3&quot;, pytest.raises(ValueError, match=&quot;must be &gt;= 0&quot;), None),
+    (&quot;abc&quot;, pytest.raises(ValueError, match=&quot;invalid literal&quot;), None),
+])
+def test_parse_age(value, expectation, expected):
+    with expectation:
+        assert parse_age(value) == expected
+$ pytest -v -p no:cacheprovider test_pe.py | grep -E &quot;PASSED|FAILED|passed|failed&quot;
+test_pe.py::test_parse_age[42-expectation0-42] PASSED                    [ 33%]
+test_pe.py::test_parse_age[-3-expectation1-None] PASSED                  [ 66%]
+test_pe.py::test_parse_age[abc-expectation2-None] PASSED                 [100%]
+============================== 3 passed in 0.02s ===============================</code></pre>
+<p>All three cases pass: the valid input returns 42 and the two invalid inputs raise <code>ValueError</code> with the expected message (<code>match=</code> is a regex search). Importing <code>nullcontext</code> as <code>does_not_raise</code> is the name used in the pytest docs and reads well in the parameter list.</p>
+<h2 id="wrong">2. What a wrong expectation looks like</h2>
+<pre><code>$ cat test_wrong.py
+from contextlib import nullcontext as does_not_raise
+import pytest
+from test_pe import parse_age
+
+@pytest.mark.parametrize(&quot;value, expectation&quot;, [
+    (&quot;7&quot;, pytest.raises(ValueError)),   # wrong: &quot;7&quot; is valid
+    (&quot;-1&quot;, does_not_raise()),           # wrong: &quot;-1&quot; raises
+], ids=[&quot;seven&quot;, &quot;minus-one&quot;])
+def test_wrong(value, expectation):
+    with expectation:
+        parse_age(value)
+$ pytest -q -p no:cacheprovider --tb=line test_wrong.py | tail -6
+E   ValueError: age must be &gt;= 0, got -1
+/tmp/pe388/test_pe.py:7: ValueError: age must be &gt;= 0, got -1
+=========================== short test summary info ============================
+FAILED test_wrong.py::test_wrong[seven] - Failed: DID NOT RAISE ValueError
+FAILED test_wrong.py::test_wrong[minus-one] - ValueError: age must be &gt;= 0, g...
+2 failed in 0.01s</code></pre>
+<p>A case that should raise but does not fails with <code>Failed: DID NOT RAISE ValueError</code>; a case marked <code>does_not_raise()</code> that does raise fails with the real exception. <code>ids=</code> gives the cases readable names in the output instead of <code>expectation0</code>.</p>
+<h2 id="xfail">3. Alternative: pytest.param with xfail(raises=...)</h2>
+<pre><code>$ cat test_xfail.py
+import pytest
+from test_pe import parse_age
+
+@pytest.mark.parametrize(&quot;value, expected&quot;, [
+    (&quot;42&quot;, 42),
+    pytest.param(&quot;-3&quot;, None, marks=pytest.mark.xfail(raises=ValueError, strict=True)),
+    pytest.param(&quot;abc&quot;, None, marks=pytest.mark.xfail(raises=TypeError, strict=True)),
+])
+def test_marks(value, expected):
+    assert parse_age(value) == expected
+$ pytest -v -p no:cacheprovider --tb=line test_xfail.py | grep -E &quot;PASSED|FAILED|XFAIL|passed|failed|^/|Error&quot;
+test_xfail.py::test_marks[42-42] PASSED                                  [ 33%]
+test_xfail.py::test_marks[-3-None] XFAIL                                 [ 66%]
+test_xfail.py::test_marks[abc-None] FAILED                               [100%]
+E   ValueError: invalid literal for int() with base 10: &#x27;abc&#x27;
+/tmp/pe388/test_pe.py:5: ValueError: invalid literal for int() with base 10: &#x27;abc&#x27;
+FAILED test_xfail.py::test_marks[abc-None] - ValueError: invalid literal for ...
+==================== 1 failed, 1 passed, 1 xfailed in 0.02s ====================</code></pre>
+<p><code>xfail(raises=ValueError, strict=True)</code> reports the case as XFAIL when it raises that type, and as FAILED when it raises something else (the third case expected <code>TypeError</code> but got <code>ValueError</code>). This works, but XFAIL means "known bug" in reports, and it cannot check the message, so for intended errors prefer the <code>pytest.raises</code> pattern from section 1.</p>
+<p>Related: <a href="/guides/pytest-raises-get-error-message/">pytest.raises: get and check the error message</a>, <a href="/guides/pytest-failed-did-not-raise/">pytest Failed: DID NOT RAISE</a>, <a href="/guides/pytest-parametrize-function-uses-no-argument/">pytest parametrize: function uses no argument</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I expect an exception in only some pytest parametrize cases?</summary><p>Add a parameter holding pytest.raises(SomeError) for failing cases and contextlib.nullcontext() for passing ones, and run the code inside with expectation:.</p></details>
+<details><summary>What is does_not_raise in pytest?</summary><p>Not a pytest function: it is contextlib.nullcontext imported under that name, a context manager that does nothing, so any exception inside it fails the test.</p></details>
+<details><summary>Can I use xfail for expected errors in parametrize?</summary><p>pytest.param(..., marks=pytest.mark.xfail(raises=ValueError, strict=True)) works, but it reports XFAIL and cannot check the message; pytest.raises is the clearer choice for intended errors.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with pytest 9.1.1 on Python 3.13.5 in a clean virtualenv. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; pytest is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

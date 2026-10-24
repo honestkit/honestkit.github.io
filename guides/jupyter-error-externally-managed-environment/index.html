@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jupyter &quot;error: externally-managed-environment&quot; Fix (Tested)</title>
+<meta name="description" content="pip install jupyter fails with externally-managed-environment on Debian/Ubuntu, even with --user. Reproduced, and fixed with a venv.">
+<link rel="canonical" href="https://honestkit.github.io/guides/jupyter-error-externally-managed-environment/">
+<meta property="og:title" content="Jupyter &quot;error: externally-managed-environment&quot; Fix (Tested)">
+<meta property="og:description" content="pip install jupyter fails with externally-managed-environment on Debian/Ubuntu, even with --user. Reproduced, and fixed with a venv.">
+<meta property="og:url" content="https://honestkit.github.io/guides/jupyter-error-externally-managed-environment/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does pip install jupyter say externally-managed-environment?", "acceptedAnswer": {"@type": "Answer", "text": "Debian and Ubuntu mark the system Python as externally managed (PEP 668), so pip refuses to install any package into it, including with --user."}}, {"@type": "Question", "name": "How do I install Jupyter on Debian or Ubuntu?", "acceptedAnswer": {"@type": "Answer", "text": "python3 -m venv ~/jupyter, then ~/jupyter/bin/pip install jupyterlab and run ~/jupyter/bin/jupyter lab."}}, {"@type": "Question", "name": "Does %pip install work in a notebook after that?", "acceptedAnswer": {"@type": "Answer", "text": "Yes: the default kernel runs the venv Python, so %pip installs into the venv and is not blocked."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Jupyter install &quot;error: externally-managed-environment&quot; on Debian/Ubuntu (tested)</h1>
+<p class="lead"><code>pip install jupyterlab</code> (or <code>jupyter</code>, <code>notebook</code>) on Debian 12+/Ubuntu 23.04+ stops with <code>error: externally-managed-environment</code>, and <code>--user</code> or <code>python3 -m pip</code> fail the same way. Install Jupyter into a virtual environment instead; reproduced and fixed below.</p>
+<h2 id="repro">1. Reproduce: installing Jupyter on Debian's Python</h2>
+<p><code>run.sh</code> runs in a fresh <code>debian:trixie-slim</code> container (Debian 13, the same on Ubuntu 23.04+), installs the distro <code>python3-pip</code>, and tries to install JupyterLab with pip, then with a virtual environment:</p>
+<pre><code>#!/bin/sh
+# Debian 13 (trixie) with the distro Python: install Jupyter three ways
+apt-get update -qq &gt;/dev/null &amp;&amp; apt-get install -y -qq python3-pip python3-venv &gt;/dev/null 2&gt;&amp;1
+python3 --version
+echo &#x27;== 1. pip install jupyterlab&#x27;
+pip install -q jupyterlab 2&gt;&amp;1 | head -3; echo &quot;exit status: $(pip install -q jupyterlab &gt;/dev/null 2&gt;&amp;1; echo $?)&quot;
+echo &#x27;== 2. pip install --user jupyterlab&#x27;
+pip install --user -q jupyterlab 2&gt;&amp;1 | head -1
+echo &#x27;== 3. python3 -m pip install jupyterlab&#x27;
+python3 -m pip install -q jupyterlab 2&gt;&amp;1 | head -1
+echo &#x27;== 4. venv&#x27;
+python3 -m venv /opt/jupyter
+/opt/jupyter/bin/pip install -q jupyterlab 2&gt;&amp;1 | tail -2
+/opt/jupyter/bin/jupyter lab --version
+echo &#x27;== 5. which python the notebook kernel runs&#x27;
+/opt/jupyter/bin/jupyter kernelspec list
+/opt/jupyter/bin/python -c &quot;import sys; print(sys.executable)&quot;
+echo &#x27;== 6. %pip install inside that kernel = the venv pip&#x27;
+/opt/jupyter/bin/python -m pip install -q six &amp;&amp; /opt/jupyter/bin/python -c &quot;import six; print(&#x27;six&#x27;, six.__version__)&quot;</code></pre>
+<p>Output:</p>
+<pre><code>Python 3.13.5
+== 1. pip install jupyterlab
+error: externally-managed-environment
+
+× This environment is externally managed
+exit status: 1
+== 2. pip install --user jupyterlab
+error: externally-managed-environment
+== 3. python3 -m pip install jupyterlab
+error: externally-managed-environment
+== 4. venv
+4.6.4
+== 5. which python the notebook kernel runs
+Available kernels:
+  python3    /opt/jupyter/share/jupyter/kernels/python3
+/opt/jupyter/bin/python
+== 6. %pip install inside that kernel = the venv pip
+six 1.17.0</code></pre>
+<h2 id="meaning">2. What it means</h2>
+<p>The distro marks its Python as <b>externally managed</b> (PEP 668), so pip refuses to install into it: plain <code>pip install</code>, <code>--user</code>, and <code>python3 -m pip</code> all fail the same way, with exit status 1, before anything is downloaded. It is not a Jupyter problem; any package gives the same error (see <a href="/guides/pip-error-externally-managed-environment/">pip "externally-managed-environment"</a>).</p>
+<h2 id="fix">3. Fix: put Jupyter in a venv</h2>
+<ul><li><code>python3 -m venv ~/jupyter</code> (needs <code>python3-venv</code>), then <code>~/jupyter/bin/pip install jupyterlab</code> and start it with <code>~/jupyter/bin/jupyter lab</code>. In the test this installed JupyterLab 4.6.4 with no error.</li>
+<li>The default <code>python3</code> kernel then lives inside the venv, so <code>%pip install</code> in a notebook installs into the venv too, and is not blocked (step 6 above).</li>
+<li>To use another project's environment as a kernel, install <code>ipykernel</code> in that environment and register it; if a kernel then won't start, see <a href="/guides/jupyter-error-starting-kernel/">Jupyter "Error Starting Kernel"</a>.</li>
+<li><code>--break-system-packages</code> also silences the error but installs into the distro Python, which the error message itself warns can break the OS's Python; prefer the venv.</li></ul>
+<p>Related: <a href="/guides/docker-pip-error-externally-managed-environment/">externally-managed-environment in Docker</a>, <a href="/guides/jupyter-notebook-kernel-not-found-nosuchkernel/">Jupyter kernel not found</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does pip install jupyter say externally-managed-environment?</summary><p>Debian and Ubuntu mark the system Python as externally managed (PEP 668), so pip refuses to install any package into it, including with --user.</p></details>
+<details><summary>How do I install Jupyter on Debian or Ubuntu?</summary><p>python3 -m venv ~/jupyter, then ~/jupyter/bin/pip install jupyterlab and run ~/jupyter/bin/jupyter lab.</p></details>
+<details><summary>Does %pip install work in a notebook after that?</summary><p>Yes: the default kernel runs the venv Python, so %pip installs into the venv and is not blocked.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 in a debian:trixie-slim container (Python 3.13.5, JupyterLab 4.6.4). The script ran verbatim and the output was pasted unedited. PlainTables is our extension; Jupyter is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

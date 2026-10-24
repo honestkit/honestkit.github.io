@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OSError: [Errno 16] Device or resource busy (Python, Tested)</title>
+<meta name="description" content="Python [Errno 16] Device or resource busy reproduced: os.replace onto a Docker bind-mounted file, rmtree on a mount point. Tested fixes for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-oserror-errno-16-device-or-resource-busy/">
+<meta property="og:title" content="OSError: [Errno 16] Device or resource busy (Python, Tested)">
+<meta property="og:description" content="Python [Errno 16] Device or resource busy reproduced: os.replace onto a Docker bind-mounted file, rmtree on a mount point. Tested fixes for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-oserror-errno-16-device-or-resource-busy/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does os.rename give Device or resource busy in Docker?", "acceptedAnswer": {"@type": "Answer", "text": "The target is a bind-mounted file (a mount point). It cannot be replaced; write to it in place or mount its parent directory instead."}}, {"@type": "Question", "name": "How do I fix shutil.rmtree Device or resource busy?", "acceptedAnswer": {"@type": "Answer", "text": "The directory is a mount point. Delete its contents with a loop over os.listdir and keep the directory itself."}}, {"@type": "Question", "name": "Is Errno 16 a permission problem?", "acceptedAnswer": {"@type": "Answer", "text": "No. It is OSError with errno EBUSY, not PermissionError, and it happens as root too."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>OSError: [Errno 16] Device or resource busy in Python (tested)</h1>
+<p class="lead"><code>OSError: [Errno 16] Device or resource busy</code> (<code>EBUSY</code>) in Python usually means you tried to rename over, delete, or <code>rmtree</code> a <strong>mount point</strong>, most often a Docker bind-mounted file or directory. We reproduced each case and tested the fixes: write in place, mount the parent directory, or clear contents instead of the directory.</p>
+<p>Setup: every block ran as <code>docker run -v ./cfg.txt:/app/config.txt -v ./data:/app/data python:3-slim python bN.py</code>, i.e. one bind-mounted file and one bind-mounted directory.</p>
+<h2 id="replace">1. Atomic save onto a bind-mounted file</h2>
+<pre><code>import os
+# /app/config.txt is a single file bind-mounted from the host (-v ./cfg.txt:/app/config.txt)
+with open(&quot;/app/config.txt.tmp&quot;, &quot;w&quot;) as f:
+    f.write(&quot;a=2\n&quot;)
+os.replace(&quot;/app/config.txt.tmp&quot;, &quot;/app/config.txt&quot;)    # atomic-save pattern</code></pre>
+<p>Output:</p>
+<pre><code>Traceback (most recent call last):
+  File &quot;/w/b1.py&quot;, line 5, in &lt;module&gt;
+    os.replace(&quot;/app/config.txt.tmp&quot;, &quot;/app/config.txt&quot;)    # atomic-save pattern
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: [Errno 16] Device or resource busy: &#x27;/app/config.txt.tmp&#x27; -&gt; &#x27;/app/config.txt&#x27;</code></pre>
+<p>Writing a temp file and then <code>os.replace()</code>/<code>os.rename()</code> onto the target is the usual safe-save pattern, and many libraries and editors do it for you. When the target is a mount point (a single file mounted with <code>-v</code>), the kernel refuses to replace it: <code>EBUSY</code>.</p>
+<h2 id="remove">2. Deleting it fails too; writing in place works</h2>
+<pre><code>import os
+try:
+    os.remove(&quot;/app/config.txt&quot;)
+except OSError as e:
+    print(f&quot;remove: {type(e).__name__}: {e}&quot;)
+with open(&quot;/app/config.txt&quot;, &quot;w&quot;) as f:                   # writing in place works
+    f.write(&quot;a=2\n&quot;)
+print(&quot;in-place write ok:&quot;, open(&quot;/app/config.txt&quot;).read().strip())</code></pre>
+<p>Output:</p>
+<pre><code>remove: OSError: [Errno 16] Device or resource busy: &#x27;/app/config.txt&#x27;
+in-place write ok: a=2</code></pre>
+<p>You cannot remove or replace a mount point, but you can open it and overwrite its contents. Either write in place (losing atomicity), or mount the <em>directory</em> that contains the file instead of the file itself, so the rename happens inside the mount.</p>
+<h2 id="rmtree">3. shutil.rmtree on a mounted directory</h2>
+<pre><code>import shutil
+# /app/data is a bind-mounted directory (-v ./data:/app/data)
+shutil.rmtree(&quot;/app/data&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>Traceback (most recent call last):
+  File &quot;/w/b3.py&quot;, line 3, in &lt;module&gt;
+    shutil.rmtree(&quot;/app/data&quot;)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File &quot;/usr/local/lib/python3.15/shutil.py&quot;, line 859, in rmtree
+    _rmtree_impl(path, dir_fd, onexc)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File &quot;/usr/local/lib/python3.15/shutil.py&quot;, line 721, in _rmtree_safe_fd
+    _rmtree_safe_fd_step(stack, onexc)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File &quot;/usr/local/lib/python3.15/shutil.py&quot;, line 803, in _rmtree_safe_fd_step
+    onexc(func, path, err, direntry=orig_entry, dir_fd=parent_fd)
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File &quot;/usr/local/lib/python3.15/shutil.py&quot;, line 754, in _rmtree_safe_fd_step
+    os.rmdir(name, dir_fd=dirfd)
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+OSError: [Errno 16] Device or resource busy: &#x27;/app/data&#x27;</code></pre>
+<p><code>rmtree</code> deletes the contents fine, then fails on the final <code>rmdir</code> of the mount point itself. Typical in Docker build/clean scripts that wipe a mounted <code>/app/data</code> or <code>/output</code>.</p>
+<pre><code>import os, shutil
+# clear the mount point&#x27;s contents but keep the directory itself
+for name in os.listdir(&quot;/app/data&quot;):
+    p = os.path.join(&quot;/app/data&quot;, name)
+    shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
+print(&quot;left:&quot;, os.listdir(&quot;/app/data&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>left: []</code></pre>
+<p>Clear the contents and keep the directory. (After the failed <code>rmtree</code> the files were already gone; it is only the mount point that cannot be removed.)</p>
+<h2 id="catch">4. It is OSError, not PermissionError</h2>
+<pre><code>import errno
+try:
+    import shutil; shutil.rmtree(&quot;/app/data&quot;)
+except OSError as e:
+    print(errno.errorcode[e.errno], e.errno, &quot;| filename:&quot;, e.filename)
+    print(&quot;PermissionError?&quot;, isinstance(e, PermissionError))</code></pre>
+<p>Output:</p>
+<pre><code>EBUSY 16 | filename: /app/data
+PermissionError? False</code></pre>
+<p>Catch <code>OSError</code> and check <code>e.errno == errno.EBUSY</code>. Running as root does not help: the mount is the reason, not permissions. On Alpine (musl) the same errno reads differently:</p>
+<pre><code>OSError: [Errno 16] Resource busy: &#x27;/app/config.txt.tmp&#x27; -&gt; &#x27;/app/config.txt&#x27;</code></pre>
+<p>Outside containers, <code>Device or resource busy</code> also appears when removing a directory that is a mount point on the host (an unmounted USB drive or NFS share that is still mounted). Run <code>findmnt PATH</code> or <code>mount | grep PATH</code> to confirm.</p>
+<p>Related: <a href="/guides/python-shutil-error-handling-copy-move-copytree-rmtree/">shutil error handling</a> · <a href="/guides/python-pathlib-mkdir-exceptions-parents-exist-ok/">pathlib mkdir exceptions</a>.</p>
+
+<aside class="cta"><strong>Debugging a containerised web app? Check the headers and status it actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does os.rename give Device or resource busy in Docker?</summary><p>The target is a bind-mounted file (a mount point). It cannot be replaced; write to it in place or mount its parent directory instead.</p></details>
+<details><summary>How do I fix shutil.rmtree Device or resource busy?</summary><p>The directory is a mount point. Delete its contents with a loop over os.listdir and keep the directory itself.</p></details>
+<details><summary>Is Errno 16 a permission problem?</summary><p>No. It is OSError with errno EBUSY, not PermissionError, and it happens as root too.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 in Docker: python:3-slim (Python 3.15.1, glibc) and python:3-alpine (musl), with bind mounts from the host. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

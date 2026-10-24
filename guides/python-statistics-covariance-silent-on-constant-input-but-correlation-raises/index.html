@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>statistics: covariance() Returns 0.0, correlation() Raises</title>
+<meta name="description" content="We measured Python 3.13.5: covariance() returns 0.0 for constant input, but correlation() and linear_regression() raise StatisticsError on the same data.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-statistics-covariance-silent-on-constant-input-but-correlation-raises/">
+<meta property="og:title" content="statistics: covariance() Returns 0.0, correlation() Raises">
+<meta property="og:description" content="We measured Python 3.13.5: covariance() returns 0.0 for constant input, but correlation() and linear_regression() raise StatisticsError on the same data.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-statistics-covariance-silent-on-constant-input-but-correlation-raises/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does statistics.covariance() raise an error for constant input?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured covariance([1,1,1,1], [1,2,3,4]) returning 0.0 silently, with no exception and no warning, even though the input is a degenerate edge case."}}, {"@type": "Question", "name": "Does statistics.correlation() raise an error for constant input?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured correlation() raising StatisticsError with the message 'at least one of the inputs is constant' on the same data where covariance() returns 0.0 silently."}}, {"@type": "Question", "name": "Do correlation() and linear_regression() raise the same error message for constant input?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured correlation() raising 'at least one of the inputs is constant' while linear_regression() raises 'x is constant' for the equivalent case. Code matching on exact error text for one won't catch the other."}}, {"@type": "Question", "name": "Why does covariance() not raise an error like correlation() does?", "acceptedAnswer": {"@type": "Answer", "text": "covariance() doesn't need to divide by either series' standard deviation, so a zero-variance input just produces a mathematically valid 0.0 result. correlation() and linear_regression() both require dividing by a standard deviation or variance term, which is undefined when that value is zero, so they raise StatisticsError instead."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>statistics: covariance() Stays Silent on Constant Input (tested)</h1>
+<p class="lead"><code>statistics.covariance()</code>, <code>correlation()</code>, and <code>linear_regression()</code> are closely related -- all three take two equal-length data series and describe how they move together. We measured what each one does when one of the series is constant (zero variance), and the three functions don't agree at all.</p>
+<h2 id="repro1">1. covariance() returns 0.0 silently; correlation() raises StatisticsError</h2>
+<pre><code>import statistics as st
+
+x = [1, 1, 1, 1]
+y = [1, 2, 3, 4]
+
+print(st.covariance(x, y))
+
+try:
+    st.correlation(x, y)
+except st.StatisticsError as e:
+    print("correlation raised:", e)</code></pre>
+<pre><code>0.0
+correlation raised: at least one of the inputs is constant</code></pre>
+<p><strong>Measured:</strong> with <code>x</code> constant, <code>covariance(x, y)</code> returns <code>0.0</code> -- mathematically correct, since a constant has zero variance and therefore zero covariance with anything -- but gives no indication that the result is a degenerate edge case rather than "genuinely no relationship." <code>correlation(x, y)</code> on the exact same data raises <code>StatisticsError</code> instead, because computing the correlation coefficient requires dividing by each series' standard deviation, and dividing by zero is undefined.</p>
+
+<h2 id="repro2">2. linear_regression() also raises, with a different message</h2>
+<pre><code>import statistics as st
+
+x = [1, 1, 1, 1]
+y = [1, 2, 3, 4]
+
+try:
+    st.linear_regression(x, y)
+except st.StatisticsError as e:
+    print("linear_regression raised:", e)</code></pre>
+<pre><code>linear_regression raised: x is constant</code></pre>
+<p><strong>Measured:</strong> <code>linear_regression(x, y)</code> also raises <code>StatisticsError</code> on the same constant <code>x</code> -- fitting a line needs a slope, and a constant <code>x</code> makes the slope undefined (division by zero variance again) -- but with yet a third distinct message ("x is constant" vs. correlation's "at least one of the inputs is constant"), so code catching one function's exact text won't reliably catch the other's.</p>
+
+<h2 id="repro3">3. Swapping which series is constant doesn't change the pattern</h2>
+<pre><code>import statistics as st
+
+both_constant = (st.covariance([5, 5, 5], [5, 5, 5]))
+print(both_constant)
+
+try:
+    st.correlation([5, 5, 5], [5, 5, 5])
+except st.StatisticsError as e:
+    print("correlation raised:", e)</code></pre>
+<pre><code>0.0
+correlation raised: at least one of the inputs is constant</code></pre>
+<p><strong>Measured:</strong> even with both series constant, <code>covariance()</code> still returns <code>0.0</code> with no error at all, while <code>correlation()</code> still raises. A pipeline that calls <code>covariance()</code> on a batch of sensor readings that occasionally includes a flat (unchanging) channel will get a silent <code>0.0</code> for that channel instead of a signal that the input was degenerate -- but the same pipeline calling <code>correlation()</code> on that channel would crash and reveal the problem immediately. Catching <code>StatisticsError</code> around <code>correlation()</code> or <code>linear_regression()</code> won't protect a nearby <code>covariance()</code> call from the same underlying issue, since it never raises.</p>
+<aside class="cta"><strong>Running covariance(), correlation(), and linear_regression() on the same data and expecting consistent error handling? Check for constant input first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does statistics.covariance() raise an error for constant input?</summary><p>No -- we measured covariance([1,1,1,1], [1,2,3,4]) returning 0.0 silently, with no exception and no warning, even though the input is a degenerate edge case.</p></details>
+<details><summary>Does statistics.correlation() raise an error for constant input?</summary><p>Yes -- we measured correlation() raising StatisticsError with the message &#x27;at least one of the inputs is constant&#x27; on the same data where covariance() returns 0.0 silently.</p></details>
+<details><summary>Do correlation() and linear_regression() raise the same error message for constant input?</summary><p>No -- we measured correlation() raising &#x27;at least one of the inputs is constant&#x27; while linear_regression() raises &#x27;x is constant&#x27; for the equivalent case. Code matching on exact error text for one won&#x27;t catch the other.</p></details>
+<details><summary>Why does covariance() not raise an error like correlation() does?</summary><p>covariance() doesn&#x27;t need to divide by either series&#x27; standard deviation, so a zero-variance input just produces a mathematically valid 0.0 result. correlation() and linear_regression() both require dividing by a standard deviation or variance term, which is undefined when that value is zero, so they raise StatisticsError instead.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in statistics module: called covariance(), correlation(), and linear_regression() with the same constant-valued input and compared behavior. PlainHeaders is our extension; Python&#x27;s statistics module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

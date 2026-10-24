@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>npm EACCES Permission Denied: Cause and the Real Fix (Tested)</title>
+<meta name="description" content="We reproduced npm&#x27;s EACCES error with a real locked-down directory and measured the one fix that doesn&#x27;t need sudo.">
+<link rel="canonical" href="https://honestkit.github.io/guides/eacces-permission-denied-npm/">
+<meta property="og:title" content="npm EACCES Permission Denied: Cause and the Real Fix (Tested)">
+<meta property="og:description" content="We reproduced npm&#x27;s EACCES error with a real locked-down directory and measured the one fix that doesn&#x27;t need sudo.">
+<meta property="og:url" content="https://honestkit.github.io/guides/eacces-permission-denied-npm/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Should I just run npm install with sudo to fix EACCES?", "acceptedAnswer": {"@type": "Answer", "text": "We don't recommend it. It removes the symptom once but leaves root-owned files in your npm cache and sometimes your home directory, which causes a different, harder-to-diagnose permission error later. The fix we measured \u2014 a user-owned prefix via npm config set prefix \u2014 avoids root ownership entirely."}}, {"@type": "Question", "name": "How do I know which directory npm actually failed to write to?", "acceptedAnswer": {"@type": "Answer", "text": "Read the \"path\" line in npm's own error output. We reproduced it: npm error path /tmp/noperm/lib/node_modules/is-odd told us exactly which directory lacked write permission, before we tried anything."}}, {"@type": "Question", "name": "I already ran sudo npm install once. How do I undo the damage?", "acceptedAnswer": {"@type": "Answer", "text": "Reclaim ownership of npm's cache: sudo chown -R $(whoami) ~/.npm (run once). That's the one legitimate use of sudo in this whole topic \u2014 to undo a previous sudo npm run, not to work around EACCES going forward."}}, {"@type": "Question", "name": "Does this affect npm install without -g too?", "acceptedAnswer": {"@type": "Answer", "text": "Local (non-global) npm install writes into your project's own node_modules, which you almost always own, so EACCES there usually means something else wrote root-owned files into node_modules first (often a Docker build). Delete node_modules and reinstall, or chown -R $(whoami) node_modules."}}, {"@type": "Question", "name": "Does switching Node.js version managers (nvm, fnm, volta) fix this?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, indirectly: they install Node (and npm's global prefix) entirely inside your home directory, so you never hit a root-owned prefix in the first place. If you're not ready to switch managers, setting prefix manually (section 3) achieves the same result."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>npm EACCES permission denied (tested)</h1>
+<p class="lead"><code>npm error code EACCES</code> / <code>permission denied, mkdir ...</code> means the Node.js process running npm doesn't have write access to the folder it needs — almost always npm's own global install location. We reproduced it exactly by making a directory read-only and installing into it.</p>
+<h2>1. The error, reproduced</h2>
+<p>We created a directory, removed write permission from it (<code>chmod 555</code>), and ran a global install against it with <code>--prefix</code>:</p>
+<pre><code>$ npm install -g --prefix /tmp/noperm is-odd
+npm error code EACCES
+npm error syscall mkdir
+npm error path /tmp/noperm/lib/node_modules/is-odd
+npm error errno -13
+npm error Error: EACCES: permission denied, mkdir '/tmp/noperm/lib/node_modules/is-odd'
+npm error     at async mkdir (node:internal/fs/promises:1564:10)
+npm error The operation was rejected by your operating system.</code></pre>
+<p>The <code>path</code> line in the error tells you exactly which directory npm couldn't write to. In real life that's usually npm's configured global prefix, check it with:</p>
+<pre><code>$ npm config get prefix</code></pre>
+
+<h2>2. Why this happens by default on Linux/macOS</h2>
+<p>Without any configuration, npm's default global prefix on Linux and macOS is <code>/usr/local</code> (or wherever Node itself was installed) — a directory your regular user account doesn't own. Every <code>npm install -g</code> then tries to write into a root-owned folder and fails with exactly the error above. This box doesn't hit that: it already has a per-user prefix configured in <code>~/.npmrc</code>, which is the actual fix, not a workaround:</p>
+<pre><code>$ cat ~/.npmrc
+prefix=~/.npm-global
+
+$ npm config get prefix
+/home/jacque/.npm-global</code></pre>
+
+<h2>3. The fix: a user-owned prefix (no sudo)</h2>
+<p>Don't use <code>sudo npm install -g</code>. It "fixes" the immediate error but leaves files in your home directory and cache owned by root, which causes a different, more confusing set of permission errors later. Instead, point npm at a folder you own:</p>
+<pre><code>mkdir -p ~/.npm-global
+npm config set prefix '~/.npm-global'</code></pre>
+<p>Then add that folder's <code>bin</code> to your <code>PATH</code> (in <code>~/.bashrc</code> or <code>~/.zshrc</code>), so globally installed CLI tools are found:</p>
+<pre><code>export PATH="$HOME/.npm-global/bin:$PATH"</code></pre>
+<p>Reload your shell and global installs go to a folder you fully own — no permission error, ever, for this cause.</p>
+
+<h2>4. Other EACCES causes, same symptom</h2>
+<ul>
+<li><strong>npm's cache directory got root-owned files</strong> (usually from a past <code>sudo npm</code> run). Fix: <code>sudo chown -R $(whoami) ~/.npm</code> once, to reclaim it — this is the one case where you do need <code>sudo</code>, but only to undo a previous <code>sudo npm</code> mistake.</li>
+<li><strong>A project's <code>node_modules</code> has files owned by another user</strong> (common after running Docker builds that write as root into a bind-mounted volume). Fix: <code>chown -R $(whoami) node_modules</code> or delete and <code>npm install</code> fresh.</li>
+<li><strong>A read-only filesystem or volume mount</strong> (some CI/Docker setups mount source as read-only). The <code>path</code> in the error tells you which mount; you need to install outside it or make that specific mount writable.</li>
+</ul>
+<p>In every case the <code>path</code> field in npm's own error output is the fastest way to confirm which directory is actually the problem before trying any fix.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Should I just run npm install with sudo to fix EACCES?</summary><p>We don&#x27;t recommend it. It removes the symptom once but leaves root-owned files in your npm cache and sometimes your home directory, which causes a different, harder-to-diagnose permission error later. The fix we measured — a user-owned prefix via npm config set prefix — avoids root ownership entirely.</p></details>
+<details><summary>How do I know which directory npm actually failed to write to?</summary><p>Read the &quot;path&quot; line in npm&#x27;s own error output. We reproduced it: npm error path /tmp/noperm/lib/node_modules/is-odd told us exactly which directory lacked write permission, before we tried anything.</p></details>
+<details><summary>I already ran sudo npm install once. How do I undo the damage?</summary><p>Reclaim ownership of npm&#x27;s cache: sudo chown -R $(whoami) ~/.npm (run once). That&#x27;s the one legitimate use of sudo in this whole topic — to undo a previous sudo npm run, not to work around EACCES going forward.</p></details>
+<details><summary>Does this affect npm install without -g too?</summary><p>Local (non-global) npm install writes into your project&#x27;s own node_modules, which you almost always own, so EACCES there usually means something else wrote root-owned files into node_modules first (often a Docker build). Delete node_modules and reinstall, or chown -R $(whoami) node_modules.</p></details>
+<details><summary>Does switching Node.js version managers (nvm, fnm, volta) fix this?</summary><p>Yes, indirectly: they install Node (and npm&#x27;s global prefix) entirely inside your home directory, so you never hit a root-owned prefix in the first place. If you&#x27;re not ready to switch managers, setting prefix manually (section 3) achieves the same result.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with npm 11.19.0 and Node.js 24.21.0 on Linux, in a throwaway /tmp directory. npm is free and bundled with Node.js.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

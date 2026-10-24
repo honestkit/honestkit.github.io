@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx streaming response: iter_bytes, iter_lines, async (tested)</title>
+<meta name="description" content="Stream httpx responses with client.stream(): iter_lines, iter_bytes(chunk_size), aiter_lines, and the ResponseNotRead, StreamConsumed and StreamClosed errors.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-stream-response-iter-bytes/">
+<meta property="og:title" content="httpx streaming response: iter_bytes, iter_lines, async (tested)">
+<meta property="og:description" content="Stream httpx responses with client.stream(): iter_lines, iter_bytes(chunk_size), aiter_lines, and the ResponseNotRead, StreamConsumed and StreamClosed errors.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-stream-response-iter-bytes/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does httpx raise ResponseNotRead?", "acceptedAnswer": {"@type": "Answer", "text": "You accessed .text, .content or .json() on a streaming response without calling read() first."}}, {"@type": "Question", "name": "How do I stream a download with httpx?", "acceptedAnswer": {"@type": "Answer", "text": "Open client.stream('GET', url) in a with block and write each chunk from r.iter_bytes() to a file."}}, {"@type": "Question", "name": "Can I iterate an httpx stream twice?", "acceptedAnswer": {"@type": "Answer", "text": "No. A second iteration raised StreamConsumed; reading after the with block raised StreamClosed."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx streaming response: stream(), iter_bytes, ResponseNotRead (tested)</h1>
+<p class="lead">Use <code>with client.stream("GET", url) as r:</code> and iterate <code>r.iter_bytes()</code> / <code>r.iter_lines()</code> inside the block (async: <code>aiter_bytes()</code>). Accessing <code>r.text</code> there raises <code>httpx.ResponseNotRead</code> unless you call <code>r.read()</code> first.</p>
+<p>Streaming in httpx means not loading the whole body into memory: <code>httpx.stream()</code> / <code>client.stream()</code> return the response as soon as the headers arrive, and you iterate over the body. Measured with httpx 0.28.1 on Python 3.13.5 against a local <code>http.server</code> that returns three lines (21 bytes).</p>
+<h2 id="notread">1. ResponseNotRead: .text/.json() inside a stream</h2>
+<pre><code>import httpx
+from srv import start
+base = start()   # returns &quot;line 1\nline 2\nline 3\n&quot;
+
+with httpx.stream(&quot;GET&quot;, base) as r:
+    try:
+        print(r.text)
+    except httpx.ResponseNotRead as e:
+        print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>ResponseNotRead: Attempted to access streaming response content, without having called `read()`.</code></pre>
+<p>Inside a <code>stream()</code> block the body has not been read, so <code>.text</code>, <code>.content</code> and <code>.json()</code> raise <code>httpx.ResponseNotRead</code>. Either iterate (below) or call <code>r.read()</code> first; if you always need the whole body, use a normal <code>client.get()</code> instead.</p>
+<h2 id="iter">2. iter_lines, iter_bytes(chunk_size) and read()</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+with httpx.Client() as client:
+    with client.stream(&quot;GET&quot;, base) as r:
+        print(r.status_code, r.headers[&quot;content-length&quot;])
+        for line in r.iter_lines():
+            print(repr(line))
+
+    with client.stream(&quot;GET&quot;, base) as r:
+        print([len(c) for c in r.iter_bytes(chunk_size=8)])
+
+    with client.stream(&quot;GET&quot;, base) as r:
+        r.read()                     # load the body, then .text works
+        print(repr(r.text[:6]))</code></pre>
+<p>Output:</p>
+<pre><code>200 21
+&#x27;line 1&#x27;
+&#x27;line 2&#x27;
+&#x27;line 3&#x27;
+[8, 8, 5]
+&#x27;line 1&#x27;</code></pre>
+<p>Status and headers are available before the body. <code>iter_lines()</code> yields decoded lines without the newline; <code>iter_bytes(chunk_size=8)</code> yields chunks of that size (the last one shorter); <code>iter_text()</code> and <code>iter_raw()</code> (no gzip/deflate decoding) also exist. To download a file, write each <code>iter_bytes()</code> chunk to an open file.</p>
+<h2 id="consumed">3. StreamConsumed and StreamClosed</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+with httpx.stream(&quot;GET&quot;, base) as r:
+    list(r.iter_bytes())
+    try:
+        list(r.iter_bytes())
+    except httpx.StreamConsumed as e:
+        print(type(e).__name__ + &quot;:&quot;, str(e)[:80])
+
+with httpx.stream(&quot;GET&quot;, base) as r:
+    pass
+try:
+    r.read()
+except httpx.StreamClosed as e:
+    print(type(e).__name__ + &quot;:&quot;, str(e)[:80])</code></pre>
+<p>Output:</p>
+<pre><code>StreamConsumed: Attempted to read or stream some content, but the content has already been strea
+StreamClosed: Attempted to read or stream content, but the stream has been closed.</code></pre>
+<p>A stream can be iterated once: a second pass raises <code>StreamConsumed</code>. After the <code>with</code> block exits, the connection is released and reading raises <code>StreamClosed</code>, so do all reading inside the block.</p>
+<h2 id="async">4. Async: client.stream with aiter_lines / aiter_bytes</h2>
+<pre><code>import asyncio, httpx
+from srv import start
+base = start()
+
+async def main():
+    async with httpx.AsyncClient() as client:
+        async with client.stream(&quot;GET&quot;, base) as r:
+            async for line in r.aiter_lines():
+                print(line)
+
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>line 1
+line 2
+line 3</code></pre>
+<p>With <code>AsyncClient</code>, use <code>async with client.stream(...)</code> and the <code>aiter_*</code> methods (<code>aiter_bytes</code>, <code>aiter_text</code>, <code>aiter_lines</code>, <code>aread()</code>).</p>
+<p>Related: <a href="/guides/httpx-timeout-default-readtimeout/">httpx timeout</a>, <a href="/guides/httpx-remoteprotocolerror-server-disconnected-without-sending-a-response/">httpx RemoteProtocolError</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does httpx raise ResponseNotRead?</summary><p>You accessed .text, .content or .json() on a streaming response without calling read() first.</p></details>
+<details><summary>How do I stream a download with httpx?</summary><p>Open client.stream(&#x27;GET&#x27;, url) in a with block and write each chunk from r.iter_bytes() to a file.</p></details>
+<details><summary>Can I iterate an httpx stream twice?</summary><p>No. A second iteration raised StreamConsumed; reading after the with block raised StreamClosed.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5 against a local http.server. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

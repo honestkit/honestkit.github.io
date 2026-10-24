@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vary Header Explained: Vary: Accept-Encoding, User-Agent and * in Chrome&#x27;s Cache (Tested)</title>
+<meta name="description" content="What Chromium 153&#x27;s HTTP cache actually does with Vary: Accept-Encoding, Vary: User-Agent, Vary: * and a custom Vary header: server hit counts for repeated, changed and switched-back request headers, back/forward and reload, plus Node and nginx snippets.">
+<link rel="canonical" href="https://honestkit.github.io/guides/vary-header-accept-encoding-user-agent/">
+<meta property="og:title" content="Vary Header Explained: Vary: Accept-Encoding, User-Agent and * in Chrome&#x27;s Cache (Tested)">
+<meta property="og:description" content="What Chromium 153&#x27;s HTTP cache actually does with Vary: Accept-Encoding, Vary: User-Agent, Vary: * and a custom Vary header: server hit counts for repeated, changed and switched-back request headers, back/forward and reload, plus Node and nginx snippets.">
+<meta property="og:url" content="https://honestkit.github.io/guides/vary-header-accept-encoding-user-agent/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does the Vary header do?", "acceptedAnswer": {"@type": "Answer", "text": "It names the request headers that change the response, so a cache only reuses a stored response when those request headers match. In Chromium 153, Vary: X-Custom made a request with a different X-Custom value go back to the server."}}, {"@type": "Question", "name": "Does Vary: Accept-Encoding stop the browser from caching?", "acceptedAnswer": {"@type": "Answer", "text": "No. With the same browser the Accept-Encoding value never changes, and a response with Vary: Accept-Encoding and max-age=60 was fetched once and then served from cache, same as no Vary."}}, {"@type": "Question", "name": "What does Vary: * mean?", "acceptedAnswer": {"@type": "Answer", "text": "That no later request can be assumed to match. Chromium 153 never reused a Vary: * response: two identical fetches both hit the server and the back button refetched the page."}}, {"@type": "Question", "name": "Should I use Vary: User-Agent?", "acceptedAnswer": {"@type": "Answer", "text": "Rarely. It does not hurt one browser's cache (the UA does not change), but documented CDN behaviour is to split or skip caching on it because User-Agent strings are so varied. Prefer separate URLs or client hints."}}, {"@type": "Question", "name": "Does Chrome cache several Vary variants of one URL?", "acceptedAnswer": {"@type": "Answer", "text": "No, not in our test. Alternating X-Custom 1, 2, 1 against Vary: X-Custom cost three server hits: each new variant replaced the previous one."}}, {"@type": "Question", "name": "Can I change User-Agent with fetch()?", "acceptedAnswer": {"@type": "Answer", "text": "Not in Chromium 153: a User-Agent header passed to fetch() was dropped and the server saw the normal browser UA. Accept-Encoding cannot be set from page JavaScript either."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Vary header: Accept-Encoding, User-Agent and * (tested)</h1>
+<p class="lead">The <code>Vary</code> response header lists the request headers that change the response, so a cache must only reuse a stored copy when those request headers match. We counted server hits in Chromium 153 for five Vary values to see when the browser cache really reuses a response and when it goes back to the server.</p>
+<h2>1. The results</h2>
+<p>Every response had <code>Cache-Control: max-age=60</code>. Numbers are requests that reached the server for that URL; 1 means every later request was answered from Chromium's HTTP cache.</p>
+<table><thead><tr><th>Vary</th><th>Same fetch twice</th><th>X-Custom 1, 2, then 1 again</th><th>UA changed (DevTools override)</th><th>Accept-Encoding changed</th><th>Back button</th><th>Reload</th></tr></thead><tbody>
+<tr><td>(none)</td><td>1</td><td>1</td><td>1</td><td>1</td><td>cache</td><td>server</td></tr>
+<tr><td><code>Accept-Encoding</code></td><td>1</td><td>1</td><td>1</td><td><strong>2</strong></td><td>cache</td><td>server</td></tr>
+<tr><td><code>User-Agent</code></td><td>1</td><td>1</td><td><strong>2</strong></td><td>1</td><td>cache</td><td>server</td></tr>
+<tr><td><code>X-Custom</code></td><td>1</td><td><strong>3</strong></td><td>1</td><td>1</td><td>cache</td><td>server</td></tr>
+<tr><td><code>Accept-Encoding, User-Agent</code></td><td>1</td><td>1</td><td>2</td><td>2</td><td>cache</td><td>server</td></tr>
+<tr><td><code>*</code></td><td><strong>2</strong></td><td>3</td><td>2</td><td>2</td><td><strong>server</strong></td><td>server</td></tr>
+</tbody></table>
+<p>What the numbers show:</p>
+<ul>
+<li><strong>Vary only matters when the named request header changes.</strong> With an unchanged browser, <code>Vary: Accept-Encoding</code> and <code>Vary: User-Agent</code> cached exactly like no Vary at all: one server hit, then cache.</li>
+<li><strong>Chromium keeps one variant per URL.</strong> With <code>Vary: X-Custom</code>, fetching with <code>X-Custom: 1</code>, then <code>2</code>, then <code>1</code> again cost 3 server hits, not 2. The <code>2</code> response replaced the <code>1</code> response, so switching back missed. A header that alternates between values makes the browser cache close to useless for that URL.</li>
+<li><strong><code>Vary: *</code> is never reused.</strong> Two identical fetches hit the server twice, and even the back button refetched the page (3 hits after goto, goto, back). It behaves like <code>no-cache</code> for Chromium's HTTP cache.</li>
+<li><strong>Reload always went to the server</strong>, whatever the Vary value, and sent <code>Cache-Control: max-age=0</code>. Plain back/forward reused the cached page unless Vary was <code>*</code>.</li>
+</ul>
+<h2>2. You cannot change User-Agent or Accept-Encoding from fetch()</h2>
+<p>We called <code>fetch(url, {headers: {'User-Agent': 'OtherUA/1.0'}})</code>. Chromium 153 silently dropped the header: the server received the normal <code>HeadlessChrome/153.0.0.0</code> user agent and, with <code>Vary: User-Agent</code>, the response came from cache. <code>Accept-Encoding</code> cannot be set from page JavaScript either; Chromium always sent <code>gzip, deflate, br, zstd</code>. So for a real browser those two Vary values only split the cache when the browser itself changes (DevTools device emulation, a UA override, an update that changes the version string). We changed them with DevTools protocol overrides (<code>Network.setUserAgentOverride</code>, extra headers) to get the columns above.</p>
+<h2>3. Vary: Accept-Encoding: send it on every response</h2>
+<p>If a server picks gzip or plain bytes based on <code>Accept-Encoding</code>, the response must say <code>Vary: Accept-Encoding</code> on <strong>both</strong> branches, or a shared cache can store the gzip version and hand it to a client that cannot decode it. Node.js, checked with curl 8.14.1 (both responses carried <code>Vary: Accept-Encoding</code>, only the first had <code>Content-Encoding: gzip</code>):</p>
+<pre><code>const http = require('http');
+const zlib = require('zlib');
+http.createServer((req, res) =&gt; {
+  const body = JSON.stringify({ hello: 'world' });
+  const gzip = /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Cache-Control', 'public, max-age=60');
+  res.setHeader('Vary', 'Accept-Encoding'); // on BOTH branches
+  if (gzip) {
+    res.setHeader('Content-Encoding', 'gzip');
+    res.end(zlib.gzipSync(body));
+  } else {
+    res.end(body);
+  }
+}).listen(8967);</code></pre>
+<p>nginx (config only, not run in this test): <code>gzip_vary on;</code> adds <code>Vary: Accept-Encoding</code> to responses that the gzip module could compress.</p>
+<pre><code>gzip on;
+gzip_vary on;
+gzip_types text/css application/javascript application/json image/svg+xml;</code></pre>
+<p>If you append to Vary yourself, merge values into one header (<code>Vary: Accept-Encoding, Origin</code>) rather than overwriting what a framework already set.</p>
+<h2>4. Vary: User-Agent and Vary: *: usually avoid</h2>
+<p>Documentation, not measured here: shared caches and CDNs key on the full header value, and real User-Agent strings vary per browser version and OS, so <code>Vary: User-Agent</code> splits a CDN cache into many near-identical copies or makes it skip caching. Some CDNs only honour a short list of Vary values and treat others as uncacheable; check your CDN's docs. If you must serve different HTML per device, prefer separate URLs or client hints with a small value set. For <code>Vary: *</code>, RFC 9110 says the response cannot be matched by a later request without contacting the origin, which is what we measured in Chromium. If you want "do not reuse", say it directly with <code>Cache-Control: no-cache</code> or <code>no-store</code>.</p>
+<h2>5. Vary: Origin</h2>
+<p>For CORS responses that echo the request origin, the important value is <code>Vary: Origin</code>; we measured that case with an nginx cache in <a href="/guides/vary-origin-header-cors-cache/">Vary: Origin, CORS and caching</a>.</p>
+<aside class="cta"><strong>See the Vary header a URL really sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does the Vary header do?</summary><p>It names the request headers that change the response, so a cache only reuses a stored response when those request headers match. In Chromium 153, Vary: X-Custom made a request with a different X-Custom value go back to the server.</p></details>
+<details><summary>Does Vary: Accept-Encoding stop the browser from caching?</summary><p>No. With the same browser the Accept-Encoding value never changes, and a response with Vary: Accept-Encoding and max-age=60 was fetched once and then served from cache, same as no Vary.</p></details>
+<details><summary>What does Vary: * mean?</summary><p>That no later request can be assumed to match. Chromium 153 never reused a Vary: * response: two identical fetches both hit the server and the back button refetched the page.</p></details>
+<details><summary>Should I use Vary: User-Agent?</summary><p>Rarely. It does not hurt one browser&#x27;s cache (the UA does not change), but documented CDN behaviour is to split or skip caching on it because User-Agent strings are so varied. Prefer separate URLs or client hints.</p></details>
+<details><summary>Does Chrome cache several Vary variants of one URL?</summary><p>No, not in our test. Alternating X-Custom 1, 2, 1 against Vary: X-Custom cost three server hits: each new variant replaced the previous one.</p></details>
+<details><summary>Can I change User-Agent with fetch()?</summary><p>Not in Chromium 153: a User-Agent header passed to fetch() was dropped and the server saw the normal browser UA. Accept-Encoding cannot be set from page JavaScript either.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 in full Chromium 153.0.8010.12 (Playwright, channel &#x27;chromium&#x27;, one fresh browser context per Vary value) against a Node.js 24.21.0 server on localhost:8965-8967 that counted every request per URL and answered with Cache-Control: max-age=60 plus the Vary value under test. Each case used its own URL. The nginx snippet and the CDN notes are documentation, not executed. PlainHeaders is our extension; Node.js, Chromium and the HTTP headers tool are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

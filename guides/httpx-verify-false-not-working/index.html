@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx verify=False not working: 4 causes (tested)</title>
+<meta name="description" content="httpx verify=False ignored? Put it on Client not client.get(), on the transport when using transport= or mounts=, and never as the string &#x27;False&#x27;. Tested.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-verify-false-not-working/">
+<meta property="og:title" content="httpx verify=False not working: 4 causes (tested)">
+<meta property="og:description" content="httpx verify=False ignored? Put it on Client not client.get(), on the transport when using transport= or mounts=, and never as the string &#x27;False&#x27;. Tested.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-verify-false-not-working/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is httpx verify=False not working?", "acceptedAnswer": {"@type": "Answer", "text": "Usually because a custom transport= or mounts= transport is used; those ignore the client's verify. Set verify=False on httpx.HTTPTransport(...)."}}, {"@type": "Question", "name": "Can I pass verify=False to client.get()?", "acceptedAnswer": {"@type": "Answer", "text": "No. In httpx 0.28.1 Client.get() raises TypeError: unexpected keyword argument 'verify'. Set it on the Client."}}, {"@type": "Question", "name": "Does httpx warn when verify=False?", "acceptedAnswer": {"@type": "Answer", "text": "No warning was emitted in the test with httpx 0.28.1."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx verify=False not working: 4 causes (tested)</h1>
+<p class="lead">Pass <code>verify=False</code> to <code>httpx.Client()</code> (per-request is a TypeError). If you also pass <code>transport=</code> or <code>mounts=</code>, set <code>verify=False</code> on that <code>HTTPTransport</code>: the client's setting does not reach it.</p>
+<p>Use <code>verify=False</code> only against test servers you control: it disables certificate checks, so anyone in the network path can impersonate the server. When it seems to have no effect, it is almost always one of the cases below. Measured with httpx 0.28.1 on Python 3.13.5 against a local hypercorn server with a self-signed certificate (<code>srv.start()</code> returns its https URL).</p>
+<h2 id="where">1. verify goes on the Client, not on client.get()</h2>
+<pre><code>import httpx, srv
+url, _ = srv.start()
+with httpx.Client() as c:
+    try:
+        c.get(url, verify=False)
+    except TypeError as e:
+        print(&quot;TypeError:&quot;, e)
+with httpx.Client(verify=False) as c:
+    print(&quot;Client(verify=False):&quot;, c.get(url).status_code)
+print(&quot;httpx.get(verify=False):&quot;, httpx.get(url, verify=False).status_code)</code></pre>
+<p>Output:</p>
+<pre><code>TypeError: Client.get() got an unexpected keyword argument &#x27;verify&#x27;
+Client(verify=False): 200
+httpx.get(verify=False): 200</code></pre>
+<p>The module-level <code>httpx.get()</code> accepts <code>verify=</code> because it builds a client per call. On a <code>Client</code>, TLS settings are fixed at construction, so per-request <code>verify=</code> is a <code>TypeError</code>.</p>
+<h2 id="transport">2. httpx verify=False not working with a custom transport</h2>
+<pre><code>import httpx, srv
+url, _ = srv.start()
+with httpx.Client(verify=False, transport=httpx.HTTPTransport(retries=2)) as c:
+    try:
+        c.get(url)
+    except httpx.ConnectError as e:
+        print(&quot;ConnectError:&quot;, e)
+with httpx.Client(transport=httpx.HTTPTransport(retries=2, verify=False)) as c:
+    print(&quot;verify=False on the transport:&quot;, c.get(url).status_code)</code></pre>
+<p>Output:</p>
+<pre><code>ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1029)
+verify=False on the transport: 200</code></pre>
+<p>When you pass <code>transport=</code> (for example to get <a href="/guides/httpx-retry-transport-retries/">retries</a>), the client's own <code>verify</code> is not applied to it; the transport uses its own default (verify on). Put <code>verify=False</code> on <code>httpx.HTTPTransport(...)</code> instead.</p>
+<h2 id="string">3. verify="False" is a file path</h2>
+<pre><code>import httpx, srv
+url, _ = srv.start()
+for v in [&quot;False&quot;, &quot;false&quot;]:
+    try:
+        httpx.Client(verify=v)
+    except Exception as e:
+        print(f&quot;verify={v!r}: {type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>verify=&#x27;False&#x27;: FileNotFoundError: [Errno 2] No such file or directory
+verify=&#x27;false&#x27;: FileNotFoundError: [Errno 2] No such file or directory</code></pre>
+<p>A string is treated as a CA bundle path, so a value read from an environment variable or config file fails with <code>FileNotFoundError</code>. Convert it to a real boolean first, e.g. <code>os.environ.get("VERIFY", "1") not in ("0", "false", "False")</code>.</p>
+<h2 id="warning">4. No warning is printed</h2>
+<pre><code>import warnings, httpx, srv
+url, _ = srv.start()
+with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter(&quot;always&quot;)
+    httpx.get(url, verify=False)
+print(&quot;warnings from httpx verify=False:&quot;, [str(x.message) for x in w])</code></pre>
+<p>Output:</p>
+<pre><code>warnings from httpx verify=False: []</code></pre>
+<p>httpx emitted no warning for an unverified request in this test, so nothing in the logs tells you verification is off. Search your code for <code>verify=False</code> before shipping.</p>
+<h2 id="async">5. AsyncClient verify=False, and mounts=</h2>
+<pre><code>import asyncio, httpx, srv
+url, _ = srv.start()
+async def main():
+    async with httpx.AsyncClient(verify=False) as c:
+        print(&quot;AsyncClient(verify=False):&quot;, (await c.get(url)).status_code)
+    async with httpx.AsyncClient(verify=False, mounts={&quot;https://&quot;: httpx.AsyncHTTPTransport()}) as c:
+        try:
+            await c.get(url)
+        except httpx.ConnectError as e:
+            print(&quot;with mounts= transport:&quot;, type(e).__name__)
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>AsyncClient(verify=False): 200
+with mounts= transport: ConnectError</code></pre>
+<p><code>AsyncClient(verify=False)</code> works the same way. Transports passed in <code>mounts=</code> also ignore the client setting; give them <code>verify=False</code> (or, better, an SSLContext that trusts your CA, see <a href="/guides/httpx-connecterror-ssl-certificate-verify-failed/">httpx CERTIFICATE_VERIFY_FAILED</a>).</p>
+<p>Related: <a href="/guides/httpx-connecterror-ssl-certificate-verify-failed/">httpx SSL CERTIFICATE_VERIFY_FAILED fix</a>, <a href="/guides/httpx-retry-transport-retries/">httpx retries transport</a>, <a href="/guides/httpx-proxy-unexpected-keyword-argument-proxies/">httpx proxy and mounts</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests differences</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is httpx verify=False not working?</summary><p>Usually because a custom transport= or mounts= transport is used; those ignore the client&#x27;s verify. Set verify=False on httpx.HTTPTransport(...).</p></details>
+<details><summary>Can I pass verify=False to client.get()?</summary><p>No. In httpx 0.28.1 Client.get() raises TypeError: unexpected keyword argument &#x27;verify&#x27;. Set it on the Client.</p></details>
+<details><summary>Does httpx warn when verify=False?</summary><p>No warning was emitted in the test with httpx 0.28.1.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5 against a local HTTPS server with a self-signed certificate. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

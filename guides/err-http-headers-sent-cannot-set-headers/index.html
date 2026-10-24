@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ERR_HTTP_HEADERS_SENT: Cannot Set Headers After Sent (Tested)</title>
+<meta name="description" content="We triggered ERR_HTTP_HEADERS_SENT 7 ways in Express 5.2.1: what the log shows, what the client gets, when the process crashes, and the fix for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-http-headers-sent-cannot-set-headers/">
+<meta property="og:title" content="ERR_HTTP_HEADERS_SENT: Cannot Set Headers After Sent (Tested)">
+<meta property="og:description" content="We triggered ERR_HTTP_HEADERS_SENT 7 ways in Express 5.2.1: what the log shows, what the client gets, when the process crashes, and the fix for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-http-headers-sent-cannot-set-headers/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does the client get a normal response when the server logs this error?", "acceptedAnswer": {"@type": "Answer", "text": "Because the first response already went out complete. In our tests the client got the first 400 or 200 every time the first response was a full res.send(). Only the second call fails, and only the server sees it."}}, {"@type": "Question", "name": "Does ERR_HTTP_HEADERS_SENT crash Node?", "acceptedAnswer": {"@type": "Answer", "text": "Not in a sync or async Express 5 route: Express catches it and logs the stack. It did crash our process (exit code 1) when the second send ran in a setTimeout callback or in a .then() chain the handler did not return."}}, {"@type": "Question", "name": "How do I find which line sends the second response?", "acceptedAnswer": {"@type": "Answer", "text": "Look at the stack below express/lib/response.js. The first frame in your own file is the second res.send, res.json or res.redirect. The first response is earlier in the same request path."}}, {"@type": "Question", "name": "Should I check res.headersSent before every send?", "acceptedAnswer": {"@type": "Answer", "text": "No. Fix the control flow with return first. Use res.headersSent where two paths race, like a timeout and the real work, and always in custom error handlers: if (res.headersSent) return next(err)."}}, {"@type": "Question", "name": "Why did my client get an empty reply?", "acceptedAnswer": {"@type": "Answer", "text": "If headers or part of a body were already written when the error happened, Express's default handler destroys the socket. In our res.write() test curl reported (52) Empty reply from server and fetch failed with UND_ERR_SOCKET other side closed."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ERR_HTTP_HEADERS_SENT: Cannot set headers after they are sent (tested)</h1>
+<p class="lead"><code>Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after they are sent to the client</code> means your code tried to respond twice to one request. The first response already went out. We reproduced seven common causes in Express 5.2.1 on Node 24 and measured what the server logs, what the client receives, and when the whole process dies.</p>
+<h2>1. What the error means</h2>
+<p>An HTTP response has one status line and one set of headers. Once Node has sent them, they cannot change. Any later call that sets a header throws this error. In Express that includes <code>res.send()</code>, <code>res.json()</code>, <code>res.status().send()</code>, <code>res.redirect()</code> and <code>res.setHeader()</code>.</p>
+<p>The top of the stack is always the same. This is the exact output we got from a second <code>res.send()</code>:</p>
+<pre><code>Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after they are sent to the client
+    at ServerResponse.setHeader (node:_http_outgoing:684:11)
+    at ServerResponse.header (.../express/lib/response.js:686:10)
+    at ServerResponse.send (.../express/lib/response.js:163:12)
+    at /tmp/gheaderssent/app.js:9:7</code></pre>
+<p>The first line under <code>express/lib/response.js</code> that points into <em>your</em> file is the second response. That is the line to look at. The first response happened earlier and is not in the stack.</p>
+
+<h2>2. Results: seven ways to trigger it</h2>
+<table>
+<tr><th>Cause</th><th>Client received</th><th>Server</th></tr>
+<tr><td>Missing <code>return</code> after <code>res.status(400).send()</code></td><td>400 "name required", complete</td><td>Stack logged, process kept running</td></tr>
+<tr><td><code>res.json()</code> inside <code>forEach</code></td><td>200 <code>{"i":1}</code> only</td><td>Stack logged once (the loop stops at the throw)</td></tr>
+<tr><td>Callback and promise both respond</td><td>200 "promise-data"</td><td><strong>Process crashed</strong>, exit code 1</td></tr>
+<tr><td><code>next()</code> after <code>res.send()</code></td><td>200 "done"</td><td>Stack logged from the next handler's <code>res.send</code></td></tr>
+<tr><td><code>res.setHeader()</code> after <code>res.write()</code></td><td>Nothing: curl <code>(52) Empty reply from server</code>; fetch "fetch failed", cause <code>UND_ERR_SOCKET</code> "other side closed"</td><td>Stack logged, socket destroyed</td></tr>
+<tr><td><code>res.redirect()</code> after <code>res.send()</code></td><td>200 "ok", no redirect</td><td>Stack logged, top frames <code>res.location</code> / <code>res.redirect</code></td></tr>
+<tr><td>Second <code>res.send()</code> after <code>await</code> in an async handler</td><td>200 "ok"</td><td>Stack logged, process kept running</td></tr>
+</table>
+<p>Most of the time the client gets the <em>first</em> response and never sees an error. That is why this bug hides in production: users get a 200 or 400 and only your logs show the stack.</p>
+
+<h2>3. Does it crash the process?</h2>
+<p>It depends on where the second response is called from. We ran each case with no <code>process.on('uncaughtException')</code> handler:</p>
+<ul>
+<li><strong>Synchronous handler:</strong> Express catches the throw. The process stays up.</li>
+<li><strong>Async handler (<code>async (req, res) =&gt; ...</code>):</strong> Express 5 catches the rejected promise and passes it to error handling. The process stays up. Per the Express docs (not measured), Express 4 did not do this.</li>
+<li><strong>Timer or callback (<code>setTimeout</code>, old-style <code>cb(err, data)</code> APIs, event emitters):</strong> nothing catches it. Node printed the error and exited with code 1. The next curl got <code>(7) Failed to connect</code>.</li>
+<li><strong>A <code>.then()</code> chain the handler does not return:</strong> also crashed (exit code 1). The rejection is unhandled because Express never saw the promise.</li>
+</ul>
+<p>When Express does catch it, its default error handler (finalhandler 2.1.1) prints the stack with <code>console.error</code> and then, because headers were already sent, calls <code>req.socket.destroy()</code>. If the first response was complete, the client is fine. If it was a half-written stream, the client gets a cut-off or empty reply. That is what happened in the <code>res.write()</code> case: the buffered "part" was never flushed, so curl got an empty reply.</p>
+
+<h2>4. Fix: return when you respond</h2>
+<p>The most common cause is a guard clause without <code>return</code>:</p>
+<pre><code>// Bug: falls through to the second res.send
+app.get('/hello', (req, res) =&gt; {
+  if (!req.query.name) { res.status(400).send('name required'); }
+  res.send('hello ' + req.query.name);
+});
+
+// Fix
+app.get('/hello', (req, res) =&gt; {
+  if (!req.query.name) { return res.status(400).send('name required'); }
+  res.send('hello ' + req.query.name);
+});</code></pre>
+<p>Verified: the fixed route returned 400 without a name and 200 "hello a" with one, and logged nothing.</p>
+<p>Apply the same rule to <code>if/else</code> chains, <code>try/catch</code> (a <code>catch</code> that responds after the <code>try</code> already did), and middleware: once you send, do not call <code>next()</code>. Our <code>next-fixed</code> route (send, no <code>next()</code>) logged nothing.</p>
+
+<h2>5. Fix: one response per request</h2>
+<ul>
+<li><strong>Loops.</strong> Build the data first, send once: <code>res.json(items.map(i =&gt; ({ i })))</code>. Verified: 200 <code>[{"i":1},{"i":2},{"i":3}]</code>, no error.</li>
+<li><strong>Callback plus promise.</strong> Pick one style. We used <code>const d = await legacy(); res.send(d);</code> and passed a no-op callback. Verified: 200 "promise-data", process stayed up.</li>
+<li><strong>Redirect.</strong> Use <code>return res.redirect('/login')</code> instead of sending a body first. A redirect <em>is</em> the response.</li>
+<li><strong>Headers with streaming.</strong> Set every header before the first <code>res.write()</code>. Verified: setting <code>X-Late</code> before <code>write</code> returned it in the response with no error.</li>
+</ul>
+
+<h2>6. Guard with res.headersSent</h2>
+<p><code>res.headersSent</code> is <code>true</code> once the status line and headers are on the wire. Use it when a late path really cannot know if someone else already answered, such as a timeout handler racing the real work:</p>
+<pre><code>app.get('/report', async (req, res) =&gt; {
+  res.send('ok');
+  await somethingSlow();
+  if (!res.headersSent) res.send('again');   // skipped
+});</code></pre>
+<p>Verified: the guard logged <code>headersSent= true</code> and skipped the second send. No error.</p>
+<p>Do not use it to paper over a real double response. A missing <code>return</code> is better fixed with a <code>return</code>.</p>
+<p>Custom error handlers need the same check. Express's docs say to delegate to the default handler when headers are already sent:</p>
+<pre><code>app.use((err, req, res, next) =&gt; {
+  if (res.headersSent) return next(err);
+  res.status(500).send('error');
+});</code></pre>
+<p>Without that check, your handler's own <code>res.status(500).send()</code> throws a second ERR_HTTP_HEADERS_SENT. With it, our handler saw <code>headersSent= true</code> for every case above and handed off cleanly.</p>
+
+<h2>7. Errors thrown after the response</h2>
+<p>An error that happens after you already answered is not ERR_HTTP_HEADERS_SENT, but it lands in the same place. We sent "ok", awaited 10 ms, then threw <code>new Error('db write failed')</code>. The client got 200 "ok". Express 5 forwarded the error, our error handler saw <code>headersSent= true</code>, and the default handler logged <code>Error: db write failed</code>. The process kept running. The client never learns the write failed, so do slow work before you respond, or use a queue.</p>
+<p>If the client gets a 500 instead, see <a href="/guides/500-internal-server-error/">500 Internal Server Error</a>. If Express answers <code>Cannot GET /path</code>, the route did not match at all: see <a href="/guides/cannot-get-express/">Cannot GET in Express</a>.</p>
+
+<h2>8. Checklist</h2>
+<ul>
+<li>Read the stack: the first frame in your code is the <em>second</em> response.</li>
+<li>Put <code>return</code> in front of every <code>res.send/json/redirect/render</code> inside a condition.</li>
+<li>No <code>res.*</code> calls inside loops.</li>
+<li>Do not mix callbacks and promises for one result. Await, then respond once.</li>
+<li>Never call <code>next()</code> after sending.</li>
+<li>Set headers before <code>res.write()</code>.</li>
+<li>Error handlers start with <code>if (res.headersSent) return next(err);</code>.</li>
+<li>Late errors in timers and callbacks crash the process. Keep them inside an <code>async</code> handler so Express 5 can catch them.</li>
+</ul>
+<aside class="cta"><strong>Check the status and headers your Express app actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does the client get a normal response when the server logs this error?</summary><p>Because the first response already went out complete. In our tests the client got the first 400 or 200 every time the first response was a full res.send(). Only the second call fails, and only the server sees it.</p></details>
+<details><summary>Does ERR_HTTP_HEADERS_SENT crash Node?</summary><p>Not in a sync or async Express 5 route: Express catches it and logs the stack. It did crash our process (exit code 1) when the second send ran in a setTimeout callback or in a .then() chain the handler did not return.</p></details>
+<details><summary>How do I find which line sends the second response?</summary><p>Look at the stack below express/lib/response.js. The first frame in your own file is the second res.send, res.json or res.redirect. The first response is earlier in the same request path.</p></details>
+<details><summary>Should I check res.headersSent before every send?</summary><p>No. Fix the control flow with return first. Use res.headersSent where two paths race, like a timeout and the real work, and always in custom error handlers: if (res.headersSent) return next(err).</p></details>
+<details><summary>Why did my client get an empty reply?</summary><p>If headers or part of a body were already written when the error happened, Express&#x27;s default handler destroys the socket. In our res.write() test curl reported (52) Empty reply from server and fetch failed with UND_ERR_SOCKET other side closed.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Express 5.2.1 (finalhandler 2.1.1), Node.js 24.21.0, curl 8.14.1 and Node fetch. Every bug and every fix below was run as a real route and hit with curl. PlainHeaders is our extension; Express, Node.js and curl are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

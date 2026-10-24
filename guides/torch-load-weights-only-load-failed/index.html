@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>torch.load &quot;Weights only load failed&quot;: 3 tested fixes</title>
+<meta name="description" content="Since torch 2.6, torch.load defaults to weights_only=True and rejects full-model files. Tested fixes: weights_only=False, add_safe_globals, or a state_dict.">
+<link rel="canonical" href="https://honestkit.github.io/guides/torch-load-weights-only-load-failed/">
+<meta property="og:title" content="torch.load &quot;Weights only load failed&quot;: 3 tested fixes">
+<meta property="og:description" content="Since torch 2.6, torch.load defaults to weights_only=True and rejects full-model files. Tested fixes: weights_only=False, add_safe_globals, or a state_dict.">
+<meta property="og:url" content="https://honestkit.github.io/guides/torch-load-weights-only-load-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is weights_only=False safe?", "acceptedAnswer": {"@type": "Answer", "text": "Only for files you trust. It unpickles arbitrary objects, which can run code stored in the file."}}, {"@type": "Question", "name": "Which torch version changed this?", "acceptedAnswer": {"@type": "Answer", "text": "torch 2.6 changed the default of weights_only in torch.load from False to True, as the error message itself says."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>torch.load: Weights only load failed (fix)</h1>
+<p class="lead">Since torch 2.6, <code>torch.load</code> defaults to <code>weights_only=True</code>, so loading a file saved with <code>torch.save(model)</code> fails with <code>_pickle.UnpicklingError: Weights only load failed</code>. Tested fixes: <code>weights_only=False</code> for trusted files, <code>torch.serialization.add_safe_globals</code>, or save a <code>state_dict</code>.</p>
+<h2 id="repro">1. The error</h2>
+<p>A model class in <code>net.py</code>, saved two ways:</p>
+<pre><code>import torch
+
+class Net(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = torch.nn.Linear(4, 2)</code></pre>
+<pre><code>import torch
+from net import Net
+
+torch.save(Net(), &quot;model.pt&quot;)               # whole model object
+torch.save(Net().state_dict(), &quot;weights.pt&quot;)  # weights only
+print(&quot;saved&quot;)</code></pre>
+<p>Loading the whole-model file with the default arguments on torch 2.14.1:</p>
+<pre><code>import torch
+
+model = torch.load(&quot;model.pt&quot;)</code></pre>
+<pre><code>Traceback (most recent call last):
+...
+_pickle.UnpicklingError: Weights only load failed. This file can still be loaded, to do so you have two options, do those steps only if you trust the source of the checkpoint.
+	(1) In PyTorch 2.6, we changed the default value of the `weights_only` argument in `torch.load` from `False` to `True`. Re-running `torch.load` with `weights_only` set to `False` will likely succeed, but it can result in arbitrary code execution. Do it only if you got the file from a trusted source.
+	(2) Alternatively, to load with `weights_only=True` please check the recommended steps in the following error message.
+	WeightsUnpickler error: Unsupported global: GLOBAL net.Net was not an allowed global by default. Please use `torch.serialization.add_safe_globals([net.Net])` or the `torch.serialization.safe_globals([net.Net])` context manager to allowlist this global if you trust this class/function.</code></pre>
+<p>Since torch 2.6, <code>torch.load</code> defaults to <code>weights_only=True</code>. That mode only unpickles tensors, plain containers and an allowlist of torch types, so a file holding a full <code>nn.Module</code> object (your class <code>net.Net</code>) is rejected. Files written before 2.6 with <code>torch.save(model)</code> hit this too.</p>
+<h2 id="trusted">2. Fix for a file you trust: weights_only=False</h2>
+<pre><code>import torch
+
+model = torch.load(&quot;model.pt&quot;, weights_only=False)  # only for files you trust
+print(type(model).__name__)</code></pre>
+<pre><code>Net</code></pre>
+<p>This is the old behaviour. Unpickling with <code>weights_only=False</code> can run arbitrary code stored in the file, so use it only for checkpoints you created or got from a source you trust. If the <code>torch.load</code> call is inside a library you cannot edit, the environment variable <code>TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1</code> has the same effect for calls that do not pass <code>weights_only</code>; it printed <code>UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected ... forcing weights_only=False.</code> and loaded the model.</p>
+<h2 id="allowlist">3. Safer: allowlist the classes the error names</h2>
+<pre><code>import torch
+from net import Net
+
+torch.serialization.add_safe_globals([Net, torch.nn.Linear])
+model = torch.load(&quot;model.pt&quot;)
+print(type(model).__name__)</code></pre>
+<pre><code>Net</code></pre>
+<p>This keeps <code>weights_only=True</code> and trusts only the classes you list. The error names one class at a time: with only <code>Net</code> listed, it next reported <code>torch.nn.modules.linear.Linear</code>. Add each one it reports. <code>torch.serialization.safe_globals([...])</code> does the same inside a <code>with</code> block.</p>
+<h2 id="state-dict">4. Best long-term: save a state_dict</h2>
+<pre><code>import torch
+from net import Net
+
+model = Net()
+model.load_state_dict(torch.load(&quot;weights.pt&quot;))
+print(&quot;loaded&quot;, list(model.state_dict()))</code></pre>
+<pre><code>loaded [&#x27;fc.weight&#x27;, &#x27;fc.bias&#x27;]</code></pre>
+<p>A <code>state_dict</code> file contains only tensors, so the default <code>torch.load</code> accepts it with no flags. Load an old full-model file once with option 2, then re-save it with <code>torch.save(model.state_dict(), ...)</code>.</p>
+<p>Related: <a href="/guides/ultralytics-yolo-weights-only-load-failed/">ultralytics YOLO (old releases)</a> · <a href="/guides/yolov5-no-module-named-pkg-resources/">yolov5 (hits this after the setuptools fix)</a> · <a href="/guides/torch-runtimeerror-numpy-is-not-available/">torch: Numpy is not available</a> · <a href="/guides/torch-not-compiled-with-cuda-enabled/">Torch not compiled with CUDA enabled</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is weights_only=False safe?</summary><p>Only for files you trust. It unpickles arbitrary objects, which can run code stored in the file.</p></details>
+<details><summary>Which torch version changed this?</summary><p>torch 2.6 changed the default of weights_only in torch.load from False to True, as the error message itself says.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux with torch 2.14.1+cpu and CPython 3.11.17. Output pasted unedited except a cut traceback. PlainTables is our extension; PyTorch is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

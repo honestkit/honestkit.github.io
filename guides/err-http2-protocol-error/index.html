@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>net::ERR_HTTP2_PROTOCOL_ERROR: Causes and Fixes (Tested)</title>
+<meta name="description" content="We made a Node.js HTTP/2 server break streams on purpose and recorded what Chromium 153 and curl 8.14.1 report. What triggers ERR_HTTP2_PROTOCOL_ERROR, and how to find the real cause.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-http2-protocol-error/">
+<meta property="og:title" content="net::ERR_HTTP2_PROTOCOL_ERROR: Causes and Fixes (Tested)">
+<meta property="og:description" content="We made a Node.js HTTP/2 server break streams on purpose and recorded what Chromium 153 and curl 8.14.1 report. What triggers ERR_HTTP2_PROTOCOL_ERROR, and how to find the real cause.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-http2-protocol-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does ERR_HTTP2_PROTOCOL_ERROR mean the server sent a PROTOCOL_ERROR code?", "acceptedAnswer": {"@type": "Answer", "text": "Not necessarily. In our test, Chromium 153 showed net::ERR_HTTP2_PROTOCOL_ERROR both when the server reset the stream with PROTOCOL_ERROR and when it reset it with INTERNAL_ERROR mid-body. Use curl --http2 to see the actual code."}}, {"@type": "Question", "name": "What does curl error 92 mean?", "acceptedAnswer": {"@type": "Answer", "text": "It means the HTTP/2 stream was reset. We saw 'curl: (92) HTTP/2 stream 1 was not closed cleanly: PROTOCOL_ERROR (err 1)' and '... INTERNAL_ERROR (err 2)'. The part after the colon is the reset code."}}, {"@type": "Question", "name": "Does a wrong Content-Length cause ERR_HTTP2_PROTOCOL_ERROR?", "acceptedAnswer": {"@type": "Answer", "text": "Not in our run. With content-length: 1000 and a 12-byte body, Chromium 153 loaded the page with no error, but curl 8.14.1 failed with error 92 PROTOCOL_ERROR."}}, {"@type": "Question", "name": "Can I set Connection: keep-alive on an HTTP/2 response?", "acceptedAnswer": {"@type": "Answer", "text": "No. HTTP/2 forbids it. Node.js 24 throws ERR_HTTP2_INVALID_CONNECTION_HEADERS. In our test the resulting reset showed in Chromium as net::ERR_HTTP2_PROTOCOL_ERROR."}}, {"@type": "Question", "name": "Is clearing the browser cache enough?", "acceptedAnswer": {"@type": "Answer", "text": "Only sometimes. It helps with a broken cached entry. Most cases come from the server or proxy, such as a disk full of nginx temp files or a backend that dies mid-response, so check the server logs first."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>net::ERR_HTTP2_PROTOCOL_ERROR (tested)</h1>
+<p class="lead"><code>net::ERR_HTTP2_PROTOCOL_ERROR</code> means Chrome's HTTP/2 stream was reset or broken before the response finished. In our tests, almost any server-side stream reset showed up as this one error, whatever the reset code was. The fix is on the server or proxy side, so the job is to find which hop reset the stream.</p>
+<h2>1. What we measured</h2>
+<p>We ran a Node.js <code>http2.createSecureServer</code> with a self-signed certificate and HTTP/1.1 turned off. Each path broke the response a different way. We loaded each path in headless Chromium 153 and with <code>curl --http2 -k</code>.</p>
+<table>
+<tr><th>Server behaviour</th><th>Chromium 153</th><th>curl 8.14.1</th></tr>
+<tr><td>Normal response (control)</td><td>200, page loads</td><td>200, exit 0</td></tr>
+<tr><td>RST_STREAM before headers: <code>stream.close(NGHTTP2_PROTOCOL_ERROR)</code></td><td><code>net::ERR_HTTP2_PROTOCOL_ERROR</code></td><td><code>curl: (92) HTTP/2 stream 1 was not closed cleanly: PROTOCOL_ERROR (err 1)</code></td></tr>
+<tr><td>Headers + 5003 bytes sent, then <code>stream.destroy(err)</code> (RST_STREAM with INTERNAL_ERROR)</td><td><code>net::ERR_HTTP2_PROTOCOL_ERROR</code> (page load hung, request failed)</td><td><code>curl: (92) HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR (err 2)</code>, 5003 bytes received</td></tr>
+<tr><td>Headers + body written, then <code>stream.close(NGHTTP2_INTERNAL_ERROR)</code></td><td>No error, 5003 bytes received</td><td>No error, exit 0, 5003 bytes</td></tr>
+<tr><td><code>content-length: 1000</code> but only 12 bytes sent</td><td>No error: page and <code>fetch()</code> got 12 bytes</td><td><code>curl: (92) HTTP/2 stream 1 was not closed cleanly: PROTOCOL_ERROR (err 1)</code></td></tr>
+<tr><td>Set <code>connection: keep-alive</code> on the response</td><td><code>net::ERR_HTTP2_PROTOCOL_ERROR</code></td><td><code>curl: (92) HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR (err 2)</code></td></tr>
+<tr><td>Set <code>transfer-encoding: chunked</code> on the response</td><td><code>net::ERR_HTTP2_PROTOCOL_ERROR</code></td><td><code>curl: (92) HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR (err 2)</code></td></tr>
+</table>
+<p>Three things stand out:</p>
+<ul>
+<li>Chromium showed <code>ERR_HTTP2_PROTOCOL_ERROR</code> for a PROTOCOL_ERROR reset and for an INTERNAL_ERROR reset. The name does not tell you which reset code the server sent. curl does.</li>
+<li>Calling <code>stream.close(NGHTTP2_INTERNAL_ERROR)</code> after the body was written did not break anything in our run. Both clients got the full 5003 bytes. To break a stream mid-body we had to use <code>stream.destroy()</code>.</li>
+<li>A too-large <code>Content-Length</code> did not trigger the error in Chromium 153. curl did reject it. See <a href="/guides/content-length-header-mismatch/">Content-Length mismatch</a>.</li>
+</ul>
+
+<h2>2. Connection headers: Node refuses, proxies may not</h2>
+<p>HTTP/2 forbids HTTP/1 connection-specific headers such as <code>Connection</code>, <code>Keep-Alive</code> and <code>Transfer-Encoding</code>. Node.js will not send them. In our run, <code>stream.respond()</code> threw:</p>
+<pre><code>ERR_HTTP2_INVALID_CONNECTION_HEADERS
+HTTP/1 Connection specific headers are forbidden: "connection"
+HTTP/1 Connection specific headers are forbidden: "transfer-encoding"</code></pre>
+<p>Our handler caught the throw and reset the stream, which Chromium reported as <code>ERR_HTTP2_PROTOCOL_ERROR</code>. So an app framework rarely puts these headers on the wire itself. When it happens in production, it is usually a proxy or CDN that copies an HTTP/1.1 backend header into its HTTP/2 response. Background: <a href="/guides/transfer-encoding-chunked-vs-content-length/">Transfer-Encoding chunked vs Content-Length</a>.</p>
+
+<h2>3. Reproduce it with curl</h2>
+<p>curl names the reset code, which Chrome hides:</p>
+<pre><code>curl -sS --http2 -o /dev/null -w 'http=%{http_code} v=%{http_version} size=%{size_download}\n' https://example.com/page
+echo "exit=$?"</code></pre>
+<p>Exit code 92 with <code>was not closed cleanly</code> means the stream was reset. <code>PROTOCOL_ERROR (err 1)</code> or <code>INTERNAL_ERROR (err 2)</code> is the code the server or proxy sent. If <code>size</code> is not 0, the reset came mid-body. Now force HTTP/1.1:</p>
+<pre><code>curl -sS --http1.1 -o /dev/null -w 'http=%{http_code} size=%{size_download}\n' https://example.com/page</code></pre>
+<p>If HTTP/1.1 works and HTTP/2 fails, the problem is in the HTTP/2 layer, usually a proxy. If both fail, the backend itself is cutting the response short. Compare <a href="/guides/err-connection-reset-econnreset/">ERR_CONNECTION_RESET</a> and <a href="/guides/502-bad-gateway/">502 Bad Gateway</a>.</p>
+
+<h2>4. Common real causes (from docs and reports, not measured)</h2>
+<ul>
+<li><strong>nginx can't buffer the upstream response.</strong> With <code>proxy_buffering on</code>, large responses go to temp files. A full disk or a temp directory nginx can't write to makes it abort the stream mid-body. Look for <code>open() ... failed</code> or <code>No space left on device</code> in the nginx error log.</li>
+<li><strong>Backend crashes or times out mid-response.</strong> The proxy has already sent headers, so it can only reset the stream.</li>
+<li><strong>Headers too large.</strong> Huge cookies or many <code>Set-Cookie</code> headers can go past HPACK or proxy header limits.</li>
+<li><strong>Compression mismatch.</strong> The response says <code>Content-Encoding: gzip</code> but the body is not gzip, or is gzip twice, or the length doesn't match after a proxy rewrite.</li>
+<li><strong>Antivirus or corporate HTTPS scanning.</strong> Tools that intercept TLS can mishandle HTTP/2. If only one machine sees the error, suspect this first.</li>
+<li><strong>CDN or Cloudflare.</strong> The edge talks HTTP/2 to the browser and may reset the stream when the origin misbehaves. Test the origin directly to see which side is at fault.</li>
+</ul>
+
+<h2>5. Fixes, in order</h2>
+<ol>
+<li>Check the server and proxy error logs at the time of the failure. This is where the real cause is.</li>
+<li>Reproduce with <code>curl --http2</code> to get the reset code, then with <code>--http1.1</code> to compare.</li>
+<li>Disable HTTP/2 on the proxy for a short test (in nginx, drop <code>http2</code> from the <code>listen</code> line). If the error goes away, the bug is in the HTTP/2 path.</li>
+<li>Free disk space, or fix permissions on nginx temp paths, or set <code>proxy_max_temp_file_size</code>.</li>
+<li>Remove <code>Connection</code>, <code>Keep-Alive</code>, <code>Upgrade</code> and <code>Transfer-Encoding</code> from responses a proxy forwards over HTTP/2.</li>
+<li>On the user side: clear the browser cache, try a private window, and pause HTTPS scanning in antivirus to rule it out.</li>
+</ol>
+<aside class="cta"><strong>See the exact response headers your server or proxy sends over HTTP/2:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does ERR_HTTP2_PROTOCOL_ERROR mean the server sent a PROTOCOL_ERROR code?</summary><p>Not necessarily. In our test, Chromium 153 showed net::ERR_HTTP2_PROTOCOL_ERROR both when the server reset the stream with PROTOCOL_ERROR and when it reset it with INTERNAL_ERROR mid-body. Use curl --http2 to see the actual code.</p></details>
+<details><summary>What does curl error 92 mean?</summary><p>It means the HTTP/2 stream was reset. We saw &#x27;curl: (92) HTTP/2 stream 1 was not closed cleanly: PROTOCOL_ERROR (err 1)&#x27; and &#x27;... INTERNAL_ERROR (err 2)&#x27;. The part after the colon is the reset code.</p></details>
+<details><summary>Does a wrong Content-Length cause ERR_HTTP2_PROTOCOL_ERROR?</summary><p>Not in our run. With content-length: 1000 and a 12-byte body, Chromium 153 loaded the page with no error, but curl 8.14.1 failed with error 92 PROTOCOL_ERROR.</p></details>
+<details><summary>Can I set Connection: keep-alive on an HTTP/2 response?</summary><p>No. HTTP/2 forbids it. Node.js 24 throws ERR_HTTP2_INVALID_CONNECTION_HEADERS. In our test the resulting reset showed in Chromium as net::ERR_HTTP2_PROTOCOL_ERROR.</p></details>
+<details><summary>Is clearing the browser cache enough?</summary><p>Only sometimes. It helps with a broken cached entry. Most cases come from the server or proxy, such as a disk full of nginx temp files or a backend that dies mid-response, so check the server logs first.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with a Node.js 24.21.0 http2.createSecureServer (TLS, allowHTTP1 false), headless Chromium 153.0.8010.12 via Playwright, and curl 8.14.1 (nghttp2 1.64.0) with --http2 -k. Causes like nginx temp files, antivirus and Cloudflare come from docs and reports, not from our run. PlainHeaders is our extension; curl, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

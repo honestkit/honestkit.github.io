@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>scipy minimize Error: success=False and What It Means (Tested)</title>
+<meta name="description" content="scipy.optimize.minimize errors, tested on SciPy 1.18: maxiter exceeded, precision loss, NaN objective, must return a scalar, x0 one dimension, args.">
+<link rel="canonical" href="https://honestkit.github.io/guides/scipy-minimize-error-success-false/">
+<meta property="og:title" content="scipy minimize Error: success=False and What It Means (Tested)">
+<meta property="og:description" content="scipy.optimize.minimize errors, tested on SciPy 1.18: maxiter exceeded, precision loss, NaN objective, must return a scalar, x0 one dimension, args.">
+<meta property="og:url" content="https://honestkit.github.io/guides/scipy-minimize-error-success-false/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does scipy minimize return success False?", "acceptedAnswer": {"@type": "Answer", "text": "The optimizer stopped without meeting its tolerance: iteration limit, precision loss from NaN or non-smooth objectives, or infeasible constraints. Read r.message and r.status."}}, {"@type": "Question", "name": "What does \"Desired error not necessarily achieved due to precision loss\" mean?", "acceptedAnswer": {"@type": "Answer", "text": "BFGS could not make progress along its line search, usually because the objective returned NaN, is not smooth, or the gradient is inaccurate."}}, {"@type": "Question", "name": "How do I fix \"The user-provided objective function must return a scalar value\"?", "acceptedAnswer": {"@type": "Answer", "text": "Make the objective return one number, for example by summing squared residuals."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>scipy minimize error: success False, precision loss, maxiter (tested)</h1>
+<p class="lead"><code>scipy.optimize.minimize</code> usually does not raise when it fails: it returns <code>success=False</code> with a <code>message</code> such as "Maximum number of iterations has been exceeded" or "Desired error not necessarily achieved due to precision loss". Below, each message is reproduced, with the fix that made it converge.</p>
+<h2 id="status">1. success=False: read message and status, not just x</h2>
+<p><code>scipy.optimize.minimize</code> almost never raises when the optimizer fails. It returns an <code>OptimizeResult</code> with <code>success=False</code>, a numeric <code>status</code> and a <code>message</code>. <code>b1.py</code> triggers the most common ones:</p>
+<pre><code>import numpy as np
+from scipy.optimize import minimize, rosen
+
+# minimize() rarely raises: it returns success=False plus a message
+r = minimize(rosen, np.zeros(5), method=&quot;BFGS&quot;, options={&quot;maxiter&quot;: 10})
+print(&quot;1:&quot;, r.success, r.status, &quot;|&quot;, r.message, &quot;| nit&quot;, r.nit)
+r = minimize(rosen, np.zeros(5), method=&quot;BFGS&quot;)
+print(&quot;2:&quot;, r.success, r.status, &quot;|&quot;, r.message, &quot;| nit&quot;, r.nit)
+
+# non-smooth objective: BFGS lands on the answer but reports failure
+def f_abs(x):
+    return abs(x[0] - 2) + abs(x[1] + 1)
+r = minimize(f_abs, [0.0, 0.0], method=&quot;BFGS&quot;)
+print(&quot;3:&quot;, r.success, r.status, &quot;|&quot;, r.message, &quot;| x&quot;, np.round(r.x, 4))
+r = minimize(f_abs, [0.0, 0.0], method=&quot;Nelder-Mead&quot;)
+print(&quot;4:&quot;, r.success, r.status, &quot;|&quot;, r.message, &quot;| x&quot;, np.round(r.x, 4))
+
+# constraints that cannot all hold (x &gt;= 2 and x &lt;= 1)
+cons = [{&quot;type&quot;: &quot;ineq&quot;, &quot;fun&quot;: lambda x: x[0] - 2},
+        {&quot;type&quot;: &quot;ineq&quot;, &quot;fun&quot;: lambda x: 1 - x[0]}]
+r = minimize(lambda x: x[0]**2, [0.0], method=&quot;SLSQP&quot;, constraints=cons)
+print(&quot;5:&quot;, r.success, r.status, &quot;|&quot;, r.message)</code></pre>
+<p>Output (SciPy 1.18.1, NumPy 2.5.4, Python 3.13.5):</p>
+<pre><code>1: False 1 | Maximum number of iterations has been exceeded. | nit 10
+2: True 0 | Optimization terminated successfully. | nit 40
+3: False 2 | Desired error not necessarily achieved due to precision loss. | x [ 2. -1.]
+4: True 0 | Optimization terminated successfully. | x [ 2. -1.]
+5: False 8 | Positive directional derivative for linesearch</code></pre>
+<ul><li><strong>"Maximum number of iterations has been exceeded."</strong> (status 1): the run was cut off. Raise <code>options={"maxiter": ...}</code>; with the default limit the same problem converges in 40 iterations (line 2).</li>
+<li><strong>"Desired error not necessarily achieved due to precision loss."</strong> (status 2): BFGS assumes a smooth function. With <code>abs()</code> in the objective it found the right point but could not prove it. Use a derivative-free method (<code>Nelder-Mead</code>, <code>Powell</code>) for non-smooth objectives, or supply an exact gradient with <code>jac=</code> for smooth ones. It also appears when the objective returns NaN (section 2).</li>
+<li><strong>SLSQP with constraints that cannot all hold</strong> (here x &gt;= 2 and x &lt;= 1) failed with status 8, <strong>"Positive directional derivative for linesearch"</strong>, not with a message that mentions the constraints. If you see that from SLSQP, check that your constraints are feasible together.</li>
+<li>Always check <code>if not r.success: print(r.status, r.message)</code> before using <code>r.x</code>; in line 3, <code>r.x</code> was correct but flagged, and in other cases it is simply the last point tried.</li></ul>
+<h2 id="raise">2. Errors that do raise, and the NaN case</h2>
+<pre><code>import numpy as np
+from scipy.optimize import minimize
+
+def show(label, fn):
+    try:
+        r = fn()
+        print(label, &quot;-&gt;&quot;, r.success, &quot;|&quot;, r.message)
+    except Exception as e:
+        print(label, &quot;-&gt;&quot;, type(e).__name__ + &quot;:&quot;, e)
+
+# objective returns an array instead of a scalar
+show(&quot;A array&quot;, lambda: minimize(lambda x: (x - 1)**2, [0.0, 0.0]))
+# extra arguments not passed via args=
+def f(x, a):
+    return ((x - a)**2).sum()
+show(&quot;B no args&quot;, lambda: minimize(f, [0.0]))
+show(&quot;C args&quot;, lambda: minimize(f, [0.0], args=(4.0,)))
+# 2-D x0
+show(&quot;D 2-D x0&quot;, lambda: minimize(lambda x: (x**2).sum(), np.zeros((2, 2))))
+# objective goes NaN outside its domain
+def g(x):
+    return np.sqrt(x[0]) + x[0]
+show(&quot;E nan&quot;, lambda: minimize(g, [1.0]))
+show(&quot;F bounds&quot;, lambda: minimize(g, [1.0], bounds=[(0, None)]))</code></pre>
+<p>Output:</p>
+<pre><code>A array -&gt; ValueError: The user-provided objective function must return a scalar value.
+B no args -&gt; TypeError: f() missing 1 required positional argument: &#x27;a&#x27;
+C args -&gt; True | Optimization terminated successfully.
+D 2-D x0 -&gt; ValueError: &#x27;x0&#x27; must only have one dimension.
+/tmp/sm408/b2.py:22: RuntimeWarning: invalid value encountered in sqrt
+  return np.sqrt(x[0]) + x[0]
+/tmp/sm408/b2.py:22: RuntimeWarning: invalid value encountered in sqrt
+  return np.sqrt(x[0]) + x[0]
+/tmp/sm408/b2.py:22: RuntimeWarning: invalid value encountered in sqrt
+  return np.sqrt(x[0]) + x[0]
+E nan -&gt; False | Desired error not necessarily achieved due to precision loss.
+F bounds -&gt; True | CONVERGENCE: NORM OF PROJECTED GRADIENT &lt;= PGTOL</code></pre>
+<ul><li><strong>"The user-provided objective function must return a scalar value."</strong>: your function returned an array. Return a single number, e.g. <code>((x - 1)**2).sum()</code>.</li>
+<li><strong>"missing 1 required positional argument"</strong>: extra parameters of the objective must be passed with <code>args=(...)</code> (case C).</li>
+<li><strong>"'x0' must only have one dimension."</strong>: flatten the starting point with <code>x0.ravel()</code> and reshape inside the objective.</li>
+<li><strong>NaN objective</strong>: <code>np.sqrt(x)</code> stepped to a negative x, NumPy printed <code>RuntimeWarning: invalid value encountered in sqrt</code>, and BFGS stopped with the same "precision loss" message (status 2). Keeping x in its domain with <code>bounds=[(0, None)]</code> (L-BFGS-B is chosen automatically when bounds are given) converged to x = 0.</li></ul>
+<h2 id="checklist">3. Checklist</h2>
+<ol><li>Print <code>r.success</code>, <code>r.status</code>, <code>r.message</code>, <code>r.nit</code>.</li>
+<li>Iteration limit: raise <code>maxiter</code>, or rescale variables so they are of similar size.</li>
+<li>Precision loss: look for NaN/inf (run with <code>np.seterr(all="raise")</code> to find where), non-smooth terms, or an inaccurate gradient; add <code>bounds</code> or switch method.</li>
+<li>SLSQP status 8 or similar with constraints: test the constraints alone at a point you know is feasible.</li></ol>
+<p>Related: <a href="/guides/numpy-floating-point-errors-isclose/">NumPy floating point errors and isclose</a>, <a href="/guides/numpy-polyfit-rankwarning-poorly-conditioned/">numpy polyfit RankWarning</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does scipy minimize return success False?</summary><p>The optimizer stopped without meeting its tolerance: iteration limit, precision loss from NaN or non-smooth objectives, or infeasible constraints. Read r.message and r.status.</p></details>
+<details><summary>What does &quot;Desired error not necessarily achieved due to precision loss&quot; mean?</summary><p>BFGS could not make progress along its line search, usually because the objective returned NaN, is not smooth, or the gradient is inaccurate.</p></details>
+<details><summary>How do I fix &quot;The user-provided objective function must return a scalar value&quot;?</summary><p>Make the objective return one number, for example by summing squared residuals.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with SciPy 1.18.1, NumPy 2.5.4 and Python 3.13.5 on Linux. Scripts ran verbatim and the output was pasted unedited. PlainTables is our extension; SciPy is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

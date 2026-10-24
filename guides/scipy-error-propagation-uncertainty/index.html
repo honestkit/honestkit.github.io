@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SciPy Error Propagation: Linear, Monte Carlo, uncertainties</title>
+<meta name="description" content="Propagate measurement uncertainty in Python, tested: approx_fprime linear formula, scipy.stats Monte Carlo, the uncertainties package, and correlated inputs.">
+<link rel="canonical" href="https://honestkit.github.io/guides/scipy-error-propagation-uncertainty/">
+<meta property="og:title" content="SciPy Error Propagation: Linear, Monte Carlo, uncertainties">
+<meta property="og:description" content="Propagate measurement uncertainty in Python, tested: approx_fprime linear formula, scipy.stats Monte Carlo, the uncertainties package, and correlated inputs.">
+<meta property="og:url" content="https://honestkit.github.io/guides/scipy-error-propagation-uncertainty/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I propagate errors in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Use the linear formula with numerical derivatives (scipy.optimize.approx_fprime), a Monte Carlo with scipy.stats samples, or the uncertainties package (ufloat)."}}, {"@type": "Question", "name": "When is Monte Carlo error propagation better than the linear formula?", "acceptedAnswer": {"@type": "Answer", "text": "When the function is strongly non-linear over the input uncertainty; if the two disagree, trust the Monte Carlo."}}, {"@type": "Question", "name": "How do correlated inputs change error propagation?", "acceptedAnswer": {"@type": "Answer", "text": "Use sigma = sqrt(J @ cov @ J) with the full covariance matrix; quadrature addition assumes independence."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Error propagation in Python with SciPy: linear, Monte Carlo, uncertainties (tested)</h1>
+<p class="lead">To propagate errors with SciPy, take numerical partial derivatives with <code>scipy.optimize.approx_fprime</code> and combine them with the input sigmas (or the covariance matrix), or sample the inputs with <code>scipy.stats</code> and run a Monte Carlo. For everyday arithmetic, the <code>uncertainties</code> package does the linear propagation for you. All three agree on the example below.</p>
+<h2 id="three">1. Three ways, one example: g from a pendulum</h2>
+<p><code>b1.py</code> propagates the uncertainty of a length (2.00 &plusmn; 0.05 m) and a period (2.84 &plusmn; 0.03 s) into <code>g = 4&pi;&sup2;L/T&sup2;</code>:</p>
+<pre><code>import numpy as np
+from scipy import stats
+from scipy.optimize import approx_fprime
+import uncertainties
+from uncertainties import ufloat
+
+# measured: length L = 2.00 +/- 0.05 m, period T = 2.84 +/- 0.03 s -&gt; g = 4 pi^2 L / T^2
+L, sL, T, sT = 2.00, 0.05, 2.84, 0.03
+def g(p):
+    return 4 * np.pi**2 * p[0] / p[1]**2
+
+# 1. first-order (linear) propagation with a numerical gradient
+p = np.array([L, T])
+J = approx_fprime(p, g, 1e-8)
+sg_lin = np.sqrt((J[0] * sL)**2 + (J[1] * sT)**2)
+print(&quot;g            &quot;, round(g(p), 4))
+print(&quot;linear sigma &quot;, round(sg_lin, 4))
+
+# 2. Monte Carlo with scipy.stats
+rng = np.random.default_rng(0)
+Ls = stats.norm(L, sL).rvs(200_000, random_state=rng)
+Ts = stats.norm(T, sT).rvs(200_000, random_state=rng)
+gs = g([Ls, Ts])
+print(&quot;MC mean, std &quot;, round(gs.mean(), 4), round(gs.std(ddof=1), 4))
+
+# 3. the uncertainties package
+gu = 4 * np.pi**2 * ufloat(L, sL) / ufloat(T, sT)**2
+print(&quot;uncertainties&quot;, gu, &quot;| version&quot;, uncertainties.__version__)
+
+# 4. correlated inputs: pass the covariance, not two sigmas
+cov = np.array([[sL**2, 0.8 * sL * sT], [0.8 * sL * sT, sT**2]])
+print(&quot;correlated   &quot;, round(float(np.sqrt(J @ cov @ J)), 4))</code></pre>
+<p>Output (SciPy 1.18.1, NumPy 2.5.4, uncertainties 3.2.3, Python 3.13.5):</p>
+<pre><code>g             9.7893
+linear sigma  0.3204
+MC mean, std  9.7926 0.3215
+uncertainties 9.79+/-0.32 | version 3.2.3
+correlated    0.1473</code></pre>
+<ul><li><strong>Linear (first-order) propagation</strong>: &sigma;<sub>g</sub>&sup2; = &Sigma; (&part;g/&part;x<sub>i</sub> &middot; &sigma;<sub>i</sub>)&sup2;. <code>scipy.optimize.approx_fprime</code> gives the partial derivatives numerically, so you don't have to derive them by hand.</li>
+<li><strong>Monte Carlo</strong>: sample the inputs with <code>scipy.stats.norm(...).rvs</code>, push the samples through the formula, take the standard deviation. 0.3215 vs 0.3204 here: they agree because the relative errors are small. When they disagree, the function is too non-linear for the linear formula and the Monte Carlo number is the one to trust.</li>
+<li><strong>uncertainties package</strong>: <code>ufloat(value, sigma)</code> objects carry the linear propagation through ordinary arithmetic and print as <code>9.79+/-0.32</code>.</li>
+<li><strong>Correlated inputs</strong>: with a correlation of 0.8 the result drops from 0.32 to 0.15, because L and T enter with opposite signs. Use <code>sqrt(J @ cov @ J)</code> with the full covariance matrix; adding the sigmas in quadrature assumes independent inputs.</li></ul>
+<h2 id="fit">2. Fitted parameters</h2>
+<p>If your inputs come from <code>curve_fit</code>, use the returned <code>pcov</code> as the covariance in point 4; the parameters of a fit are usually correlated. Standard errors themselves: <a href="/guides/scipy-standard-error-stats-sem/">SciPy standard error (stats.sem, linregress, curve_fit)</a>.</p>
+<p>Plot the result with error bars: <a href="/guides/matplotlib-errorbar-fmt-asymmetric-bar-chart/">matplotlib errorbar</a>, <a href="/guides/plotly-error-bars-error-y/">plotly error_y</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I propagate errors in Python?</summary><p>Use the linear formula with numerical derivatives (scipy.optimize.approx_fprime), a Monte Carlo with scipy.stats samples, or the uncertainties package (ufloat).</p></details>
+<details><summary>When is Monte Carlo error propagation better than the linear formula?</summary><p>When the function is strongly non-linear over the input uncertainty; if the two disagree, trust the Monte Carlo.</p></details>
+<details><summary>How do correlated inputs change error propagation?</summary><p>Use sigma = sqrt(J @ cov @ J) with the full covariance matrix; quadrature addition assumes independence.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with SciPy 1.18.1, NumPy 2.5.4, uncertainties 3.2.3 and Python 3.13.5 on Linux. The script ran verbatim and the output was pasted unedited. PlainTables is our extension; SciPy is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Selenium NoSuchElementException: Unable to Locate Element</title>
+<meta name="description" content="Selenium no such element: Unable to locate element, tested in Chrome 156: exact-match By.ID, late JavaScript content, waits, iframes and shadow DOM.">
+<link rel="canonical" href="https://honestkit.github.io/guides/selenium-nosuchelementexception-unable-to-locate-element/">
+<meta property="og:title" content="Selenium NoSuchElementException: Unable to Locate Element">
+<meta property="og:description" content="Selenium no such element: Unable to locate element, tested in Chrome 156: exact-match By.ID, late JavaScript content, waits, iframes and shadow DOM.">
+<meta property="og:url" content="https://honestkit.github.io/guides/selenium-nosuchelementexception-unable-to-locate-element/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes NoSuchElementException in Selenium?", "acceptedAnswer": {"@type": "Answer", "text": "The locator matches nothing in the current document right now: a wrong or partial selector, content that JavaScript adds later, or an element inside an iframe or shadow root."}}, {"@type": "Question", "name": "How do I check if an element exists without an exception?", "acceptedAnswer": {"@type": "Answer", "text": "Use driver.find_elements(by, value): it returns an empty list when nothing matches instead of raising NoSuchElementException."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Selenium NoSuchElementException (tested)</h1>
+<p class="lead"><code>NoSuchElementException: no such element: Unable to locate element</code> means <code>find_element()</code> found nothing in the current document at that moment. Check the selector in the message, wait for content added by JavaScript, and switch into iframes or shadow roots before searching.</p>
+<h2 id="setup">Setup used in every block</h2>
+<p><code>common.py</code> writes a small HTML page to a local file and starts headless Chrome. Exception messages are cut to their first line (Selenium appends the session info and a documentation link).</p>
+<pre><code>import os, pathlib
+from selenium import webdriver
+CHROME = os.path.expanduser(&quot;~/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome&quot;)
+def page(html):
+    p = pathlib.Path(&quot;/tmp/sl383/page.html&quot;); p.write_text(html); return p.as_uri()
+def driver():
+    o = webdriver.ChromeOptions()
+    o.binary_location = CHROME
+    o.add_argument(&quot;--headless=new&quot;); o.add_argument(&quot;--no-sandbox&quot;); o.add_argument(&quot;--window-size=1000,700&quot;)
+    return webdriver.Chrome(options=o)</code></pre>
+<h2 id="locator">1. Reproduce it: the locator matches nothing</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+d = driver()
+d.get(page(&#x27;&lt;input id=&quot;search-box&quot; class=&quot;form-control big&quot; name=&quot;q&quot;&gt;&#x27;))
+for by, value in [(By.ID, &quot;search&quot;), (By.ID, &quot;#search-box&quot;), (By.NAME, &quot;q &quot;), (By.XPATH, &quot;//input[@id=&#x27;search-box&#x27;]&quot;)]:
+    try:
+        d.find_element(by, value)
+        print(f&quot;{by}={value!r}: found&quot;)
+    except Exception as e:
+        print(f&quot;{by}={value!r}: {type(e).__name__}: {e.msg.splitlines()[0]}&quot;)
+print(&quot;find_elements on a miss:&quot;, d.find_elements(By.ID, &quot;search&quot;))
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>id=&#x27;search&#x27;: NoSuchElementException: no such element: Unable to locate element: {&quot;method&quot;:&quot;css selector&quot;,&quot;selector&quot;:&quot;[id=&quot;search&quot;]&quot;}
+id=&#x27;#search-box&#x27;: NoSuchElementException: no such element: Unable to locate element: {&quot;method&quot;:&quot;css selector&quot;,&quot;selector&quot;:&quot;[id=&quot;#search-box&quot;]&quot;}
+name=&#x27;q &#x27;: NoSuchElementException: no such element: Unable to locate element: {&quot;method&quot;:&quot;css selector&quot;,&quot;selector&quot;:&quot;[name=&quot;q &quot;]&quot;}
+xpath=&quot;//input[@id=&#x27;search-box&#x27;]&quot;: found
+find_elements on a miss: []</code></pre>
+<p>The message shows the locator chromedriver actually used. <code>By.ID</code> and <code>By.NAME</code> are sent as CSS attribute selectors (<code>[id="..."]</code>) that must match the attribute exactly: a partial id, a leading <code>#</code> or a stray space finds nothing. Copy the value from the page source, or test it in the browser console with <code>document.querySelectorAll('[id="search"]')</code>. If you only want to check whether an element exists, <code>find_elements()</code> returns an empty list instead of raising.</p>
+<h2 id="timing">2. The element is added later by JavaScript</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+html = &#x27;&#x27;&#x27;&lt;div id=&quot;out&quot;&gt;&lt;/div&gt;
+&lt;script&gt;setTimeout(() =&gt; document.getElementById(&quot;out&quot;).innerHTML = &quot;&lt;p id=result&gt;42&lt;/p&gt;&quot;, 1000)&lt;/script&gt;&#x27;&#x27;&#x27;
+d = driver()
+d.get(page(html))
+try:
+    d.find_element(By.ID, &quot;result&quot;)
+except Exception as e:
+    print(&quot;immediately:&quot;, type(e).__name__)
+print(&quot;explicit wait:&quot;, WebDriverWait(d, 5).until(EC.presence_of_element_located((By.ID, &quot;result&quot;))).text)
+d.get(page(html))
+d.implicitly_wait(5)            # applies to every find_element call from now on
+print(&quot;implicit wait:&quot;, d.find_element(By.ID, &quot;result&quot;).text)
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>immediately: NoSuchElementException
+explicit wait: 42
+implicit wait: 42</code></pre>
+<p><code>find_element()</code> looks once, immediately. For content rendered after load, wait with <code>WebDriverWait(...).until(EC.presence_of_element_located(...))</code>. <code>implicitly_wait(5)</code> also works but applies to every lookup for the rest of the session, including the ones you expect to fail, which then each take 5 seconds; the Selenium docs advise against mixing it with explicit waits.</p>
+<h2 id="frames">3. The element is inside an iframe or a shadow root</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+d = driver()
+d.get(page(&#x27;&#x27;&#x27;&lt;iframe srcdoc=&quot;&lt;input id=card&gt;&quot;&gt;&lt;/iframe&gt;
+&lt;my-widget&gt;&lt;/my-widget&gt;
+&lt;script&gt;document.querySelector(&quot;my-widget&quot;).attachShadow({mode: &quot;open&quot;}).innerHTML = &quot;&lt;button id=buy&gt;Buy&lt;/button&gt;&quot;&lt;/script&gt;&#x27;&#x27;&#x27;))
+for id_ in (&quot;card&quot;, &quot;buy&quot;):
+    try:
+        d.find_element(By.ID, id_)
+    except Exception as e:
+        print(f&quot;#{id_}:&quot;, type(e).__name__)
+d.switch_to.frame(d.find_element(By.TAG_NAME, &quot;iframe&quot;))
+print(&quot;#card after switch_to.frame:&quot;, d.find_element(By.ID, &quot;card&quot;).tag_name)
+d.switch_to.default_content()
+root = d.find_element(By.TAG_NAME, &quot;my-widget&quot;).shadow_root
+print(&quot;#buy via shadow_root:&quot;, root.find_element(By.CSS_SELECTOR, &quot;#buy&quot;).text)
+try:
+    root.find_element(By.XPATH, &quot;.//button&quot;)
+except Exception as e:
+    print(&quot;XPath inside shadow_root:&quot;, type(e).__name__)
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>#card: NoSuchElementException
+#buy: NoSuchElementException
+#card after switch_to.frame: input
+#buy via shadow_root: Buy
+XPath inside shadow_root: InvalidArgumentException</code></pre>
+<p>Neither element is found from the main document, although both are visible on the page. For an <code>&lt;iframe&gt;</code> (payment forms, embedded widgets), switch into it with <code>driver.switch_to.frame(...)</code> and back with <code>switch_to.default_content()</code>. For a web component with a shadow root, get the host element's <code>.shadow_root</code> and search inside it with a CSS selector: XPath is not supported there (<code>InvalidArgumentException</code>).</p>
+<h2 id="checklist">4. Checklist</h2>
+<ul><li>Read the selector in the error message and test it in DevTools on the same page.</li><li>Is the page the one you think? Print <code>driver.current_url</code> and <code>driver.title</code>: a login redirect or a consent page is a common surprise.</li><li>Dynamic content: <code>WebDriverWait</code> + <code>presence_of_element_located</code>.</li><li>iframe: <code>switch_to.frame</code>. Shadow DOM: <code>.shadow_root</code> + CSS.</li><li>Generated ids (<code>ember123</code>, <code>react-select-5-input</code>) change between runs: use a stable attribute instead.</li></ul>
+<p>Related: <a href="/guides/selenium-timeoutexception-message/">Selenium TimeoutException: Message:</a>, <a href="/guides/selenium-element-not-interactable/">Selenium element not interactable</a>, <a href="/guides/selenium-stale-element-reference-exception/">Selenium StaleElementReferenceException</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers of the page your test loads:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes NoSuchElementException in Selenium?</summary><p>The locator matches nothing in the current document right now: a wrong or partial selector, content that JavaScript adds later, or an element inside an iframe or shadow root.</p></details>
+<details><summary>How do I check if an element exists without an exception?</summary><p>Use driver.find_elements(by, value): it returns an empty list when nothing matches instead of raising NoSuchElementException.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Selenium 4.51.0 (Python 3.13.5) and headless Chrome for Testing 156.0.8078.4. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python, Selenium and Chrome are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

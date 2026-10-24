@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Django Server Error (500) When DEBUG=False (Tested Fixes)</title>
+<meta name="description" content="Django 500 error only with DEBUG=False, tested on 6.1.2: no traceback by default, LOGGING to see it, missing staticfiles manifest entry, custom 500.html.">
+<link rel="canonical" href="https://honestkit.github.io/guides/django-500-error-debug-false/">
+<meta property="og:title" content="Django Server Error (500) When DEBUG=False (Tested Fixes)">
+<meta property="og:description" content="Django 500 error only with DEBUG=False, tested on 6.1.2: no traceback by default, LOGGING to see it, missing staticfiles manifest entry, custom 500.html.">
+<meta property="og:url" content="https://honestkit.github.io/guides/django-500-error-debug-false/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Django show Server Error (500) only when DEBUG is False?", "acceptedAnswer": {"@type": "Answer", "text": "Often ManifestStaticFilesStorage without collectstatic: {% static %} raises Missing staticfiles manifest entry. Configure LOGGING for django.request to see the exact traceback."}}, {"@type": "Question", "name": "Why is there no traceback in the console with DEBUG=False?", "acceptedAnswer": {"@type": "Answer", "text": "Django's default console handler only logs when DEBUG is True; errors go to mail_admins. Add a LOGGING config with a StreamHandler for django.request."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Django 500 error with DEBUG=False (tested)</h1>
+<p class="lead">When Django returns <code>Server Error (500)</code> only with <code>DEBUG = False</code>, the default logging hides the traceback. Log <code>django.request</code> to the console to see it; the most common cause is <code>Missing staticfiles manifest entry</code> (run <code>collectstatic</code>).</p>
+<h2 id="setup">Setup used in every block</h2>
+<p><code>common.py</code> builds a minimal project with <code>DEBUG=False</code> and returns a test client that turns exceptions into 500 responses like a real server; <code>show()</code> prints the status and the start of the body. The views and the template:</p>
+<pre><code>import sys; sys.path.insert(0, &#x27;/w/proj&#x27;)
+import django
+from django.conf import settings
+def setup(**extra):
+    conf = dict(DEBUG=False, SECRET_KEY=&#x27;x&#x27;, ALLOWED_HOSTS=[&#x27;testserver&#x27;], ROOT_URLCONF=&#x27;urls&#x27;,
+        INSTALLED_APPS=[&#x27;django.contrib.staticfiles&#x27;], STATIC_URL=&#x27;static/&#x27;, STATIC_ROOT=&#x27;/tmp/static&#x27;,
+        TEMPLATES=[{&#x27;BACKEND&#x27;: &#x27;django.template.backends.django.DjangoTemplates&#x27;, &#x27;DIRS&#x27;: [&#x27;/w/proj/templates&#x27;]}])
+    conf.update(extra)
+    settings.configure(**conf)
+    django.setup()
+    from django.test import Client
+    return Client(raise_request_exception=False)
+def show(r):
+    print(r.status_code, repr(r.content.decode().strip()[:120]))</code></pre>
+<pre><code>from django.urls import path
+from django.shortcuts import render
+def boom(request):
+    return 1 / 0
+def home(request):
+    return render(request, &#x27;home.html&#x27;)
+urlpatterns = [path(&#x27;boom/&#x27;, boom), path(&#x27;&#x27;, home)]</code></pre>
+<pre><code>{% load static %}&lt;link rel=&quot;stylesheet&quot; href=&quot;{% static &quot;site.css&quot; %}&quot;&gt;Home</code></pre>
+<h2 id="silent">1. DEBUG=False: a 500 page and no traceback</h2>
+<pre><code>from common import *
+c = setup()                      # Django&#x27;s default LOGGING
+show(c.get(&#x27;/boom/&#x27;))
+print(&#x27;(nothing else was printed: no traceback on the console)&#x27;)</code></pre>
+<p>Output:</p>
+<pre><code>500 &#x27;&lt;!doctype html&gt;\n&lt;html lang=&quot;en&quot;&gt;\n&lt;head&gt;\n  &lt;title&gt;Server Error (500)&lt;/title&gt;\n&lt;/head&gt;\n&lt;body&gt;\n  &lt;h1&gt;Server Error (500)&lt;/h1&gt;&#x27;
+(nothing else was printed: no traceback on the console)</code></pre>
+<p>With <code>DEBUG = False</code> the yellow debug page is replaced by a bare <code>Server Error (500)</code> page, and with Django's default logging nothing is printed either: the default <code>console</code> handler has the <code>require_debug_true</code> filter, and errors go to <code>mail_admins</code> instead, which sends nothing unless <code>ADMINS</code> and email are configured. (Your server, e.g. gunicorn, may still log the request line, but not Django's traceback.)</p>
+<h2 id="logging">2. Fix step 1: log the traceback</h2>
+<pre><code>from common import *
+c = setup(LOGGING={&#x27;version&#x27;: 1, &#x27;disable_existing_loggers&#x27;: False,
+    &#x27;handlers&#x27;: {&#x27;console&#x27;: {&#x27;class&#x27;: &#x27;logging.StreamHandler&#x27;, &#x27;stream&#x27;: &#x27;ext://sys.stdout&#x27;}},
+    &#x27;loggers&#x27;: {&#x27;django.request&#x27;: {&#x27;handlers&#x27;: [&#x27;console&#x27;], &#x27;level&#x27;: &#x27;ERROR&#x27;}}})
+show(c.get(&#x27;/boom/&#x27;))</code></pre>
+<p>Output:</p>
+<pre><code>Internal Server Error: /boom/
+Traceback (most recent call last):
+  File &quot;/usr/local/lib/python3.14/site-packages/django/core/handlers/exception.py&quot;, line 56, in inner
+    response = get_response(request)
+  File &quot;/usr/local/lib/python3.14/site-packages/django/core/handlers/base.py&quot;, line 199, in _get_response
+    response = wrapped_callback(request, *callback_args, **callback_kwargs)
+  File &quot;/w/proj/urls.py&quot;, line 4, in boom
+    return 1 / 0
+           ~~^~~
+ZeroDivisionError: division by zero
+500 &#x27;&lt;!doctype html&gt;\n&lt;html lang=&quot;en&quot;&gt;\n&lt;head&gt;\n  &lt;title&gt;Server Error (500)&lt;/title&gt;\n&lt;/head&gt;\n&lt;body&gt;\n  &lt;h1&gt;Server Error (500)&lt;/h1&gt;&#x27;</code></pre>
+<p>A <code>LOGGING</code> setting that sends the <code>django.request</code> logger to a <code>StreamHandler</code> prints <code>Internal Server Error: /boom/</code> with the full traceback, even with <code>DEBUG = False</code>. Add it to your production settings so the cause of every 500 lands in the server log.</p>
+<h2 id="static">3. The classic cause: missing staticfiles manifest entry</h2>
+<pre><code>from common import *
+c = setup(STATICFILES_DIRS=[&#x27;/w/proj/static&#x27;],
+          STORAGES={&#x27;staticfiles&#x27;: {&#x27;BACKEND&#x27;:
+          &#x27;django.contrib.staticfiles.storage.ManifestStaticFilesStorage&#x27;}})
+from django.template.loader import render_to_string
+r = c.get(&#x27;/&#x27;)
+print(&#x27;GET / -&gt;&#x27;, r.status_code)
+try:
+    render_to_string(&#x27;home.html&#x27;)
+except ValueError as e:
+    print(&#x27;ValueError:&#x27;, e)
+from django.core.management import call_command
+call_command(&#x27;collectstatic&#x27;, interactive=False, verbosity=1)
+r = c.get(&#x27;/&#x27;)
+print(&#x27;GET / -&gt;&#x27;, r.status_code, r.content.decode().strip())</code></pre>
+<p>Output:</p>
+<pre><code>GET / -&gt; 500
+ValueError: Missing staticfiles manifest entry for &#x27;site.css&#x27;
+
+1 static file copied to &#x27;/tmp/static&#x27;, 1 post-processed.
+GET / -&gt; 200 &lt;link rel=&quot;stylesheet&quot; href=&quot;/static/site.3c7253c0b179.css&quot;&gt;Home</code></pre>
+<p>The page works with <code>DEBUG = True</code> but returns 500 with <code>DEBUG = False</code> when you use <code>ManifestStaticFilesStorage</code> (or WhiteNoise's <code>CompressedManifestStaticFilesStorage</code>, which subclasses it) and <code>collectstatic</code> has not been run, or a template references a file that does not exist: <code>{% static %}</code> raises <code>ValueError: Missing staticfiles manifest entry for 'site.css'</code>. Run <code>python manage.py collectstatic</code> as part of every deploy and fix any path it reports as missing.</p>
+<p>Separately, <code>runserver</code> serves static files only when <code>DEBUG = True</code> (or with <code>runserver --insecure</code>); with <code>DEBUG = False</code> the CSS 404s but the page itself does not 500.</p>
+<h2 id="template">4. Optional: a custom 500.html</h2>
+<pre><code>import shutil; shutil.copy(&#x27;/w/500.html.txt&#x27;, &#x27;/w/proj/templates/500.html&#x27;)
+from common import *
+c = setup()
+show(c.get(&#x27;/boom/&#x27;))</code></pre>
+<p>Output:</p>
+<pre><code>500 &#x27;Sorry, something broke on our side.&#x27;</code></pre>
+<p>A <code>500.html</code> in a template directory replaces the default body (here it contains one line of text). Keep it simple: it is rendered without a request context, so avoid tags that may fail themselves.</p>
+<p>Related: <a href="/guides/django-400-bad-request-debug-false-allowed-hosts/">Django 400 Bad Request with DEBUG=False</a>, <a href="/guides/500-internal-server-error/">500 Internal Server Error</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers your deployed Django site returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Django show Server Error (500) only when DEBUG is False?</summary><p>Often ManifestStaticFilesStorage without collectstatic: {% static %} raises Missing staticfiles manifest entry. Configure LOGGING for django.request to see the exact traceback.</p></details>
+<details><summary>Why is there no traceback in the console with DEBUG=False?</summary><p>Django&#x27;s default console handler only logs when DEBUG is True; errors go to mail_admins. Add a LOGGING config with a StreamHandler for django.request.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Django 6.1.2 and Python 3.14.7 (python:3-alpine in Docker, Django test client). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Django are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

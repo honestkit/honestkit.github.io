@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx vs requests: differences that break ported code (tested)</title>
+<meta name="description" content="httpx vs requests, measured: redirects not followed, 5 s default timeout, raise_for_status on 3xx, ConnectError vs ConnectionError, plus async and HTTP/2.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-vs-requests-differences/">
+<meta property="og:title" content="httpx vs requests: differences that break ported code (tested)">
+<meta property="og:description" content="httpx vs requests, measured: redirects not followed, 5 s default timeout, raise_for_status on 3xx, ConnectError vs ConnectionError, plus async and HTTP/2.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-vs-requests-differences/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is httpx a drop-in replacement for requests?", "acceptedAnswer": {"@type": "Answer", "text": "Not quite. In the test httpx returned a 302 where requests followed the redirect, had a 5 s default timeout vs none, and used different exception and argument names."}}, {"@type": "Question", "name": "Does requests have a default timeout?", "acceptedAnswer": {"@type": "Answer", "text": "No. HTTPAdapter.send defaults to timeout=None in requests 2.34.2, so always pass timeout=."}}, {"@type": "Question", "name": "When should I use httpx instead of requests?", "acceptedAnswer": {"@type": "Answer", "text": "When you need async (AsyncClient) or HTTP/2. For simple synchronous scripts both work."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx vs requests: the default differences that break ported code (tested)</h1>
+<p class="lead">httpx copies the requests API but not its defaults: it does not follow redirects, times out after 5 s (requests never does), raises on 3xx in <code>raise_for_status()</code>, and uses different exception names. It adds <code>AsyncClient</code> and optional HTTP/2.</p>
+<p>httpx looks like requests (<code>httpx.get(url, params=..., json=...)</code>, <code>r.json()</code>, <code>r.raise_for_status()</code>), but several defaults differ, and they are what breaks code ported from requests. Measured with httpx 0.28.1 and requests 2.34.2 on Python 3.13.5 against a local <code>http.server</code> (<code>/r302</code> redirects to <code>/final</code>). No speed benchmark here: for a single request the network dominates either way.</p>
+<h2 id="defaults">1. Redirects and timeouts: opposite defaults</h2>
+<pre><code>import inspect, httpx, requests
+from srv import start
+base = start()
+
+for lib in (requests, httpx):
+    r = lib.get(base + &quot;/r302&quot;)
+    print(f&quot;{lib.__name__:8} {lib.__version__:7} status={r.status_code} url={r.url}&quot;)
+
+print(&quot;requests timeout default:&quot;, inspect.signature(requests.adapters.HTTPAdapter.send).parameters[&quot;timeout&quot;].default)
+print(&quot;httpx timeout default:   &quot;, httpx.Client().timeout)</code></pre>
+<p>Output:</p>
+<pre><code>requests 2.34.2  status=200 url=http://127.0.0.1:8963/final
+httpx    0.28.1  status=302 url=http://127.0.0.1:8963/r302
+requests timeout default: None
+httpx timeout default:    Timeout(timeout=5.0)</code></pre>
+<p>requests follows redirects and has <strong>no timeout</strong> (a stalled server hangs forever); httpx does <strong>not</strong> follow redirects and times out after <strong>5 seconds</strong>. Port code with <code>follow_redirects=True</code> and an explicit <code>timeout=</code>. Details: <a href="/guides/httpx-follow-redirects/">httpx follow redirects</a>, <a href="/guides/httpx-timeout-default-readtimeout/">httpx timeout default</a>.</p>
+<h2 id="raise">2. raise_for_status() also raises on 3xx in httpx</h2>
+<pre><code>import httpx, requests
+from srv import start
+base = start()
+
+for lib, r in ((&quot;requests&quot;, requests.get(base + &quot;/r302&quot;, allow_redirects=False)),
+               (&quot;httpx&quot;, httpx.get(base + &quot;/r302&quot;))):
+    try:
+        r.raise_for_status()
+        print(f&quot;{lib:8} {r.status_code}: raise_for_status() passes&quot;)
+    except Exception as e:
+        print(f&quot;{lib:8} {r.status_code}: raise_for_status() -&gt; {type(e).__name__}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>requests 302: raise_for_status() passes
+httpx    302: raise_for_status() -&gt; HTTPStatusError</code></pre>
+<p>requests raises only for 4xx/5xx; httpx raises <code>HTTPStatusError</code> for anything that is not 2xx, including an unfollowed redirect.</p>
+<h2 id="names">3. Different exception and argument names</h2>
+<pre><code>import httpx, requests
+for name, call in ((&quot;requests&quot;, lambda: requests.get(&quot;http://127.0.0.1:8999/&quot;)),
+                   (&quot;httpx&quot;, lambda: httpx.get(&quot;http://127.0.0.1:8999/&quot;))):
+    try:
+        call()
+    except Exception as e:
+        print(f&quot;{name:8} {type(e).__module__}.{type(e).__name__}&quot;)
+try:
+    httpx.get(&quot;http://127.0.0.1:8999/&quot;, allow_redirects=True)
+except TypeError as e:
+    print(&quot;TypeError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>requests requests.exceptions.ConnectionError
+httpx    httpx.ConnectError
+TypeError: get() got an unexpected keyword argument &#x27;allow_redirects&#x27;. Did you mean &#x27;follow_redirects&#x27;?</code></pre>
+<p>Connection refused is <code>requests.exceptions.ConnectionError</code> vs <code>httpx.ConnectError</code> (timeouts: <code>requests.exceptions.Timeout</code> vs <code>httpx.TimeoutException</code>), so <code>except</code> clauses must change. <code>allow_redirects=</code> is a <code>TypeError</code> in httpx. TLS failures are also a <code>ConnectError</code> in httpx: see <a href="/guides/httpx-connecterror-ssl-certificate-verify-failed/">httpx CERTIFICATE_VERIFY_FAILED</a>.</p>
+<h2 id="extras">4. What httpx adds: async and HTTP/2</h2>
+<pre><code>import httpx
+try:
+    httpx.Client(http2=True)
+except ImportError as e:
+    print(&quot;ImportError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>ImportError: Using http2=True, but the &#x27;h2&#x27; package is not installed. Make sure to install httpx using `pip install httpx[http2]`.</code></pre>
+<p>httpx has <code>httpx.AsyncClient</code> with the same API for <code>asyncio</code> code (requests has no async support), and optional HTTP/2, which needs the extra <code>pip install "httpx[http2]"</code>. If you need neither, requests is fine; if you use async code, httpx (or aiohttp) avoids blocking the event loop.</p>
+<p>All httpx guides: <a href="/guides/httpx-params-query-parameters/">params</a>, <a href="/guides/httpx-headers-client-default-response/">headers</a>, <a href="/guides/httpx-post-json-vs-data/">post json vs data</a>, <a href="/guides/httpx-auth-basic-bearer-token/">auth</a>, <a href="/guides/httpx-follow-redirects/">follow redirects</a>, <a href="/guides/httpx-timeout-default-readtimeout/">timeout</a>, <a href="/guides/httpx-connecterror-ssl-certificate-verify-failed/">SSL verify</a>, <a href="/guides/httpx-proxy-unexpected-keyword-argument-proxies/">proxy</a>, <a href="/guides/httpx-retry-transport-retries/">retries</a>, <a href="/guides/httpx-remoteprotocolerror-server-disconnected-without-sending-a-response/">RemoteProtocolError</a>, <a href="/guides/httpx-stream-response-iter-bytes/">streaming</a>, <a href="/guides/httpx-asyncclient-connection-pool-limits/">AsyncClient connection pool</a>, <a href="/guides/httpx-raise-for-status-httpstatuserror/">raise_for_status</a>, <a href="/guides/httpx-cookies-client-set-cookies/">cookies</a>, <a href="/guides/httpx-upload-file-post-files-multipart/">file upload</a>, <a href="/guides/httpx-download-file-stream-to-disk/">file download</a>, <a href="/guides/httpx-mock-transport-pytest/">MockTransport for tests</a>, <a href="/guides/httpx-logging-disable-debug/">logging</a>, <a href="/guides/httpx-http2-enable/">HTTP/2</a>, <a href="/guides/httpx-client-base-url/">base_url</a>, <a href="/guides/httpx-verify-false-not-working/">verify=False not working</a>, <a href="/guides/httpx-json-decode-error/">JSON decode error</a>, <a href="/guides/httpx-websocket-client/">websockets</a>, <a href="/guides/httpx-asyncclient-runtimeerror-event-loop-is-closed/">Event loop is closed</a>.</p>
+<p>Related: <a href="/guides/python-requests-readtimeout-read-timed-out/">requests ReadTimeout</a>, <a href="/guides/python-requests-connectionerror-max-retries/">requests ConnectionError max retries</a>, <a href="/guides/python-requests-http-error-get-response-message/">requests HTTPError response message</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is httpx a drop-in replacement for requests?</summary><p>Not quite. In the test httpx returned a 302 where requests followed the redirect, had a 5 s default timeout vs none, and used different exception and argument names.</p></details>
+<details><summary>Does requests have a default timeout?</summary><p>No. HTTPAdapter.send defaults to timeout=None in requests 2.34.2, so always pass timeout=.</p></details>
+<details><summary>When should I use httpx instead of requests?</summary><p>When you need async (AsyncClient) or HTTP/2. For simple synchronous scripts both work.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 and requests 2.34.2 on Python 3.13.5 against a local http.server. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx and requests are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

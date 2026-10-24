@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>No module named &#x27;torchaudio.io&#x27; (StreamReader): tested fixes</title>
+<meta name="description" content="torchaudio 2.9 removed torchaudio.io (StreamReader/StreamWriter). Tested: torchcodec AudioDecoder/AudioEncoder, or pin 2.8.0 with FFmpeg 6 or older.">
+<link rel="canonical" href="https://honestkit.github.io/guides/torchaudio-no-module-named-io/">
+<meta property="og:title" content="No module named &#x27;torchaudio.io&#x27; (StreamReader): tested fixes">
+<meta property="og:description" content="torchaudio 2.9 removed torchaudio.io (StreamReader/StreamWriter). Tested: torchcodec AudioDecoder/AudioEncoder, or pin 2.8.0 with FFmpeg 6 or older.">
+<meta property="og:url" content="https://honestkit.github.io/guides/torchaudio-no-module-named-io/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Which torchaudio version removed torchaudio.io?", "acceptedAnswer": {"@type": "Answer", "text": "In our test from torchaudio.io import StreamReader works on 2.8.0 and raises ModuleNotFoundError on 2.9.0."}}, {"@type": "Question", "name": "Why does StreamReader on torchaudio 2.8 say Failed to intialize FFmpeg extension?", "acceptedAnswer": {"@type": "Answer", "text": "torchaudio 2.8.0 tried FFmpeg 6, 5 and 4 only; with FFmpeg 7 libraries it raised the same ImportError as with none. Use FFmpeg 6 or older, or move to torchcodec."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>No module named &#x27;torchaudio.io&#x27; (fix)</h1>
+<p class="lead"><code>from torchaudio.io import StreamReader</code> raises <code>ModuleNotFoundError: No module named 'torchaudio.io'</code> on torchaudio 2.9 and newer (or <code>module 'torchaudio' has no attribute 'io'</code>). We tested the TorchCodec replacements for reading and writing, and the pin-2.8 route with its FFmpeg catch.</p>
+<h2 id="error">1. The error</h2>
+<pre><code>import torchaudio
+print(&quot;torchaudio&quot;, torchaudio.__version__)
+from torchaudio.io import StreamReader</code></pre>
+<p>torchaudio 2.9.0:</p>
+<pre><code>torchaudio 2.9.0+cpu
+Traceback (most recent call last):
+  File &quot;b1.py&quot;, line 3, in &lt;module&gt;
+    from torchaudio.io import StreamReader
+ModuleNotFoundError: No module named &#x27;torchaudio.io&#x27;</code></pre>
+<p>torchaudio 2.8.0 imports it fine:</p>
+<pre><code>torchaudio 2.8.0+cu128</code></pre>
+<p><code>import torchaudio; torchaudio.io</code> gives the AttributeError variant of the same thing. The <code>torchaudio.io</code> streaming API (<code>StreamReader</code>, <code>StreamWriter</code>) was removed in 2.9; TorchCodec replaces it.</p>
+<h2 id="decode">2. Fix: decode with torchcodec AudioDecoder</h2>
+<p>torchcodec must match your torch (0.8/0.9 for torch 2.9) and needs FFmpeg 4–8 shared libraries; see <a href="/guides/torchcodec-could-not-load-libtorchcodec/">Could not load libtorchcodec</a> if it won't import. torch 2.9.0, torchcodec 0.9.1, FFmpeg 7, on a 1-second 16 kHz mono WAV:</p>
+<pre><code>from torchcodec.decoders import AudioDecoder
+dec = AudioDecoder(&quot;tone.wav&quot;)
+print(dec.metadata.sample_rate, dec.metadata.num_channels, dec.metadata.duration_seconds)
+samples = dec.get_all_samples()
+print(samples.data.shape, samples.sample_rate)</code></pre>
+<pre><code>16000 1 1.0
+torch.Size([1, 16000]) 16000</code></pre>
+<p><code>samples.data</code> is a float32 <code>(channels, samples)</code> tensor, the same layout <code>torchaudio.load</code> returns. For chunked reading, <code>dec.get_samples_played_in_range(start, stop)</code> takes seconds.</p>
+<h2 id="encode">3. Fix: encode with torchcodec AudioEncoder (replaces StreamWriter)</h2>
+<pre><code>import torch
+from torchcodec.encoders import AudioEncoder
+t = torch.linspace(0, 1, 16000)
+wave = (0.3 * torch.sin(2 * torch.pi * 440 * t)).unsqueeze(0)   # (channels, samples)
+AudioEncoder(wave, sample_rate=16000).to_file(&quot;out.flac&quot;)
+from torchcodec.decoders import AudioDecoder
+print(AudioDecoder(&quot;out.flac&quot;).get_all_samples().data.shape)</code></pre>
+<pre><code>torch.Size([1, 16000])</code></pre>
+<h2 id="pin">4. Or pin torchaudio 2.8.0 — but mind the FFmpeg version</h2>
+<p><code>pip install &quot;torch==2.8.0&quot; &quot;torchaudio==2.8.0&quot;</code> brings <code>torchaudio.io</code> back. Actually reading needs FFmpeg too, and 2.8.0 only looks for FFmpeg 4, 5 or 6:</p>
+<pre><code>from torchaudio.io import StreamReader
+r = StreamReader(&quot;tone.wav&quot;)
+r.add_basic_audio_stream(frames_per_chunk=16000)
+for (chunk,) in r.stream():
+    print(chunk.shape)</code></pre>
+<p>With no FFmpeg, and again with FFmpeg 7 libraries on <code>LD_LIBRARY_PATH</code>, we got the same error:</p>
+<pre><code>Traceback (most recent call last):
+  ...
+ImportError: Failed to intialize FFmpeg extension. Tried versions: [&#x27;6&#x27;, &#x27;5&#x27;, &#x27;4&#x27;, &#x27;&#x27;]. Enable DEBUG logging to see more details about the error.</code></pre>
+<p>So on the 2.8 route install FFmpeg 6 or older (e.g. <code>conda install -c conda-forge &quot;ffmpeg&lt;7&quot;</code>). TorchCodec accepts 4–8. Full walkthrough: <a href="/guides/torchaudio-failed-to-initialize-ffmpeg-extension/">Failed to intialize FFmpeg extension</a>.</p>
+<p>Related: <a href="/guides/torchaudio-no-module-named-backend/">No module named torchaudio.backend</a> · <a href="/guides/torchaudio-has-no-attribute-info/">torchaudio has no attribute info</a> · <a href="/guides/torchaudio-has-no-attribute-audiometadata/">torchaudio has no attribute AudioMetaData</a> · <a href="/guides/torchaudio-sox-effects-libsox-so-cannot-open/">torchaudio sox_effects: libsox.so not found</a></p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Which torchaudio version removed torchaudio.io?</summary><p>In our test from torchaudio.io import StreamReader works on 2.8.0 and raises ModuleNotFoundError on 2.9.0.</p></details>
+<details><summary>Why does StreamReader on torchaudio 2.8 say Failed to intialize FFmpeg extension?</summary><p>torchaudio 2.8.0 tried FFmpeg 6, 5 and 4 only; with FFmpeg 7 libraries it raised the same ImportError as with none. Use FFmpeg 6 or older, or move to torchcodec.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux with CPython 3.11.17, torch/torchaudio 2.8.0 (PyPI wheels) and 2.9.0 (CPU wheels), torchcodec 0.9.1, conda-forge FFmpeg 7. Output pasted unedited except shortened site-packages paths and cut tracebacks. PlainTables is our extension; torchaudio and torchcodec are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

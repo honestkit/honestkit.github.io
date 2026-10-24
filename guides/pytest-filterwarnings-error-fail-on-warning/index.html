@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pytest filterwarnings error: Fail Tests on Warnings (Tested)</title>
+<meta name="description" content="Make pytest fail on warnings with -W error or filterwarnings = error, ignore specific ones, and why .* works in pytest.ini but not with -W. Tested on 9.1.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pytest-filterwarnings-error-fail-on-warning/">
+<meta property="og:title" content="pytest filterwarnings error: Fail Tests on Warnings (Tested)">
+<meta property="og:description" content="Make pytest fail on warnings with -W error or filterwarnings = error, ignore specific ones, and why .* works in pytest.ini but not with -W. Tested on 9.1.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pytest-filterwarnings-error-fail-on-warning/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I make pytest fail on warnings?", "acceptedAnswer": {"@type": "Answer", "text": "Use pytest -W error, or add filterwarnings = error to the [pytest] section of pytest.ini (or filterwarnings = [\"error\"] in pyproject.toml)."}}, {"@type": "Question", "name": "Why does my filterwarnings message pattern not match?", "acceptedAnswer": {"@type": "Answer", "text": "With -W on the command line the message is a literal prefix; in the config file it is a regex matched from the start, so escape ( ) and . there."}}, {"@type": "Question", "name": "How do I ignore one warning but error on the rest?", "acceptedAnswer": {"@type": "Answer", "text": "List error first and then ignore:message:Category; when several filters match, the last one wins."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pytest filterwarnings error: fail on warnings (tested)</h1>
+<p class="lead">Run <code>pytest -W error</code> or set <code>filterwarnings = error</code> in pytest.ini / pyproject.toml to turn every warning into a test failure. Add <code>ignore:&lt;message regex&gt;:Category</code> lines <em>after</em> <code>error</code> for warnings you accept; the last matching filter wins.</p>
+<p>By default pytest only <em>reports</em> warnings in a summary and the run still passes. To make warnings fail tests, turn them into errors with <code>-W error</code> on the command line or <code>filterwarnings = error</code> in the config. The rules for matching specific warnings differ between the two, which is where most surprises come from. All blocks were run on pytest 9.1.1.</p>
+<h2 id="cli">1. Fail on any warning from the command line: -W error</h2>
+<pre><code>$ cat test_a.py
+import warnings
+
+def old():
+    warnings.warn(&quot;old() is deprecated&quot;, DeprecationWarning)
+    return 1
+
+def test_old():
+    assert old() == 1
+$ pytest -q | tail -1
+1 passed, 1 warning in 0.00s
+$ pytest -q -W error | grep -E &quot;^E |passed|failed&quot;; echo &quot;exit code: ${PIPESTATUS[0]}&quot;
+E       DeprecationWarning: old() is deprecated
+1 failed in 0.01s
+exit code: 1</code></pre>
+<p>The warning is raised as an exception inside the test, so the test FAILS (exit code 1) and the traceback points at the <code>warnings.warn</code> line.</p>
+<h2 id="ini">2. Make it permanent: filterwarnings = error</h2>
+<pre><code>$ cat pytest.ini
+[pytest]
+filterwarnings =
+    error
+$ pytest -q | grep -E &quot;^E |passed|failed&quot;
+E       DeprecationWarning: old() is deprecated
+1 failed in 0.01s</code></pre>
+<p>The same works in <code>pyproject.toml</code> under <code>[tool.pytest.ini_options]</code> as <code>filterwarnings = ["error"]</code>.</p>
+<h2 id="only-some">3. Only some warnings: action:message:category:module</h2>
+<pre><code>$ pytest -q -W error::DeprecationWarning | tail -1
+1 failed in 0.01s
+$ pytest -q -W &quot;error:old:DeprecationWarning&quot; | tail -1
+1 failed in 0.01s
+$ pytest -q -W &quot;error:.*deprecated:DeprecationWarning&quot; | tail -1
+1 passed, 1 warning in 0.00s</code></pre>
+<p>On the command line the message part is a <strong>literal prefix</strong> of the warning text, not a regex: <code>old</code> matches "old() is deprecated", but <code>.*deprecated</code> matched nothing and the test passed with a warning. In the config file the message is a <strong>regular expression</strong> matched from the start of the text, so the same filter works there:</p>
+<pre><code>$ cat pytest.ini
+[pytest]
+filterwarnings =
+    error:.*deprecated:DeprecationWarning
+$ pytest -q | tail -1
+1 failed in 0.01s</code></pre>
+<p>Because it is a regex in the config, parentheses and dots in the message must be escaped (<code>old\(\)</code>, as in the next block).</p>
+<h2 id="order">4. error plus exceptions: later lines win</h2>
+<pre><code>$ cat pytest.ini
+[pytest]
+filterwarnings =
+    error
+    ignore:old\(\) is deprecated:DeprecationWarning
+$ pytest -q | tail -1
+1 passed in 0.00s
+$ cat pytest.ini
+[pytest]
+filterwarnings =
+    ignore:old\(\) is deprecated:DeprecationWarning
+    error
+$ pytest -q | tail -1
+1 failed in 0.01s
+$ pytest -q -W &quot;ignore::DeprecationWarning&quot; | tail -1
+1 passed in 0.00s</code></pre>
+<p>When several filters match, the <strong>last</strong> one in the list wins. Put <code>error</code> first and the <code>ignore:</code> lines for warnings you accept (often from third-party libraries) after it. <code>-W</code> options on the command line take precedence over the config file, as the last command shows.</p>
+<h2 id="unknown-category">5. "while parsing the following warning configuration" (exit code 4)</h2>
+<pre><code>$ pytest -q -W error::FooWarning 2&gt;&amp;1 | grep -v &quot;^ \|^$&quot; | tail -2; echo &quot;exit code: ${PIPESTATUS[0]}&quot;
+Traceback (most recent call last):
+AttributeError: module &#x27;builtins&#x27; has no attribute &#x27;FooWarning&#x27;. Did you mean: &#x27;Warning&#x27;?
+exit code: 4</code></pre>
+<p>A category name that is not a built-in warning must be written with its full import path, e.g. <code>error::mylib.MyWarning</code>; a bare unknown name stops pytest with a usage error (<a href="/guides/pytest-exit-codes-discovery-failed-exit-code-2-4/">exit code 4</a>) before any test runs.</p>
+<h2 id="import-time">6. A warning at import time becomes a collection error</h2>
+<pre><code>$ cat mylib/__init__.py
+import warnings
+warnings.warn(&quot;mylib config is old&quot;, UserWarning)
+$ pytest -q -W error | tail -3; echo &quot;exit code: ${PIPESTATUS[0]}&quot;
+ERROR test_e.py - UserWarning: mylib config is old
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.08s
+exit code: 2</code></pre>
+<p>If a library warns while being imported, <code>-W error</code> turns that into an error collecting the test file and the run is interrupted (exit code 2). Add an <code>ignore:</code> filter for that specific message after <code>error</code>.</p>
+<h2 id="per-test">7. Per test: mark.filterwarnings, and pytest.warns to expect one</h2>
+<pre><code>$ cat test_f.py
+import warnings, pytest
+
+def old():
+    warnings.warn(&quot;old() is deprecated&quot;, DeprecationWarning)
+    return 1
+
+@pytest.mark.filterwarnings(&quot;error&quot;)
+def test_strict():
+    assert old() == 1
+
+def test_relaxed():
+    assert old() == 1
+
+def test_expects_warning():
+    with pytest.warns(DeprecationWarning, match=&quot;deprecated&quot;):
+        old()
+$ pytest -q -rA | grep -E &quot;^(PASSED|FAILED)&quot;
+PASSED test_f.py::test_relaxed
+PASSED test_f.py::test_expects_warning
+FAILED test_f.py::test_strict - DeprecationWarning: old() is deprecated</code></pre>
+<p><code>@pytest.mark.filterwarnings("error")</code> makes only that test strict. To <em>assert</em> that code warns, use <code>pytest.warns(Category, match=...)</code>; inside it the warning is captured instead of failing the test.</p>
+<p>Related: <a href="/guides/pytest-failed-did-not-raise/">pytest Failed: DID NOT RAISE</a>, <a href="/guides/pandas-suppress-warnings/">suppress pandas warnings</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I make pytest fail on warnings?</summary><p>Use pytest -W error, or add filterwarnings = error to the [pytest] section of pytest.ini (or filterwarnings = [&quot;error&quot;] in pyproject.toml).</p></details>
+<details><summary>Why does my filterwarnings message pattern not match?</summary><p>With -W on the command line the message is a literal prefix; in the config file it is a regex matched from the start, so escape ( ) and . there.</p></details>
+<details><summary>How do I ignore one warning but error on the rest?</summary><p>List error first and then ignore:message:Category; when several filters match, the last one wins.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with pytest 9.1.1 on Python 3.13.5 in a clean virtualenv. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and pytest are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

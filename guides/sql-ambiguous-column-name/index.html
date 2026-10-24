@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL Ambiguous Column Name Error: Causes and Fixes, Tested</title>
+<meta name="description" content="We reproduced PostgreSQL&#x27;s &quot;column reference is ambiguous&quot; error 4 ways (JOIN, WHERE, GROUP BY, USING) and tested the exact fixes with real queries.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sql-ambiguous-column-name/">
+<meta property="og:title" content="SQL Ambiguous Column Name Error: Causes and Fixes, Tested">
+<meta property="og:description" content="We reproduced PostgreSQL&#x27;s &quot;column reference is ambiguous&quot; error 4 ways (JOIN, WHERE, GROUP BY, USING) and tested the exact fixes with real queries.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sql-ambiguous-column-name/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Which table does the ambiguous column error complain about?", "acceptedAnswer": {"@type": "Answer", "text": "Neither, by name. PostgreSQL's error names only the column (e.g. \"id\"), not the tables. You have to check your FROM/JOIN clauses yourself to see which tables share that column name."}}, {"@type": "Question", "name": "Does SELECT * trigger this error?", "acceptedAnswer": {"@type": "Answer", "text": "No. In our tests, SELECT * across a join with duplicate column names returned both columns without error. The ambiguity error only fires when you reference the bare column name directly, e.g. in WHERE, GROUP BY, or a specific SELECT item."}}, {"@type": "Question", "name": "What's the difference between qualifying a column and using USING?", "acceptedAnswer": {"@type": "Answer", "text": "Qualifying (u.id) keeps both columns distinct; you choose which one you meant. USING (id) merges two identically-named join columns into a single output column. USING only works when both sides are actually named the same thing and represent the same key."}}, {"@type": "Question", "name": "Why did my query work yesterday but fail today with this error?", "acceptedAnswer": {"@type": "Answer", "text": "Someone likely added a column with a colliding name to one of the joined tables, or a SELECT * was narrowed down to explicit column names, which is exactly when the ambiguity becomes visible, per section 5."}}, {"@type": "Question", "name": "Is this the same error in MySQL and SQL Server?", "acceptedAnswer": {"@type": "Answer", "text": "The cause and fix are identical, but the wording differs. Per their docs (not measured here): MySQL raises 'ERROR 1052: Column is ambiguous', SQL Server raises 'Msg 209: Ambiguous column name'. PostgreSQL, which we tested, says 'column reference is ambiguous'."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQL &quot;column reference is ambiguous&quot; (tested)</h1>
+<p class="lead"><code>column reference "id" is ambiguous</code> (PostgreSQL) or a similar "ambiguous column name" error (MySQL, SQL Server) means two or more tables in your query have a column with the same name, and you referred to it without saying which table you meant. The database can't guess, so it refuses to run the query at all &mdash; even if the two columns happen to hold the same value.</p>
+<h2>1. Reading the error</h2>
+<p>The message names the column, not the table: <code>column reference "id" is ambiguous</code>. It tells you which name collided but not which tables are colliding &mdash; you have to look at the query to see that. This only happens when a query touches more than one table (a <code>JOIN</code>, or more than one table listed after <code>FROM</code>) and at least two of them have a column with the identical name.</p>
+
+<h2>2. Four reproduced cases (PostgreSQL 16.15)</h2>
+<table>
+<tr><th>Query</th><th>Exact error</th></tr>
+<tr><td><code>SELECT id, name FROM users JOIN orders ON users.id = orders.user_id WHERE id = 1;</code></td><td><code>ERROR: column reference "id" is ambiguous</code></td></tr>
+<tr><td><code>SELECT id, count(*) FROM users JOIN orders ON users.id = orders.user_id GROUP BY id;</code></td><td><code>ERROR: column reference "id" is ambiguous</code></td></tr>
+<tr><td><code>SELECT id FROM a_tbl JOIN b_tbl ON a_tbl.id = b_tbl.id;</code></td><td><code>ERROR: column reference "id" is ambiguous</code></td></tr>
+<tr><td><code>SELECT id, name FROM users JOIN orders ON users.id = orders.user_id;</code> (SELECT list only, no WHERE/GROUP BY use)</td><td><code>ERROR: column reference "id" is ambiguous</code></td></tr>
+</table>
+<p>Both <code>orders</code> and <code>users</code> have a column named <code>id</code> in this schema (every table has its own primary key called <code>id</code>). Postgres raises the error as soon as the unqualified name <code>id</code> appears anywhere &mdash; <code>SELECT</code> list, <code>WHERE</code>, or <code>GROUP BY</code> &mdash; it doesn't matter which clause.</p>
+
+<h2>3. The fix: qualify the column with a table name or alias</h2>
+<p>Prefix the column with the table (or a short alias) everywhere it's used:</p>
+<pre><code>-- fails: ambiguous
+SELECT id, name FROM users JOIN orders ON users.id = orders.user_id WHERE id = 1;
+
+-- works: every "id" is qualified
+SELECT u.id, u.name, o.amount
+FROM users u JOIN orders o ON u.id = o.user_id
+WHERE u.id = 1;</code></pre>
+<p>Real output after qualifying:</p>
+<pre><code>psql&gt; SELECT u.id, u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = 1;
+ id | name  | amount
+----+-------+--------
+  1 | Alice |     50
+(1 row)</code></pre>
+<p>Same fix for <code>GROUP BY</code>:</p>
+<pre><code>psql&gt; SELECT u.id, count(*) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.id;
+ id | count
+----+-------
+  2 |     1
+  1 |     1
+(2 rows)</code></pre>
+
+<h2>4. A second fix for natural joins: <code>USING</code></h2>
+<p>If the shared column has the exact same name and meaning in both tables (a true natural join key, not two unrelated <code>id</code> columns), <code>USING</code> lets you reference it unqualified afterwards &mdash; Postgres merges the two columns into one output column instead of keeping them ambiguous:</p>
+<pre><code>psql&gt; SELECT id, val, note FROM a_tbl JOIN b_tbl USING (id);
+ id | val | note
+----+-----+------
+  1 | x   | y
+(1 row)</code></pre>
+<p><code>USING (id)</code> only works when both sides are actually named <code>id</code> and you want them merged. It will not resolve our <code>users</code>/<code>orders</code> example above, because there the matching columns are named differently (<code>users.id</code> vs <code>orders.user_id</code>) &mdash; <code>USING</code> requires identical names on both sides, so that case needs the alias fix in section 3 instead.</p>
+
+<h2>5. Why <code>SELECT *</code> doesn't always catch this</h2>
+<p><code>SELECT *</code> across a join with duplicate column names doesn't error &mdash; it just returns both columns, often with no way to tell them apart in the result set. The ambiguity error only fires when <em>you</em> write the bare column name somewhere Postgres has to resolve it (a specific column in the <code>SELECT</code> list, a <code>WHERE</code>, a <code>GROUP BY</code>, an <code>ORDER BY</code>). That's why this error tends to show up only after someone narrows a <code>SELECT *</code> query down to specific columns.</p>
+
+<h2>6. Other databases</h2>
+<p>Per the MySQL and SQL Server docs (not measured on this box): MySQL raises <code>ERROR 1052 (23000): Column 'id' in field list is ambiguous</code>; SQL Server raises <code>Msg 209: Ambiguous column name 'id'</code>. The cause and fix are identical &mdash; qualify the column with its table name or alias.</p>
+
+<h2>7. Checklist</h2>
+<ul>
+<li>Alias every table in a multi-table query (<code>FROM users u JOIN orders o ON ...</code>), even if you think you won't need it.</li>
+<li>Qualify every column that could exist in more than one of the joined tables &mdash; not just the one the error names, since fixing one occurrence often reveals the next.</li>
+<li>Use <code>USING (col)</code> only when the join key is genuinely the same column in both tables and you want Postgres to merge it into one output column.</li>
+<li>Don't rely on <code>SELECT *</code> to catch this during development &mdash; it hides the collision instead of erroring.</li>
+</ul>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Which table does the ambiguous column error complain about?</summary><p>Neither, by name. PostgreSQL&#x27;s error names only the column (e.g. &quot;id&quot;), not the tables. You have to check your FROM/JOIN clauses yourself to see which tables share that column name.</p></details>
+<details><summary>Does SELECT * trigger this error?</summary><p>No. In our tests, SELECT * across a join with duplicate column names returned both columns without error. The ambiguity error only fires when you reference the bare column name directly, e.g. in WHERE, GROUP BY, or a specific SELECT item.</p></details>
+<details><summary>What&#x27;s the difference between qualifying a column and using USING?</summary><p>Qualifying (u.id) keeps both columns distinct; you choose which one you meant. USING (id) merges two identically-named join columns into a single output column. USING only works when both sides are actually named the same thing and represent the same key.</p></details>
+<details><summary>Why did my query work yesterday but fail today with this error?</summary><p>Someone likely added a column with a colliding name to one of the joined tables, or a SELECT * was narrowed down to explicit column names, which is exactly when the ambiguity becomes visible, per section 5.</p></details>
+<details><summary>Is this the same error in MySQL and SQL Server?</summary><p>The cause and fix are identical, but the wording differs. Per their docs (not measured here): MySQL raises &#x27;ERROR 1052: Column is ambiguous&#x27;, SQL Server raises &#x27;Msg 209: Ambiguous column name&#x27;. PostgreSQL, which we tested, says &#x27;column reference is ambiguous&#x27;.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with PostgreSQL 16.15 (official Docker image), using psql. Every error message below is copy-pasted output, not paraphrased. MySQL and SQL Server use the same join/alias rule but phrase the error differently (per their docs, not measured here). PlainHeaders is our extension; PostgreSQL and Docker are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

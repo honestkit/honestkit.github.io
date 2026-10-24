@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MongoDB Connection Refused (ECONNREFUSED): Causes and Fixes</title>
+<meta name="description" content="The mongodb driver doesn&#x27;t fail fast: by default it waits 30s before reporting ECONNREFUSED. We measured the exact error, the real wait, and mongoose&#x27;s wrapper.">
+<link rel="canonical" href="https://honestkit.github.io/guides/mongodb-connection-refused-econnrefused/">
+<meta property="og:title" content="MongoDB Connection Refused (ECONNREFUSED): Causes and Fixes">
+<meta property="og:description" content="The mongodb driver doesn&#x27;t fail fast: by default it waits 30s before reporting ECONNREFUSED. We measured the exact error, the real wait, and mongoose&#x27;s wrapper.">
+<meta property="og:url" content="https://honestkit.github.io/guides/mongodb-connection-refused-econnrefused/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the exact error for a MongoDB connection refused in Node?", "acceptedAnswer": {"@type": "Answer", "text": "With the official mongodb driver (measured, v7.7.0) it's a MongoServerSelectionError whose message is \"connect ECONNREFUSED 127.0.0.1:<port>\" and whose .cause holds the raw ECONNREFUSED. With mongoose (measured, v9.10.3) the class name is MongooseServerSelectionError instead, same message."}}, {"@type": "Question", "name": "Why does my app take 30 seconds to fail when MongoDB is down?", "acceptedAnswer": {"@type": "Answer", "text": "That's the driver's default serverSelectionTimeoutMS. We measured that the real TCP refusal happens in milliseconds, but the driver retries server selection internally (about every 500ms, per our heartbeat measurements) and only throws after the full 30000ms default elapses. Set serverSelectionTimeoutMS lower if you need a faster failure; we measured 2000ms working with the same error."}}, {"@type": "Question", "name": "Is this different from how Postgres or Redis fail?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, measured on this box: pg and ioredis both surface ECONNREFUSED within milliseconds, with no mandatory wait. MongoDB's driver buries the same millisecond-fast refusal inside a 30-second default retry window before your code sees anything."}}, {"@type": "Question", "name": "Does MongoDB automatically reconnect if the server comes back?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, measured: we stopped a live container mid-session and started a fresh one 5 seconds later with no reconnect code. The driver kept retrying heartbeats on its own and picked the new server up as soon as it was listening. Queries issued during the outage stayed pending and resolved successfully once the server returned, rather than failing individually."}}, {"@type": "Question", "name": "I'm on MongoDB Atlas and get a timeout, not ECONNREFUSED. Why?", "acceptedAnswer": {"@type": "Answer", "text": "Per MongoDB's documentation (not measured on this box, since Atlas needs a cloud account), an IP not on the project's allowlist is typically dropped rather than actively refused, so you get a timeout-style failure inside MongoServerSelectionError rather than an immediate ECONNREFUSED. It can still take up to the full serverSelectionTimeoutMS to surface. Check the Atlas Network Access allowlist before assuming it's a generic network problem."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>MongoDB connection refused (tested)</h1>
+<p class="lead">MongoDB connection errors in Node almost always surface as a <code>MongoServerSelectionError</code>, not a plain <code>ECONNREFUSED</code>. The driver hides the instant OS-level refusal behind its own retry loop and a 30-second default timeout. We ran a real MongoDB in Docker, then measured the closed-port error, the real wall-clock wait, mongoose's wrapper, and what happens to in-flight queries when a live server disappears mid-session.</p>
+<h2>1. The error you are probably seeing</h2>
+<p>With the official <code>mongodb</code> driver (measured, v7.7.0), connecting to a port nothing is listening on throws a <code>MongoServerSelectionError</code>, not a raw <code>ECONNREFUSED</code>. We connected to port 27019 (nothing listening) and let the driver run to its default timeout:</p>
+<pre><code>MongoServerSelectionError: connect ECONNREFUSED 127.0.0.1:27019
+    at Topology.selectServer (.../mongodb/lib/sdam/topology.js:348:38)
+    at async Topology._connect (.../mongodb/lib/sdam/topology.js:220:28)
+    at async MongoClient.connect (.../mongodb/lib/mongo_client.js:195:13)
+{
+  errorLabelSet: Set(3) { 'SystemOverloadedError', 'RetryableError', 'ResetPool' },
+  [cause]: Error: connect ECONNREFUSED 127.0.0.1:27019 {
+    errno: -111, code: 'ECONNREFUSED', syscall: 'connect'
+  }
+}</code></pre>
+<p>The real <code>ECONNREFUSED</code> is still there &mdash; it is the <code>.cause</code> of the error, and it fires in a few milliseconds, same as Postgres and Redis. But the driver does not throw it to your code right away. It treats the first refusal as "this one server is bad" and keeps retrying server selection against the whole topology until <code>serverSelectionTimeoutMS</code> runs out, which defaults to <strong>30000</strong>. Only then does it give up and throw <code>MongoServerSelectionError</code>, with the original <code>ECONNREFUSED</code> attached as <code>.cause</code>.</p>
+
+<h2>2. Our test setup</h2>
+<p>This box has Docker but no <code>mongod</code> or <code>mongosh</code> binaries (<code>which mongod mongosh</code> returned nothing). We ran a real, throwaway MongoDB and drove it with Node instead of the Mongo shell.</p>
+<pre><code>$ docker run --rm -d --name forever-mongotest -p 27018:27017 mongo:7
+$ docker logs forever-mongotest | tail -1
+{"msg":"Waiting for connections","attr":{"port":27017,"ssl":"off"}}</code></pre>
+<p>mongod was already "Waiting for connections" by the time the pull finished and the container started (image was cached after the first pull). We connected the <code>mongodb</code> driver to the live container, to a closed port (27019), then stopped the live container mid-session with <code>docker stop</code> and started a fresh one on the same port 5 seconds later, with no reconnect code in the app.</p>
+
+<h2>3. Results: a 30-second default wait, confirmed by the clock</h2>
+<table>
+<tr><th>Scenario</th><th>What we did</th><th>Exact result</th><th>Wall-clock time</th></tr>
+<tr><td>Happy path</td><td>Connected to live mongo:7 on 27018</td><td>Connected, <code>buildInfo</code> returned version <code>7.0.43</code></td><td>26 ms</td></tr>
+<tr><td>Closed port, default options</td><td>Connected to port 27019, no options</td><td><code>MongoServerSelectionError: connect ECONNREFUSED 127.0.0.1:27019</code></td><td><strong>30007 ms</strong></td></tr>
+<tr><td>Closed port, <code>serverSelectionTimeoutMS: 2000</code></td><td>Same, with an explicit 2 s cap</td><td>Same error message, same error class</td><td>2011 ms</td></tr>
+<tr><td>Closed port, mongoose default</td><td><code>mongoose.connect()</code> with <code>serverSelectionTimeoutMS: 2000</code></td><td><code>MongooseServerSelectionError: connect ECONNREFUSED 127.0.0.1:27019</code></td><td>2016 ms</td></tr>
+</table>
+<p>The first row proves this is not a hang on our end: a reachable MongoDB answers in milliseconds, same as Postgres or Redis. The second row is the one that catches people out &mdash; with no options set, our code <strong>sat for exactly 30 seconds</strong> before seeing any error at all, even though the OS refused the TCP connection in under 5 ms. We confirmed the internal retries are frequent, not one 30 s sleep: listening for <code>serverHeartbeatFailed</code> events during the 2 s run showed attempts at roughly 12 ms, 516 ms, 1018 ms and 1522 ms &mdash; about every 500 ms, which matches the driver's <code>minHeartbeatFrequencyMS</code> default used while establishing a connection.</p>
+
+<h2>4. mongoose wraps the same error, doesn't fix the wait</h2>
+<p>Most apps use <code>mongoose</code>, not the raw driver. We measured that mongoose's error has a different name, <code>MongooseServerSelectionError</code> instead of <code>MongoServerSelectionError</code>, but the same message and the same underlying 30 s default (we tested with an explicit 2 s cap for speed; the message text was identical: <code>connect ECONNREFUSED 127.0.0.1:27019</code>). If your code checks <code>err.name</code> or does <code>err instanceof MongoServerSelectionError</code>, that check will miss on mongoose &mdash; use <code>err.name === 'MongooseServerSelectionError'</code> or check for the driver error as <code>err.cause</code>/nested reason instead, or just match on the <code>ECONNREFUSED</code> substring in the message.</p>
+
+<h2>5. Live test: stop the server, watch queries queue, restart it</h2>
+<p>We connected to the live container, pinged it once a second, then ran <code>docker stop forever-mongotest</code> about 6.8 s in and started a fresh container on the same port roughly 5 s after that, with <code>serverSelectionTimeoutMS: 20000</code> and no reconnect code.</p>
+<pre><code>[+6534ms] heartbeat ok
+[+6810ms] heartbeat FAILED interrupted at shutdown
+[+7315ms] heartbeat FAILED connect ECONNREFUSED 127.0.0.1:27018
+[+7819ms .. +12344ms] heartbeat FAILED connect ECONNREFUSED 127.0.0.1:27018   (every ~500ms)
+[+12846ms] heartbeat FAILED connection &lt;monitor&gt; to 127.0.0.1:27018 closed
+[+13852ms] heartbeat ok
+[+13859ms] ping -&gt; OK   (6 pings issued during the outage all resolved here, together)</code></pre>
+<p>Two things stand out. First, the driver recovered with zero reconnect code, the same as what we measured for <code>ioredis</code> against Redis &mdash; it kept retrying heartbeats roughly every 500 ms and picked the new server up the moment it started listening. Second, and different from both Postgres and Redis: the <code>ping</code> commands we issued <em>during</em> the outage did not reject or error individually. They stayed pending &mdash; queued behind server selection &mdash; and all resolved successfully together the instant the server came back, because the whole outage (about 7 s) was inside the 20 s <code>serverSelectionTimeoutMS</code> we'd set. An app that only logs on error would see nothing at all for an outage shorter than its timeout, just slower responses.</p>
+
+<h2>6. Common real causes</h2>
+<ul>
+<li><strong>mongod not started yet, crashed, or wrong port.</strong> Measured (section 3): gives <code>MongoServerSelectionError</code> wrapping <code>ECONNREFUSED</code>, but only after the full <code>serverSelectionTimeoutMS</code> wait unless you've lowered it.</li>
+<li><strong>Docker Compose startup race.</strong> Per the pattern we measured for Postgres and Redis containers, not separately re-measured for Mongo here: mongod can take a few seconds to log "Waiting for connections," and an app that connects at container start hits the same ECONNREFUSED-under-the-hood case, just hidden behind a much longer default timeout than Postgres or Redis apps see.</li>
+<li><strong>MongoDB Atlas (cloud) IP allowlist rejecting the connection.</strong> Per MongoDB's own documentation, not measured on this box (Atlas needs a cloud account): an IP not on the project's allowlist typically does not get an instant refusal at all. It times out during server selection, producing the same <code>MongoServerSelectionError</code> class but with a timeout-flavored underlying cause rather than <code>ECONNREFUSED</code> &mdash; and it can take the full 30 s default to surface, which is easy to mistake for a slow network rather than a blocked IP.</li>
+<li><strong>Wrong connection string host/replica set name.</strong> Per MongoDB docs, not measured: an <code>mongodb+srv://</code> URI with a bad DNS record fails at the SRV lookup step, before server selection even starts, with a DNS-flavored error rather than <code>ECONNREFUSED</code>.</li>
+<li><strong>Auth failure once reachable.</strong> Per MongoDB docs, not measured here: a reachable server rejecting bad credentials returns a fast, explicit authentication error, not a <code>MongoServerSelectionError</code> &mdash; if you're getting the slow 30 s error, the problem is reachability, not your username or password.</li>
+</ul>
+
+<h2>7. How MongoDB compares to Postgres and Redis</h2>
+<p>We measured <a href="/guides/err-connection-refused-econnrefused/">ECONNREFUSED</a> behaviour the same way for all three database layers on this box, and the timeout default is the real difference:</p>
+<ul>
+<li><strong>Postgres (<code>pg</code> driver):</strong> throws a plain <code>Error</code> with <code>code: 'ECONNREFUSED'</code> within a few milliseconds of a refused connection. No built-in retry.</li>
+<li><strong>Redis (<code>ioredis</code>):</strong> emits an <code>'error'</code> event with <code>ECONNREFUSED</code> within milliseconds, then retries forever on its own with growing backoff, by default.</li>
+<li><strong>MongoDB (<code>mongodb</code>/<code>mongoose</code>):</strong> the underlying <code>ECONNREFUSED</code> also happens within milliseconds, but it is buried inside internal retries for the full <code>serverSelectionTimeoutMS</code> (30 s default) before your code ever sees an error. That is the single biggest practical difference: a MongoDB outage can look like your whole app hung for 30 seconds, when the network-level failure was actually instant.</li>
+</ul>
+
+<h2>8. How to fix it</h2>
+<ul>
+<li>Lower <code>serverSelectionTimeoutMS</code> for anything latency-sensitive (we measured 2000 ms working exactly as expected, same error, 15x faster). Don't set it to near-zero in production: a brief Compose startup race or a GC pause can then look like a real outage.</li>
+<li>Confirm the process is actually up: <code>docker ps</code> for a mongod container, or <code>docker logs &lt;container&gt;</code> for <code>"Waiting for connections"</code> (what we waited for in our test).</li>
+<li>Check <code>err.cause</code> (raw driver) or the error message text for <code>ECONNREFUSED</code> to tell "nothing is listening" apart from an Atlas allowlist timeout or a DNS/SRV failure &mdash; they land in the same error class but need different fixes.</li>
+<li>On mongoose, match on <code>err.name === 'MongooseServerSelectionError'</code>, not <code>MongoServerSelectionError</code> &mdash; the names differ even though the message is the same.</li>
+<li>Don't assume a silent app is a healthy one: we measured that queries issued mid-outage just queue and succeed quietly if the server returns before the timeout. Add your own query-level timeout or latency metric if you need to notice a degraded database before the 30 s mark.</li>
+<li>In Docker, make sure the published port and host match your connection string, and that the app and MongoDB containers share a network if either uses a service name instead of an IP.</li>
+</ul>
+<p>For the plain cross-language version of this error outside a database context, see <a href="/guides/err-connection-refused-econnrefused/">ERR_CONNECTION_REFUSED / ECONNREFUSED</a>. If your connection hangs with no refusal at all rather than an eventual error, see <a href="/guides/err-connection-timed-out-etimedout/">ETIMEDOUT</a>.</p>
+<aside class="cta"><strong>Check the status and headers your API actually returns when its database is unreachable:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the exact error for a MongoDB connection refused in Node?</summary><p>With the official mongodb driver (measured, v7.7.0) it&#x27;s a MongoServerSelectionError whose message is &quot;connect ECONNREFUSED 127.0.0.1:&lt;port&gt;&quot; and whose .cause holds the raw ECONNREFUSED. With mongoose (measured, v9.10.3) the class name is MongooseServerSelectionError instead, same message.</p></details>
+<details><summary>Why does my app take 30 seconds to fail when MongoDB is down?</summary><p>That&#x27;s the driver&#x27;s default serverSelectionTimeoutMS. We measured that the real TCP refusal happens in milliseconds, but the driver retries server selection internally (about every 500ms, per our heartbeat measurements) and only throws after the full 30000ms default elapses. Set serverSelectionTimeoutMS lower if you need a faster failure; we measured 2000ms working with the same error.</p></details>
+<details><summary>Is this different from how Postgres or Redis fail?</summary><p>Yes, measured on this box: pg and ioredis both surface ECONNREFUSED within milliseconds, with no mandatory wait. MongoDB&#x27;s driver buries the same millisecond-fast refusal inside a 30-second default retry window before your code sees anything.</p></details>
+<details><summary>Does MongoDB automatically reconnect if the server comes back?</summary><p>Yes, measured: we stopped a live container mid-session and started a fresh one 5 seconds later with no reconnect code. The driver kept retrying heartbeats on its own and picked the new server up as soon as it was listening. Queries issued during the outage stayed pending and resolved successfully once the server returned, rather than failing individually.</p></details>
+<details><summary>I&#x27;m on MongoDB Atlas and get a timeout, not ECONNREFUSED. Why?</summary><p>Per MongoDB&#x27;s documentation (not measured on this box, since Atlas needs a cloud account), an IP not on the project&#x27;s allowlist is typically dropped rather than actively refused, so you get a timeout-style failure inside MongoServerSelectionError rather than an immediate ECONNREFUSED. It can still take up to the full serverSelectionTimeoutMS to surface. Check the Atlas Network Access allowlist before assuming it&#x27;s a generic network problem.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0, the official `mongodb` npm driver v7.7.0, and `mongoose` v9.10.3, against a real mongo:7 Docker image (mongod 7.0.43) on 127.0.0.1:27018, and against a definitely-closed local port 27019. This box has no mongod or mongosh binaries, only Docker. MongoDB Atlas&#x27;s IP-allowlist behaviour is labelled as such and was not measured. PlainHeaders is our extension; curl, Node.js, Docker and the mongodb/mongoose packages are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

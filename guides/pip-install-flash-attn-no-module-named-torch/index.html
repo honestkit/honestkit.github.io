@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pip install flash-attn: No module named &#x27;torch&#x27; (fix)</title>
+<meta name="description" content="Why flash-attn fails to build (torch, setuptools.build_meta, CUDA_HOME), the SKIP_CUDA_BUILD trap, and which prebuilt wheel to use. Measured, incl. ComfyUI.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pip-install-flash-attn-no-module-named-torch/">
+<meta property="og:title" content="pip install flash-attn: No module named &#x27;torch&#x27; (fix)">
+<meta property="og:description" content="Why flash-attn fails to build (torch, setuptools.build_meta, CUDA_HOME), the SKIP_CUDA_BUILD trap, and which prebuilt wheel to use. Measured, incl. ComfyUI.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pip-install-flash-attn-no-module-named-torch/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does pip install flash-attn say No module named torch when torch is installed?", "acceptedAnswer": {"@type": "Answer", "text": "pip builds it in an isolated environment without torch, and flash-attn's setup.py imports torch. Use --no-build-isolation, or better, install a matching prebuilt wheel from the GitHub release."}}, {"@type": "Question", "name": "Is there a flash-attn wheel for torch 2.9 or Windows?", "acceptedAnswer": {"@type": "Answer", "text": "Not from the project: release v2.8.3.post2 has Linux x86_64 wheels for torch 2.4 to 2.8 only."}}, {"@type": "Question", "name": "Does FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE fix it?", "acceptedAnswer": {"@type": "Answer", "text": "No. The install succeeds but the wheel has no compiled kernel, so importing flash_attn fails with No module named 'flash_attn_2_cuda'."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pip install flash-attn: No module named &#x27;torch&#x27; (fix)</h1>
+<p class="lead"><code>pip install flash-attn</code> fails with <code>ModuleNotFoundError: No module named &#x27;torch&#x27;</code> even though torch is installed. We reproduced that and the three errors that come after it (including ComfyUI&#x27;s <code>--use-flash-attention</code> message), and checked which prebuilt wheels exist.</p>
+<h2 id="comfyui">1. ComfyUI: --use-flash-attention without flash-attn</h2>
+<p>ComfyUI v0.37.0 started with <code>python main.py --use-flash-attention</code> in a venv that does not have flash-attn:</p>
+<pre><code>[ERROR] 
+
+To use the `--use-flash-attention` feature, the `flash-attn` package must be installed first.
+command:
+	/path/to/venv/bin/python -m pip install flash-attn</code></pre>
+<p>ComfyUI exited with code 255. flash-attn is not in ComfyUI&#x27;s <code>requirements.txt</code>, and the command it suggests is exactly the one that fails next.</p>
+<h2 id="torch">2. pip install flash-attn: No module named &#x27;torch&#x27;</h2>
+<p>flash-attn 2.8.3.post2 is published on PyPI as a source archive only (no wheels). With pip 26.2.2 and torch 2.9.0 already installed in the venv:</p>
+<pre><code>python -m pip install flash-attn</code></pre>
+<pre><code>        File &quot;&lt;string&gt;&quot;, line 22, in &lt;module&gt;
+      ModuleNotFoundError: No module named &#x27;torch&#x27;
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+ERROR: Failed to build &#x27;flash-attn&#x27; when getting requirements to build wheel</code></pre>
+<p>Torch <i>is</i> installed, but pip builds the package in an isolated build environment that only contains the build tools, and flash-attn&#x27;s <code>setup.py</code> imports torch at line 22. That is why its README says to use <code>--no-build-isolation</code>.</p>
+<h2 id="setuptools">3. --no-build-isolation: Cannot import &#x27;setuptools.build_meta&#x27;</h2>
+<p>Without isolation, pip uses whatever is in your venv. Venvs made by <code>uv venv</code> (and some others) contain no setuptools:</p>
+<pre><code>pip._vendor.pyproject_hooks._impl.BackendUnavailable: Cannot import &#x27;setuptools.build_meta&#x27;</code></pre>
+<p>(pip exit code 2.) Install the build requirements first: <code>python -m pip install setuptools wheel packaging psutil ninja</code>.</p>
+<h2 id="cuda">4. CUDA_HOME environment variable is not set</h2>
+<p>With those installed and torch 2.9.0+cu128 from PyPI, on a machine without the CUDA toolkit:</p>
+<pre><code>python -m pip install flash-attn --no-build-isolation</code></pre>
+<pre><code>          raise OSError(&#x27;CUDA_HOME environment variable is not set. &#x27;
+      OSError: CUDA_HOME environment variable is not set. Please set it to your CUDA install root.
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+error: metadata-generation-failed
+
+× Encountered error while generating package metadata.
+╰─&gt; flash-attn
+
+note: This is an issue with the package mentioned above, not pip.
+hint: See above for details.</code></pre>
+<p>The PyPI torch wheel ships CUDA <i>runtime</i> libraries, not the compiler (<code>nvcc</code>). flash-attn&#x27;s <code>setup.py</code> defines its CUDA extension while pip is still generating metadata, so it needs a CUDA toolkit before it even reaches its &quot;download a prebuilt wheel&quot; step.</p>
+<h2 id="trap">5. The trap: FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE</h2>
+<p>Setting that variable makes the install &quot;succeed&quot;:</p>
+<pre><code>FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE python -m pip install flash-attn --no-build-isolation</code></pre>
+<pre><code>  Building wheel for flash-attn (pyproject.toml): finished with status &#x27;done&#x27;
+  Created wheel for flash-attn: filename=flash_attn-2.8.3.post2-py3-none-any.whl size=373167 sha256=b8379362a4a69ab969a3ea8ff13f9bc50e51b5fcb7005f9263be51d3af2a81a7
+  Stored in directory: ~/.cache/pip/wheels/03/65/4b/0234d6d6db26f61784989e2e0f1782aeee16df3f25dff78c93
+Successfully built flash-attn
+Installing collected packages: einops, flash-attn
+
+Successfully installed einops-0.8.2 flash-attn-2.8.3.post2</code></pre>
+<p>Note the 373 kB <code>py3-none-any</code> wheel: there is no compiled kernel in it. Importing it:</p>
+<pre><code>python -c "from flash_attn import flash_attn_func"</code></pre>
+<pre><code>  File &quot;&lt;string&gt;&quot;, line 1, in &lt;module&gt;
+  File &quot;/path/to/venv/lib/python3.11/site-packages/flash_attn/__init__.py&quot;, line 3, in &lt;module&gt;
+    from flash_attn.flash_attn_interface import (
+  File &quot;/path/to/venv/lib/python3.11/site-packages/flash_attn/flash_attn_interface.py&quot;, line 15, in &lt;module&gt;
+    import flash_attn_2_cuda as flash_attn_gpu
+ModuleNotFoundError: No module named &#x27;flash_attn_2_cuda&#x27;</code></pre>
+<p>Uninstall it (<code>python -m pip uninstall flash-attn</code>) and use one of the fixes below.</p>
+<h2 id="fix">6. Fix: install the matching prebuilt wheel</h2>
+<p>The project&#x27;s GitHub release <code>v2.8.3.post2</code> (2026-10-13) has 48 prebuilt wheels. All are <b>Linux x86_64, CUDA 12, torch 2.4 to 2.8, CPython 3.9 to 3.13</b>. There are no Windows wheels and none for torch 2.9. Check which one you need:</p>
+<pre><code>python -c "import torch,sys;print(torch.__version__, torch.version.cuda, torch._C._GLIBCXX_USE_CXX11_ABI, &#x27;cp%d%d&#x27;%sys.version_info[:2])"</code></pre>
+<pre><code>2.9.0+cu128 12.8 True cp311</code></pre>
+<p>The wheel name is <code>flash_attn-2.8.3.post2+cu12torch&lt;MAJOR.MINOR&gt;cxx11abi&lt;TRUE|FALSE&gt;-&lt;cpXY&gt;-&lt;cpXY&gt;-linux_x86_64.whl</code>. For example, with torch 2.8, ABI True and Python 3.11:</p>
+<pre><code>python -m pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post2/flash_attn-2.8.3.post2+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl</code></pre>
+<ul>
+<li><b>torch 2.9 or newer (as in our output above):</b> no prebuilt wheel matches. Either install torch 2.8 in that venv, or build from source: install the CUDA toolkit, set <code>CUDA_HOME</code>, and run step 4&#x27;s command (setting <code>MAX_JOBS=4</code> keeps RAM use down; the build takes a long time).</li>
+<li><b>Windows:</b> the project publishes no Windows wheels; you have to build from source with Visual Studio and the CUDA toolkit, or use third-party wheels at your own risk.</li>
+<li><b>ComfyUI without flash-attn:</b> just drop <code>--use-flash-attention</code>. ComfyUI falls back to PyTorch attention.</li>
+</ul>
+<p>Limits: this box has no NVIDIA GPU, so we measured every failure above but could not run the flash-attn kernel itself.</p>
+<p>Related: <a href="/guides/comfyui-sageattention-no-module-named-triton/">ComfyUI: sageattention No module named &#x27;triton&#x27;</a> · <a href="/guides/comfyui-no-module-named-torchsde/">ComfyUI: No module named &#x27;torchsde&#x27;</a> · <a href="/guides/comfyui-no-module-named-torch-directml/">ComfyUI: No module named &#x27;torch_directml&#x27;</a></p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does pip install flash-attn say No module named torch when torch is installed?</summary><p>pip builds it in an isolated environment without torch, and flash-attn&#x27;s setup.py imports torch. Use --no-build-isolation, or better, install a matching prebuilt wheel from the GitHub release.</p></details>
+<details><summary>Is there a flash-attn wheel for torch 2.9 or Windows?</summary><p>Not from the project: release v2.8.3.post2 has Linux x86_64 wheels for torch 2.4 to 2.8 only.</p></details>
+<details><summary>Does FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE fix it?</summary><p>No. The install succeeds but the wheel has no compiled kernel, so importing flash_attn fails with No module named &#x27;flash_attn_2_cuda&#x27;.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux x86_64 (no GPU), CPython 3.11.17, pip 26.2.2: flash-attn 2.8.3.post2 from PyPI with torch 2.9.0+cpu and 2.9.0+cu128; ComfyUI v0.37.0 --use-flash-attention. Release assets read from GitHub the same day. The CUDA kernel itself not run. Output pasted unedited except shortened paths. PlainTables is our extension; flash-attn and ComfyUI are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

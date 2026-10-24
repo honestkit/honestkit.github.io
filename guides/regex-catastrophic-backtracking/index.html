@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Regex Catastrophic Backtracking: Cause, Timing and Fix (Tested)</title>
+<meta name="description" content="We timed a vulnerable regex on growing input until it hung, then measured three fixes that stay fast at 100,000 characters.">
+<link rel="canonical" href="https://honestkit.github.io/guides/regex-catastrophic-backtracking/">
+<meta property="og:title" content="Regex Catastrophic Backtracking: Cause, Timing and Fix (Tested)">
+<meta property="og:description" content="We timed a vulnerable regex on growing input until it hung, then measured three fixes that stay fast at 100,000 characters.">
+<meta property="og:url" content="https://honestkit.github.io/guides/regex-catastrophic-backtracking/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What makes (a+)+ catastrophic but a+ alone fine?", "acceptedAnswer": {"@type": "Answer", "text": "a+ has exactly one way to match any run of a's, so there's nothing to backtrack into. (a+)+ can split the same run of a's between the inner and outer + in many different ways, and on a failing match the engine tries each split in turn. We measured that growing the input by 5 characters multiplied the time by roughly 30x, which is exponential, not linear."}}, {"@type": "Question", "name": "How fast does it actually blow up?", "acceptedAnswer": {"@type": "Answer", "text": "In our measurements: n=10 took 0.0001s, n=20 took 0.0476s, n=25 took 1.4802s, and n=30 did not finish inside a hard 5-second timeout (killed, exit code 124). Real inputs are usually longer than 30 characters, so this is a real hang, not a theoretical slowdown."}}, {"@type": "Question", "name": "Do atomic groups or possessive quantifiers change what the pattern matches?", "acceptedAnswer": {"@type": "Answer", "text": "They can, in patterns where backtracking into the inner group was load-bearing for matching something the outer pattern would otherwise reject. For the simplify-or-harden examples we tested, the match result (None, on non-matching input) was identical with and without the fix \u2014 only the time changed. Always re-test your real match cases after adding either one."}}, {"@type": "Question", "name": "What Python version added atomic groups and possessive quantifiers to re?", "acceptedAnswer": {"@type": "Answer", "text": "Per the Python changelog (not something we measured directly), both landed in Python 3.11. We confirmed on this box's Python 3.13.5 that both (?>...) and ++ /*+ /?+ compile and run correctly. On older versions, the third-party regex package supports both."}}, {"@type": "Question", "name": "What if I can't control or rewrite the pattern at all?", "acceptedAnswer": {"@type": "Answer", "text": "Wrap the match call in a hard wall-clock timeout as a backstop. We measured signal.setitimer aborting a hanging match() cleanly at a 2-second budget. It's Unix-only and runs on the main thread; in a worker thread or on Windows, run the match in a separate process with a timeout instead."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Regex Catastrophic Backtracking (tested)</h1>
+<p class="lead">Catastrophic backtracking is when a regex engine's running time explodes on certain non-matching input, because nested or overlapping quantifiers force it to try an exponential number of ways to fail. We reproduced it with real timings, then measured three different fixes.</p>
+<h2>1. Reproduced: a pattern that looks harmless</h2>
+<pre><code>$ cat backtrack.py
+import re, time, sys
+pattern = re.compile(r"^(a+)+$")
+n = int(sys.argv[1])
+s = "a" * n + "!"
+t0 = time.perf_counter()
+m = pattern.match(s)
+t1 = time.perf_counter()
+print(f"n={n} match={m} elapsed={t1-t0:.4f}s")</code></pre>
+<p><code>^(a+)+$</code> matches one or more "a"s. We fed it strings of all "a"s followed by one "!" so it can never match, and timed how long the engine takes to give up and report that:</p>
+<table>
+<tr><th>n (a's before the !)</th><th>Result</th><th>Elapsed</th></tr>
+<tr><td>10</td><td>None</td><td>0.0001s</td></tr>
+<tr><td>20</td><td>None</td><td>0.0476s</td></tr>
+<tr><td>25</td><td>None</td><td>1.4802s</td></tr>
+<tr><td>30</td><td>&mdash;</td><td>killed by a hard 5s timeout, still running</td></tr>
+<tr><td>35</td><td>&mdash;</td><td>killed by a hard 5s timeout, still running</td></tr>
+</table>
+<p>Each +5 characters multiplied the time by roughly 30&times;. That's exponential growth, not linear or even polynomial: the same engine that rejects a 25-character string in 1.5 seconds doesn't finish a 30-character string in 5 full seconds. A real input of a few hundred characters would not finish this century.</p>
+
+<h2>2. Why it happens</h2>
+<p><code>(a+)+</code> nests one "one or more" quantifier inside another. For an input of all "a"s, there are many different ways to split those "a"s between the inner and outer repetition that all consume the same characters &mdash; for example 20 a's could be grouped as one block of 20, two blocks of 10, four of 5, and so on. When the overall match fails (because of the trailing <code>!</code>), the engine backtracks and tries the <em>next</em> grouping instead of concluding immediately that no grouping will ever help, since none of them touch the real problem: the <code>!</code> at the end. The number of groupings grows exponentially with the number of a's, and Python's <code>re</code> tries them one at a time.</p>
+
+<h2>3. Reproduced: it's a real hang, not just "slow"</h2>
+<pre><code>$ timeout 5 python3 backtrack.py 30; echo "exit=$?"
+exit=124</code></pre>
+<p>Exit code 124 is what GNU <code>timeout</code> returns when it had to kill the process. This is the actual risk: a regex like this, fed user input (a search box, a log line, a URL), can tie up a worker thread or an entire request indefinitely. It is a known denial-of-service vector (sometimes called ReDoS), not a theoretical curiosity.</p>
+
+<h2>4. Fix 1 &mdash; rewrite the pattern</h2>
+<p><code>(a+)+</code> is redundant: one or more of "one or more a's" is exactly the same language as one or more a's. We measured the simplified pattern <code>^a+$</code> against an input 3,000&times; longer than the one the original pattern couldn't finish in 5 seconds:</p>
+<pre><code>$ cat fixed_rewrite.py
+import re, time, sys
+pattern = re.compile(r"^a+$")
+n = int(sys.argv[1])
+s = "a" * n + "!"
+t0 = time.perf_counter()
+m = pattern.match(s)
+print(f"rewrite n={n} match={m} elapsed={time.perf_counter()-t0:.4f}s")
+
+$ python3 fixed_rewrite.py 100000
+rewrite n=100000 match=None elapsed=0.0007s</code></pre>
+<p>100,000 characters in under a millisecond, versus the original pattern not finishing 30 characters in 5 seconds. The best fix for catastrophic backtracking is almost always removing the redundant nesting that caused it &mdash; it's worth checking whether the "safe" pattern just does, too.</p>
+
+<h2>5. Fix 2 &mdash; atomic group, when you can't simplify the pattern</h2>
+<p>Python's <code>re</code> module (3.11+) supports atomic groups with <code>(?&gt;...)</code>. An atomic group commits to whatever it matched and never backtracks into it, which removes the exponential blowup even when you keep the nested structure:</p>
+<pre><code>$ cat fixed_atomic.py
+import re, time, sys
+pattern = re.compile(r"^(?&gt;a+)+$")
+n = int(sys.argv[1])
+s = "a" * n + "!"
+t0 = time.perf_counter()
+m = pattern.match(s)
+print(f"atomic n={n} match={m} elapsed={time.perf_counter()-t0:.4f}s")
+
+$ python3 fixed_atomic.py 100000
+atomic n=100000 match=None elapsed=0.0001s</code></pre>
+<p>We measured the same 100,000-character input instant with the atomic group added, with the original nested shape otherwise untouched.</p>
+
+<h2>6. Fix 3 &mdash; possessive quantifiers</h2>
+<p>Also added to <code>re</code> in Python 3.11, <code>++</code> is a possessive version of <code>+</code>: it matches greedily like normal but, like an atomic group, never gives back characters by backtracking:</p>
+<pre><code>$ cat fixed_possessive.py
+import re, time, sys
+pattern = re.compile(r"^(a++)+$")
+n = int(sys.argv[1])
+s = "a" * n + "!"
+t0 = time.perf_counter()
+m = pattern.match(s)
+print(f"possessive n={n} match={m} elapsed={time.perf_counter()-t0:.4f}s")
+
+$ python3 fixed_possessive.py 100000
+possessive n=100000 match=None elapsed=0.0001s</code></pre>
+<p>Same result as the atomic group: instant on 100,000 characters. Use whichever reads clearer in context; they solve the same problem the same way.</p>
+
+<h2>7. Fix 4 &mdash; a hard timeout as a backstop</h2>
+<p>None of the above helps if you don't control the pattern (for example, a user-supplied regex). As a last resort we measured a hard wall-clock budget using <code>signal.setitimer</code>, which works because SIGALRM interrupts even a CPU-bound C-level match in progress:</p>
+<pre><code>$ cat sigtimeout.py
+import re, signal, time
+class RegexTimeout(Exception): pass
+def handler(signum, frame): raise RegexTimeout()
+pattern = re.compile(r"^(a+)+$")
+s = "a" * 30 + "!"
+signal.signal(signal.SIGALRM, handler)
+signal.setitimer(signal.ITIMER_REAL, 2.0)
+t0 = time.perf_counter()
+try:
+    m = pattern.match(s)
+    print("matched:", m)
+except RegexTimeout:
+    print(f"aborted: regex exceeded 2.0s budget (elapsed {time.perf_counter()-t0:.2f}s)")
+finally:
+    signal.setitimer(signal.ITIMER_REAL, 0)
+
+$ python3 sigtimeout.py
+aborted: regex exceeded 2.0s budget (elapsed 2.00s)</code></pre>
+<p>This cleanly aborted the same pattern that otherwise hangs past 5 seconds, at exactly the 2-second budget we set. Caveat we didn't disprove but didn't need to test further: <code>SIGALRM</code> is Unix-only and fires on the main thread, so this exact approach doesn't work unmodified inside a thread or on Windows &mdash; there, a separate worker process with a timeout is the equivalent backstop.</p>
+
+<h2>8. Checklist</h2>
+<ul>
+<li>Look for nested or adjacent quantifiers on patterns that can overlap the same characters: <code>(a+)+</code>, <code>(a|a)*</code>, <code>(a*)*</code>, <code>(.*)*</code>.</li>
+<li>First try removing the redundant nesting &mdash; it's usually both faster and more correct.</li>
+<li>If the structure is genuinely needed, add atomic groups <code>(?&gt;...)</code> or possessive quantifiers (<code>++</code>, <code>*+</code>, <code>?+</code>); both are in Python's <code>re</code> since 3.11.</li>
+<li>For patterns you don't control (user-supplied regex), wrap matching in a hard timeout as a backstop, not as the primary fix.</li>
+<li>Test with adversarial input before shipping: a long run of the repeated character followed by one character that can't match, like our <code>"a"*n + "!"</code>.</li>
+</ul>
+<p>If the pattern itself is failing to compile rather than hanging, see <a href="/guides/python-invalid-escape-sequence-regex/">Python's invalid escape sequence warning</a>, a different regex gotcha we measured on the same box.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What makes (a+)+ catastrophic but a+ alone fine?</summary><p>a+ has exactly one way to match any run of a&#x27;s, so there&#x27;s nothing to backtrack into. (a+)+ can split the same run of a&#x27;s between the inner and outer + in many different ways, and on a failing match the engine tries each split in turn. We measured that growing the input by 5 characters multiplied the time by roughly 30x, which is exponential, not linear.</p></details>
+<details><summary>How fast does it actually blow up?</summary><p>In our measurements: n=10 took 0.0001s, n=20 took 0.0476s, n=25 took 1.4802s, and n=30 did not finish inside a hard 5-second timeout (killed, exit code 124). Real inputs are usually longer than 30 characters, so this is a real hang, not a theoretical slowdown.</p></details>
+<details><summary>Do atomic groups or possessive quantifiers change what the pattern matches?</summary><p>They can, in patterns where backtracking into the inner group was load-bearing for matching something the outer pattern would otherwise reject. For the simplify-or-harden examples we tested, the match result (None, on non-matching input) was identical with and without the fix — only the time changed. Always re-test your real match cases after adding either one.</p></details>
+<details><summary>What Python version added atomic groups and possessive quantifiers to re?</summary><p>Per the Python changelog (not something we measured directly), both landed in Python 3.11. We confirmed on this box&#x27;s Python 3.13.5 that both (?&gt;...) and ++ /*+ /?+ compile and run correctly. On older versions, the third-party regex package supports both.</p></details>
+<details><summary>What if I can&#x27;t control or rewrite the pattern at all?</summary><p>Wrap the match call in a hard wall-clock timeout as a backstop. We measured signal.setitimer aborting a hanging match() cleanly at a 2-second budget. It&#x27;s Unix-only and runs on the main thread; in a worker thread or on Windows, run the match in a separate process with a timeout instead.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with CPython 3.13.5 on a real Linux box. Every timing below is from time.perf_counter() around a single match() call; runs that could hang were hard-capped with the shell&#x27;s timeout(1) at 5s so none ran unbounded. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

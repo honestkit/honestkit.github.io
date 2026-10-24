@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TensorFlow &quot;triggered tf.function retracing&quot; Warning: Fix</title>
+<meta name="description" content="&quot;5 out of the last 5 calls ... triggered tf.function retracing&quot;: reproduced on TensorFlow 2.21 with trace counts, then fixed with tensors and reduce_retracing.">
+<link rel="canonical" href="https://honestkit.github.io/guides/tensorflow-function-triggered-tf-function-retracing/">
+<meta property="og:title" content="TensorFlow &quot;triggered tf.function retracing&quot; Warning: Fix">
+<meta property="og:description" content="&quot;5 out of the last 5 calls ... triggered tf.function retracing&quot;: reproduced on TensorFlow 2.21 with trace counts, then fixed with tensors and reduce_retracing.">
+<meta property="og:url" content="https://honestkit.github.io/guides/tensorflow-function-triggered-tf-function-retracing/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does triggered tf.function retracing mean?", "acceptedAnswer": {"@type": "Answer", "text": "The tf.function built a new graph on (almost) every call. It is a performance warning; results are still correct."}}, {"@type": "Question", "name": "How do I stop tf.function retracing?", "acceptedAnswer": {"@type": "Answer", "text": "Pass tensors instead of Python scalars, define the function once outside loops, and use reduce_retracing=True or an input_signature when shapes change."}}, {"@type": "Question", "name": "How can I count how often a tf.function traced?", "acceptedAnswer": {"@type": "Answer", "text": "Call fn.experimental_get_tracing_count() on the decorated function."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TensorFlow &quot;triggered tf.function retracing&quot; warning (tested)</h1>
+<p class="lead"><code>WARNING:tensorflow:5 out of the last 5 calls to &lt;function&gt; triggered tf.function retracing</code> means each call built a new graph, usually because you pass Python numbers instead of tensors or a new shape each time. Measured below: 6 traces for 6 calls, down to 1 with <code>tf.constant</code> and 2 with <code>reduce_retracing=True</code>.</p>
+<h2 id="repro">1. Reproduce</h2>
+<p><code>b1.py</code> calls a <code>@tf.function</code> six times, passing a different Python <code>int</code> each time:</p>
+<pre><code>import os; os.environ[&quot;TF_CPP_MIN_LOG_LEVEL&quot;] = &quot;3&quot;
+import tensorflow as tf
+
+@tf.function
+def scale(x, factor):
+    return x * factor
+
+for i in range(6):
+    scale(tf.constant([1.0, 2.0]), i)          # Python int: a new graph per value
+print(&quot;traces:&quot;, scale.experimental_get_tracing_count())</code></pre>
+<pre><code>WARNING:tensorflow:5 out of the last 5 calls to &lt;function scale at 0x7f1b27e471a0&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings could be due to (1) creating @tf.function repeatedly in a loop, (2) passing tensors with different shapes, (3) passing Python objects instead of tensors. For (1), please define your @tf.function outside of the loop. For (2), @tf.function has reduce_retracing=True option that can avoid unnecessary retracing. For (3), please refer to https://www.tensorflow.org/guide/function#controlling_retracing and https://www.tensorflow.org/api_docs/python/tf/function for  more details.
+WARNING:tensorflow:6 out of the last 6 calls to &lt;function scale at 0x7f1b27e471a0&gt; triggered tf.function retracing. Tracing is expensive and the excessive number of tracings could be due to (1) creating @tf.function repeatedly in a loop, (2) passing tensors with different shapes, (3) passing Python objects instead of tensors. For (1), please define your @tf.function outside of the loop. For (2), @tf.function has reduce_retracing=True option that can avoid unnecessary retracing. For (3), please refer to https://www.tensorflow.org/guide/function#controlling_retracing and https://www.tensorflow.org/api_docs/python/tf/function for  more details.
+traces: 6</code></pre>
+<p>It is a warning, not an exception: the results are correct, but every call built a new graph (6 traces for 6 calls), which is slower than plain eager code. Python values (ints, floats, strings, lists) are part of the trace signature, so each new value means a new trace.</p>
+<h2 id="fix">2. Fix: pass tensors, and relax shapes</h2>
+<pre><code>import os; os.environ[&quot;TF_CPP_MIN_LOG_LEVEL&quot;] = &quot;3&quot;
+import tensorflow as tf
+
+@tf.function
+def scale(x, factor):
+    return x * factor
+
+for i in range(6):
+    scale(tf.constant([1.0, 2.0]), tf.constant(float(i)))   # tensor arg: one graph
+print(&quot;traces:&quot;, scale.experimental_get_tracing_count())
+
+@tf.function(reduce_retracing=True)
+def total(x):
+    return tf.reduce_sum(x)
+
+for n in range(1, 7):
+    total(tf.ones([n]))                        # new shape every call
+print(&quot;reduce_retracing traces:&quot;, total.experimental_get_tracing_count())</code></pre>
+<pre><code>traces: 1
+reduce_retracing traces: 2</code></pre>
+<ul><li><strong>Python scalars:</strong> wrap them in <code>tf.constant(...)</code>; the same function now traces once for all six calls.</li>
+<li><strong>Changing shapes:</strong> <code>@tf.function(reduce_retracing=True)</code> traced twice for six different lengths, then reused a generalized shape. An explicit <code>input_signature=[tf.TensorSpec([None], tf.float32)]</code> pins it to one trace.</li>
+<li><strong>Function defined in a loop:</strong> each new <code>tf.function</code> object traces from scratch; define it once, outside the loop (cause (1) in the warning).</li></ul>
+<p>Count traces yourself with <code>fn.experimental_get_tracing_count()</code>, as above.</p>
+<p>Related: <a href="/guides/tensorflow-keras-error-keras-3-imports/">TensorFlow Keras errors after Keras 3</a>, <a href="/guides/tensorflow-install-error-no-matching-distribution/">pip install tensorflow: no matching distribution found</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does triggered tf.function retracing mean?</summary><p>The tf.function built a new graph on (almost) every call. It is a performance warning; results are still correct.</p></details>
+<details><summary>How do I stop tf.function retracing?</summary><p>Pass tensors instead of Python scalars, define the function once outside loops, and use reduce_retracing=True or an input_signature when shapes change.</p></details>
+<details><summary>How can I count how often a tf.function traced?</summary><p>Call fn.experimental_get_tracing_count() on the decorated function.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 with tensorflow-cpu 2.21.0 and Python 3.13.5 on Linux. The scripts ran verbatim and the output was pasted unedited (TensorFlow startup log lines filtered). PlainTables is our extension; TensorFlow is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

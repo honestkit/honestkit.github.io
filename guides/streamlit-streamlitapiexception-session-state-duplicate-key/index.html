@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StreamlitAPIException: Duplicate Key &amp; session_state Fix (Tested)</title>
+<meta name="description" content="Fix StreamlitAPIException in streamlit 1.66: duplicate element ID/key, session_state cannot be modified after the widget, read-only button state. Tested.">
+<link rel="canonical" href="https://honestkit.github.io/guides/streamlit-streamlitapiexception-session-state-duplicate-key/">
+<meta property="og:title" content="StreamlitAPIException: Duplicate Key &amp; session_state Fix (Tested)">
+<meta property="og:description" content="Fix StreamlitAPIException in streamlit 1.66: duplicate element ID/key, session_state cannot be modified after the widget, read-only button state. Tested.">
+<meta property="og:url" content="https://honestkit.github.io/guides/streamlit-streamlitapiexception-session-state-duplicate-key/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does \"There are multiple elements with the same key\" mean in Streamlit?", "acceptedAnswer": {"@type": "Answer", "text": "Two elements were given the same key argument. Keys must be unique across the whole app run."}}, {"@type": "Question", "name": "How do I fix st.session_state cannot be modified after the widget with that key is instantiated?", "acceptedAnswer": {"@type": "Answer", "text": "Set the value before the widget is created, or change it inside an on_change/on_click callback."}}, {"@type": "Question", "name": "Why can't I set a button value in st.session_state?", "acceptedAnswer": {"@type": "Answer", "text": "Button state is read-only. Store the result under a different session_state key instead."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>StreamlitAPIException: duplicate key, session_state cannot be modified (tested)</h1>
+<p class="lead"><code>StreamlitAPIException</code> is the parent of several Streamlit errors. The common ones: duplicate widgets without a unique <code>key</code>, the same <code>key</code> used twice, <code>st.session_state.x = ...</code> after the widget with <code>key="x"</code> was created, and assigning to a button's read-only state. Each fix is shown below, tested.</p>
+<h2 id="repro">1. The four common StreamlitAPIExceptions</h2>
+<p><code>b1.py</code> runs small apps with Streamlit's built-in <code>AppTest</code> and prints the exception each one raises:</p>
+<pre><code>from streamlit.testing.v1 import AppTest
+
+cases = {
+&quot;duplicate widget (no key)&quot;: &#x27;&#x27;&#x27;
+import streamlit as st
+st.text_input(&quot;Name&quot;)
+st.text_input(&quot;Name&quot;)
+&#x27;&#x27;&#x27;,
+&quot;duplicate key&quot;: &#x27;&#x27;&#x27;
+import streamlit as st
+st.button(&quot;A&quot;, key=&quot;go&quot;)
+st.button(&quot;B&quot;, key=&quot;go&quot;)
+&#x27;&#x27;&#x27;,
+&quot;session_state after widget&quot;: &#x27;&#x27;&#x27;
+import streamlit as st
+st.text_input(&quot;Name&quot;, key=&quot;name&quot;)
+st.session_state.name = &quot;Bob&quot;
+&#x27;&#x27;&#x27;,
+&quot;value + session_state&quot;: &#x27;&#x27;&#x27;
+import streamlit as st
+st.session_state.n = 5
+st.number_input(&quot;N&quot;, value=1, key=&quot;n&quot;)
+&#x27;&#x27;&#x27;,
+&quot;set button state&quot;: &#x27;&#x27;&#x27;
+import streamlit as st
+st.session_state.go = True
+st.button(&quot;Go&quot;, key=&quot;go&quot;)
+&#x27;&#x27;&#x27;,
+}
+for name, src in cases.items():
+    at = AppTest.from_string(src).run()
+    if at.exception:
+        e = at.exception[0]
+        print(f&quot;{name}:\n  {e.proto.type.split(&#x27;.&#x27;)[-1]}: {e.message.splitlines()[0]}&quot;)
+    else:
+        print(f&quot;{name}: no exception&quot;)</code></pre>
+<p>Output (streamlit 1.66.1, Python 3.13.5; Streamlit's log lines on stderr hidden):</p>
+<pre><code>duplicate widget (no key):
+  StreamlitDuplicateElementId: There are multiple `text_input` elements with the same auto-generated ID. When this element is created, it is assigned an internal ID based on the element type and provided parameters. Multiple elements with the same type and parameters will cause this error.
+duplicate key:
+  StreamlitDuplicateElementKey: There are multiple elements with the same `key=&#x27;go&#x27;`. To fix this, please make sure that the `key` argument is unique for each element you create.
+session_state after widget:
+  StreamlitWidgetAlreadyInstantiatedError: `st.session_state[&#x27;name&#x27;]` cannot be modified after the widget with that key is instantiated. Assign `st.session_state[&#x27;name&#x27;]` before creating the widget, or update it from an `on_change` or `on_click` callback, which runs before the widget is instantiated. If this is a read-only session state key (buttons, file and media inputs, `st.data_editor`, forms, chart or `ButtonColumn` selections), store the value under a different session state key.
+value + session_state: no exception
+set button state:
+  StreamlitValueAssignmentNotAllowedError: `st.session_state[&#x27;go&#x27;]` is read-only and cannot be assigned through session state. Use a different session state key for values you need to set.</code></pre>
+<ul><li><strong>StreamlitDuplicateElementId</strong>: two widgets of the same type with the same label and parameters and no <code>key</code> (typical inside a loop). Give each a unique <code>key</code>, e.g. <code>key=f"name_{i}"</code>.</li>
+<li><strong>StreamlitDuplicateElementKey</strong>: you passed the same <code>key</code> to two elements, even of different types or labels.</li>
+<li><strong>StreamlitWidgetAlreadyInstantiatedError</strong>: <code>st.session_state.name = ...</code> after the widget with <code>key="name"</code> was created in this run. Set it before the widget, or in an <code>on_change</code>/<code>on_click</code> callback.</li>
+<li><strong>StreamlitValueAssignmentNotAllowedError</strong>: buttons (and file uploaders, forms, <code>st.data_editor</code>) have read-only session state; store your own value under a different key.</li>
+<li>Setting session state <em>before</em> a widget that also has <code>value=</code> is not an exception: Streamlit logs <code>The widget with key "n" was created with a default value but also had its value set via the Session State API.</code> and the widget shows the session state value (5, not 1).</li></ul>
+<h2 id="fix">2. The fixed app</h2>
+<p><code>b2.py</code>:</p>
+<pre><code>from streamlit.testing.v1 import AppTest
+import streamlit.errors as E
+print(&quot;subclasses of StreamlitAPIException:&quot;,
+      all(issubclass(c, E.StreamlitAPIException) for c in (
+          E.StreamlitDuplicateElementId, E.StreamlitDuplicateElementKey,
+          E.StreamlitWidgetAlreadyInstantiatedError,
+          E.StreamlitValueAssignmentNotAllowedError)))
+fixed = &#x27;&#x27;&#x27;
+import streamlit as st
+st.text_input(&quot;Name&quot;, key=&quot;name_1&quot;)          # unique keys
+st.text_input(&quot;Name&quot;, key=&quot;name_2&quot;)
+if &quot;city&quot; not in st.session_state:           # set BEFORE the widget
+    st.session_state.city = &quot;Paris&quot;
+st.text_input(&quot;City&quot;, key=&quot;city&quot;)
+def reset():                                 # or change it in a callback
+    st.session_state.city = &quot;&quot;
+st.button(&quot;Reset&quot;, key=&quot;reset&quot;, on_click=reset)
+st.session_state.clicked = st.button(&quot;Go&quot;)   # store button result under another key
+st.write(&quot;city =&quot;, st.session_state.city)
+&#x27;&#x27;&#x27;
+at = AppTest.from_string(fixed).run()
+print(&quot;exceptions:&quot;, len(at.exception), &quot;| city:&quot;, at.text_input(key=&quot;city&quot;).value)
+at.button(key=&quot;reset&quot;).click().run()
+print(&quot;after Reset click -&gt; exceptions:&quot;, len(at.exception), &quot;| city:&quot;, repr(at.text_input(key=&quot;city&quot;).value))</code></pre>
+<pre><code>subclasses of StreamlitAPIException: True
+exceptions: 0 | city: Paris
+after Reset click -&gt; exceptions: 0 | city: &#x27;&#x27;</code></pre>
+<ul><li>All four are subclasses of <code>streamlit.errors.StreamlitAPIException</code>.</li>
+<li>The pattern that avoids most of them: unique keys, initialize <code>st.session_state</code> with <code>if "k" not in st.session_state</code> at the top, and change widget values only in callbacks, which run before the script re-runs.</li>
+<li><code>streamlit.testing.v1.AppTest</code> reproduces these without a browser, so you can put a regression test for your app in pytest.</li></ul>
+<p>Related: <a href="/guides/streamlit-error-message-st-error-vs-st-exception/">Streamlit error message: st.error vs st.exception</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &quot;There are multiple elements with the same key&quot; mean in Streamlit?</summary><p>Two elements were given the same key argument. Keys must be unique across the whole app run.</p></details>
+<details><summary>How do I fix st.session_state cannot be modified after the widget with that key is instantiated?</summary><p>Set the value before the widget is created, or change it inside an on_change/on_click callback.</p></details>
+<details><summary>Why can&#x27;t I set a button value in st.session_state?</summary><p>Button state is read-only. Store the result under a different session_state key instead.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with streamlit 1.66.1 and Python 3.13.5 on Linux, using streamlit.testing.v1.AppTest. Scripts ran verbatim and the output was pasted unedited. PlainTables is our extension; Streamlit is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

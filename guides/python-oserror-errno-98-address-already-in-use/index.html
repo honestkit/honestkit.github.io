@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OSError: [Errno 98] Address already in use (Python, Tested)</title>
+<meta name="description" content="Python [Errno 98] Address already in use: find what holds the port, and why SO_REUSEADDR only fixed the TIME_WAIT restart when both sockets set it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-oserror-errno-98-address-already-in-use/">
+<meta property="og:title" content="OSError: [Errno 98] Address already in use (Python, Tested)">
+<meta property="og:description" content="Python [Errno 98] Address already in use: find what holds the port, and why SO_REUSEADDR only fixed the TIME_WAIT restart when both sockets set it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-oserror-errno-98-address-already-in-use/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I fix Errno 98 Address already in use in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Find the process holding the port (ss -ltnp or lsof -i :PORT) and stop it, or use another port. For quick restarts, set SO_REUSEADDR before bind() in every run."}}, {"@type": "Question", "name": "Why does SO_REUSEADDR not fix Address already in use?", "acceptedAnswer": {"@type": "Answer", "text": "On Linux the TIME_WAIT socket left by the old server must also have had SO_REUSEADDR set. It also never allows two servers listening on the same port."}}, {"@type": "Question", "name": "Does http.server set SO_REUSEADDR?", "acceptedAnswer": {"@type": "Answer", "text": "http.server.HTTPServer and socket.create_server do; plain socketserver.TCPServer does not (allow_reuse_address = False)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>OSError: [Errno 98] Address already in use in Python (tested)</h1>
+<p class="lead"><code>OSError: [Errno 98] Address already in use</code> means <code>bind()</code> found the port taken: either another process is listening on it, or your previous server left it in <code>TIME_WAIT</code>. We tested both on Linux: <code>SO_REUSEADDR</code> fixed the restart case only when the old and the new socket both set it.</p>
+<h2 id="test">1. The error</h2>
+<pre><code>import socket
+
+a = socket.create_server((&quot;127.0.0.1&quot;, 8964))
+b = socket.create_server((&quot;127.0.0.1&quot;, 8964))</code></pre>
+<p>Output:</p>
+<pre><code>Traceback (most recent call last):
+  File &quot;/tmp/ad/b1.py&quot;, line 4, in &lt;module&gt;
+    b = socket.create_server((&quot;127.0.0.1&quot;, 8964))
+  File &quot;/usr/lib/python3.13/socket.py&quot;, line 949, in create_server
+    raise error(err.errno, msg) from None
+OSError: [Errno 98] Address already in use (while attempting to bind on address (&#x27;127.0.0.1&#x27;, 8964))</code></pre>
+<p>Something already listens on that address and port: another copy of your script, a server you started earlier that is still running in another terminal or in the background, or a different program. Find it with <code>ss -ltnp | grep :8964</code> (Linux) or <code>lsof -i :8964</code> (macOS/Linux), then stop it or choose another port.</p>
+<h2 id="type">2. It is a plain OSError with errno EADDRINUSE</h2>
+<pre><code>import errno, socket
+
+a = socket.create_server((&quot;127.0.0.1&quot;, 8964))
+try:
+    socket.create_server((&quot;127.0.0.1&quot;, 8964))
+except OSError as e:
+    print(type(e).__name__, e.errno, errno.errorcode[e.errno])
+    print(&quot;ConnectionError?&quot;, isinstance(e, ConnectionError), &quot;| PermissionError?&quot;, isinstance(e, PermissionError))</code></pre>
+<p>Output:</p>
+<pre><code>OSError 98 EADDRINUSE
+ConnectionError? False | PermissionError? False</code></pre>
+<p>There is no dedicated subclass, so catch <code>OSError</code> and compare <code>e.errno == errno.EADDRINUSE</code> (98 on Linux; the number differs on macOS and Windows, the constant does not).</p>
+<h2 id="restart">3. Address already in use right after restarting your server</h2>
+<pre><code>import socket
+
+def bind(port, reuse):
+    s = socket.socket()
+    if reuse:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((&quot;127.0.0.1&quot;, port)); s.listen()
+    return s
+
+def restart(port, old_reuse):
+    # a server that accepted a connection and closed first leaves TIME_WAIT behind
+    srv = bind(port, old_reuse)
+    c = socket.create_connection((&quot;127.0.0.1&quot;, port)); conn, _ = srv.accept()
+    conn.close(); srv.close(); c.close()
+    for reuse in (False, True):
+        try:
+            bind(port, reuse).close()
+            print(f&quot;  restart with SO_REUSEADDR={reuse}: bound&quot;)
+        except OSError as e:
+            print(f&quot;  restart with SO_REUSEADDR={reuse}: {e}&quot;)
+
+print(&quot;old server WITHOUT SO_REUSEADDR:&quot;); restart(8965, old_reuse=False)
+print(&quot;old server WITH SO_REUSEADDR:&quot;);    restart(8966, old_reuse=True)</code></pre>
+<p>Output:</p>
+<pre><code>old server WITHOUT SO_REUSEADDR:
+  restart with SO_REUSEADDR=False: [Errno 98] Address already in use
+  restart with SO_REUSEADDR=True: [Errno 98] Address already in use
+old server WITH SO_REUSEADDR:
+  restart with SO_REUSEADDR=False: [Errno 98] Address already in use
+  restart with SO_REUSEADDR=True: bound</code></pre>
+<p>When a server closes a connection first, the port stays in <code>TIME_WAIT</code> for up to a minute or so (<code>ss -tan</code> shows it), and a plain <code>bind()</code> fails during that time. <code>SO_REUSEADDR</code> fixes it, but on Linux only if <strong>both</strong> the old and the new socket set it: setting it only in the restarted server still failed. Set it before <code>bind()</code> in every run, and the next restart binds immediately. It does not let two live servers share a port.</p>
+<h2 id="helpers">4. What the standard library already does</h2>
+<pre><code>import socket
+
+print(&quot;create_server sets SO_REUSEADDR:&quot;,
+      socket.create_server((&quot;127.0.0.1&quot;, 8967)).getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0)
+s = socket.create_server((&quot;127.0.0.1&quot;, 0))     # port 0: the OS picks a free port
+print(&quot;free port:&quot;, s.getsockname()[1] &gt; 0)</code></pre>
+<p>Output:</p>
+<pre><code>create_server sets SO_REUSEADDR: True
+free port: True</code></pre>
+<pre><code>import http.server, socketserver
+print(&quot;HTTPServer.allow_reuse_address:&quot;, http.server.HTTPServer.allow_reuse_address)
+print(&quot;TCPServer.allow_reuse_address:&quot;, socketserver.TCPServer.allow_reuse_address)</code></pre>
+<p>Output:</p>
+<pre><code>HTTPServer.allow_reuse_address: 1
+TCPServer.allow_reuse_address: False</code></pre>
+<p><code>socket.create_server()</code> sets <code>SO_REUSEADDR</code> on POSIX for you, and <code>http.server.HTTPServer</code> sets <code>allow_reuse_address</code>, but a plain <code>socketserver.TCPServer</code> does not: subclass it with <code>allow_reuse_address = True</code>. Binding to port 0 lets the OS pick a free port, which is the simplest fix for tests.</p>
+<p>Related: <a href="/guides/eaddrinuse-address-already-in-use/">EADDRINUSE: address already in use (Node and others)</a> · <a href="/guides/python-connectionrefusederror-errno-111-connection-refused/">[Errno 111] Connection refused</a> · <a href="/guides/python-socket-error-handling-exceptions-and-errno-codes/">socket errors and errno codes</a>.</p>
+
+<aside class="cta"><strong>Server running again? Check the headers and status it actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I fix Errno 98 Address already in use in Python?</summary><p>Find the process holding the port (ss -ltnp or lsof -i :PORT) and stop it, or use another port. For quick restarts, set SO_REUSEADDR before bind() in every run.</p></details>
+<details><summary>Why does SO_REUSEADDR not fix Address already in use?</summary><p>On Linux the TIME_WAIT socket left by the old server must also have had SO_REUSEADDR set. It also never allows two servers listening on the same port.</p></details>
+<details><summary>Does http.server set SO_REUSEADDR?</summary><p>http.server.HTTPServer and socket.create_server do; plain socketserver.TCPServer does not (allow_reuse_address = False).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Python 3.13.5 on Linux (Debian 13). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

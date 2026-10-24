@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>statistics: kde() Returns an Unpicklable Closure</title>
+<meta name="description" content="We measured Python 3.13.5: statistics.kde() returns a local closure function, so pickling it for caching or multiprocessing raises AttributeError.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-statistics-kde-returns-a-closure-that-cant-be-pickled/">
+<meta property="og:title" content="statistics: kde() Returns an Unpicklable Closure">
+<meta property="og:description" content="We measured Python 3.13.5: statistics.kde() returns a local closure function, so pickling it for caching or multiprocessing raises AttributeError.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-statistics-kde-returns-a-closure-that-cant-be-pickled/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can you pickle the function returned by statistics.kde()?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured pickle.dumps() on it raising AttributeError: Can't get local object 'kde.<locals>.pdf', because kde() returns a closure defined inside its own function body, which pickle can't look up by name."}}, {"@type": "Question", "name": "Why can't statistics.kde()'s return value be sent to a multiprocessing worker?", "acceptedAnswer": {"@type": "Answer", "text": "Because it can't be pickled -- multiprocessing.Pool relies on pickle to send callables to worker processes, and we measured the kde() closure failing to pickle with the same AttributeError as a direct pickle.dumps() call."}}, {"@type": "Question", "name": "Does statistics.kde()'s returned function expose the original data or bandwidth?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it having no public data or h attribute, even though both values are captured internally in the function's closure cells. Recovering them means keeping the original arguments and calling kde() again."}}, {"@type": "Question", "name": "How do I cache or reuse a statistics.kde() result across processes?", "acceptedAnswer": {"@type": "Answer", "text": "Save the original data list and the h/kernel arguments instead of the returned function, and call kde() again wherever you need it -- we measured the function itself as fundamentally unpicklable, so there's no way to serialize the fitted result directly."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>statistics: kde() Returns a Closure That Can&#x27;t Be Pickled (tested)</h1>
+<p class="lead"><code>statistics.kde()</code> is new in Python 3.13 -- it fits a kernel density estimate to a dataset and hands back something you call like a function to get the estimated density at any point. We measured what that returned object actually is, and whether it survives being pickled.</p>
+<h2 id="repro1">1. kde() returns a plain function, not a reusable, inspectable object</h2>
+<pre><code>import statistics as st
+
+data = [1, 2, 3, 4, 5]
+density = st.kde(data, h=1)
+
+print(type(density))
+print(density(3))
+print(repr(density))</code></pre>
+<pre><code>&lt;class 'function'&gt;
+0.1981731324932191
+&lt;function kde.&lt;locals&gt;.pdf at 0x7f9712d15620&gt;</code></pre>
+<p><strong>Measured:</strong> <code>kde()</code> returns an ordinary Python function -- specifically a closure defined inside <code>kde()</code>'s own body (its <code>repr</code> literally says <code>kde.&lt;locals&gt;.pdf</code>). Calling it works exactly like the documentation shows. There's no separate model object with its own methods or attributes -- just this one callable.</p>
+
+<h2 id="repro2">2. That closure can't be pickled</h2>
+<pre><code>import pickle
+import statistics as st
+
+data = [1, 2, 3, 4, 5]
+density = st.kde(data, h=1)
+
+try:
+    pickle.dumps(density)
+except AttributeError as e:
+    print("pickle failed:", e)</code></pre>
+<pre><code>pickle failed: Can't get local object 'kde.&lt;locals&gt;.pdf'</code></pre>
+<p><strong>Measured:</strong> <code>pickle.dumps()</code> raises <code>AttributeError</code> because the function returned by <code>kde()</code> is defined inside another function (a closure), and Python's <code>pickle</code> module can only pickle functions it can look up by their module-level qualified name -- a locally-defined function has no such importable path. This breaks silently-expected workflows: caching a fitted density estimate to disk with <code>pickle</code>, sending it to a <code>multiprocessing.Pool</code> worker, or storing it in a <code>joblib</code>/Redis cache all rely on pickling, and all fail the same way.</p>
+
+<h2 id="repro3">3. The underlying data and parameters aren't recoverable from the returned function either</h2>
+<pre><code>import statistics as st
+
+data = [1, 2, 3, 4, 5]
+density = st.kde(data, h=1)
+
+print(density.__closure__ is not None)
+print(hasattr(density, "data"))
+print(hasattr(density, "h"))</code></pre>
+<pre><code>True
+False
+False</code></pre>
+<p><strong>Measured:</strong> the fitted data and bandwidth are captured in the function's <code>__closure__</code> cells, but there's no public attribute exposing them -- <code>density.data</code> and <code>density.h</code> both don't exist. If a fitted <code>kde()</code> result needs to survive a process boundary or be written to disk, the only option is re-running <code>kde()</code> on the original <code>data</code> and <code>h</code> again on the other side -- which means those two values need to be saved separately, not the function <code>kde()</code> returns.</p>
+<aside class="cta"><strong>Fitting a kernel density estimate with statistics.kde() and planning to cache or send it to a worker process? Check it pickles first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can you pickle the function returned by statistics.kde()?</summary><p>No -- we measured pickle.dumps() on it raising AttributeError: Can&#x27;t get local object &#x27;kde.&lt;locals&gt;.pdf&#x27;, because kde() returns a closure defined inside its own function body, which pickle can&#x27;t look up by name.</p></details>
+<details><summary>Why can&#x27;t statistics.kde()&#x27;s return value be sent to a multiprocessing worker?</summary><p>Because it can&#x27;t be pickled -- multiprocessing.Pool relies on pickle to send callables to worker processes, and we measured the kde() closure failing to pickle with the same AttributeError as a direct pickle.dumps() call.</p></details>
+<details><summary>Does statistics.kde()&#x27;s returned function expose the original data or bandwidth?</summary><p>No -- we measured it having no public data or h attribute, even though both values are captured internally in the function&#x27;s closure cells. Recovering them means keeping the original arguments and calling kde() again.</p></details>
+<details><summary>How do I cache or reuse a statistics.kde() result across processes?</summary><p>Save the original data list and the h/kernel arguments instead of the returned function, and call kde() again wherever you need it -- we measured the function itself as fundamentally unpicklable, so there&#x27;s no way to serialize the fitted result directly.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in statistics module: called the new (3.13) kde() function and tried to pickle the object it returns. PlainHeaders is our extension; Python&#x27;s statistics module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>import yolov5: No module named &#x27;pkg_resources&#x27; (tested fix)</title>
+<meta name="description" content="The yolov5 PyPI package (7.0.14) imports pkg_resources, so import yolov5 fails on setuptools 82+. Tested fix: setuptools&lt;81, then the torch 2.6 weights fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/yolov5-no-module-named-pkg-resources/">
+<meta property="og:title" content="import yolov5: No module named &#x27;pkg_resources&#x27; (tested fix)">
+<meta property="og:description" content="The yolov5 PyPI package (7.0.14) imports pkg_resources, so import yolov5 fails on setuptools 82+. Tested fix: setuptools&lt;81, then the torch 2.6 weights fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/yolov5-no-module-named-pkg-resources/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does torch.hub.load ultralytics/yolov5 have the same problem?", "acceptedAnswer": {"@type": "Answer", "text": "Not from this import: the ultralytics/yolov5 master branch no longer imports pkg_resources. Only the yolov5 package on PyPI (7.0.14) does."}}, {"@type": "Question", "name": "Why does yolov5.load fail after the setuptools fix?", "acceptedAnswer": {"@type": "Answer", "text": "On torch 2.6 and newer, torch.load defaults to weights_only=True, which rejects the full-model .pt files. TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 worked in our test; use it only with trusted checkpoints."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>import yolov5: No module named &#x27;pkg_resources&#x27; (fix)</h1>
+<p class="lead">The <code>yolov5</code> package on PyPI (7.0.14, the latest) does <code>import pkg_resources</code> in <code>yolov5/utils/general.py</code>, so <code>import yolov5</code> fails with <code>ModuleNotFoundError: No module named 'pkg_resources'</code> on setuptools 82+. Tested fix: <code>pip install "setuptools&lt;81"</code>.</p>
+<h2 id="repro">1. The error: import yolov5 on a fresh install</h2>
+<p>This is about the <code>yolov5</code> package on PyPI (<code>pip install yolov5</code>), version 7.0.14 (2024-11-11), the latest. It requires <code>setuptools&gt;=65.5.1</code> with no upper limit, so a fresh Python 3.11 venv got setuptools 84.2.1 (with torch 2.14.1 CPU). Then the import itself fails:</p>
+<pre><code>$ python -c &quot;import yolov5&quot;
+Traceback (most recent call last):
+...
+  File &quot;yolov5/utils/general.py&quot;, line 34, in &lt;module&gt;
+    import pkg_resources as pkg
+ModuleNotFoundError: No module named &#x27;pkg_resources&#x27;</code></pre>
+<p><code>yolov5/utils/general.py</code> line 34 is <code>import pkg_resources as pkg</code>, and setuptools 82.0.0 removed <code>pkg_resources</code>. The Ultralytics GitHub repository (<code>ultralytics/yolov5</code>, used by <code>torch.hub.load</code> and <code>git clone</code>) no longer has this import on <code>master</code>; only the PyPI package does.</p>
+<h2 id="fix">2. Fix: pin setuptools below 81 (tested)</h2>
+<pre><code>$ pip install &quot;setuptools&lt;81&quot;    # gave 80.10.2
+$ python -c &quot;import yolov5; print(yolov5.__version__)&quot;
+...
+7.0.14</code></pre>
+<p>The import now works, with a harmless <a href="/guides/pkg-resources-is-deprecated-as-an-api/">pkg_resources is deprecated</a> warning. To hide it, set <code>PYTHONWARNINGS=&quot;ignore:pkg_resources is deprecated as an API&quot;</code>.</p>
+<h2 id="weights">3. Next wall on torch 2.6+: Weights only load failed</h2>
+<p>Loading a model with this script still failed on torch 2.14.1:</p>
+<pre><code>import numpy as np
+import yolov5
+
+model = yolov5.load(&quot;yolov5n.pt&quot;)
+img = np.zeros((320, 320, 3), dtype=np.uint8)
+results = model(img, size=320)
+print(type(results).__name__, len(results.pred[0]), &quot;detections&quot;)</code></pre>
+<pre><code>$ python b3.py
+Traceback (most recent call last):
+...
+_pickle.UnpicklingError: Weights only load failed. This file can still be loaded, to do so you have two options, do those steps only if you trust the source of the checkpoint.
+...
+WeightsUnpickler error: Unsupported global: GLOBAL models.yolo.Model was not an allowed global by default. Please use `torch.serialization.add_safe_globals([models.yolo.Model])` or the `torch.serialization.safe_globals([models.yolo.Model])` context manager to allowlist this global if you trust this class/function.</code></pre>
+<p>torch 2.6 changed <code>torch.load</code> to <code>weights_only=True</code> by default, and the official <code>yolov5n.pt</code> file stores a full model object. torch's override variable made it work:</p>
+<pre><code>$ TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python b3.py
+...
+Detections 0 detections</code></pre>
+<p>(Zero detections is expected on a black test image.) Only use this override with checkpoints you trust, such as the official Ultralytics release files: loading with <code>weights_only=False</code> can run code stored in the file. The other route is <code>pip install &quot;torch&lt;2.6&quot;</code>, which we did not test here. More options: <a href="/guides/torch-load-weights-only-load-failed/">torch.load Weights only load failed</a>.</p>
+<p>Related: <a href="/guides/python-modulenotfounderror-no-module-named-pkg-resources/">No module named 'pkg_resources' (general fix)</a> · <a href="/guides/mim-openmim-no-module-named-pkg-resources/">openmim (same cause)</a> · <a href="/guides/no-module-named-pkg-resources-tensorboard/">TensorBoard</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does torch.hub.load ultralytics/yolov5 have the same problem?</summary><p>Not from this import: the ultralytics/yolov5 master branch no longer imports pkg_resources. Only the yolov5 package on PyPI (7.0.14) does.</p></details>
+<details><summary>Why does yolov5.load fail after the setuptools fix?</summary><p>On torch 2.6 and newer, torch.load defaults to weights_only=True, which rejects the full-model .pt files. TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 worked in our test; use it only with trusted checkpoints.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux (CPU) with yolov5 7.0.14 from PyPI, torch 2.14.1+cpu, CPython 3.11.17, setuptools 80.10.2 and 84.2.1. Output pasted unedited except shortened paths and cut tracebacks. PlainTables is our extension; YOLOv5 is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

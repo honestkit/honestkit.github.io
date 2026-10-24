@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gunicorn Access Log Format: --access-logformat Examples</title>
+<meta name="description" content="gunicorn --access-logformat measured: default line, request time in ms, request-id header, JSON-style line, and what an unknown key prints.">
+<link rel="canonical" href="https://honestkit.github.io/guides/gunicorn-access-log-format-examples/">
+<meta property="og:title" content="gunicorn Access Log Format: --access-logformat Examples">
+<meta property="og:description" content="gunicorn --access-logformat measured: default line, request time in ms, request-id header, JSON-style line, and what an unknown key prints.">
+<meta property="og:url" content="https://honestkit.github.io/guides/gunicorn-access-log-format-examples/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I log request time in gunicorn?", "acceptedAnswer": {"@type": "Answer", "text": "Use %(M)s for milliseconds or %(L)s for decimal seconds in --access-logformat."}}, {"@type": "Question", "name": "How do I log a request header in gunicorn?", "acceptedAnswer": {"@type": "Answer", "text": "Use %({header-name}i)s with the header name in lower case, e.g. %({x-request-id}i)s."}}, {"@type": "Question", "name": "What happens with an unknown key in gunicorn access_log_format?", "acceptedAnswer": {"@type": "Answer", "text": "It is printed as \"-\"; there is no error, so check the output after changing the format."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>gunicorn access log format: --access-logformat examples (tested)</h1>
+<p class="lead">gunicorn writes access lines only with <code>--access-logfile</code>, in the format set by <code>--access-logformat</code>. Below: the default line and three custom formats (milliseconds, a request header, JSON-style), each run against a real request, plus what a typo in a key does.</p>
+<h2 id="repro">1. Four access-log formats, measured</h2>
+<p><code>b1.sh</code> starts gunicorn on a minimal WSGI app with <code>--access-logfile -</code> and different <code>--access-logformat</code> strings, sends one request with an <code>X-Request-ID</code> header, and prints the log line:</p>
+<pre><code># start gunicorn with an access-log format, send one request, print what it logged
+run() {
+  gunicorn app:app -b 127.0.0.1:8965 --access-logfile - --error-logfile err.log &quot;$@&quot; &gt; access.log 2&gt;&amp;1 &amp;
+  pid=$!; until curl -s -o /dev/null -H &#x27;X-Request-ID: abc-123&#x27; &#x27;http://127.0.0.1:8965/items?id=7&#x27;; do sleep 0.2; done
+  kill $pid; wait $pid 2&gt;/dev/null; cat access.log
+}
+echo &#x27;== default format&#x27;; run
+echo &#x27;== custom: time in ms, request id header, status&#x27;
+run --access-logformat &#x27;%(h)s &quot;%(r)s&quot; %(s)s %(M)sms id=%({x-request-id}i)s&#x27;
+echo &#x27;== JSON-style&#x27;
+run --access-logformat &#x27;{&quot;ip&quot;:&quot;%(h)s&quot;,&quot;path&quot;:&quot;%(U)s&quot;,&quot;query&quot;:&quot;%(q)s&quot;,&quot;status&quot;:%(s)s,&quot;secs&quot;:%(L)s}&#x27;
+echo &#x27;== unknown key %(foo)s&#x27;
+run --access-logformat &#x27;%(h)s %(foo)s %(s)s&#x27;
+echo &#x27;== error log line format&#x27;; head -1 err.log</code></pre>
+<p>Output (gunicorn 26.2.0, Python 3.13):</p>
+<pre><code>== default format
+127.0.0.1 - - [23/Oct/2026:23:09:53 +0100] &quot;GET /items?id=7 HTTP/1.1&quot; 200 2 &quot;-&quot; &quot;curl/8.14.1&quot;
+== custom: time in ms, request id header, status
+127.0.0.1 &quot;GET /items?id=7 HTTP/1.1&quot; 200 0ms id=abc-123
+== JSON-style
+{&quot;ip&quot;:&quot;127.0.0.1&quot;,&quot;path&quot;:&quot;/items&quot;,&quot;query&quot;:&quot;id=7&quot;,&quot;status&quot;:200,&quot;secs&quot;:0.000271}
+== unknown key %(foo)s
+127.0.0.1 - 200
+== error log line format
+[2026-10-23 23:09:53 +0100] [3562812] [INFO] Starting gunicorn 26.2.0</code></pre>
+<h2 id="meaning">2. What the output shows</h2>
+<ul><li>The default access format is Apache "combined"-style: client, time, request line, status, response length, referer, user agent.</li>
+<li><code>%(M)s</code> is the request time in milliseconds, <code>%(L)s</code> in decimal seconds; a fast request shows <code>0ms</code> but <code>0.000271</code> seconds.</li>
+<li>Request headers are <code>%({header-name}i)s</code> in lower case: <code>%({x-request-id}i)s</code> printed <code>abc-123</code>.</li>
+<li><code>%(U)s</code> is the path without the query string, <code>%(q)s</code> the query string, <code>%(r)s</code> the full request line.</li>
+<li>An unknown key such as <code>%(foo)s</code> does not raise an error: it is logged as <code>-</code>, so a typo fails silently.</li>
+<li><code>--access-logformat</code> only changes access lines. Error-log lines keep the <code>[time] [pid] [LEVEL] message</code> format shown last; changing that needs a logging config (<code>--log-config</code> or <code>logconfig_dict</code>).</li></ul>
+<h2 id="config">3. In gunicorn.conf.py</h2>
+<p>The same settings as a config file: <code>accesslog = "-"</code> and <code>access_log_format = '%(h)s "%(r)s" %(s)s %(M)sms'</code>. Without <code>accesslog</code> (or <code>--access-logfile</code>) there are no access lines at all, whatever the format.</p>
+<p>Related: <a href="/guides/gunicorn-logs-location-access-log-error-log/">where gunicorn logs go</a>, <a href="/guides/gunicorn-error-unrecognized-arguments/">gunicorn unrecognized arguments</a>, <a href="/guides/gunicorn-critical-worker-timeout/">gunicorn WORKER TIMEOUT</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I log request time in gunicorn?</summary><p>Use %(M)s for milliseconds or %(L)s for decimal seconds in --access-logformat.</p></details>
+<details><summary>How do I log a request header in gunicorn?</summary><p>Use %({header-name}i)s with the header name in lower case, e.g. %({x-request-id}i)s.</p></details>
+<details><summary>What happens with an unknown key in gunicorn access_log_format?</summary><p>It is printed as &quot;-&quot;; there is no error, so check the output after changing the format.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with gunicorn 26.2.0 and Python 3.13 on Linux. The script ran verbatim and the output was pasted unedited. PlainTables is our extension; gunicorn is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

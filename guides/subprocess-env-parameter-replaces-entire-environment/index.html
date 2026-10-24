@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>subprocess&#x27;s env= Replaces the Whole Environment (Tested)</title>
+<meta name="description" content="We measured subprocess.run(..., env={...}) wiping out every inherited variable, including PATH and HOME, not just adding to them.">
+<link rel="canonical" href="https://honestkit.github.io/guides/subprocess-env-parameter-replaces-entire-environment/">
+<meta property="og:title" content="subprocess&#x27;s env= Replaces the Whole Environment (Tested)">
+<meta property="og:description" content="We measured subprocess.run(..., env={...}) wiping out every inherited variable, including PATH and HOME, not just adding to them.">
+<meta property="og:url" content="https://honestkit.github.io/guides/subprocess-env-parameter-replaces-entire-environment/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does subprocess.run(env={...}) add variables to the existing environment?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured it replacing the entire environment. The child process receives only the keys you pass in env=, not those plus whatever the parent process already had."}}, {"@type": "Question", "name": "What happens to PATH if I pass env= with my own dict?", "acceptedAnswer": {"@type": "Answer", "text": "We measured PATH disappearing entirely from the child's environment unless you explicitly include it, which makes printenv PATH exit with status 1 as if PATH were never set at all."}}, {"@type": "Question", "name": "Why did a command still work even though I passed a minimal env= dict?", "acceptedAnswer": {"@type": "Answer", "text": "Based on what we measured, programs in default system directories like /bin or /usr/bin can still be found because execvp() falls back to a built-in default search path when PATH is completely missing \u2014 that's different from PATH being merged or preserved."}}, {"@type": "Question", "name": "How do I add an environment variable without losing the rest?", "acceptedAnswer": {"@type": "Answer", "text": "We'd merge explicitly: env={**os.environ, \"MY_VAR\": \"hello\"} \u2014 that keeps everything the parent process has and adds or overrides just the keys you specify."}}, {"@type": "Question", "name": "Is this subprocess env= replacement behavior documented?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 the Python docs for subprocess.Popen state that if env is not None, it defines the entire environment for the new process, replacing the default of inheriting the current process's environment. We confirmed this matches observed behavior in Python 3.13.5."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>subprocess env= Replaces, Doesn&#x27;t Merge (tested)</h1>
+<p class="lead">Passing <code>env={"MY_VAR": "x"}</code> to <code>subprocess.run()</code> looks like it adds one variable on top of the normal environment. We measured what the child process actually receives: that one variable, and nothing else &mdash; no <code>PATH</code>, no <code>HOME</code>, nothing inherited.</p>
+<h2 id="repro1">1. env= gives the child only what you list, not your variable plus the rest</h2>
+<pre><code>import subprocess, os
+
+len(subprocess.run(["printenv"], capture_output=True, text=True).stdout.splitlines())
+58
+
+subprocess.run(["printenv"], env={"ONLY_THIS": "x"}, capture_output=True, text=True).stdout
+'ONLY_THIS=x\n'</code></pre>
+<p><strong>Measured:</strong> with no <code>env=</code> argument, the child inherits the full parent environment &mdash; 58 variables in our test. Pass <code>env={"ONLY_THIS": "x"}</code> instead, and the child gets exactly one variable. Nothing is merged; <code>env=</code> is a full replacement, not an addition.</p>
+
+<h2 id="repro2">2. That includes losing PATH, which breaks executable lookup</h2>
+<pre><code>subprocess.run(["printenv", "PATH"], env={"MY_VAR": "hello"}, capture_output=True, text=True).returncode
+1
+
+subprocess.run(["printenv", "PATH"], env={"MY_VAR": "hello"}, capture_output=True, text=True).stdout
+''</code></pre>
+<p><strong>Measured:</strong> <code>PATH</code> is simply absent from the child's environment, so <code>printenv PATH</code> exits with status <code>1</code> (variable not found) and empty output &mdash; the same way it would if you'd never set <code>PATH</code> anywhere. Programs that read <code>PATH</code>, <code>HOME</code>, locale variables, or any secret your own process needs (API keys, virtualenv markers) silently don't get them, with no warning that anything is missing.</p>
+
+<h2 id="repro3">3. A fixed executable path can mask the problem at first</h2>
+<pre><code>subprocess.run(["ls"], env={"MY_VAR": "hello"}, capture_output=True, text=True).returncode
+0</code></pre>
+<p><strong>Measured:</strong> this one still ran, which can be misleading &mdash; <code>execvp()</code> falls back to a built-in default search path (typically <code>/bin:/usr/bin</code>) when <code>PATH</code> is completely absent from the child's environment, not when it's merely different. So common commands in <code>/bin</code> or <code>/usr/bin</code> may keep working by accident even while <code>PATH</code> itself, and everything else you normally rely on being inherited, is gone.</p>
+
+<h2 id="fix">4. What to actually do</h2>
+<p>If you want to add or override one or two variables while keeping everything else the parent process already has, build the dict explicitly: <code>env={**os.environ, "MY_VAR": "hello"}</code>. Only pass a hand-built minimal dict to <code>env=</code> when you specifically want to run the child in a stripped-down environment with nothing inherited &mdash; that's the one case where full replacement is actually what you want.</p>
+
+<aside class="cta"><strong>Debugging a subprocess call that&#x27;s supposed to reach an API or local server? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does subprocess.run(env={...}) add variables to the existing environment?</summary><p>No — we measured it replacing the entire environment. The child process receives only the keys you pass in env=, not those plus whatever the parent process already had.</p></details>
+<details><summary>What happens to PATH if I pass env= with my own dict?</summary><p>We measured PATH disappearing entirely from the child&#x27;s environment unless you explicitly include it, which makes printenv PATH exit with status 1 as if PATH were never set at all.</p></details>
+<details><summary>Why did a command still work even though I passed a minimal env= dict?</summary><p>Based on what we measured, programs in default system directories like /bin or /usr/bin can still be found because execvp() falls back to a built-in default search path when PATH is completely missing — that&#x27;s different from PATH being merged or preserved.</p></details>
+<details><summary>How do I add an environment variable without losing the rest?</summary><p>We&#x27;d merge explicitly: env={**os.environ, &quot;MY_VAR&quot;: &quot;hello&quot;} — that keeps everything the parent process has and adds or overrides just the keys you specify.</p></details>
+<details><summary>Is this subprocess env= replacement behavior documented?</summary><p>Yes — the Python docs for subprocess.Popen state that if env is not None, it defines the entire environment for the new process, replacing the default of inheriting the current process&#x27;s environment. We confirmed this matches observed behavior in Python 3.13.5.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5 on Linux: ran subprocess.run([&#x27;printenv&#x27;], env={&#x27;ONLY_THIS&#x27;: &#x27;x&#x27;}) and compared its full child environment against the same call with no env= argument at all, counting how many variables the child actually received. PlainHeaders is our extension; Python&#x27;s subprocess module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

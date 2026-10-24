@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Popen.communicate(timeout=) Doesn&#x27;t Kill the Process (Tested)</title>
+<meta name="description" content="We measured Popen.communicate(timeout=1) raising TimeoutExpired while leaving the child process running — you have to kill it yourself.">
+<link rel="canonical" href="https://honestkit.github.io/guides/subprocess-communicate-timeout-does-not-kill-process/">
+<meta property="og:title" content="Popen.communicate(timeout=) Doesn&#x27;t Kill the Process (Tested)">
+<meta property="og:description" content="We measured Popen.communicate(timeout=1) raising TimeoutExpired while leaving the child process running — you have to kill it yourself.">
+<meta property="og:url" content="https://honestkit.github.io/guides/subprocess-communicate-timeout-does-not-kill-process/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Popen.communicate(timeout=...) kill the child process when it times out?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured the process still running (poll() returns None) immediately after catching TimeoutExpired from communicate(). You have to call proc.kill() and proc.wait() yourself."}}, {"@type": "Question", "name": "Does subprocess.run(timeout=...) have the same problem?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured subprocess.run() leaving no surviving process after a timeout. It kills the child internally before re-raising TimeoutExpired, unlike the lower-level Popen.communicate()."}}, {"@type": "Question", "name": "What happens if I catch TimeoutExpired from communicate() and don't kill the process?", "acceptedAnswer": {"@type": "Answer", "text": "Based on what we measured, the child keeps running exactly as if the timeout never happened \u2014 it only stops Python from waiting on it, so it becomes a leaked/orphaned process for however long it would have run on its own."}}, {"@type": "Question", "name": "Is this documented behavior for Popen.communicate()?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 the Python docs for communicate() state the child isn't killed automatically on timeout, while the docs for subprocess.run() explicitly state it will kill and wait for the child. We confirmed both behaviors match in Python 3.13.5."}}, {"@type": "Question", "name": "How do I safely time out a subprocess with Popen?", "acceptedAnswer": {"@type": "Answer", "text": "We'd wrap communicate(timeout=...) in a try/except for TimeoutExpired, and in the except block call proc.kill() (or proc.terminate() first) followed by proc.wait() to actually reap the process, or just use subprocess.run(timeout=...) if Popen's extra control isn't needed."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Popen.communicate(timeout=) Leaves Process Running (tested)</h1>
+<p class="lead">Catching <code>subprocess.TimeoutExpired</code> from <code>Popen.communicate(timeout=...)</code> feels like the timeout handled itself. We measured what's actually left behind: the child process, still running, completely unaffected by the exception.</p>
+<h2 id="repro1">1. communicate(timeout=) raises, but the process survives</h2>
+<pre><code>import subprocess
+
+proc = subprocess.Popen(["sleep", "5"])
+try:
+    proc.communicate(timeout=1)
+except subprocess.TimeoutExpired as e:
+    print(e)
+Command '['sleep', '5']' timed out after 1 seconds
+
+proc.poll()
+None</code></pre>
+<p><strong>Measured:</strong> <code>poll()</code> returning <code>None</code> means the child is still alive, a full second after the timeout fired and the exception was caught. Nothing about raising <code>TimeoutExpired</code> terminates the process &mdash; it only stops Python from waiting on it any longer.</p>
+
+<h2 id="repro2">2. It stays running until you kill it yourself</h2>
+<pre><code>import time
+
+time.sleep(0.5)
+proc.poll()
+None
+proc.kill()
+proc.wait()
+proc.poll()
+-9</code></pre>
+<p><strong>Measured:</strong> the <code>sleep 5</code> child kept running well past where the 1-second timeout fired, consuming a process slot and (for a real workload) whatever CPU/memory/file handles it holds, until <code>proc.kill()</code> plus <code>proc.wait()</code> actually ends it. Catch <code>TimeoutExpired</code> without that cleanup, and the child leaks for as long as it would have run on its own &mdash; a zombie-in-waiting if you never <code>wait()</code> on it, or a fully live orphan process otherwise.</p>
+
+<h2 id="repro3">3. Contrast: subprocess.run(timeout=) does kill it</h2>
+<pre><code>try:
+    subprocess.run(["sleep", "5"], timeout=1)
+except subprocess.TimeoutExpired as e:
+    print(e)
+Command '['sleep', '5']' timed out after 1 seconds</code></pre>
+<p><strong>Measured:</strong> checking for any surviving <code>sleep</code> process immediately after confirms <code>subprocess.run()</code> leaves nothing running &mdash; it kills the child for you before re-raising <code>TimeoutExpired</code>, exactly as the <a href="https://docs.python.org/3/library/subprocess.html#subprocess.run">Python docs</a> state. The asymmetry is real: the convenience wrapper <code>run()</code> cleans up on timeout; the lower-level <code>Popen.communicate()</code> it's built on does not.</p>
+
+<h2 id="fix">4. What to actually do</h2>
+<p>If you're using <code>Popen</code> directly (not <code>run()</code>) and pass a <code>timeout</code> to <code>communicate()</code>, always catch <code>TimeoutExpired</code> and call <code>proc.kill()</code> (or <code>proc.terminate()</code> for a graceful shutdown first) followed by <code>proc.wait()</code> in the <code>except</code> block. Prefer <code>subprocess.run(..., timeout=...)</code> whenever you don't need <code>Popen</code>'s lower-level control &mdash; it already does this cleanup for you, which is exactly why the two look interchangeable but aren't.</p>
+
+<aside class="cta"><strong>Debugging a hung subprocess call that&#x27;s supposed to hit an API or local server? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Popen.communicate(timeout=...) kill the child process when it times out?</summary><p>No — we measured the process still running (poll() returns None) immediately after catching TimeoutExpired from communicate(). You have to call proc.kill() and proc.wait() yourself.</p></details>
+<details><summary>Does subprocess.run(timeout=...) have the same problem?</summary><p>No — we measured subprocess.run() leaving no surviving process after a timeout. It kills the child internally before re-raising TimeoutExpired, unlike the lower-level Popen.communicate().</p></details>
+<details><summary>What happens if I catch TimeoutExpired from communicate() and don&#x27;t kill the process?</summary><p>Based on what we measured, the child keeps running exactly as if the timeout never happened — it only stops Python from waiting on it, so it becomes a leaked/orphaned process for however long it would have run on its own.</p></details>
+<details><summary>Is this documented behavior for Popen.communicate()?</summary><p>Yes — the Python docs for communicate() state the child isn&#x27;t killed automatically on timeout, while the docs for subprocess.run() explicitly state it will kill and wait for the child. We confirmed both behaviors match in Python 3.13.5.</p></details>
+<details><summary>How do I safely time out a subprocess with Popen?</summary><p>We&#x27;d wrap communicate(timeout=...) in a try/except for TimeoutExpired, and in the except block call proc.kill() (or proc.terminate() first) followed by proc.wait() to actually reap the process, or just use subprocess.run(timeout=...) if Popen&#x27;s extra control isn&#x27;t needed.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5 on Linux: started a child process with subprocess.Popen, called communicate(timeout=1) against a process that runs longer than that, caught the TimeoutExpired exception, and checked with poll() whether the child was still alive afterward. Compared against subprocess.run(..., timeout=...) on the same kind of child. PlainHeaders is our extension; Python&#x27;s subprocess module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

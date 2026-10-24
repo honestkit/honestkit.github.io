@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>onnxruntime cannot enable executable stack (fix)</title>
+<meta name="description" content="import onnxruntime fails with cannot enable executable stack as shared object requires: Invalid argument on glibc 2.41. 1.16.3 affected, 1.17.3 OK. 3 fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/onnxruntime-cannot-enable-executable-stack/">
+<meta property="og:title" content="onnxruntime cannot enable executable stack (fix)">
+<meta property="og:description" content="import onnxruntime fails with cannot enable executable stack as shared object requires: Invalid argument on glibc 2.41. 1.16.3 affected, 1.17.3 OK. 3 fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/onnxruntime-cannot-enable-executable-stack/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Which onnxruntime versions fail on glibc 2.41?", "acceptedAnswer": {"@type": "Answer", "text": "In our scan of CPU wheels for CPython 3.11, 1.15.1, 1.16.0 and 1.16.3 carry the flag; 1.17.3, 1.19.2, 1.20.1 and 1.21.0 do not."}}, {"@type": "Question", "name": "Why only after an OS upgrade?", "acceptedAnswer": {"@type": "Answer", "text": "glibc 2.41 stopped letting dlopen enable an executable stack, so libraries that ask for one now fail to load."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>onnxruntime: cannot enable executable stack as shared object requires (fix)</h1>
+<p class="lead"><code>import onnxruntime</code> fails with <code>cannot enable executable stack as shared object requires: Invalid argument</code> on new Linux distros. We reproduced it with onnxruntime 1.16.3 on Debian 13, found which versions carry the flag, and tested three fixes.</p>
+<h2 id="error">1. The error</h2>
+<pre><code>import onnxruntime as ort
+print(&quot;onnxruntime&quot;, ort.__version__)
+print(ort.get_available_providers())</code></pre>
+<p>onnxruntime 1.16.3 on Debian 13 (glibc 2.41):</p>
+<pre><code>Traceback (most recent call last):
+  File &quot;b1.py&quot;, line 1, in &lt;module&gt;
+    import onnxruntime as ort
+  File &quot;.../site-packages/onnxruntime/__init__.py&quot;, line 56, in &lt;module&gt;
+    raise import_capi_exception
+  File &quot;.../site-packages/onnxruntime/__init__.py&quot;, line 23, in &lt;module&gt;
+    from onnxruntime.capi._pybind_state import ExecutionMode  # noqa: F401
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File &quot;.../site-packages/onnxruntime/capi/_pybind_state.py&quot;, line 32, in &lt;module&gt;
+    from .onnxruntime_pybind11_state import *  # noqa
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ImportError: .../site-packages/onnxruntime/capi/onnxruntime_pybind11_state.cpython-311-x86_64-linux-gnu.so: cannot enable executable stack as shared object requires: Invalid argument</code></pre>
+<p>The compiled module <code>onnxruntime_pybind11_state</code> is marked as needing an executable stack, and glibc 2.41 no longer lets <code>dlopen</code> enable one, so the import fails. Same cause as the <a href="/guides/cannot-enable-executable-stack-as-shared-object-requires/">torch version of this error</a>.</p>
+<h2 id="versions">2. Which versions have the flag</h2>
+<p>We installed the CPU wheels for CPython 3.11 and scanned their <code>.so</code> files with this stdlib-only script:</p>
+<pre><code>import glob, os, struct, sys
+
+PT_GNU_STACK = 0x6474E551
+PF_X = 1
+
+def needs_execstack(path):
+    with open(path, &quot;rb&quot;) as f:
+        hdr = f.read(64)
+        if hdr[:4] != b&quot;\x7fELF&quot; or hdr[4] != 2:  # 64-bit ELF only
+            return None
+        phoff, = struct.unpack_from(&quot;&lt;Q&quot;, hdr, 0x20)
+        phentsize, phnum = struct.unpack_from(&quot;&lt;HH&quot;, hdr, 0x36)
+        for i in range(phnum):
+            f.seek(phoff + i * phentsize)
+            p_type, p_flags = struct.unpack(&quot;&lt;II&quot;, f.read(8))
+            if p_type == PT_GNU_STACK:
+                return bool(p_flags &amp; PF_X)
+    return None
+
+root = sys.argv[1]
+for so in sorted(glob.glob(os.path.join(root, &quot;**&quot;, &quot;*.so*&quot;), recursive=True)):
+    if needs_execstack(so):
+        print(&quot;needs executable stack:&quot;, os.path.relpath(so, root))
+print(&quot;scan done&quot;)</code></pre>
+<p>1.16.3 (1.15.1 and 1.16.0 give the same):</p>
+<pre><code>needs executable stack: capi/onnxruntime_pybind11_state.cpython-311-x86_64-linux-gnu.so
+scan done</code></pre>
+<p>1.17.3, 1.19.2, 1.20.1 and 1.21.0 print only <code>scan done</code>. Point the script at any package directory to check other wheels (GPU builds, other Python versions) yourself.</p>
+<h2 id="fix">3. Fix A: upgrade onnxruntime</h2>
+<p>onnxruntime 1.17.3 imports normally on the same system:</p>
+<pre><code>onnxruntime 1.17.3
+[&#x27;AzureExecutionProvider&#x27;, &#x27;CPUExecutionProvider&#x27;]</code></pre>
+<p>If a library pins <code>onnxruntime&lt;1.17</code>, try B or C.</p>
+<h2 id="patchelf">4. Fix B: clear the flag with patchelf (no root)</h2>
+<p>After <code>pip install patchelf</code>:</p>
+<pre><code>SP=$(python -c &quot;import sysconfig; print(sysconfig.get_paths()[&#x27;purelib&#x27;])&quot;)
+patchelf --clear-execstack &quot;$SP&quot;/onnxruntime/capi/onnxruntime_pybind11_state*.so
+echo &quot;patched&quot;</code></pre>
+<pre><code>patched</code></pre>
+<pre><code>scan done</code></pre>
+<pre><code>onnxruntime 1.16.3
+[&#x27;AzureExecutionProvider&#x27;, &#x27;CPUExecutionProvider&#x27;]</code></pre>
+<p>Reinstalling onnxruntime restores the flag, so re-run the patch after each reinstall.</p>
+<h2 id="tunable">5. Fix C: the glibc tunable</h2>
+<p>With the unpatched file:</p>
+<pre><code>GLIBC_TUNABLES=glibc.rtld.execstack=2 python b1.py</code></pre>
+<pre><code>onnxruntime 1.16.3
+[&#x27;AzureExecutionProvider&#x27;, &#x27;CPUExecutionProvider&#x27;]</code></pre>
+<p>This worked on Debian&#x27;s glibc 2.41. It re-allows executable stacks for the whole process, so use it to confirm the diagnosis and prefer A or B.</p>
+<p>Related: <a href="/guides/cannot-enable-executable-stack-as-shared-object-requires/">cannot enable executable stack (torch, any library)</a> · <a href="/guides/torch-no-module-named-pkg-resources/">torch: No module named pkg_resources</a></p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Which onnxruntime versions fail on glibc 2.41?</summary><p>In our scan of CPU wheels for CPython 3.11, 1.15.1, 1.16.0 and 1.16.3 carry the flag; 1.17.3, 1.19.2, 1.20.1 and 1.21.0 do not.</p></details>
+<details><summary>Why only after an OS upgrade?</summary><p>glibc 2.41 stopped letting dlopen enable an executable stack, so libraries that ask for one now fail to load.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Debian 13 (glibc 2.41-12+deb13u4), CPython 3.11.17: onnxruntime 1.15.1, 1.16.0, 1.16.3, 1.17.3, 1.19.2, 1.20.1, 1.21.0 (CPU wheels), patchelf 0.19.1. Output pasted unedited except shortened paths. PlainTables is our extension; onnxruntime and patchelf are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>axios &quot;Network Error&quot; (ERR_NETWORK): Every Cause, Tested</title>
+<meta name="description" content="CORS, refused, DNS and mixed content all give axios the same &#x27;Network Error&#x27; with no response. We tested each in Chromium 153 and show how to find the cause.">
+<link rel="canonical" href="https://honestkit.github.io/guides/axios-network-error-err-network/">
+<meta property="og:title" content="axios &quot;Network Error&quot; (ERR_NETWORK): Every Cause, Tested">
+<meta property="og:description" content="CORS, refused, DNS and mixed content all give axios the same &#x27;Network Error&#x27; with no response. We tested each in Chromium 153 and show how to find the cause.">
+<meta property="og:url" content="https://honestkit.github.io/guides/axios-network-error-err-network/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does axios say Network Error when the API works in Postman?", "acceptedAnswer": {"@type": "Answer", "text": "Postman and curl do not enforce CORS. In our test a server with no Access-Control-Allow-Origin header gave axios 'Network Error' in Chromium, while the request itself reached the server. Add the CORS header on the API."}}, {"@type": "Question", "name": "Why is error.response undefined?", "acceptedAnswer": {"@type": "Answer", "text": "Because the browser gave axios no readable HTTP response. In all four network-level cases we tested (CORS, refused, DNS, mixed content) error.response was undefined and error.request.status was 0."}}, {"@type": "Question", "name": "Is a timeout a Network Error?", "acceptedAnswer": {"@type": "Answer", "text": "No. With timeout: 500 axios 1.20.0 gave 'timeout of 500ms exceeded' with code ECONNABORTED, or ETIMEDOUT if transitional.clarifyTimeoutError is true."}}, {"@type": "Question", "name": "Can I read the CORS reason from JavaScript?", "acceptedAnswer": {"@type": "Answer", "text": "No. The browser hides it on purpose. It only appears in the DevTools console, for example \"No 'Access-Control-Allow-Origin' header is present on the requested resource.\""}}, {"@type": "Question", "name": "Why do I get ECONNREFUSED in Node but Network Error in the browser?", "acceptedAnswer": {"@type": "Answer", "text": "Node exposes the socket error. In Node 24 axios gave code ECONNREFUSED with message 'connect ECONNREFUSED 127.0.0.1:8990'. The browser only exposes ERR_NETWORK for the same failure."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>axios Network Error (ERR_NETWORK) (tested)</h1>
+<p class="lead"><code>AxiosError: Network Error</code> with <code>code: 'ERR_NETWORK'</code> means the browser gave axios no HTTP response at all. We triggered seven failure types with axios 1.20.0 in Chromium 153. Four different causes produced the exact same error object. Only the DevTools console showed which one it was.</p>
+<h2>1. What ERR_NETWORK means</h2>
+<p>In the browser, axios uses XMLHttpRequest. When the request fails before any HTTP response is readable, XHR fires an <code>error</code> event with <code>status 0</code>. axios turns that into <code>message: 'Network Error'</code>, <code>code: 'ERR_NETWORK'</code> and <code>error.response === undefined</code>. The browser does not tell JavaScript why. That is on purpose, so pages cannot probe other networks.</p>
+
+<h2>2. Our test setup</h2>
+<p>A Node HTTPS server served a blank page on <code>https://127.0.0.1:8991</code>. We injected <code>axios.min.js</code> into it and called <code>axios.get()</code> against different targets. For each call we logged <code>error.message</code>, <code>error.code</code>, <code>error.response</code>, <code>error.request.status</code> and the console messages Chromium printed.</p>
+<pre><code>try {
+  await axios.get(url, opts);
+} catch (e) {
+  console.log(e.message, e.code, e.response?.status, e.request?.status);
+}</code></pre>
+
+<h2>3. Results in Chromium 153</h2>
+<table>
+<tr><th>Cause</th><th>error.message</th><th>error.code</th><th>error.response</th><th>request.status</th><th>Console showed</th></tr>
+<tr><td>CORS blocked (no Access-Control-Allow-Origin)</td><td>Network Error</td><td>ERR_NETWORK</td><td>undefined</td><td>0</td><td>"...has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource." and net::ERR_FAILED</td></tr>
+<tr><td>Connection refused (nothing on the port)</td><td>Network Error</td><td>ERR_NETWORK</td><td>undefined</td><td>0</td><td>net::ERR_CONNECTION_REFUSED</td></tr>
+<tr><td>DNS failure (https://nosuchhost.invalid)</td><td>Network Error</td><td>ERR_NETWORK</td><td>undefined</td><td>0</td><td>net::ERR_NAME_NOT_RESOLVED</td></tr>
+<tr><td>Mixed content (http:// URL from an https page)</td><td>Network Error</td><td>ERR_NETWORK</td><td>undefined</td><td>0</td><td>"Mixed Content: ... requested an insecure XMLHttpRequest endpoint ... This request has been blocked"</td></tr>
+<tr><td><code>timeout: 500</code> on a 3 s endpoint</td><td>timeout of 500ms exceeded</td><td>ECONNABORTED</td><td>undefined</td><td>0</td><td>nothing</td></tr>
+<tr><td>Same, with <code>transitional: {clarifyTimeoutError: true}</code></td><td>timeout of 500ms exceeded</td><td>ETIMEDOUT</td><td>undefined</td><td>0</td><td>nothing</td></tr>
+<tr><td>AbortController abort after 300 ms</td><td>canceled</td><td>ERR_CANCELED</td><td>undefined</td><td>0</td><td>nothing</td></tr>
+<tr><td>Server returns 404 (with CORS header)</td><td>Request failed with status code 404</td><td>ERR_BAD_REQUEST</td><td>404</td><td>404</td><td>"Failed to load resource: the server responded with a status of 404 (Not Found)"</td></tr>
+<tr><td>Server returns 500 (with CORS header)</td><td>Request failed with status code 500</td><td>ERR_BAD_RESPONSE</td><td>500</td><td>500</td><td>"...status of 500 (Internal Server Error)"</td></tr>
+</table>
+<p>Key points:</p>
+<ul>
+<li>The first four rows are identical in JavaScript. You cannot tell CORS from a down server from a typo in the host name by looking at the error object.</li>
+<li>A timeout is <em>not</em> <code>ERR_NETWORK</code>. By default it is <code>ECONNABORTED</code>; the abort is <code>ERR_CANCELED</code> with <code>error.name === 'CanceledError'</code> and <code>axios.isCancel(e) === true</code>.</li>
+<li>4xx gives <code>ERR_BAD_REQUEST</code> and 5xx gives <code>ERR_BAD_RESPONSE</code>, both with a real <code>error.response</code>. If you see a response, it is not a network error.</li>
+<li>Mixed content is checked before DNS. Our first DNS test used an <code>http://</code> host from the https page and Chromium reported mixed content, not a DNS failure.</li>
+</ul>
+
+<h2>4. Node.js is more specific</h2>
+<p>In Node.js 24 axios uses the http module, and the real error code comes through:</p>
+<table>
+<tr><th>Cause</th><th>error.message</th><th>error.code</th></tr>
+<tr><td>Connection refused</td><td>connect ECONNREFUSED 127.0.0.1:8990</td><td>ECONNREFUSED</td></tr>
+<tr><td>DNS failure</td><td>getaddrinfo ENOTFOUND nosuchhost.invalid</td><td>ENOTFOUND</td></tr>
+</table>
+<p>So if the same call works from Node (or curl) but fails in the browser with Network Error, suspect CORS or mixed content first. There is no CORS in Node.</p>
+
+<h2>5. How to find the real cause</h2>
+<ol>
+<li>Open DevTools &gt; Console. The red line next to the failed request names the cause: <code>blocked by CORS policy</code>, <code>Mixed Content</code>, <code>net::ERR_CONNECTION_REFUSED</code> or <code>net::ERR_NAME_NOT_RESOLVED</code>.</li>
+<li>Open the Network tab. A CORS failure shows a request that reached the server; refused and DNS failures show no response at all.</li>
+<li>Run the same URL with curl from your machine. If curl gets a response, the server is up and the browser is blocking it.</li>
+</ol>
+
+<h2>6. Fixes by cause</h2>
+<ul>
+<li><strong>CORS:</strong> the API must send <code>Access-Control-Allow-Origin</code> for your page origin (and handle the preflight if you send JSON or custom headers). See <a href="/guides/cors-error-messages-explained/">CORS error messages explained</a>. Changing axios settings cannot fix this.</li>
+<li><strong>Connection refused:</strong> the server is not listening on that host and port. Check the base URL, the port, and that the server binds to the right interface. See <a href="/guides/err-connection-refused-econnrefused/">ERR_CONNECTION_REFUSED / ECONNREFUSED</a>.</li>
+<li><strong>DNS failure:</strong> fix the host name in <code>baseURL</code> or the DNS record.</li>
+<li><strong>Mixed content:</strong> use <code>https://</code> for the API, or a relative URL. See <a href="/guides/mixed-content-blocked-https/">mixed content blocked</a>.</li>
+<li><strong>Timeouts:</strong> handle <code>ECONNABORTED</code> (or <code>ETIMEDOUT</code> with <code>clarifyTimeoutError</code>) separately from <code>ERR_NETWORK</code>.</li>
+</ul>
+<pre><code>catch (e) {
+  if (axios.isCancel(e)) return;               // ERR_CANCELED
+  if (e.response) { /* HTTP error: e.response.status */ }
+  else if (e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT') { /* timeout */ }
+  else if (e.code === 'ERR_NETWORK') { /* CORS, offline, DNS, refused, mixed content: check console */ }
+}</code></pre>
+<p>fetch() has the same problem with a different message. See <a href="/guides/typeerror-failed-to-fetch/">TypeError: Failed to fetch</a>.</p>
+
+<aside class="cta"><strong>Check the status and CORS headers your API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does axios say Network Error when the API works in Postman?</summary><p>Postman and curl do not enforce CORS. In our test a server with no Access-Control-Allow-Origin header gave axios &#x27;Network Error&#x27; in Chromium, while the request itself reached the server. Add the CORS header on the API.</p></details>
+<details><summary>Why is error.response undefined?</summary><p>Because the browser gave axios no readable HTTP response. In all four network-level cases we tested (CORS, refused, DNS, mixed content) error.response was undefined and error.request.status was 0.</p></details>
+<details><summary>Is a timeout a Network Error?</summary><p>No. With timeout: 500 axios 1.20.0 gave &#x27;timeout of 500ms exceeded&#x27; with code ECONNABORTED, or ETIMEDOUT if transitional.clarifyTimeoutError is true.</p></details>
+<details><summary>Can I read the CORS reason from JavaScript?</summary><p>No. The browser hides it on purpose. It only appears in the DevTools console, for example &quot;No &#x27;Access-Control-Allow-Origin&#x27; header is present on the requested resource.&quot;</p></details>
+<details><summary>Why do I get ECONNREFUSED in Node but Network Error in the browser?</summary><p>Node exposes the socket error. In Node 24 axios gave code ECONNREFUSED with message &#x27;connect ECONNREFUSED 127.0.0.1:8990&#x27;. The browser only exposes ERR_NETWORK for the same failure.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with axios 1.20.0 (dist/axios.min.js) in headless Chromium 153 via Playwright, against a local HTTPS Node server, and axios 1.20.0 in Node.js 24.21.0. PlainHeaders is our extension; axios, Chromium and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

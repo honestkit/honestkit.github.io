@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FastAPI 422 Unprocessable Entity: Causes and Fixes (Tested)</title>
+<meta name="description" content="FastAPI 422 Unprocessable Entity tested on 0.161: reading detail/loc, form data vs JSON, missing Content-Type, str params read as query, logging 422s.">
+<link rel="canonical" href="https://honestkit.github.io/guides/fastapi-422-unprocessable-entity/">
+<meta property="og:title" content="FastAPI 422 Unprocessable Entity: Causes and Fixes (Tested)">
+<meta property="og:description" content="FastAPI 422 Unprocessable Entity tested on 0.161: reading detail/loc, form data vs JSON, missing Content-Type, str params read as query, logging 422s.">
+<meta property="og:url" content="https://honestkit.github.io/guides/fastapi-422-unprocessable-entity/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does FastAPI return 422 Unprocessable Entity?", "acceptedAnswer": {"@type": "Answer", "text": "The request failed validation: a missing or wrongly typed field, form data or a string body where JSON was expected, or a value sent in the body for a parameter FastAPI reads from the query string. Check detail[].loc."}}, {"@type": "Question", "name": "Why is my POST parameter expected in the query?", "acceptedAnswer": {"@type": "Answer", "text": "A plain str/int function parameter is a query parameter in FastAPI. Use a Pydantic model or Annotated[str, Body(embed=True)] to read it from the JSON body."}}, {"@type": "Question", "name": "How do I log FastAPI 422 errors?", "acceptedAnswer": {"@type": "Answer", "text": "Add @app.exception_handler(RequestValidationError) and log exc.body and exc.errors(), then return JSONResponse(status_code=422, content={'detail': exc.errors()})."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>FastAPI 422 Unprocessable Entity (tested)</h1>
+<p class="lead">FastAPI returns <code>422 Unprocessable Entity</code> when the request does not validate against the endpoint's parameters. The response's <code>detail[].loc</code> tells you where it looked (<code>body</code>, <code>query</code>, <code>path</code>) and which field failed. In our tests the usual causes were form data instead of JSON, a missing Content-Type, and plain parameters that FastAPI reads from the query string.</p>
+<p>The app used by blocks 1 and 2 (<code>app.py</code>):</p>
+<pre><code>from fastapi import FastAPI
+from pydantic import BaseModel
+app = FastAPI()
+class Item(BaseModel):
+    name: str
+    price: float
+@app.post(&quot;/items&quot;)
+def create(item: Item):
+    return item
+@app.post(&quot;/rename&quot;)
+def rename(new_name: str):          # plain str -&gt; FastAPI expects a QUERY param
+    return {&quot;new_name&quot;: new_name}
+@app.get(&quot;/items/{item_id}&quot;)
+def read(item_id: int):
+    return {&quot;item_id&quot;: item_id}</code></pre>
+<h2 id="detail">1. Read the detail: loc says where, msg says what</h2>
+<pre><code>import json
+from fastapi.testclient import TestClient
+from app import app
+c = TestClient(app)
+def show(label, r):
+    print(f&quot;--- {label}: {r.status_code}&quot;)
+    for e in r.json().get(&quot;detail&quot;, []): print(json.dumps(e))
+show(&quot;ok&quot;, c.post(&quot;/items&quot;, json={&quot;name&quot;: &quot;pen&quot;, &quot;price&quot;: 1.5}))
+show(&quot;missing field&quot;, c.post(&quot;/items&quot;, json={&quot;name&quot;: &quot;pen&quot;}))
+show(&quot;wrong type&quot;, c.post(&quot;/items&quot;, json={&quot;name&quot;: &quot;pen&quot;, &quot;price&quot;: &quot;cheap&quot;}))
+show(&quot;path param not an int&quot;, c.get(&quot;/items/abc&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>--- ok: 200
+--- missing field: 422
+{&quot;type&quot;: &quot;missing&quot;, &quot;loc&quot;: [&quot;body&quot;, &quot;price&quot;], &quot;msg&quot;: &quot;Field required&quot;, &quot;input&quot;: {&quot;name&quot;: &quot;pen&quot;}}
+--- wrong type: 422
+{&quot;type&quot;: &quot;float_parsing&quot;, &quot;loc&quot;: [&quot;body&quot;, &quot;price&quot;], &quot;msg&quot;: &quot;Input should be a valid number, unable to parse string as a number&quot;, &quot;input&quot;: &quot;cheap&quot;}
+--- path param not an int: 422
+{&quot;type&quot;: &quot;int_parsing&quot;, &quot;loc&quot;: [&quot;path&quot;, &quot;item_id&quot;], &quot;msg&quot;: &quot;Input should be a valid integer, unable to parse string as an integer&quot;, &quot;input&quot;: &quot;abc&quot;}</code></pre>
+<p>Every 422 from FastAPI has a <code>detail</code> list. <code>loc</code> starts with where FastAPI looked (<code>body</code>, <code>query</code>, <code>path</code>, <code>header</code>) followed by the field name; <code>msg</code> and <code>type</code> are the Pydantic validation error; <code>input</code> is what it actually received. Print the response body before guessing.</p>
+<h2 id="mismatch">2. The request is not what the endpoint expects</h2>
+<pre><code>import json
+from fastapi.testclient import TestClient
+from app import app
+c = TestClient(app)
+def show(label, r):
+    print(f&quot;--- {label}: {r.status_code}&quot;)
+    print(json.dumps(r.json()))
+show(&quot;form data instead of JSON&quot;, c.post(&quot;/items&quot;, data={&quot;name&quot;: &quot;pen&quot;, &quot;price&quot;: &quot;1.5&quot;}))
+show(&quot;JSON string with no Content-Type&quot;, c.post(&quot;/items&quot;, content=&#x27;{&quot;name&quot;: &quot;pen&quot;, &quot;price&quot;: 1.5}&#x27;))
+show(&quot;plain str param sent as JSON body&quot;, c.post(&quot;/rename&quot;, json={&quot;new_name&quot;: &quot;x&quot;}))
+show(&quot;plain str param sent as query&quot;, c.post(&quot;/rename&quot;, params={&quot;new_name&quot;: &quot;x&quot;}))</code></pre>
+<p>Output:</p>
+<pre><code>--- form data instead of JSON: 422
+{&quot;detail&quot;: [{&quot;type&quot;: &quot;model_attributes_type&quot;, &quot;loc&quot;: [&quot;body&quot;], &quot;msg&quot;: &quot;Input should be a valid dictionary or object to extract fields from&quot;, &quot;input&quot;: &quot;name=pen&amp;price=1.5&quot;}]}
+--- JSON string with no Content-Type: 422
+{&quot;detail&quot;: [{&quot;type&quot;: &quot;model_attributes_type&quot;, &quot;loc&quot;: [&quot;body&quot;], &quot;msg&quot;: &quot;Input should be a valid dictionary or object to extract fields from&quot;, &quot;input&quot;: &quot;{\&quot;name\&quot;: \&quot;pen\&quot;, \&quot;price\&quot;: 1.5}&quot;}]}
+--- plain str param sent as JSON body: 422
+{&quot;detail&quot;: [{&quot;type&quot;: &quot;missing&quot;, &quot;loc&quot;: [&quot;query&quot;, &quot;new_name&quot;], &quot;msg&quot;: &quot;Field required&quot;, &quot;input&quot;: null}]}
+--- plain str param sent as query: 200
+{&quot;new_name&quot;: &quot;x&quot;}</code></pre>
+<p>Three common mismatches, all 422:</p>
+<ul><li><strong>Form data instead of JSON</strong> (<code>requests.post(url, data=dict)</code>, an HTML form): <code>loc: ["body"]</code>, and <code>input</code> is the urlencoded string. Send <code>json=...</code>.</li><li><strong>A JSON string without <code>Content-Type: application/json</code></strong> (<code>data=json.dumps(...)</code> with no header, some fetch/axios setups): the body is treated as a string, same error. Set the header or pass <code>json=</code>.</li><li><strong>A plain <code>str</code>/<code>int</code> parameter on a POST</strong>: FastAPI reads it from the <em>query string</em>, not the body, so <code>loc: ["query", "new_name"]</code> is missing even though you sent it in JSON.</li></ul>
+<h2 id="fix">3. Read a single value from the body, and log every 422</h2>
+<p><code>app3.py</code>:</p>
+<pre><code>from typing import Annotated
+from fastapi import FastAPI, Body, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+app = FastAPI()
+@app.post(&quot;/rename&quot;)
+def rename(new_name: Annotated[str, Body(embed=True)]):   # now read from the JSON body
+    return {&quot;new_name&quot;: new_name}
+@app.exception_handler(RequestValidationError)
+async def log_422(request: Request, exc: RequestValidationError):
+    print(&quot;422 on&quot;, request.url.path, &quot;body:&quot;, exc.body, &quot;errors:&quot;, [(e[&quot;loc&quot;], e[&quot;msg&quot;]) for e in exc.errors()])
+    return JSONResponse(status_code=422, content={&quot;detail&quot;: exc.errors()})</code></pre>
+<pre><code>from fastapi.testclient import TestClient
+from app3 import app
+c = TestClient(app)
+r = c.post(&quot;/rename&quot;, json={&quot;new_name&quot;: &quot;x&quot;}); print(r.status_code, r.json())
+r = c.post(&quot;/rename&quot;, json={&quot;name&quot;: &quot;x&quot;}); print(r.status_code)</code></pre>
+<p>Output:</p>
+<pre><code>200 {&#x27;new_name&#x27;: &#x27;x&#x27;}
+422 on /rename body: {&#x27;name&#x27;: &#x27;x&#x27;} errors: [((&#x27;body&#x27;, &#x27;new_name&#x27;), &#x27;Field required&#x27;)]
+422</code></pre>
+<p><code>Body(embed=True)</code> makes FastAPI read <code>{"new_name": ...}</code> from the JSON body (or use a Pydantic model). A <code>RequestValidationError</code> handler that logs <code>exc.body</code> and <code>exc.errors()</code> shows exactly what clients send, which helps when the 422 comes from a frontend you do not control.</p>
+<p>Related: <a href="/guides/422-unprocessable-entity/">422 Unprocessable Entity (HTTP status)</a>.</p>
+
+<aside class="cta"><strong>Debugging what your API client actually sends? Check request and response headers:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does FastAPI return 422 Unprocessable Entity?</summary><p>The request failed validation: a missing or wrongly typed field, form data or a string body where JSON was expected, or a value sent in the body for a parameter FastAPI reads from the query string. Check detail[].loc.</p></details>
+<details><summary>Why is my POST parameter expected in the query?</summary><p>A plain str/int function parameter is a query parameter in FastAPI. Use a Pydantic model or Annotated[str, Body(embed=True)] to read it from the JSON body.</p></details>
+<details><summary>How do I log FastAPI 422 errors?</summary><p>Add @app.exception_handler(RequestValidationError) and log exc.body and exc.errors(), then return JSONResponse(status_code=422, content={&#x27;detail&#x27;: exc.errors()}).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with FastAPI 0.161.1, Pydantic 2.14.1 and Python 3.14.7 (TestClient, python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and FastAPI are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx websocket: connect with httpx-ws (sync and async, tested)</title>
+<meta name="description" content="httpx has no WebSocket support: httpx.get(&#x27;ws://...&#x27;) gets 426 Upgrade Required. Use httpx-ws connect_ws/aconnect_ws with your Client, or websockets.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-websocket-client/">
+<meta property="og:title" content="httpx websocket: connect with httpx-ws (sync and async, tested)">
+<meta property="og:description" content="httpx has no WebSocket support: httpx.get(&#x27;ws://...&#x27;) gets 426 Upgrade Required. Use httpx-ws connect_ws/aconnect_ws with your Client, or websockets.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-websocket-client/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does httpx support websockets?", "acceptedAnswer": {"@type": "Answer", "text": "Not by itself. The httpx-ws package adds connect_ws / aconnect_ws on top of an httpx Client or AsyncClient."}}, {"@type": "Question", "name": "Why does httpx return 426 Upgrade Required for a ws:// URL?", "acceptedAnswer": {"@type": "Answer", "text": "httpx 0.28.1 sent a plain GET without the WebSocket handshake headers, so the server refused it with 426."}}, {"@type": "Question", "name": "What does WebSocketUpgradeError mean?", "acceptedAnswer": {"@type": "Answer", "text": "The server answered the handshake with a normal response (e.g. 200 or 404) instead of 101 Switching Protocols."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx websocket client: httpx-ws (tested)</h1>
+<p class="lead">httpx has no built-in WebSockets; <code>httpx.get("ws://...")</code> just gets <code>426 Upgrade Required</code>. <code>pip install httpx-ws</code> and use <code>connect_ws(url, client)</code> (or <code>aconnect_ws</code> with <code>AsyncClient</code>).</p>
+<p>httpx itself has no WebSocket API. For a WebSocket client you either add the <code>httpx-ws</code> package (it reuses your httpx Client) or use the <code>websockets</code> library directly. Measured with httpx 0.28.1, httpx-ws 0.9.0 and websockets 17.3 on Python 3.13.5; <code>srv</code> is a local websockets echo server that returns its <code>ws://</code> URL.</p>
+<h2 id="plain">1. httpx.get("ws://...") sends a plain HTTP request</h2>
+<pre><code>import httpx, srv
+url = srv.start()
+print(url)
+r = httpx.get(url)
+print(r.status_code, r.reason_phrase, &quot;|&quot;, r.text.strip())</code></pre>
+<p>Output:</p>
+<pre><code>ws://127.0.0.1:8964
+426 Upgrade Required | Failed to open a WebSocket connection: invalid Connection header: keep-alive.
+
+You cannot access a WebSocket server directly with a browser. You need a WebSocket client.</code></pre>
+<p>httpx accepted the <code>ws://</code> URL without an error but sent an ordinary GET with no upgrade headers, so the server answered <code>426 Upgrade Required</code>. A 426 from a WebSocket endpoint means the client did not do the handshake.</p>
+<h2 id="sync">2. httpx websocket client with httpx-ws</h2>
+<pre><code>import httpx, srv
+from httpx_ws import connect_ws
+url = srv.start().replace(&quot;ws://&quot;, &quot;http://&quot;)
+with httpx.Client() as client:
+    with connect_ws(url, client) as ws:
+        ws.send_text(&quot;hello&quot;)
+        print(ws.receive_text())</code></pre>
+<p>Output:</p>
+<pre><code>echo: hello</code></pre>
+<p><code>pip install httpx-ws</code>. <code>connect_ws(url, client)</code> performs the upgrade through your existing <code>httpx.Client</code>, so its headers, auth and other client settings apply. Pass the URL with <code>http://</code> (or <code>https://</code>), as in the block.</p>
+<h2 id="async">3. httpx AsyncClient websocket</h2>
+<pre><code>import asyncio, httpx, srv
+from httpx_ws import aconnect_ws
+url = srv.start().replace(&quot;ws://&quot;, &quot;http://&quot;)
+async def main():
+    async with httpx.AsyncClient() as client:
+        async with aconnect_ws(url, client) as ws:
+            for i in range(3):
+                await ws.send_text(f&quot;msg {i}&quot;)
+                print(await ws.receive_text())
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>echo: msg 0
+echo: msg 1
+echo: msg 2</code></pre>
+<p>The async version is <code>aconnect_ws(url, async_client)</code>, with <code>await ws.send_text()</code> / <code>await ws.receive_text()</code>.</p>
+<h2 id="upgrade">4. WebSocketUpgradeError: the server did not upgrade</h2>
+<pre><code>import threading, http.server, httpx
+from httpx_ws import connect_ws, WebSocketUpgradeError
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        self.send_response(200); self.send_header(&quot;Content-Length&quot;, &quot;2&quot;); self.end_headers(); self.wfile.write(b&quot;hi&quot;)
+s = http.server.ThreadingHTTPServer((&quot;127.0.0.1&quot;, 8965), H)
+threading.Thread(target=s.serve_forever, daemon=True).start()
+
+with httpx.Client() as client:
+    try:
+        with connect_ws(&quot;http://127.0.0.1:8965/&quot;, client):
+            pass
+    except WebSocketUpgradeError as e:
+        print(&quot;WebSocketUpgradeError:&quot;, e.response.status_code, &quot;(server did not switch protocols)&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>WebSocketUpgradeError: 200 (server did not switch protocols)</code></pre>
+<p>If the endpoint is a normal HTTP route (wrong path, or a proxy that strips <code>Upgrade</code> headers), httpx-ws raises <code>WebSocketUpgradeError</code> with the actual response attached; check <code>e.response.status_code</code> and the URL.</p>
+<h2 id="websockets">5. Without httpx: the websockets library</h2>
+<pre><code>import asyncio, srv
+from websockets.asyncio.client import connect
+url = srv.start()
+async def main():
+    async with connect(url) as ws:
+        await ws.send(&quot;hello&quot;)
+        print(await ws.recv())
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>echo: hello</code></pre>
+<p>If you do not need httpx client settings for the handshake, <code>websockets</code> is the standard choice and takes <code>ws://</code> / <code>wss://</code> URLs directly.</p>
+<p>Related: <a href="/guides/websocket-connection-failed/">WebSocket connection failed</a>, <a href="/guides/websocket-closed-1006/">WebSocket closed with code 1006</a>, <a href="/guides/httpx-asyncclient-connection-pool-limits/">httpx AsyncClient connection pool</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests differences</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does httpx support websockets?</summary><p>Not by itself. The httpx-ws package adds connect_ws / aconnect_ws on top of an httpx Client or AsyncClient.</p></details>
+<details><summary>Why does httpx return 426 Upgrade Required for a ws:// URL?</summary><p>httpx 0.28.1 sent a plain GET without the WebSocket handshake headers, so the server refused it with 426.</p></details>
+<details><summary>What does WebSocketUpgradeError mean?</summary><p>The server answered the handshake with a normal response (e.g. 200 or 404) instead of 101 Switching Protocols.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1, httpx-ws 0.9.0 and websockets 17.3 on Python 3.13.5 against a local echo server. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx, httpx-ws and websockets are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

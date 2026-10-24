@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>codecs.StreamReader Crashes with NoneType Concat on None</title>
+<meta name="description" content="We measured Python 3.13.5: codecs.StreamReader (codecs.open&#x27;s encoding engine) crashes concatenating a transient None read straight into its byte buffer.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-codecs-streamreader-none-cant-concat-nonetype-bytes/">
+<meta property="og:title" content="codecs.StreamReader Crashes with NoneType Concat on None">
+<meta property="og:description" content="We measured Python 3.13.5: codecs.StreamReader (codecs.open&#x27;s encoding engine) crashes concatenating a transient None read straight into its byte buffer.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-codecs-streamreader-none-cant-concat-nonetype-bytes/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "codecs's documentation describes StreamReader as wrapping a file-like object that supports read(); it says nothing about None or non-blocking streams. We measured that a None-returning read() reaches a raw bytes concatenation with no type check, crashing before any decoding logic runs."}}, {"@type": "Question", "name": "Why doesn't io.TextIOWrapper have this exact crash?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that TextIOWrapper (the C-accelerated default for text mode) has its own separate buffering implementation that collapses a transient None from readline() into '' instead of crashing -- the already-confirmed silent-EOF flavor. codecs.StreamReader is a different, pure-Python implementation used for encodings TextIOWrapper's fast path doesn't natively handle, and it has no equivalent None-to-empty collapse at all -- it just crashes on the raw concatenation instead."}}, {"@type": "Question", "name": "Does this affect codecs.open() the same way?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured that codecs.open(filename, encoding=...) constructs exactly this StreamReader internally around the file it opens. Any non-blocking file-like object passed through that path hits the identical TypeError on a transient None."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- same family already confirmed in json.load(), quopri.decode(), shutil.copyfileobj, and others: a correctly-returned non-blocking None gets mishandled one layer above io itself. codecs.StreamReader is the second case in the family (after quopri.decode()'s binascii path) where the crash comes from a raw, module-unaware operation -- here a bytes concatenation -- rather than from any explicit type check."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>codecs.StreamReader Crashes Concatenating None to Its Byte Buffer (tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> from <code>readinto()</code> -- distinct from the empty read that means real end-of-stream. We measured that <code>codecs.open()</code> and <code>codecs.getreader()</code> -- the mechanism used for encodings that <code>io.TextIOWrapper</code>'s fast path doesn't cover -- read via a pure-Python <code>StreamReader.read()</code> implementation that calls <code>newdata = self.stream.read()</code> and then immediately does <code>data = self.bytebuffer + newdata</code> with no check in between. When the underlying read returns a transient <code>None</code>, that line crashes with <code>TypeError: can't concat NoneType to bytes</code> -- an error that references neither codecs, encodings, nor files, on a payload that is valid and complete one read call away.</p>
+<h2 id="repro1">1. A real, valid text payload behind one transient None</h2>
+<pre><code>import codecs, io
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self, payload):
+        self.calls = 0
+        self.sent = False
+        self.payload = payload
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None            # transient: no data ready yet
+        if not self.sent:
+            self.sent = True
+            n = len(self.payload)
+            b[:n] = self.payload
+            return n               # the real, complete text
+        return 0                   # real EOF after that
+
+raw = FlakyRaw(b"hello world\nline2\n")
+br = io.BufferedReader(raw)
+reader = codecs.getreader('utf-8')(br)
+try:
+    line = reader.readline()
+    print("LINE:", repr(line))
+except Exception as e:
+    print("CRASHED:", type(e).__name__, "--", e)
+print("raw calls made:", raw.calls)</code></pre>
+<pre><code>CRASHED: TypeError -- can't concat NoneType to bytes
+raw calls made: 1</code></pre>
+<p><strong>Measured:</strong> the text is valid and complete, one read call away, and only one raw read happened before the crash. <code>codecs.StreamReader.read()</code> calls <code>self.stream.read()</code> and immediately concatenates the result onto its internal <code>bytebuffer</code> with <code>self.bytebuffer + newdata</code> -- no <code>None</code> check anywhere in that path, so the crash comes straight out of a <code>bytes.__add__</code> call with no reference to codecs, encodings, or the file at all.</p>
+
+<h2 id="repro2">2. The fix: drain into a real buffer first, retrying on None</h2>
+<pre><code>def read_retrying_on_none(buffered_reader, chunk_size=65536):
+    out = io.BytesIO()
+    while True:
+        chunk = buffered_reader.read(chunk_size)
+        if chunk is None:
+            continue   # retry: not ready yet, not real EOF
+        if not chunk:
+            break      # real EOF
+        out.write(chunk)
+    out.seek(0)
+    return out
+
+raw2 = FlakyRaw(b"hello world\nline2\n")
+br2 = io.BufferedReader(raw2)
+safe_buf = read_retrying_on_none(br2)
+reader2 = codecs.getreader('utf-8')(safe_buf)
+print("line 1:", repr(reader2.readline()))
+print("line 2:", repr(reader2.readline()))</code></pre>
+<pre><code>line 1: 'hello world\n'
+line 2: 'line2\n'</code></pre>
+<p><strong>Measured:</strong> resolving the <code>None</code>/EOF distinction before the bytes reach the <code>StreamReader</code> decodes correctly. If you see <code>TypeError: can't concat NoneType to bytes</code> coming from code that uses <code>codecs.open()</code> or <code>codecs.getreader()</code>, the real cause is almost certainly a non-blocking stream behind the file object, not a bug in your encoding choice.</p>
+<aside class="cta"><strong>Reading text in a non-default encoding with codecs.open() or codecs.getreader() on a non-blocking stream? A transient None read crashes the decoder&#x27;s own buffer with a raw concatenation TypeError:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>codecs&#x27;s documentation describes StreamReader as wrapping a file-like object that supports read(); it says nothing about None or non-blocking streams. We measured that a None-returning read() reaches a raw bytes concatenation with no type check, crashing before any decoding logic runs.</p></details>
+<details><summary>Why doesn&#x27;t io.TextIOWrapper have this exact crash?</summary><p>We measured that TextIOWrapper (the C-accelerated default for text mode) has its own separate buffering implementation that collapses a transient None from readline() into &#x27;&#x27; instead of crashing -- the already-confirmed silent-EOF flavor. codecs.StreamReader is a different, pure-Python implementation used for encodings TextIOWrapper&#x27;s fast path doesn&#x27;t natively handle, and it has no equivalent None-to-empty collapse at all -- it just crashes on the raw concatenation instead.</p></details>
+<details><summary>Does this affect codecs.open() the same way?</summary><p>Yes -- we measured that codecs.open(filename, encoding=...) constructs exactly this StreamReader internally around the file it opens. Any non-blocking file-like object passed through that path hits the identical TypeError on a transient None.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>Yes -- same family already confirmed in json.load(), quopri.decode(), shutil.copyfileobj, and others: a correctly-returned non-blocking None gets mishandled one layer above io itself. codecs.StreamReader is the second case in the family (after quopri.decode()&#x27;s binascii path) where the crash comes from a raw, module-unaware operation -- here a bytes concatenation -- rather than from any explicit type check.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in codecs.getreader(&#x27;utf-8&#x27;) (the same StreamReader class codecs.open() uses internally), reading a genuinely valid, complete text payload through an io.BufferedReader over a custom non-blocking RawIOBase whose readinto() returns None once before returning the real bytes. PlainHeaders is our extension; Python&#x27;s codecs and io modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Export App Store Reviews to CSV / Excel (Free Python Script, Any App)</title>
+<meta name="description" content="Download up to 500 recent reviews per country for any iPhone app into a CSV file with a dependency-free Python script, including the retry Apple&#x27;s review feed needs, tested on a real app.">
+<link rel="canonical" href="https://honestkit.github.io/guides/export-app-store-reviews/">
+<meta property="og:title" content="Export App Store Reviews to CSV / Excel (Free Python Script, Any App)">
+<meta property="og:description" content="Download up to 500 recent reviews per country for any iPhone app into a CSV file with a dependency-free Python script, including the retry Apple&#x27;s review feed needs, tested on a real app.">
+<meta property="og:url" content="https://honestkit.github.io/guides/export-app-store-reviews/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can I export reviews from App Store Connect?", "acceptedAnswer": {"@type": "Answer", "text": "App Store Connect shows the reviews of your own apps and offers them through its API (customerReviews), but has no CSV export button. For your own app, the API or the script above both work; for any other app, only the public feed does."}}, {"@type": "Question", "name": "Why does my CSV have fewer than 500 reviews?", "acceptedAnswer": {"@type": "Answer", "text": "Either the app has fewer written reviews in that country, or Apple's feed stopped serving pages early. Run the script again later and remove duplicate ids."}}, {"@type": "Question", "name": "Does it work for Google Play reviews?", "acceptedAnswer": {"@type": "Answer", "text": "No. Google Play has a different system; the Play Console exports reviews of your own apps as CSV files from Google Cloud Storage."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to export App Store reviews to CSV</h1>
+<p class="lead">App Store Connect only exports reviews of your own apps, and only in its web view. For any app, Apple's public review feed gives the most recent 500 reviews per country. This script saves them as a CSV that opens in Excel or Google Sheets.</p>
+<h2>1. The script</h2>
+<p>Save as <code>reviews2csv.py</code>:</p>
+<pre><code>import csv, json, sys, time, urllib.request
+
+app_id, countries = sys.argv[1], sys.argv[2].split(',') if len(sys.argv) &gt; 2 else ['us']
+rows = []
+
+def fetch_page(country, page, tries=15):
+    # Apple often answers a page with an EMPTY feed, at random per URL. A fresh query string gets a fresh answer.
+    for i in range(tries):
+        url = f'https://itunes.apple.com/{country}/rss/customerreviews/id={app_id}/page={page}/sortby=mostrecent/json?v={i}{int(time.time())}'
+        try:
+            entries = json.load(urllib.request.urlopen(url, timeout=30))['feed'].get('entry', [])
+        except Exception as e:
+            print(f'{country} page {page}: {e}', file=sys.stderr); entries = []
+        if isinstance(entries, dict): entries = [entries]  # a page with one review is not a list
+        entries = [e for e in entries if 'im:rating' in e]  # skip the app's own entry, if present
+        if entries: return entries
+        time.sleep(0.5)
+    return []
+for country in countries:
+    for page in range(1, 11):  # the feed stops at page 10 (50 reviews per page)
+        entries = fetch_page(country, page)
+        if not entries: break
+        for e in entries:
+            rows.append({'country': country, 'id': e['id']['label'], 'date': e['updated']['label'],
+                         'rating': e['im:rating']['label'], 'version': e['im:version']['label'],
+                         'author': e['author']['name']['label'], 'title': e['title']['label'],
+                         'review': e['content']['label']})
+        time.sleep(1)  # be gentle
+with open(f'reviews-{app_id}.csv', 'w', newline='', encoding='utf-8-sig') as f:
+    w = csv.DictWriter(f, fieldnames=['country', 'id', 'date', 'rating', 'version', 'author', 'title', 'review'])
+    w.writeheader(); w.writerows(rows)
+print(f'{len(rows)} reviews -&gt; reviews-{app_id}.csv')
+</code></pre>
+<h2>2. Run it</h2>
+<p>Pass the app ID (the number after <code>id</code> in the App Store link) and the store countries:</p>
+<pre><code>python3 reviews2csv.py 389801252 us,gb</code></pre>
+<p>Our run printed <code>800 reviews -&gt; reviews-389801252.csv</code>, with these columns:</p>
+<pre><code>country,id,date,rating,version,author,title,review</code></pre>
+<p>One row per review: the two-letter store, Apple's review ID, the date, 1 to 5 stars, the app version it was written for, the reviewer's nickname, the title and the text.</p>
+<h2>3. Why the retry loop</h2>
+<p>Apple's feed is old and undocumented, and it often answers a page with an empty feed even when reviews exist. In our tests on 2026-09-30 and 2026-10-01, the same page came back empty or full depending on the exact URL, and one URL spelling (<code>…/page=1/id=…</code>) was empty every time for a day. A fresh query string (<code>?v=…</code>) gets a fresh answer, so the script asks up to 15 times before treating a page as empty.</p>
+<p>Even so, a run can stop early: our US run ended at 300 reviews because page 7 never came back with entries, while the UK run got the full 500. Run it again later to fill the gap; the <code>id</code> column lets you drop duplicates.</p>
+<h2>4. Limits</h2>
+<ul><li><strong>500 reviews per country</strong> (10 pages of 50), most recent first. For a popular app that covers weeks, not years. Save a CSV regularly if you need history.</li>
+<li>Only written reviews. Star-only ratings are never listed.</li>
+<li>Each country is a separate store with its own reviews; add codes like <code>de,fr,jp,ca,au</code>.</li></ul>
+<p>The feed's URL format, fields and the App Store Connect API for your own apps are covered in <a href="/guides/app-store-reviews-api/">App Store reviews API</a>.</p>
+<h2>5. Without code, many apps or countries</h2>
+<p>Our <a href="/apify/apple-app-store-reviews/">App Store Reviews Scraper on Apify</a> takes app IDs, links or names and many countries at once, retries the feed the same way, and exports CSV, Excel or JSON directly.</p>
+<aside class="cta"><strong>Need it in bulk?</strong> <a href="/apify/apple-app-store-reviews/">App Store Reviews Scraper – Apple iOS, Multi-Country</a> (hosted, pay per result)</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can I export reviews from App Store Connect?</summary><p>App Store Connect shows the reviews of your own apps and offers them through its API (customerReviews), but has no CSV export button. For your own app, the API or the script above both work; for any other app, only the public feed does.</p></details>
+<details><summary>Why does my CSV have fewer than 500 reviews?</summary><p>Either the app has fewer written reviews in that country, or Apple&#x27;s feed stopped serving pages early. Run the script again later and remove duplicate ids.</p></details>
+<details><summary>Does it work for Google Play reviews?</summary><p>No. Google Play has a different system; the Play Console exports reviews of your own apps as CSV files from Google Cloud Storage.</p></details>
+</section>
+<p class="note">Written with AI assistance. The script was run on 2026-10-01 for Instagram (app ID 389801252) in the US and UK stores: 800 reviews (UK 500, US 300), all unique, dated 2026-08-08 to 2026-09-29, Python 3 standard library only. The Apify tool is ours; the APIs are free to call directly.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

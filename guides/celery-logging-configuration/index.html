@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Celery logging configuration: why your handlers vanish (tested)</title>
+<meta name="description" content="A Celery worker hijacks the root logger and drops your handlers. Tested fixes: worker_hijack_root_logger=False and the setup_logging signal.">
+<link rel="canonical" href="https://honestkit.github.io/guides/celery-logging-configuration/">
+<meta property="og:title" content="Celery logging configuration: why your handlers vanish (tested)">
+<meta property="og:description" content="A Celery worker hijacks the root logger and drops your handlers. Tested fixes: worker_hijack_root_logger=False and the setup_logging signal.">
+<meta property="og:url" content="https://honestkit.github.io/guides/celery-logging-configuration/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why are my log messages not written to my file in a Celery worker?", "acceptedAnswer": {"@type": "Answer", "text": "The worker hijacks the root logger by default and removes handlers you added at import time. Set worker_hijack_root_logger = False or connect to the setup_logging signal."}}, {"@type": "Question", "name": "How do I use my own logging config with Celery?", "acceptedAnswer": {"@type": "Answer", "text": "Connect a function to celery.signals.setup_logging and call logging.config.dictConfig in it. When any receiver is connected, Celery skips its own logging setup."}}, {"@type": "Question", "name": "Why do get_task_logger messages not reach my root handler?", "acceptedAnswer": {"@type": "Answer", "text": "Celery attaches its own handler to task loggers and does not propagate them to the root logger, even with worker_hijack_root_logger = False. With the setup_logging signal connected they propagate normally."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Celery logging configuration (tested with a real worker)</h1>
+<p class="lead">By default a Celery worker removes the root logger handlers you configured and logs everything in its own format to its own output. Set <code>app.conf.worker_hijack_root_logger = False</code> to keep your handlers (task loggers still don't reach them), or connect a receiver to <code>celery.signals.setup_logging</code> so Celery leaves logging entirely to you.</p>
+<p>If you configure logging in your own code (a file handler, a custom format) and start a Celery worker, your log lines can disappear: by default the worker <em>hijacks the root logger</em>, removes the handlers you added, and sends everything to its own stderr/<code>--logfile</code> output. Below, the same task module is run three ways. Measured with Celery 5.6.3 on Python 3.13.5, a real worker and Redis 7 as the broker.</p>
+<h2 id="default">1. Default: the worker replaces your handlers</h2>
+<pre><code>$ cat tasks.py
+import logging, os
+from celery import Celery, signals
+from celery.utils.log import get_task_logger
+
+logging.basicConfig(filename=&quot;app.log&quot;, level=logging.INFO,
+                    format=&quot;APP %(levelname)s %(name)s: %(message)s&quot;)
+
+app = Celery(&quot;tasks&quot;, broker=&quot;redis://127.0.0.1:8964/0&quot;, backend=&quot;redis://127.0.0.1:8964/1&quot;)
+app.conf.worker_hijack_root_logger = os.environ.get(&quot;HIJACK&quot;, &quot;1&quot;) == &quot;1&quot;
+
+if os.environ.get(&quot;OWN_LOGGING&quot;) == &quot;1&quot;:
+    @signals.setup_logging.connect
+    def setup_logging(**kwargs):
+        pass  # Celery now leaves logging alone; the basicConfig above stays
+
+log = logging.getLogger(&quot;myapp&quot;)
+task_log = get_task_logger(__name__)
+
+@app.task
+def work(x):
+    log.info(&quot;plain logger: working on %s&quot;, x)
+    task_log.info(&quot;task logger: working on %s&quot;, x)
+    return x
+$ celery -A tasks worker -n w1@example -c 1 --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ python call.py
+1
+$ grep -a &quot;logger:&quot; worker.log | cut -c1-160
+[2026-10-23 11:29:38,391: INFO/ForkPoolWorker-1] plain logger: working on 1
+[2026-10-23 11:29:38,392: INFO/ForkPoolWorker-1] tasks.work[718e5707-4875-401f-91a1-d1cddf9f250f]: task logger: working on 1
+$ cat app.log</code></pre>
+<p><code>app.log</code> stays empty although <code>logging.basicConfig(filename="app.log")</code> ran when the worker imported <code>tasks.py</code>. Both the plain <code>myapp</code> logger and the task logger ended up in the worker's own output, in Celery's format. <code>get_task_logger()</code> adds the task name and id to each line.</p>
+<h2 id="hijack">2. worker_hijack_root_logger = False: your handlers stay</h2>
+<pre><code>$ HIJACK=0 celery -A tasks worker -n w1@example -c 1 --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ python call.py
+1
+$ grep -a &quot;logger:&quot; worker.log | cut -c1-160
+[2026-10-23 11:29:46,772: INFO/ForkPoolWorker-1] tasks.work[adf4ce55-83a2-45a7-b45b-ad846b993097]: task logger: working on 1
+$ cat app.log
+APP INFO celery.worker.consumer.connection: Connected to redis://127.0.0.1:8964/0
+APP INFO celery.worker.consumer.mingle: mingle: searching for neighbors
+APP INFO celery.worker.consumer.mingle: mingle: all alone
+APP INFO celery.apps.worker: w1@example ready.
+APP INFO celery.worker.strategy: Task tasks.work[adf4ce55-83a2-45a7-b45b-ad846b993097] received
+APP INFO myapp: plain logger: working on 1
+APP INFO celery.app.trace: Task tasks.work[adf4ce55-83a2-45a7-b45b-ad846b993097] succeeded in 0.006449081003665924s: 1</code></pre>
+<p>Now your root handler and format are kept, and Celery's own messages go there too. But note the task logger line is <strong>only</strong> in the worker output, not in <code>app.log</code>: Celery still gives task loggers their own handler and does not propagate them to the root logger. If you need task log lines in your file, use a plain <code>logging.getLogger(...)</code> logger in tasks, or take over completely as in section 3.</p>
+<h2 id="signal">3. Connect setup_logging: Celery does not touch logging at all</h2>
+<pre><code>$ OWN_LOGGING=1 celery -A tasks worker -n w1@example -c 1 --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ python call.py
+1
+$ grep -a &quot;logger:&quot; worker.log | cut -c1-160
+
+$ cat app.log
+APP INFO celery.worker.consumer.connection: Connected to redis://127.0.0.1:8964/0
+APP INFO celery.worker.consumer.mingle: mingle: searching for neighbors
+APP INFO celery.worker.consumer.mingle: mingle: all alone
+APP INFO celery.apps.worker: w1@example ready.
+APP INFO celery.worker.strategy: Task tasks.work[5686882b-f2aa-4483-90ec-7ea0c19eab3a] received
+APP INFO myapp: plain logger: working on 1
+APP INFO tasks: task logger: working on 1
+APP INFO celery.app.trace: Task tasks.work[5686882b-f2aa-4483-90ec-7ea0c19eab3a] succeeded in 0.006512746214866638s: 1</code></pre>
+<p>When any receiver is connected to <code>celery.signals.setup_logging</code>, Celery skips its logging setup entirely. The worker output has no task lines; everything, including the task logger, goes through the configuration you made (here the <code>basicConfig</code> at import time; in a real project, call <code>logging.config.dictConfig(...)</code> inside the handler). This is the most predictable option if you already have a logging config, for example Django's <code>LOGGING</code> setting.</p>
+<p>Related: <a href="/guides/celery-chain-error-handling/">Celery chain error handling</a>, <a href="/guides/celery-task-timeout-error-time-limit/">Celery task timeout and time limits</a>, <a href="/guides/pytest-caplog-assert-logger-error/">pytest caplog not capturing logs</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why are my log messages not written to my file in a Celery worker?</summary><p>The worker hijacks the root logger by default and removes handlers you added at import time. Set worker_hijack_root_logger = False or connect to the setup_logging signal.</p></details>
+<details><summary>How do I use my own logging config with Celery?</summary><p>Connect a function to celery.signals.setup_logging and call logging.config.dictConfig in it. When any receiver is connected, Celery skips its own logging setup.</p></details>
+<details><summary>Why do get_task_logger messages not reach my root handler?</summary><p>Celery attaches its own handler to task loggers and does not propagate them to the root logger, even with worker_hijack_root_logger = False. With the setup_logging signal connected they propagate normally.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Celery 5.6.3, kombu 5.6.2 and redis-py 8.1.0 on Python 3.13.5, one worker (-c 1), Redis 7 (Docker) as broker and backend. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Celery and Redis are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

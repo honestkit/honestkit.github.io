@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Celery Received unregistered task of type: KeyError fix</title>
+<meta name="description" content="Fix Celery &#x27;Received unregistered task of type&#x27; KeyError / NotRegistered: the worker never imported the task module. include=, autodiscover_tasks, names.">
+<link rel="canonical" href="https://honestkit.github.io/guides/celery-received-unregistered-task-of-type-keyerror/">
+<meta property="og:title" content="Celery Received unregistered task of type: KeyError fix">
+<meta property="og:description" content="Fix Celery &#x27;Received unregistered task of type&#x27; KeyError / NotRegistered: the worker never imported the task module. include=, autodiscover_tasks, names.">
+<meta property="og:url" content="https://honestkit.github.io/guides/celery-received-unregistered-task-of-type-keyerror/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Celery 'Received unregistered task of type' mean?", "acceptedAnswer": {"@type": "Answer", "text": "The worker got a message for a task name that is not in its registry, because the module defining the task was never imported in the worker process."}}, {"@type": "Question", "name": "Is the task retried after an unregistered task KeyError?", "acceptedAnswer": {"@type": "Answer", "text": "No. In our test the worker discarded the message and the caller received NotRegistered."}}, {"@type": "Question", "name": "How do I see which tasks a Celery worker has registered?", "acceptedAnswer": {"@type": "Answer", "text": "Start it with --loglevel=INFO and read the [tasks] list in the banner, or run celery -A proj inspect registered."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Celery: Received unregistered task of type (KeyError) (tested)</h1>
+<p class="lead"><code>Received unregistered task of type 'x'</code> with <code>KeyError: 'x'</code> means the worker never imported the module that defines task <code>x</code>. Add it with <code>Celery(..., include=["myapp.tasks"])</code> or <code>app.autodiscover_tasks()</code>, restart the worker, and check that it appears under <code>[tasks]</code> in the startup banner.</p>
+<p>A Celery worker only knows the tasks whose modules it has <strong>imported</strong>. When a message arrives for a name that is not in its registry, the worker logs <code>Received unregistered task of type ...</code> with a <code>KeyError</code> traceback and discards the message. Measured with Celery 5.6.3 and Redis 7.</p>
+<h2 id="repro">1. Reproduce: the task module is never imported by the worker</h2>
+<pre><code>$ cat celery_app.py
+from celery import Celery
+app = Celery(&quot;proj&quot;, broker=&quot;redis://127.0.0.1:8964/0&quot;, backend=&quot;redis://127.0.0.1:8964/1&quot;)
+# tasks live in myapp/tasks.py, but nothing imports that module in the worker
+$ cat myapp/tasks.py
+from celery_app import app
+
+@app.task
+def add(x, y):
+    return x + y
+$ cat send.py
+from celery_app import app
+from celery.exceptions import NotRegistered
+r = app.send_task(&quot;myapp.tasks.add&quot;, args=(2, 3))
+try:
+    print(&quot;result:&quot;, r.get(timeout=5))
+except Exception as e:
+    print(&quot;caller:&quot;, type(e).__name__, e)
+try:
+    app.tasks[&quot;myapp.tasks.add&quot;]
+except NotRegistered as e:
+    print(&quot;app.tasks lookup:&quot;, type(e).__name__, e)
+$ celery -A celery_app worker -c 1 --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ timeout 30 python send.py
+caller: NotRegistered &#x27;myapp.tasks.add&#x27;
+app.tasks lookup: NotRegistered &#x27;myapp.tasks.add&#x27;
+$ grep -A1 &quot;\[tasks\]&quot; worker.log; grep -E &quot;unregistered|ignored and discarded|^Did you|^KeyError&quot; worker.log | sed -E &quot;s/^\[[^]]*\] //&quot;
+[tasks]
+
+Received unregistered task of type &#x27;myapp.tasks.add&#x27;.
+The message has been ignored and discarded.
+Did you remember to import the module containing this task?
+KeyError: &#x27;myapp.tasks.add&#x27;</code></pre>
+<p>The <code>[tasks]</code> section of the worker banner is empty, so the worker has no <code>myapp.tasks.add</code>. The caller got <code>NotRegistered</code> back from the result backend, and the message was not retried: it is gone.</p>
+<h2 id="fix">2. Fix: make the worker import the module</h2>
+<pre><code>$ cat celery_app.py
+from celery import Celery
+app = Celery(&quot;proj&quot;, broker=&quot;redis://127.0.0.1:8964/0&quot;, backend=&quot;redis://127.0.0.1:8964/1&quot;,
+             include=[&quot;myapp.tasks&quot;])   # the worker imports this module at startup
+$ celery -A celery_app worker -c 1 --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ timeout 30 python send.py
+result: 5
+app.tasks lookup: NotRegistered &#x27;myapp.tasks.add&#x27;
+$ grep -A1 &quot;\[tasks\]&quot; worker.log; grep -c unregistered worker.log
+[tasks]
+  . myapp.tasks.add
+0</code></pre>
+<p>With <code>include=["myapp.tasks"]</code> the banner lists <code>. myapp.tasks.add</code> and the same call returns 5. Alternatives: <code>app.autodiscover_tasks(["myapp"])</code> (looks for <code>myapp/tasks.py</code>; in Django, <code>app.autodiscover_tasks()</code> scans <code>INSTALLED_APPS</code>), or <code>imports=</code> in the config. Note <code>include</code> is applied when the worker starts; the client process above still had no <code>add</code> in <code>app.tasks</code>, which is fine for <code>send_task</code> by name.</p>
+<h2 id="other">Other causes when the module is imported</h2>
+<ul><li><strong>The name differs:</strong> compare the name in the error with the <code>[tasks]</code> list. A module imported as <code>tasks</code> in one process and <code>myapp.tasks</code> in another registers different names; set <code>@app.task(name="myapp.tasks.add")</code> or use the same import path everywhere.</li><li><strong>An old worker:</strong> you added the task but did not restart the worker, or a second worker (another machine or container) consumes the same queue.</li></ul>
+<p>Related: <a href="/guides/celery-error-111-connection-refused/">Celery Error 111 connection refused</a>, <a href="/guides/celery-chord-error-handling/">Celery chord error handling</a>, <a href="/guides/celery-workerlosterror-worker-exited-prematurely/">Celery WorkerLostError</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Celery &#x27;Received unregistered task of type&#x27; mean?</summary><p>The worker got a message for a task name that is not in its registry, because the module defining the task was never imported in the worker process.</p></details>
+<details><summary>Is the task retried after an unregistered task KeyError?</summary><p>No. In our test the worker discarded the message and the caller received NotRegistered.</p></details>
+<details><summary>How do I see which tasks a Celery worker has registered?</summary><p>Start it with --loglevel=INFO and read the [tasks] list in the banner, or run celery -A proj inspect registered.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Celery 5.6.3 (kombu 5.6.2, redis-py 8.1.0) on Python 3.13.5, Redis 7 (Docker) as broker and backend. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Celery and Redis are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

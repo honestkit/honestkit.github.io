@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python AssertionError: Fix It, and Why python -O Skips Asserts</title>
+<meta name="description" content="We measured Python&#x27;s AssertionError: reading the traceback, python -O and PYTHONOPTIMIZE silently deleting asserts, and the always-true tuple assert.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-assertionerror-assert-not-working-with-python-o/">
+<meta property="og:title" content="Python AssertionError: Fix It, and Why python -O Skips Asserts">
+<meta property="og:description" content="We measured Python&#x27;s AssertionError: reading the traceback, python -O and PYTHONOPTIMIZE silently deleting asserts, and the always-true tuple assert.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-assertionerror-assert-not-working-with-python-o/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does my assert not raise AssertionError?", "acceptedAnswer": {"@type": "Answer", "text": "Either Python runs with -O / PYTHONOPTIMIZE (asserts are stripped; we measured a failing assert returning -400 instead), or the assert has parentheses around condition and message, making an always-true tuple."}}, {"@type": "Question", "name": "How do I fix AssertionError in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Read the condition the traceback underlines and fix whatever made it false. We measured the traceback pointing at the assert line on Python 3.13.5."}}, {"@type": "Question", "name": "Should I use assert to validate input?", "acceptedAnswer": {"@type": "Answer", "text": "No. python -O removes asserts; we measured the check vanishing. Raise ValueError or TypeError for input validation."}}, {"@type": "Question", "name": "Why is my AssertionError message empty?", "acceptedAnswer": {"@type": "Answer", "text": "A bare assert cond has no message. Add one: assert cond, 'what went wrong'."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python AssertionError and assert not working with -O (tested)</h1>
+<p class="lead"><code>AssertionError</code> means an <code>assert</code> condition was false. The bigger trap is the opposite: asserts that never fire. We measured both on Python 3.13.5.</p>
+<h2 id="what">1. What AssertionError means</h2>
+<pre><code>def withdraw(balance, amount):
+    assert amount &lt;= balance, f&quot;insufficient funds: {amount} &gt; {balance}&quot;
+    return balance - amount
+
+print(withdraw(100, 30))
+print(withdraw(100, 500))</code></pre>
+<p>Output:</p>
+<pre><code>70
+Traceback (most recent call last):
+  File &quot;/tmp/as/b1.py&quot;, line 6, in &lt;module&gt;
+    print(withdraw(100, 500))
+          ~~~~~~~~^^^^^^^^^^
+  File &quot;/tmp/as/b1.py&quot;, line 2, in withdraw
+    assert amount &lt;= balance, f&quot;insufficient funds: {amount} &gt; {balance}&quot;
+           ^^^^^^^^^^^^^^^^^
+AssertionError: insufficient funds: 500 &gt; 100</code></pre>
+<p><code>assert cond, msg</code> raises <code>AssertionError(msg)</code> when <code>cond</code> is false. <strong>Measured on Python 3.13.5:</strong> the traceback points at the <code>assert</code> line and underlines the failing condition. Read the condition: the fix is in whatever made it false, not in the assert. A bare <code>assert cond</code> with no message gives an <code>AssertionError</code> with an empty message, so add one.</p>
+
+<h2 id="optimize">2. python -O deletes every assert</h2>
+<pre><code>import subprocess, sys
+src = &quot;def withdraw(b, a):\n    assert a &lt;= b, &#x27;insufficient funds&#x27;\n    return b - a\nprint(withdraw(100, 500))\n&quot;
+for flags in ([], [&quot;-O&quot;]):
+    r = subprocess.run([sys.executable, *flags, &quot;-c&quot;, src], capture_output=True, text=True)
+    print(flags or &quot;default&quot;, &quot;-&gt;&quot;, (r.stdout or r.stderr.strip().splitlines()[-1]).strip())
+r = subprocess.run([sys.executable, &quot;-c&quot;, &quot;print(__debug__)&quot;], capture_output=True, text=True, env={&quot;PYTHONOPTIMIZE&quot;: &quot;1&quot;})
+print(&quot;PYTHONOPTIMIZE=1 __debug__ -&gt;&quot;, r.stdout.strip())</code></pre>
+<p>Output:</p>
+<pre><code>default -&gt; AssertionError: insufficient funds
+[&#x27;-O&#x27;] -&gt; -400
+PYTHONOPTIMIZE=1 __debug__ -&gt; False</code></pre>
+<p><strong>Measured:</strong> the same call that raises by default returns <code>-400</code> under <code>python -O</code>, a negative balance with no error. <code>-O</code> (and the <code>PYTHONOPTIMIZE</code> environment variable, which we measured setting <code>__debug__</code> to <code>False</code>) strips assert statements at compile time. If anything in your deployment sets <code>PYTHONOPTIMIZE</code> (a Dockerfile <code>ENV</code> line, a service unit), an assert that guards real input can vanish in production.</p>
+
+<h2 id="tuple">3. assert with parentheses never fails</h2>
+<pre><code>import warnings
+warnings.simplefilter(&quot;always&quot;)
+x = 0
+# parentheses make a 2-tuple, which is always truthy: this never fails
+exec(compile(&quot;assert (x &gt; 1, &#x27;x must be &gt; 1&#x27;)&quot;, &quot;demo.py&quot;, &quot;exec&quot;))
+print(&quot;passed?!&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>demo.py:1: SyntaxWarning: assertion is always true, perhaps remove parentheses?
+passed?!</code></pre>
+<p><strong>Measured:</strong> <code>assert (x &gt; 1, 'msg')</code> asserts a non-empty tuple, which is always true, so it passes with <code>x = 0</code>. Python only emits a <code>SyntaxWarning</code> at compile time, easy to miss. Write <code>assert x &gt; 1, 'msg'</code> without the outer parentheses.</p>
+
+<h2 id="fix">4. Validate input with raise, not assert</h2>
+<pre><code>def withdraw(balance, amount):
+    if amount &gt; balance:
+        raise ValueError(f&quot;insufficient funds: {amount} &gt; {balance}&quot;)
+    return balance - amount
+
+try:
+    withdraw(100, 500)
+except ValueError as e:
+    print(&quot;ValueError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>ValueError: insufficient funds: 500 &gt; 100</code></pre>
+<p>Use <code>assert</code> for internal invariants that should be impossible (and are fine to skip under <code>-O</code>). For user input, API data and anything that must always be checked, <code>raise</code> a specific exception such as <code>ValueError</code> or <code>TypeError</code>, which <code>-O</code> never removes.</p>
+
+<aside class="cta"><strong>Asserting on an HTTP response? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does my assert not raise AssertionError?</summary><p>Either Python runs with -O / PYTHONOPTIMIZE (asserts are stripped; we measured a failing assert returning -400 instead), or the assert has parentheses around condition and message, making an always-true tuple.</p></details>
+<details><summary>How do I fix AssertionError in Python?</summary><p>Read the condition the traceback underlines and fix whatever made it false. We measured the traceback pointing at the assert line on Python 3.13.5.</p></details>
+<details><summary>Should I use assert to validate input?</summary><p>No. python -O removes asserts; we measured the check vanishing. Raise ValueError or TypeError for input validation.</p></details>
+<details><summary>Why is my AssertionError message empty?</summary><p>A bare assert cond has no message. Add one: assert cond, &#x27;what went wrong&#x27;.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: a failing assert and its traceback, the same code under python -O, PYTHONOPTIMIZE and __debug__, the parenthesised-tuple assert and its SyntaxWarning, and raise ValueError as the fix. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

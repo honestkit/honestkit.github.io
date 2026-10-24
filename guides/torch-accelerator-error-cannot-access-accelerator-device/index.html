@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>torch.accelerator Error: Cannot Access Accelerator Device</title>
+<meta name="description" content="torch.accelerator raises RuntimeError when no device is usable, and current_accelerator() can return cuda with no GPU. Reproduced on torch 2.14, with the fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/torch-accelerator-error-cannot-access-accelerator-device/">
+<meta property="og:title" content="torch.accelerator Error: Cannot Access Accelerator Device">
+<meta property="og:description" content="torch.accelerator raises RuntimeError when no device is usable, and current_accelerator() can return cuda with no GPU. Reproduced on torch 2.14, with the fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/torch-accelerator-error-cannot-access-accelerator-device/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Cannot access accelerator device when none is available mean?", "acceptedAnswer": {"@type": "Answer", "text": "A torch.accelerator function that needs a device (current_device_index, synchronize, set_device_index) was called while torch.accelerator.is_available() is False."}}, {"@type": "Question", "name": "Why does torch.accelerator.current_accelerator() return cuda without a GPU?", "acceptedAnswer": {"@type": "Answer", "text": "On a CUDA build it reports the compiled-in accelerator type. Pass check_available=True to get None when no device is usable."}}, {"@type": "Question", "name": "How do I pick a device with torch.accelerator?", "acceptedAnswer": {"@type": "Answer", "text": "device = torch.accelerator.current_accelerator(check_available=True) or torch.device(\"cpu\")."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>torch.accelerator error: Cannot access accelerator device (tested)</h1>
+<p class="lead"><code>RuntimeError: Cannot access accelerator device when none is available</code> comes from <code>torch.accelerator</code> calls such as <code>current_device_index()</code> or <code>synchronize()</code> when no GPU is usable. Use <code>torch.accelerator.current_accelerator(check_available=True)</code>, which returns <code>None</code> in that case, and fall back to CPU.</p>
+<h2 id="repro">1. Reproduce</h2>
+<p><code>b1.py</code> calls the device-generic <code>torch.accelerator</code> API on a machine without a GPU:</p>
+<pre><code>import torch
+print(&quot;torch&quot;, torch.__version__)
+print(&quot;is_available:&quot;, torch.accelerator.is_available())
+print(&quot;current_accelerator:&quot;, torch.accelerator.current_accelerator())
+print(&quot;device_count:&quot;, torch.accelerator.device_count())
+for name, call in [(&quot;current_device_index()&quot;, torch.accelerator.current_device_index),
+                   (&quot;synchronize()&quot;, torch.accelerator.synchronize),
+                   (&quot;set_device_index(0)&quot;, lambda: torch.accelerator.set_device_index(0)),
+                   (&quot;current_accelerator(check_available=True)&quot;, lambda: torch.accelerator.current_accelerator(check_available=True))]:
+    try:
+        print(name, &quot;-&gt;&quot;, call())
+    except Exception as e:
+        print(name, &quot;-&gt;&quot;, type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>With the CPU-only build:</p>
+<pre><code>torch 2.14.1+cpu
+is_available: False
+current_accelerator: None
+device_count: 0
+current_device_index() -&gt; RuntimeError: Cannot access accelerator device when none is available.
+synchronize() -&gt; RuntimeError: Cannot access accelerator device when none is available.
+set_device_index(0) -&gt; RuntimeError: Cannot access accelerator device when none is available.
+current_accelerator(check_available=True) -&gt; None</code></pre>
+<p>With a CUDA build on the same machine (no NVIDIA GPU or driver):</p>
+<pre><code>torch 2.14.1+cu130
+is_available: False
+current_accelerator: cuda
+device_count: 0
+current_device_index() -&gt; RuntimeError: Found no NVIDIA driver on your system. Please check that you have an NVIDIA GPU and installed a driver from http://www.nvidia.com/Download/index.aspx
+synchronize() -&gt; RuntimeError: Found no NVIDIA driver on your system. Please check that you have an NVIDIA GPU and installed a driver from http://www.nvidia.com/Download/index.aspx
+set_device_index(0) -&gt; RuntimeError: Found no NVIDIA driver on your system. Please check that you have an NVIDIA GPU and installed a driver from http://www.nvidia.com/Download/index.aspx
+current_accelerator(check_available=True) -&gt; None</code></pre>
+<p>The query functions (<code>is_available</code>, <code>device_count</code>, <code>current_accelerator</code>) never raise. Anything that touches a device (<code>current_device_index</code>, <code>synchronize</code>, <code>set_device_index</code>) raises <code>RuntimeError</code>: <code>Cannot access accelerator device when none is available</code> on a CPU build, or the backend's own error (<code>Found no NVIDIA driver</code>) on a CUDA build. The trap: on the CUDA build <code>current_accelerator()</code> returns <code>cuda</code> even though <code>is_available()</code> is <code>False</code>, so code that only checks <code>current_accelerator()</code> picks a device that cannot be used.</p>
+<h2 id="fix">2. Fix: pass check_available=True, fall back to CPU</h2>
+<pre><code>import torch
+# Portable device pick: an accelerator only if it is really usable, else CPU
+device = torch.accelerator.current_accelerator(check_available=True) or torch.device(&quot;cpu&quot;)
+x = torch.ones(2, device=device)
+print(&quot;device:&quot;, device, &quot;| tensor on:&quot;, x.device)</code></pre>
+<p>Output on both builds:</p>
+<pre><code>device: cpu | tensor on: cpu
+device: cpu | tensor on: cpu</code></pre>
+<p>Guard device calls with <code>torch.accelerator.is_available()</code>. If you expected a GPU, the error is a build or driver problem, see <a href="/guides/torch-not-compiled-with-cuda-enabled/">Torch not compiled with CUDA enabled</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Cannot access accelerator device when none is available mean?</summary><p>A torch.accelerator function that needs a device (current_device_index, synchronize, set_device_index) was called while torch.accelerator.is_available() is False.</p></details>
+<details><summary>Why does torch.accelerator.current_accelerator() return cuda without a GPU?</summary><p>On a CUDA build it reports the compiled-in accelerator type. Pass check_available=True to get None when no device is usable.</p></details>
+<details><summary>How do I pick a device with torch.accelerator?</summary><p>device = torch.accelerator.current_accelerator(check_available=True) or torch.device(&quot;cpu&quot;).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 with torch 2.14.1+cpu and 2.14.1+cu130 on Python 3.13.5, Linux x86_64 without an NVIDIA GPU. The scripts ran verbatim and the output was pasted unedited. PlainTables is our extension; PyTorch is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

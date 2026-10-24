@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forwarded Header (RFC 7239) vs X-Forwarded-For: What Apps Read (Tested)</title>
+<meta name="description" content="Express 5.2.1 and Werkzeug 3.1.9 ignored the standard Forwarded header completely and read only X-Forwarded-For/Proto/Host. With trust proxy true, a client-sent X-Forwarded-For: 6.6.6.6 became req.ip. Hop counts, syntax and fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/forwarded-header-vs-x-forwarded-for/">
+<meta property="og:title" content="Forwarded Header (RFC 7239) vs X-Forwarded-For: What Apps Read (Tested)">
+<meta property="og:description" content="Express 5.2.1 and Werkzeug 3.1.9 ignored the standard Forwarded header completely and read only X-Forwarded-For/Proto/Host. With trust proxy true, a client-sent X-Forwarded-For: 6.6.6.6 became req.ip. Hop counts, syntax and fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/forwarded-header-vs-x-forwarded-for/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between Forwarded and X-Forwarded-For?", "acceptedAnswer": {"@type": "Answer", "text": "Forwarded is the standard header from RFC 7239 and carries the client IP, scheme and host in one header (for=, proto=, host=, by=). X-Forwarded-For, X-Forwarded-Proto and X-Forwarded-Host are older non-standard headers, one per value. Most frameworks still read only the X-Forwarded-* headers."}}, {"@type": "Question", "name": "Does Express support the Forwarded header?", "acceptedAnswer": {"@type": "Answer", "text": "No. In Express 5.2.1, Forwarded: for=203.0.113.7;proto=https;host=shop.example.com left req.ip, req.protocol and req.hostname unchanged under every trust proxy setting we tried. Express reads only X-Forwarded-For, X-Forwarded-Proto and X-Forwarded-Host."}}, {"@type": "Question", "name": "Does Flask ProxyFix read the Forwarded header?", "acceptedAnswer": {"@type": "Answer", "text": "No. Werkzeug 3.1.9 ProxyFix with x_for=1, x_proto=1, x_host=1 ignored Forwarded completely and applied the same values when sent as X-Forwarded-* headers."}}, {"@type": "Question", "name": "Is trust proxy true safe in Express?", "acceptedAnswer": {"@type": "Answer", "text": "Only if no client can reach the app except through your proxies. With trust proxy true, a client-sent X-Forwarded-For: 6.6.6.6 became req.ip after a proxy appended the real address. With trust proxy 1, req.ip was the real address."}}, {"@type": "Question", "name": "How do I write an IPv6 address in the Forwarded header?", "acceptedAnswer": {"@type": "Answer", "text": "From RFC 7239: put it in brackets and double quotes, for example Forwarded: for=\"[2001:db8::1]:4711\". IPv4 with a port also needs quotes: for=\"203.0.113.7:4711\"."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Forwarded vs X-Forwarded-For (tested)</h1>
+<p class="lead"><code>Forwarded</code> (RFC 7239, 2014) is the standard header for passing the original client address, scheme and host through a proxy. <code>X-Forwarded-For</code>, <code>X-Forwarded-Proto</code> and <code>X-Forwarded-Host</code> are the older, non-standard headers that do the same job. We sent both kinds to Express 5.2.1 and Werkzeug 3.1.9. Neither framework read <code>Forwarded</code> at all, so in practice your proxy still has to send the <code>X-Forwarded-*</code> headers.</p>
+<h2>1. The two formats side by side</h2>
+<p>The same request, after one proxy, written both ways (syntax from RFC 7239, not measured):</p>
+<pre><code>X-Forwarded-For: 203.0.113.7
+X-Forwarded-Proto: https
+X-Forwarded-Host: shop.example.com
+
+Forwarded: for=203.0.113.7;proto=https;host=shop.example.com</code></pre>
+<table><thead><tr><th>Information</th><th>X-Forwarded-* header</th><th><code>Forwarded</code> parameter</th></tr></thead><tbody>
+<tr><td>Original client IP</td><td><code>X-Forwarded-For</code></td><td><code>for=</code></td></tr>
+<tr><td>Original scheme (http/https)</td><td><code>X-Forwarded-Proto</code></td><td><code>proto=</code></td></tr>
+<tr><td>Original Host header</td><td><code>X-Forwarded-Host</code></td><td><code>host=</code></td></tr>
+<tr><td>The proxy's own interface</td><td>(none)</td><td><code>by=</code></td></tr>
+</tbody></table>
+<p>Rules from RFC 7239 (not measured):</p>
+<ul>
+<li>Parameters inside one element are separated by <code>;</code>. Each proxy adds an element; elements are separated by <code>,</code>, so a two-proxy chain looks like <code>Forwarded: for=203.0.113.7;proto=https, for=198.51.100.2</code>.</li>
+<li>An IPv6 address must be in brackets <em>and</em> quotes, because <code>:</code> and <code>[</code> are not allowed in an unquoted value: <code>for="[2001:db8::1]:4711"</code>. An IPv4 address with a port needs quotes too: <code>for="203.0.113.7:4711"</code>.</li>
+<li>A proxy that does not want to reveal an address can send <code>for=unknown</code> or an obfuscated identifier starting with <code>_</code>, for example <code>for=_hidden</code>.</li>
+<li>The main advantage is that one header carries all the values per hop, so the IP and the scheme of the same hop stay together. With <code>X-Forwarded-*</code> they are three separate lists that may not line up.</li>
+</ul>
+<h2>2. Express 5.2.1 ignores Forwarded</h2>
+<p>A route that returned <code>req.ip</code>, <code>req.ips</code>, <code>req.protocol</code> and <code>req.hostname</code>. The connection always came from <code>127.0.0.1</code>. With <code>app.set('trust proxy', true)</code>:</p>
+<table><thead><tr><th>Request headers</th><th><code>req.ip</code></th><th><code>req.protocol</code></th><th><code>req.hostname</code></th></tr></thead><tbody>
+<tr><td>(none)</td><td>127.0.0.1</td><td>http</td><td>localhost</td></tr>
+<tr><td><code>X-Forwarded-For: 203.0.113.7</code>, <code>X-Forwarded-Proto: https</code>, <code>X-Forwarded-Host: shop.example.com</code></td><td>203.0.113.7</td><td>https</td><td>shop.example.com</td></tr>
+<tr><td><code>Forwarded: for=203.0.113.7;proto=https;host=shop.example.com</code></td><td><strong>127.0.0.1</strong></td><td><strong>http</strong></td><td><strong>localhost</strong></td></tr>
+</tbody></table>
+<p>The <code>Forwarded</code> header changed nothing under any <code>trust proxy</code> setting we tried (false, true, 1, 2, <code>'loopback'</code>). The source agrees: the <code>forwarded</code> 0.2.0 package that Express uses parses only <code>req.headers['x-forwarded-for']</code>, and <code>req.protocol</code> / <code>req.host</code> read only <code>X-Forwarded-Proto</code> / <code>X-Forwarded-Host</code>. If your proxy sends only <code>Forwarded</code>, Express sees the proxy's IP and plain http.</p>
+<h2>3. Werkzeug / Flask ProxyFix ignores it too</h2>
+<p>Werkzeug 3.1.9 with <code>ProxyFix(app, x_for=1, x_proto=1, x_host=1)</code>:</p>
+<table><thead><tr><th>Request headers</th><th><code>remote_addr</code></th><th><code>scheme</code></th><th><code>host</code></th></tr></thead><tbody>
+<tr><td><code>X-Forwarded-For: 203.0.113.7</code> + Proto <code>https</code> + Host <code>shop.example.com</code></td><td>203.0.113.7</td><td>https</td><td>shop.example.com</td></tr>
+<tr><td><code>Forwarded: for=203.0.113.7;proto=https;host=shop.example.com</code></td><td><strong>127.0.0.1</strong></td><td><strong>http</strong></td><td><strong>localhost</strong></td></tr>
+</tbody></table>
+<p>The string <code>Forwarded</code> (as a header name) does not appear anywhere in the installed Werkzeug package. Two more things we measured:</p>
+<ul>
+<li><code>ProxyFix(app)</code> with no arguments defaults to <code>x_for=1, x_proto=1</code>, so it already applied <code>X-Forwarded-Proto: https</code>. <code>X-Forwarded-Host</code> is off until you set <code>x_host=1</code>.</li>
+<li>Without ProxyFix, <code>request.remote_addr</code> stayed <code>127.0.0.1</code>, but <code>request.access_route</code> returned the raw client-sent list, for example <code>["1.2.3.4", "203.0.113.7", "198.51.100.2"]</code>. Do not use <code>access_route[0]</code> as the client IP.</li>
+</ul>
+<h2>4. The spoofing problem: trust proxy true</h2>
+<p>A proxy that appends (nginx's <code>$proxy_add_x_forwarded_for</code>, for example) keeps whatever the client sent and adds the real address on the right. So a client that sends <code>X-Forwarded-For: 6.6.6.6</code> through one proxy produces <code>X-Forwarded-For: 6.6.6.6, 198.51.100.2</code>. We sent that header to Express:</p>
+<table><thead><tr><th><code>trust proxy</code></th><th><code>req.ip</code></th><th><code>req.ips</code></th></tr></thead><tbody>
+<tr><td><code>false</code> (default)</td><td>127.0.0.1</td><td><code>[]</code></td></tr>
+<tr><td><code>true</code></td><td><strong>6.6.6.6</strong> (the client's fake)</td><td><code>["6.6.6.6", "198.51.100.2"]</code></td></tr>
+<tr><td><code>1</code></td><td>198.51.100.2 (the real client)</td><td><code>["198.51.100.2"]</code></td></tr>
+<tr><td><code>'loopback'</code></td><td>198.51.100.2</td><td><code>["198.51.100.2"]</code></td></tr>
+<tr><td><code>'10.0.0.0/8'</code> (does not match the 127.0.0.1 peer)</td><td>127.0.0.1</td><td><code>[]</code></td></tr>
+</tbody></table>
+<p><code>true</code> trusts every hop and takes the leftmost entry, which the client controls. Rate limits, IP allowlists and logs keyed on <code>req.ip</code> can then be bypassed with one header. Use the number of proxies you actually run (<code>1</code> for a single nginx or load balancer) or the proxy's address or subnet.</p>
+<p>A 3-entry chain <code>1.2.3.4, 203.0.113.7, 198.51.100.2</code> gave <code>req.ip</code> = <code>1.2.3.4</code> with <code>true</code>, <code>198.51.100.2</code> with <code>1</code>, and <code>203.0.113.7</code> with <code>2</code>. Werkzeug's <code>x_for=1</code> and <code>x_for=2</code> gave the same results as Express <code>1</code> and <code>2</code>. With <code>x_for=2</code> and only one entry in the header, Werkzeug ignored the header and kept <code>127.0.0.1</code>; Express <code>2</code> used the single entry.</p>
+<p>Neither framework validated the value. <code>X-Forwarded-For: not-an-ip</code> became <code>req.ip</code> = <code>"not-an-ip"</code> in Express (<code>true</code> and <code>1</code>) and <code>remote_addr</code> = <code>"not-an-ip"</code> with ProxyFix <code>x_for=1</code>. If you store the IP in a database column of type <code>inet</code>, validate it first.</p>
+<h2>5. Proto and Host lists: Express and Werkzeug disagree</h2>
+<p>We sent <code>X-Forwarded-Proto: https, http</code> and <code>X-Forwarded-Host: a.example.com, b.example.com</code>:</p>
+<table><thead><tr><th>Framework and setting</th><th>Scheme</th><th>Host</th></tr></thead><tbody>
+<tr><td>Express 5.2.1, <code>trust proxy</code> true, 1, 2 or <code>'loopback'</code></td><td>https (first value)</td><td>a.example.com (first value)</td></tr>
+<tr><td>Werkzeug 3.1.9, <code>x_proto=1, x_host=1</code></td><td>http (last value)</td><td>b.example.com (last value)</td></tr>
+</tbody></table>
+<p>Express applies the hop count only to <code>X-Forwarded-For</code>. For Proto and Host it checks that the direct peer is trusted and then takes the first, client-controlled value. So even with <code>trust proxy 1</code>, your proxy must <strong>overwrite</strong> <code>X-Forwarded-Proto</code> and <code>X-Forwarded-Host</code>, not append to them. See <a href="/guides/x-forwarded-proto-nginx/">X-Forwarded-Proto in nginx</a> and <a href="/guides/host-header-injection-nginx/">Host header injection</a>.</p>
+<h2>6. What to configure</h2>
+<p>For a single nginx in front of Express or Flask (nginx config from the nginx docs, not measured here):</p>
+<pre><code>proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Host  $host;</code></pre>
+<pre><code>// Express
+app.set('trust proxy', 1);
+
+# Flask / Werkzeug
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)</code></pre>
+<p><code>$proxy_add_x_forwarded_for</code> appends to the client's value, which is fine when the app trusts exactly one hop. <code>$scheme</code> and <code>$host</code> replace whatever the client sent. More detail, including <code>set_real_ip_from</code> and <code>real_ip_header</code>: <a href="/guides/x-forwarded-for-real-ip-nginx/">X-Forwarded-For and the real client IP in nginx</a>.</p>
+<p>If you also want the standard header, nginx has no built-in <code>Forwarded</code> variable; you build it with <code>proxy_set_header Forwarded "for=$remote_addr;proto=$scheme;host=$host";</code> (from docs, not measured). That simple version breaks the RFC for IPv6 clients, which need <code>for="[...]"</code>, and it drops earlier hops. Only send it if something downstream actually reads it, and keep the <code>X-Forwarded-*</code> headers alongside it for Express and Werkzeug.</p>
+<h2>7. Checklist</h2>
+<ol>
+<li>Find out which header your framework reads. In our tests Express and Werkzeug read only <code>X-Forwarded-*</code>.</li>
+<li>Set the trust to the number of proxies you run, never <code>true</code> on a server the internet can reach directly.</li>
+<li>Make the proxy overwrite Proto and Host, and append (or overwrite) For.</li>
+<li>Test it: send <code>X-Forwarded-For: 6.6.6.6</code> yourself and check that your logs still show your real IP.</li>
+</ol>
+<aside class="cta"><strong>Send your own Forwarded and X-Forwarded-* headers to your app and see what it does:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between Forwarded and X-Forwarded-For?</summary><p>Forwarded is the standard header from RFC 7239 and carries the client IP, scheme and host in one header (for=, proto=, host=, by=). X-Forwarded-For, X-Forwarded-Proto and X-Forwarded-Host are older non-standard headers, one per value. Most frameworks still read only the X-Forwarded-* headers.</p></details>
+<details><summary>Does Express support the Forwarded header?</summary><p>No. In Express 5.2.1, Forwarded: for=203.0.113.7;proto=https;host=shop.example.com left req.ip, req.protocol and req.hostname unchanged under every trust proxy setting we tried. Express reads only X-Forwarded-For, X-Forwarded-Proto and X-Forwarded-Host.</p></details>
+<details><summary>Does Flask ProxyFix read the Forwarded header?</summary><p>No. Werkzeug 3.1.9 ProxyFix with x_for=1, x_proto=1, x_host=1 ignored Forwarded completely and applied the same values when sent as X-Forwarded-* headers.</p></details>
+<details><summary>Is trust proxy true safe in Express?</summary><p>Only if no client can reach the app except through your proxies. With trust proxy true, a client-sent X-Forwarded-For: 6.6.6.6 became req.ip after a proxy appended the real address. With trust proxy 1, req.ip was the real address.</p></details>
+<details><summary>How do I write an IPv6 address in the Forwarded header?</summary><p>From RFC 7239: put it in brackets and double quotes, for example Forwarded: for=&quot;[2001:db8::1]:4711&quot;. IPv4 with a port also needs quotes: for=&quot;203.0.113.7:4711&quot;.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 and Express 5.2.1 (proxy-addr 2.0.8, forwarded 0.2.0) on localhost:8983, curl 8.14.1 as the client, and Werkzeug 3.1.9 ProxyFix on Python 3.13.5 (Werkzeug&#x27;s in-process test client with REMOTE_ADDR 127.0.0.1, no socket). The RFC 7239 syntax and the nginx config are from the RFC and the nginx docs, not measured; nginx is not installed on the test box. PlainHeaders is our extension; Node.js, Express, Werkzeug and curl are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

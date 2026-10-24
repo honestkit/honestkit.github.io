@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLAlchemy DetachedInstanceError: not bound to a Session (Tested)</title>
+<meta name="description" content="SQLAlchemy DetachedInstanceError tested on 2.1.6: lazy load and attribute refresh after the session closes. Fixes: selectinload, expire_on_commit=False, merge.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlalchemy-detachedinstanceerror-not-bound-to-a-session/">
+<meta property="og:title" content="SQLAlchemy DetachedInstanceError: not bound to a Session (Tested)">
+<meta property="og:description" content="SQLAlchemy DetachedInstanceError tested on 2.1.6: lazy load and attribute refresh after the session closes. Fixes: selectinload, expire_on_commit=False, merge.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlalchemy-detachedinstanceerror-not-bound-to-a-session/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes DetachedInstanceError?", "acceptedAnswer": {"@type": "Answer", "text": "Accessing a lazy relationship, or any attribute expired by commit(), on an object whose session has been closed. SQLAlchemy needs the session to run the load query."}}, {"@type": "Question", "name": "Does expire_on_commit=False fix DetachedInstanceError?", "acceptedAnswer": {"@type": "Answer", "text": "Only for attributes that were already loaded. Relationships that were never loaded still fail; use selectinload() or joinedload() in the query."}}, {"@type": "Question", "name": "How do I use an object in a new session?", "acceptedAnswer": {"@type": "Answer", "text": "obj = new_session.merge(obj), then use the returned object."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLAlchemy DetachedInstanceError: not bound to a Session (tested)</h1>
+<p class="lead"><code>DetachedInstanceError: Parent instance is not bound to a Session; lazy load operation of attribute cannot proceed</code> means you touched a relationship (or an attribute expired by <code>commit()</code>) after the object's session closed. Load it up front with <code>selectinload()</code>, keep values with <code>expire_on_commit=False</code>, or re-attach with <code>session.merge()</code>.</p>
+<p>Every block imports this <code>common.py</code> (in-memory SQLite, one author with two books):</p>
+<pre><code>from sqlalchemy import create_engine, ForeignKey
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session
+
+class Base(DeclarativeBase): pass
+class Author(Base):
+    __tablename__ = &quot;authors&quot;
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    books: Mapped[list[&quot;Book&quot;]] = relationship(back_populates=&quot;author&quot;)
+class Book(Base):
+    __tablename__ = &quot;books&quot;
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    author_id: Mapped[int] = mapped_column(ForeignKey(&quot;authors.id&quot;))
+    author: Mapped[Author] = relationship(back_populates=&quot;books&quot;)
+
+engine = create_engine(&quot;sqlite://&quot;)
+Base.metadata.create_all(engine)
+with Session(engine) as s:
+    s.add(Author(name=&quot;Ada&quot;, books=[Book(title=&quot;Notes&quot;), Book(title=&quot;Engines&quot;)])); s.commit()</code></pre>
+<h2 id="test">1. The error: lazy loading after the session closed</h2>
+<pre><code>from common import *
+from sqlalchemy import select
+def get_author():
+    with Session(engine) as s:
+        return s.scalars(select(Author)).first()
+a = get_author()
+print(a.name)
+print(a.books)          # lazy-loaded relationship, but the session is closed</code></pre>
+<p>Output:</p>
+<pre><code>Ada
+Traceback (most recent call last):
+  File &quot;/w/b1.py&quot;, line 8, in &lt;module&gt;
+    print(a.books)          # lazy-loaded relationship, but the session is closed
+          ^^^^^^^
+  File &quot;/usr/local/lib/python3.14/site-packages/sqlalchemy/orm/attributes.py&quot;, line 575, in __get__
+    return self.impl.get(state, dict_)  # type: ignore[no-any-return]
+           ~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File &quot;/usr/local/lib/python3.14/site-packages/sqlalchemy/orm/attributes.py&quot;, line 1091, in get
+    value = self._fire_loader_callables(state, key, passive)
+  File &quot;/usr/local/lib/python3.14/site-packages/sqlalchemy/orm/attributes.py&quot;, line 1126, in _fire_loader_callables
+    return self.callable_(state, passive)
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File &quot;/usr/local/lib/python3.14/site-packages/sqlalchemy/orm/strategies.py&quot;, line 957, in _load_for_state
+    raise orm_exc.DetachedInstanceError(
+    ...&lt;3 lines&gt;...
+    )
+sqlalchemy.orm.exc.DetachedInstanceError: Parent instance &lt;Author at 0x7f46085a3d90&gt; is not bound to a Session; lazy load operation of attribute &#x27;books&#x27; cannot proceed (Background on this error at: https://sqlalche.me/e/21/bhk3)</code></pre>
+<p><code>a.name</code> was loaded by the query, so it works. <code>a.books</code> is a lazy relationship: SQLAlchemy runs a second query the first time you touch it, and that needs the session. The session closed when the function returned, so the object is <em>detached</em>. This is the classic case: a repository function or a request handler returns ORM objects, and a template or serializer touches a relationship later.</p>
+<h2 id="commit">2. After commit, even plain columns fail</h2>
+<pre><code>from common import *
+from sqlalchemy import select
+with Session(engine) as s:
+    a = s.scalars(select(Author)).first()
+    s.commit()                         # expire_on_commit=True expires every attribute
+try:
+    print(a.name)                      # even a plain column now needs the session
+except Exception as e:
+    print(type(e).__name__ + &quot;:&quot;, str(e)[:120])</code></pre>
+<p>Output:</p>
+<pre><code>DetachedInstanceError: Instance &lt;Author at 0x7f43a311ae90&gt; is not bound to a Session; attribute refresh operation cannot proceed (Background on</code></pre>
+<p>By default <code>commit()</code> expires every loaded attribute (<code>expire_on_commit=True</code>), so the next access must refresh from the database. If the session is gone by then, you get the variant <code>attribute refresh operation cannot proceed</code>.</p>
+<h2 id="eager">3. Fix: load what you need before the session closes</h2>
+<pre><code>from common import *
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+def get_author():
+    with Session(engine) as s:
+        return s.scalars(select(Author).options(selectinload(Author.books))).first()
+a = get_author()
+print(a.name, [b.title for b in a.books])       # loaded up front, works after close</code></pre>
+<p>Output:</p>
+<pre><code>Ada [&#x27;Notes&#x27;, &#x27;Engines&#x27;]</code></pre>
+<p><code>selectinload()</code> (or <code>joinedload()</code>) fetches the relationship in the original query, so nothing is lazy afterwards. This is the cleanest fix: it also avoids the N+1 queries that lazy loading causes in loops. Converting to plain dicts or Pydantic models inside the session works for the same reason.</p>
+<h2 id="expire">4. expire_on_commit=False keeps loaded values readable</h2>
+<pre><code>from common import *
+from sqlalchemy import select
+with Session(engine, expire_on_commit=False) as s:
+    a = s.scalars(select(Author)).first()
+    a.name = &quot;Ada L.&quot;
+    s.commit()
+print(a.name)                                   # still readable after commit + close
+try:
+    a.books
+except Exception as e:
+    print(&quot;unloaded relationship still fails:&quot;, type(e).__name__)</code></pre>
+<p>Output:</p>
+<pre><code>Ada L.
+unloaded relationship still fails: DetachedInstanceError</code></pre>
+<p>This fixes block 2 (values stay as they were at commit), but not block 1: a relationship that was never loaded still needs a session. Many web apps set <code>sessionmaker(..., expire_on_commit=False)</code>; it is the recommended setting with <code>AsyncSession</code>.</p>
+<h2 id="merge">5. Re-attach a detached object with merge()</h2>
+<pre><code>from common import *
+from sqlalchemy import select
+with Session(engine) as s:
+    a = s.scalars(select(Author)).first()
+with Session(engine) as s2:
+    a = s2.merge(a)                             # re-attach to a new session
+    print(a.name, [b.title for b in a.books])</code></pre>
+<p>Output:</p>
+<pre><code>Ada [&#x27;Notes&#x27;, &#x27;Engines&#x27;]</code></pre>
+<p><code>session.merge(obj)</code> returns a copy that belongs to the new session, so lazy loads work again. Use the returned object, not the original.</p>
+<p>Related: <a href="/guides/sqlalchemy-integrityerror-unique-constraint-failed/">SQLAlchemy IntegrityError and PendingRollbackError</a> · <a href="/guides/sqlite-database-is-locked/">SQLite database is locked</a>.</p>
+
+<aside class="cta"><strong>Collecting data from web tables? Copy them as CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes DetachedInstanceError?</summary><p>Accessing a lazy relationship, or any attribute expired by commit(), on an object whose session has been closed. SQLAlchemy needs the session to run the load query.</p></details>
+<details><summary>Does expire_on_commit=False fix DetachedInstanceError?</summary><p>Only for attributes that were already loaded. Relationships that were never loaded still fail; use selectinload() or joinedload() in the query.</p></details>
+<details><summary>How do I use an object in a new session?</summary><p>obj = new_session.merge(obj), then use the returned object.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with SQLAlchemy 2.1.6 and Python 3.14.7 (python:3-alpine in Docker), SQLite in-memory database. Each block was run verbatim and the output pasted unedited. PlainTables is our extension; Python and SQLAlchemy are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

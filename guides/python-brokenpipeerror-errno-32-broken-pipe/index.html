@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BrokenPipeError: [Errno 32] Broken pipe in Python (Tested Fix)</title>
+<meta name="description" content="We measured Python BrokenPipeError [Errno 32]: piping into head, sockets whose peer closed, subprocess stdin, and the two fixes (catch + dup2, SIGPIPE).">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-brokenpipeerror-errno-32-broken-pipe/">
+<meta property="og:title" content="BrokenPipeError: [Errno 32] Broken pipe in Python (Tested Fix)">
+<meta property="og:description" content="We measured Python BrokenPipeError [Errno 32]: piping into head, sockets whose peer closed, subprocess stdin, and the two fixes (catch + dup2, SIGPIPE).">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-brokenpipeerror-errno-32-broken-pipe/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does BrokenPipeError: [Errno 32] Broken pipe mean?", "acceptedAnswer": {"@type": "Answer", "text": "Python wrote to a pipe or socket with no reader left. We measured it from print() piped into head -n 2, a socketpair whose peer was closed, and a subprocess stdin after the child exited."}}, {"@type": "Question", "name": "Why does python script.py | head raise BrokenPipeError?", "acceptedAnswer": {"@type": "Answer", "text": "head exits after its lines, and Python ignores SIGPIPE, so the next stdout flush raises instead of quietly ending the process. Catch it and dup2 devnull onto stdout, or restore SIG_DFL for SIGPIPE in CLI tools."}}, {"@type": "Question", "name": "How do I suppress Exception ignored BrokenPipeError at exit?", "acceptedAnswer": {"@type": "Answer", "text": "After catching BrokenPipeError, point stdout at os.devnull with os.dup2 before exiting, so Python's final flush of any still-buffered output has somewhere to go. We measured this pattern exits with no traceback and status 1."}}, {"@type": "Question", "name": "Is it safe to set signal.SIGPIPE to SIG_DFL?", "acceptedAnswer": {"@type": "Answer", "text": "In a command-line tool, yes (we measured exit status 141 and no traceback). In a server, no: a client disconnecting would kill the process. It's also unavailable on Windows."}}, {"@type": "Question", "name": "Why does subprocess raise BrokenPipeError?", "acceptedAnswer": {"@type": "Answer", "text": "You wrote to p.stdin after the child exited. We measured communicate() with the same input returning normally, so use communicate() or subprocess.run(input=...)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>BrokenPipeError: [Errno 32] Broken pipe (tested)</h1>
+<p class="lead"><code>BrokenPipeError: [Errno 32] Broken pipe</code> means Python wrote to a pipe or socket after the reader went away. We measured the three common places it comes from on Python 3.13.5, and which fixes leave no traceback behind.</p>
+<h2 id="head">1. Piping into head: the classic cause</h2>
+<pre><code>for i in range(100000):
+    print(i)</code></pre>
+<p>Piped into head:</p>
+<pre><code>$ python3 b1.py | head -n 2; echo &quot;exit=${PIPESTATUS[0]}&quot;
+0
+1
+Traceback (most recent call last):
+  File &quot;/tmp/bp/b1.py&quot;, line 2, in &lt;module&gt;
+    print(i)
+    ~~~~~^^^
+BrokenPipeError: [Errno 32] Broken pipe
+exit=1</code></pre>
+<p><strong>Measured on Python 3.13.5 (Linux):</strong> <code>head -n 2</code> reads two lines and exits. The next time Python flushes stdout, the pipe has no reader, the write fails with <code>EPIPE</code>, and Python raises <code>BrokenPipeError: [Errno 32] Broken pipe</code>. Python ignores <code>SIGPIPE</code> at startup, so you get an exception where <code>cat</code> or <code>grep</code> would just stop. The same happens with <code>| less</code> (quit early), <code>| grep -m1</code>, and <code>| python -c "input()"</code>.</p>
+
+<h2 id="catch">2. Fix: catch it and exit quietly (cross-platform)</h2>
+<pre><code>import os, sys
+try:
+    for i in range(100000):
+        print(i)
+    sys.stdout.flush()
+except BrokenPipeError:
+    # Python flushes stdout again at exit; point it at devnull so that doesn&#x27;t fail too
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, sys.stdout.fileno())
+    sys.exit(1)</code></pre>
+<p>Piped into head:</p>
+<pre><code>$ python3 b2.py | head -n 2; echo &quot;exit=${PIPESTATUS[0]}&quot;
+0
+1
+exit=1</code></pre>
+<p>This is the pattern the Python docs recommend (the <code>signal</code> module's note on SIGPIPE). The <code>dup2</code> to devnull is there because Python flushes stdout once more at exit; if output is still buffered, that flush hits the same broken pipe and prints <code>Exception ignored ... BrokenPipeError</code>. In our run, a version without the <code>dup2</code> happened to exit cleanly too, but that depends on what is left in the buffer, so keep it.</p>
+
+<h2 id="sigpipe">3. Fix: restore default SIGPIPE (Unix CLI tools)</h2>
+<pre><code>import signal
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)   # Unix only: die quietly like cat/grep do
+for i in range(100000):
+    print(i)</code></pre>
+<p>Piped into head:</p>
+<pre><code>$ python3 b3.py | head -n 2; echo &quot;exit=${PIPESTATUS[0]}&quot;
+0
+1
+exit=141</code></pre>
+<p><strong>Measured:</strong> no traceback, and the exit status is 141 (128 + signal 13), the same as other Unix tools killed by SIGPIPE. Only do this in a command-line program: in a server, a client hanging up on a socket would kill the whole process instead of raising an exception you can handle. <code>signal.SIGPIPE</code> doesn't exist on Windows.</p>
+
+<h2 id="socket">4. Sockets: the other side closed the connection</h2>
+<pre><code>import socket
+a, b = socket.socketpair()
+b.close()                         # the other side hung up
+try:
+    a.sendall(b&quot;x&quot; * 100)
+except BrokenPipeError as e:
+    print(type(e).__name__, e)
+try:
+    a.sendall(b&quot;x&quot; * 100)
+except OSError as e:
+    print(&quot;again:&quot;, type(e).__name__, e.errno)</code></pre>
+<p>Output:</p>
+<pre><code>BrokenPipeError [Errno 32] Broken pipe
+again: BrokenPipeError 32</code></pre>
+<p><strong>Measured:</strong> writing to a socket whose peer has closed raises <code>BrokenPipeError</code> (on a TCP connection the first write may succeed and the second fail, or you may get <code>ConnectionResetError: [Errno 104]</code> instead). In a web server this usually means the browser or client gave up (navigated away, timed out); log it at debug level rather than treating it as a bug. For clients, reconnect and retry if the request is safe to repeat.</p>
+
+<h2 id="subprocess">5. subprocess: writing to a child that already exited</h2>
+<pre><code>import subprocess
+p = subprocess.Popen([&quot;head&quot;, &quot;-c&quot;, &quot;1&quot;], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+p.stdin.write(b&quot;a&quot;)
+p.stdin.flush()
+p.wait()                          # head has exited
+try:
+    p.stdin.write(b&quot;b&quot; * 100000)
+    p.stdin.flush()
+except BrokenPipeError as e:
+    print(&quot;write after child exit:&quot;, type(e).__name__, e)
+p2 = subprocess.Popen([&quot;head&quot;, &quot;-c&quot;, &quot;1&quot;], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+out, err = p2.communicate(b&quot;b&quot; * 1000000)   # communicate() ignores EPIPE
+print(&quot;communicate returncode:&quot;, p2.returncode)</code></pre>
+<p>Output:</p>
+<pre><code>write after child exit: BrokenPipeError [Errno 32] Broken pipe
+communicate returncode: 0</code></pre>
+<p><strong>Measured:</strong> writing to <code>p.stdin</code> after the child exited raises <code>BrokenPipeError</code>; <code>communicate()</code> with the same data doesn't, because it ignores EPIPE when sending input. Prefer <code>communicate(input)</code> or <code>subprocess.run(..., input=...)</code> over writing to <code>stdin</code> yourself.</p>
+
+<aside class="cta"><strong>Debugging a Python HTTP script? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does BrokenPipeError: [Errno 32] Broken pipe mean?</summary><p>Python wrote to a pipe or socket with no reader left. We measured it from print() piped into head -n 2, a socketpair whose peer was closed, and a subprocess stdin after the child exited.</p></details>
+<details><summary>Why does python script.py | head raise BrokenPipeError?</summary><p>head exits after its lines, and Python ignores SIGPIPE, so the next stdout flush raises instead of quietly ending the process. Catch it and dup2 devnull onto stdout, or restore SIG_DFL for SIGPIPE in CLI tools.</p></details>
+<details><summary>How do I suppress Exception ignored BrokenPipeError at exit?</summary><p>After catching BrokenPipeError, point stdout at os.devnull with os.dup2 before exiting, so Python&#x27;s final flush of any still-buffered output has somewhere to go. We measured this pattern exits with no traceback and status 1.</p></details>
+<details><summary>Is it safe to set signal.SIGPIPE to SIG_DFL?</summary><p>In a command-line tool, yes (we measured exit status 141 and no traceback). In a server, no: a client disconnecting would kill the process. It&#x27;s also unavailable on Windows.</p></details>
+<details><summary>Why does subprocess raise BrokenPipeError?</summary><p>You wrote to p.stdin after the child exited. We measured communicate() with the same input returning normally, so use communicate() or subprocess.run(input=...).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: print() piped into head with no fix, the catch + dup2 fix and SIGPIPE SIG_DFL, a socketpair with a closed peer, and subprocess stdin after the child exited. Every block was run verbatim and its output pasted from that run. Windows and macOS were not tested. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

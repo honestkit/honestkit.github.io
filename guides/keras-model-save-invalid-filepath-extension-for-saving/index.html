@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keras model.save: &quot;Invalid filepath extension for saving&quot; Fix</title>
+<meta name="description" content="Keras 3 model.save(&quot;my_model&quot;) ValueError reproduced, then fixed: .keras vs .h5, model.export() for SavedModel, and loading it back with TFSMLayer.">
+<link rel="canonical" href="https://honestkit.github.io/guides/keras-model-save-invalid-filepath-extension-for-saving/">
+<meta property="og:title" content="Keras model.save: &quot;Invalid filepath extension for saving&quot; Fix">
+<meta property="og:description" content="Keras 3 model.save(&quot;my_model&quot;) ValueError reproduced, then fixed: .keras vs .h5, model.export() for SavedModel, and loading it back with TFSMLayer.">
+<meta property="og:url" content="https://honestkit.github.io/guides/keras-model-save-invalid-filepath-extension-for-saving/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does model.save say invalid filepath extension?", "acceptedAnswer": {"@type": "Answer", "text": "Keras 3 only saves to paths ending in .keras (native) or .h5 (legacy). A bare folder name or .tf is rejected."}}, {"@type": "Question", "name": "How do I save a SavedModel in Keras 3?", "acceptedAnswer": {"@type": "Answer", "text": "Call model.export(\"dir\"). It writes a TensorFlow SavedModel for serving; model.save no longer does."}}, {"@type": "Question", "name": "How do I load a SavedModel in Keras 3?", "acceptedAnswer": {"@type": "Answer", "text": "load_model does not support it. Use keras.layers.TFSMLayer(\"dir\", call_endpoint=\"serve\") for inference (the endpoint name may be serving_default for older exports)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Keras &quot;Invalid filepath extension for saving&quot; (tested fix)</h1>
+<p class="lead"><code>ValueError: Invalid filepath extension for saving. Please add either a `.keras` extension ... or a `.h5` extension</code> comes from Keras 3 when you call <code>model.save("my_model")</code> or <code>.tf</code>. Use <code>model.save("my_model.keras")</code>; for a TensorFlow SavedModel use <code>model.export()</code> and reload it with <code>TFSMLayer</code>. All three are run below.</p>
+<h2 id="repro">1. Reproduce</h2>
+<pre><code>import keras
+
+model = keras.Sequential([keras.Input((4,)), keras.layers.Dense(2)])
+
+for path in [&quot;my_model&quot;, &quot;my_model.tf&quot;]:
+    try:
+        model.save(path)
+    except ValueError as e:
+        print(f&quot;save({path!r}):&quot;, type(e).__name__, &quot;-&quot;, str(e))</code></pre>
+<pre><code>save(&#x27;my_model&#x27;): ValueError - Invalid filepath extension for saving. Please add either a `.keras` extension for the native Keras format (recommended) or a `.h5` extension. Use `model.export(filepath)` if you want to export a SavedModel for use with TFLite/TFServing/etc. Received: filepath=my_model.
+save(&#x27;my_model.tf&#x27;): ValueError - Invalid filepath extension for saving. Please add either a `.keras` extension for the native Keras format (recommended) or a `.h5` extension. Use `model.export(filepath)` if you want to export a SavedModel for use with TFLite/TFServing/etc. Received: filepath=my_model.tf.</code></pre>
+<p>Keras 3 picks the format from the extension and only accepts <code>.keras</code> or <code>.h5</code>. A bare directory name (the old TF2 SavedModel default) and <code>.tf</code> both raise this ValueError.</p>
+<h2 id="fix">2. Fix: .keras to save, export() for SavedModel</h2>
+<pre><code>import os
+import numpy as np
+import keras
+
+model = keras.Sequential([keras.Input((4,)), keras.layers.Dense(2)])
+x = np.ones((1, 4), dtype=&quot;float32&quot;)
+
+model.save(&quot;my_model.keras&quot;)      # Keras 3 native format
+model.save(&quot;my_model.h5&quot;)         # legacy HDF5, still supported
+model.export(&quot;my_saved_model&quot;)    # TF SavedModel for serving (TF backend)
+
+for p in [&quot;my_model.keras&quot;, &quot;my_model.h5&quot;]:
+    m = keras.models.load_model(p)
+    print(p, &quot;-&gt;&quot;, type(m).__name__, np.allclose(m(x), model(x)))
+print(&quot;my_saved_model:&quot;, sorted(os.listdir(&quot;my_saved_model&quot;)))
+try:
+    keras.models.load_model(&quot;my_saved_model&quot;)
+except ValueError as e:
+    print(&quot;load_model(SavedModel dir):&quot;, str(e))
+
+# To use a SavedModel in Keras 3, wrap it as an inference-only layer:
+layer = keras.layers.TFSMLayer(&quot;my_saved_model&quot;, call_endpoint=&quot;serve&quot;)
+print(&quot;TFSMLayer:&quot;, np.allclose(layer(x), model(x)))</code></pre>
+<pre><code>my_model.keras -&gt; Sequential True
+my_model.h5 -&gt; Sequential True
+my_saved_model: [&#x27;assets&#x27;, &#x27;fingerprint.pb&#x27;, &#x27;saved_model.pb&#x27;, &#x27;variables&#x27;]
+load_model(SavedModel dir): File format not supported: filepath=my_saved_model. Keras 3 only supports V3 `.keras` files, legacy H5 format files (`.h5` extension). Note that the legacy SavedModel format is not supported by `load_model()` in Keras 3. In order to reload a TensorFlow SavedModel as an inference-only layer in Keras 3, use `keras.layers.TFSMLayer(my_saved_model, call_endpoint=&#x27;serving_default&#x27;)` (note that your `call_endpoint` might have a different name).
+TFSMLayer: True</code></pre>
+<p>(The endpoint listing that <code>export()</code> prints was trimmed.)</p>
+<ul><li><code>.keras</code> is the native format: architecture, weights and compile state in one zip file. Use it unless something else forces you.</li>
+<li><code>.h5</code> still saves and loads, but logs <code>WARNING:absl:You are saving your model as an HDF5 file ... This file format is considered legacy</code>.</li>
+<li><code>model.export(dir)</code> writes a TensorFlow SavedModel for TF Serving / TFLite. <code>load_model</code> cannot read it back; wrap it with <code>keras.layers.TFSMLayer</code>. Note the endpoint name: the error message suggests <code>'serving_default'</code>, but a model written by <code>model.export()</code> exposes <code>'serve'</code>, as used above.</li>
+<li>Old SavedModel directories from Keras 2 / TF &le;2.15 load the same way, through <code>TFSMLayer</code> (inference only). To keep training them, rebuild the model in code and load the weights.</li></ul>
+<p>Related: <a href="/guides/tensorflow-keras-error-keras-3-imports/">TensorFlow Keras errors after Keras 3</a>, <a href="/guides/keras-wrappers-scikit-learn-modulenotfounderror-scikeras/">No module named keras.wrappers.scikit_learn</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does model.save say invalid filepath extension?</summary><p>Keras 3 only saves to paths ending in .keras (native) or .h5 (legacy). A bare folder name or .tf is rejected.</p></details>
+<details><summary>How do I save a SavedModel in Keras 3?</summary><p>Call model.export(&quot;dir&quot;). It writes a TensorFlow SavedModel for serving; model.save no longer does.</p></details>
+<details><summary>How do I load a SavedModel in Keras 3?</summary><p>load_model does not support it. Use keras.layers.TFSMLayer(&quot;dir&quot;, call_endpoint=&quot;serve&quot;) for inference (the endpoint name may be serving_default for older exports).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 with tensorflow-cpu 2.21.0, keras 3.15.1 and Python 3.13.5 on Linux. The scripts ran verbatim and the output was pasted unedited except where marked (TensorFlow startup log lines filtered). PlainTables is our extension; Keras and TensorFlow are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Selenium InvalidSessionIdException: invalid session id (Tested)</title>
+<meta name="description" content="Selenium invalid session id, tested in Chrome 156: browser closed the connection (crash, Docker /dev/shm), close() on the last tab, MaxRetryError after quit">
+<link rel="canonical" href="https://honestkit.github.io/guides/selenium-invalid-session-id/">
+<meta property="og:title" content="Selenium InvalidSessionIdException: invalid session id (Tested)">
+<meta property="og:description" content="Selenium invalid session id, tested in Chrome 156: browser closed the connection (crash, Docker /dev/shm), close() on the last tab, MaxRetryError after quit">
+<meta property="og:url" content="https://honestkit.github.io/guides/selenium-invalid-session-id/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes invalid session id in Selenium?", "acceptedAnswer": {"@type": "Answer", "text": "The browser for that session no longer exists: it crashed or was killed (often memory or a small /dev/shm in Docker), or driver.close() closed the last window."}}, {"@type": "Question", "name": "Why do I get MaxRetryError Connection refused instead?", "acceptedAnswer": {"@type": "Answer", "text": "The driver was used after quit(): chromedriver has exited, so the HTTP request to its local port is refused. Don't use a driver after quit()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Selenium invalid session id (tested)</h1>
+<p class="lead"><code>InvalidSessionIdException: invalid session id</code> means the browser behind your WebDriver session is gone: Chrome crashed or was killed ("session deleted as the browser has closed the connection"), or <code>close()</code> closed its last window. Start a new driver, and fix the cause: memory or <code>/dev/shm</code> in Docker, or code that closes too early.</p>
+<h2 id="setup">Setup used in every block</h2>
+<p><code>common.py</code> writes a small HTML page to a local file and starts headless Chrome. Exception messages are cut to their first line.</p>
+<pre><code>import os, pathlib
+from selenium import webdriver
+CHROME = os.path.expanduser(&quot;~/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome&quot;)
+def page(html):
+    p = pathlib.Path(&quot;/tmp/sl383/page.html&quot;); p.write_text(html); return p.as_uri()
+def driver():
+    o = webdriver.ChromeOptions()
+    o.binary_location = CHROME
+    o.add_argument(&quot;--headless=new&quot;); o.add_argument(&quot;--no-sandbox&quot;); o.add_argument(&quot;--window-size=1000,700&quot;)
+    return webdriver.Chrome(options=o)</code></pre>
+<h2 id="crash">1. Reproduce it: the browser died under the session</h2>
+<pre><code>import os, signal, subprocess
+from common import *
+d = driver()
+d.get(page(&quot;&lt;p&gt;hi&lt;/p&gt;&quot;))
+# simulate a browser crash (out of memory, /dev/shm full in Docker, ...): kill the Chrome process
+pid = d.service.process.pid                                   # chromedriver
+chrome = subprocess.run([&quot;pgrep&quot;, &quot;-P&quot;, str(pid)], capture_output=True, text=True).stdout.split()
+for p in chrome:
+    os.kill(int(p), signal.SIGKILL)
+for attempt in (1, 2):
+    try:
+        d.title
+    except Exception as e:
+        print(f&quot;call {attempt}:&quot;, type(e).__name__ + &quot;:&quot;, e.msg.splitlines()[0])
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>call 1: InvalidSessionIdException: invalid session id: session deleted as the browser has closed the connection
+call 2: InvalidSessionIdException: invalid session id; For documentation on this error, please visit: https://www.selenium.dev/documentation/webdriver/troubleshooting/errors#invalidsessionidexception</code></pre>
+<p>Killing Chrome (as the OS does when it runs out of memory) gives exactly the error people search for: the first call says <em>invalid session id: session deleted as the browser has closed the connection</em>, every later call just <em>invalid session id</em>. chromedriver is still running; the browser behind the session is gone, so the only fix is a new driver. Find out why Chrome died: in Docker the usual cause is the 64 MB default <code>/dev/shm</code> (run the container with <code>--shm-size=2g</code>, or add the Chrome argument <code>--disable-dev-shm-usage</code>); otherwise check memory (<code>dmesg</code> for the OOM killer) and very long sessions that accumulate tabs.</p>
+<h2 id="close">2. close() on the last window ends the session</h2>
+<pre><code>from common import *
+d = driver()
+d.get(page(&quot;&lt;p&gt;hi&lt;/p&gt;&quot;))
+d.close()                        # closes the only window
+try:
+    d.title
+except Exception as e:
+    print(&quot;after close() of the last window:&quot;, type(e).__name__ + &quot;:&quot;, e.msg.splitlines()[0])
+try:
+    d.quit()
+    print(&quot;quit() after that: OK&quot;)
+except Exception as e:
+    print(&quot;quit():&quot;, type(e).__name__)</code></pre>
+<p>Output:</p>
+<pre><code>after close() of the last window: InvalidSessionIdException: invalid session id; For documentation on this error, please visit: https://www.selenium.dev/documentation/webdriver/troubleshooting/errors#invalidsessionidexception
+quit() after that: OK</code></pre>
+<p><code>driver.close()</code> closes the current window; when it is the only one, chromedriver ends the session, and the next command raises <code>InvalidSessionIdException</code>. Use <code>close()</code> only for extra tabs (then <code>switch_to.window()</code> back to one that is still open), and <code>quit()</code> to finish. Calling <code>quit()</code> afterwards was still fine.</p>
+<h2 id="quit">3. After quit(): not InvalidSessionId but MaxRetryError</h2>
+<pre><code>from common import *
+d = driver()
+d.get(page(&quot;&lt;p&gt;hi&lt;/p&gt;&quot;))
+d.quit()
+try:
+    d.title
+except Exception as e:
+    print(&quot;after quit():&quot;, type(e).__module__ + &quot;.&quot; + type(e).__name__)
+    print(str(e).split(&quot; (Caused by&quot;)[0])</code></pre>
+<p>Output:</p>
+<pre><code>after quit(): urllib3.exceptions.MaxRetryError
+HTTPConnectionPool(host=&#x27;localhost&#x27;, port=42099): Max retries exceeded with url: /session/f0fdee7053df2b89a105408a159aaeca/title</code></pre>
+<p>After <code>quit()</code>, chromedriver itself has exited, so the next call does not even get an "invalid session id": the HTTP request to chromedriver's local port is refused, and you get <code>urllib3.exceptions.MaxRetryError ... Max retries exceeded with url: /session/&lt;id&gt;/...</code> caused by <code>Connection refused</code> (only the first line is printed here). Seeing this error means some code still uses a driver after <code>quit()</code>, typically a test fixture that quits in teardown while another test, thread or <code>atexit</code> handler still holds it.</p>
+<h2 id="checklist">4. Checklist</h2>
+<ul><li>One driver per test or per thread; never share one driver between threads.</li><li>Call <code>quit()</code> exactly once, in a <code>finally</code> block or fixture teardown, and do not touch the driver after that.</li><li>Docker: <code>--shm-size=2g</code> or <code>--disable-dev-shm-usage</code>; watch memory.</li><li>Recover from a crash by creating a new driver; the old session cannot be revived.</li></ul>
+<p>Related: <a href="/guides/selenium-unable-to-obtain-driver-for-chrome/">Selenium Unable to obtain driver for chrome</a>, <a href="/guides/selenium-this-version-of-chromedriver-only-supports-chrome-version/">This version of ChromeDriver only supports Chrome version</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers of the page your test loads:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes invalid session id in Selenium?</summary><p>The browser for that session no longer exists: it crashed or was killed (often memory or a small /dev/shm in Docker), or driver.close() closed the last window.</p></details>
+<details><summary>Why do I get MaxRetryError Connection refused instead?</summary><p>The driver was used after quit(): chromedriver has exited, so the HTTP request to its local port is refused. Don&#x27;t use a driver after quit().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Selenium 4.51.0 (Python 3.13.5) and headless Chrome for Testing 156.0.8078.4. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python, Selenium and Chrome are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

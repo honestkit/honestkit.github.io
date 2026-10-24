@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pip install torch: No Matching Distribution Found (Fix)</title>
+<meta name="description" content="&quot;Could not find a version that satisfies the requirement torch (from versions: none)&quot;: reproduced on Python 3.15 and Alpine, with the wheel matrix and fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/torch-install-error-no-matching-distribution/">
+<meta property="og:title" content="pip install torch: No Matching Distribution Found (Fix)">
+<meta property="og:description" content="&quot;Could not find a version that satisfies the requirement torch (from versions: none)&quot;: reproduced on Python 3.15 and Alpine, with the wheel matrix and fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/torch-install-error-no-matching-distribution/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does pip say no matching distribution found for torch?", "acceptedAnswer": {"@type": "Answer", "text": "No torch wheel matches your Python version or platform, and there is no source distribution. torch 2.14.1 supports CPython 3.10-3.14 on glibc Linux, Apple Silicon macOS and 64-bit Windows."}}, {"@type": "Question", "name": "Can I pip install torch on Alpine Linux?", "acceptedAnswer": {"@type": "Answer", "text": "Not from PyPI: torch publishes manylinux (glibc) wheels only, so pip on Alpine reports \"from versions: none\". Use a Debian-based image such as python:3.13-slim."}}, {"@type": "Question", "name": "How do I install the CPU-only version of torch?", "acceptedAnswer": {"@type": "Answer", "text": "pip install torch --index-url https://download.pytorch.org/whl/cpu installs the +cpu build (2.14.1+cpu when tested)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pip install torch: No matching distribution found (tested)</h1>
+<p class="lead"><code>ERROR: Could not find a version that satisfies the requirement torch (from versions: none)</code> means no torch wheel matches your interpreter or platform. torch 2.14.1 ships wheels for CPython <strong>3.10-3.14</strong> on glibc Linux (x86_64/aarch64), Apple Silicon and 64-bit Windows only, with no source distribution. Python 3.15, Alpine, Intel Macs and 32-bit Python all hit this error.</p>
+<h2 id="repro">1. Reproduce</h2>
+<p><code>b1.sh</code> asks pip to resolve torch (metadata only, nothing is downloaded). It ran in two official Docker images: <code>python:3-slim</code> (Python 3.15, glibc) and <code>python:3-alpine</code> (Python 3.14, musl):</p>
+<pre><code>python -c &quot;import sys, platform; print(&#x27;Python&#x27;, sys.version.split()[0], platform.libc_ver()[0] or &#x27;musl&#x27;)&quot;
+pip install --dry-run --no-deps torch 2&gt;&amp;1 | grep -v &#x27;^\[notice\]&#x27;
+echo &quot;pip exit status: ${PIPESTATUS[0]}&quot;</code></pre>
+<pre><code>### python:3-slim
+Python 3.15.1 glibc
+ERROR: Could not find a version that satisfies the requirement torch (from versions: none)
+ERROR: No matching distribution found for torch
+pip exit status: 1
+### python:3-alpine
+Python 3.14.7 musl
+ERROR: Could not find a version that satisfies the requirement torch (from versions: none)
+ERROR: No matching distribution found for torch
+pip exit status: 1</code></pre>
+<p>Both fail identically with <code>(from versions: none)</code>: pip found zero torch files it is allowed to install, for two different reasons.</p>
+<h2 id="why">2. Why: torch ships wheels only, for a fixed matrix</h2>
+<p><code>b2.py</code> lists every file of the latest release from the PyPI JSON API:</p>
+<pre><code># Which Python versions and platforms does the latest torch ship wheels for?
+import json, urllib.request
+d = json.load(urllib.request.urlopen(&quot;https://pypi.org/pypi/torch/json&quot;))
+print(&quot;torch&quot;, d[&quot;info&quot;][&quot;version&quot;], &quot;requires_python:&quot;, d[&quot;info&quot;][&quot;requires_python&quot;])
+print(&quot;sdist on PyPI:&quot;, any(f[&quot;packagetype&quot;] == &quot;sdist&quot; for f in d[&quot;urls&quot;]))
+plats = {}
+for f in d[&quot;urls&quot;]:
+    _, _, py, _, plat = f[&quot;filename&quot;][:-4].split(&quot;-&quot;)
+    plats.setdefault(plat, set()).add(py)
+for plat, pys in sorted(plats.items()):
+    print(f&quot;{plat:28} {&#x27; &#x27;.join(sorted(pys))}&quot;)</code></pre>
+<pre><code>torch 2.14.1 requires_python: &gt;=3.10
+sdist on PyPI: False
+macosx_14_0_arm64            cp310 cp311 cp312 cp313 cp314
+manylinux_2_28_aarch64       cp310 cp311 cp312 cp313 cp314
+manylinux_2_28_x86_64        cp310 cp311 cp312 cp313 cp314
+win_amd64                    cp310 cp311 cp312 cp313 cp314</code></pre>
+<p>There is no source distribution, so if no wheel matches, pip has nothing to fall back to. Read the table against your setup:</p>
+<ul><li><strong>Python 3.15</strong> (or anything outside 3.10-3.14): no <code>cp315</code> wheel. That is the <code>python:3-slim</code> failure above.</li>
+<li><strong>Alpine / musl</strong>: only <code>manylinux</code> (glibc) wheels exist, no <code>musllinux</code>, so even Python 3.14 on Alpine fails.</li>
+<li><strong>Intel Mac</strong>: the only macOS wheels are <code>arm64</code>.</li>
+<li><strong>Old Linux</strong>: <code>manylinux_2_28</code> needs glibc 2.28 or newer.</li>
+<li><strong>32-bit Python</strong> on Windows: only <code>win_amd64</code>.</li></ul>
+<p>Check yours with <code>python -c "import sys, platform, struct; print(sys.version, platform.machine(), platform.libc_ver(), struct.calcsize('P')*8, 'bit')"</code>.</p>
+<h2 id="fix">3. Fix: a supported Python on a supported platform</h2>
+<pre><code># Fix: an environment on a supported Python (3.10-3.14, glibc Linux)
+uv venv -q -p 3.13 tenv
+tenv/bin/python --version
+uv pip install -p tenv/bin/python --dry-run --no-deps torch 2&gt;&amp;1 | grep -E &#x27;Would install|torch==&#x27;
+# CPU-only build from PyTorch&#x27;s own index
+uv pip install -p tenv/bin/python --dry-run --no-deps torch --index-url https://download.pytorch.org/whl/cpu 2&gt;&amp;1 | grep -E &#x27;torch==&#x27;</code></pre>
+<pre><code>Python 3.13.5
+Would install 1 package
+ + torch==2.14.1
+ + torch==2.14.1+cpu</code></pre>
+<p>Same machine, same index: with a 3.13 environment the resolver picks torch 2.14.1, and PyTorch's own CPU index resolves <code>2.14.1+cpu</code>. Without uv, create the venv with a supported interpreter (<code>python3.13 -m venv .venv</code>) and, in Docker, use a glibc image such as <code>python:3.13-slim</code> instead of Alpine or the floating <code>python:3-slim</code> tag. For CUDA builds, copy the exact <code>--index-url</code> from the selector on pytorch.org.</p>
+<p>Related: <a href="/guides/torch-not-compiled-with-cuda-enabled/">Torch not compiled with CUDA enabled</a>, <a href="/guides/tensorflow-install-error-no-matching-distribution/">pip install tensorflow: no matching distribution found</a>, <a href="/guides/pip-install-failed/">pip install failed</a>, <a href="/guides/pip-error-externally-managed-environment/">pip error: externally-managed-environment</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does pip say no matching distribution found for torch?</summary><p>No torch wheel matches your Python version or platform, and there is no source distribution. torch 2.14.1 supports CPython 3.10-3.14 on glibc Linux, Apple Silicon macOS and 64-bit Windows.</p></details>
+<details><summary>Can I pip install torch on Alpine Linux?</summary><p>Not from PyPI: torch publishes manylinux (glibc) wheels only, so pip on Alpine reports &quot;from versions: none&quot;. Use a Debian-based image such as python:3.13-slim.</p></details>
+<details><summary>How do I install the CPU-only version of torch?</summary><p>pip install torch --index-url https://download.pytorch.org/whl/cpu installs the +cpu build (2.14.1+cpu when tested).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 with pip in the python:3-slim (Python 3.15.1) and python:3-alpine (Python 3.14.7) Docker images, uv with Python 3.13.5, and the live PyPI JSON API on Linux x86_64. The scripts ran verbatim and the output was pasted unedited (blank lines removed). PlainTables is our extension; PyTorch and pip are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

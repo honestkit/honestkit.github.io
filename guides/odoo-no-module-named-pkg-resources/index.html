@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Odoo: ModuleNotFoundError: No module named &#x27;pkg_resources&#x27;</title>
+<meta name="description" content="Odoo 16 imports pkg_resources in odoo/modules/module.py, so odoo-bin fails on setuptools 82+. Tested fix: pin setuptools&lt;81. Odoo 17 has a fallback.">
+<link rel="canonical" href="https://honestkit.github.io/guides/odoo-no-module-named-pkg-resources/">
+<meta property="og:title" content="Odoo: ModuleNotFoundError: No module named &#x27;pkg_resources&#x27;">
+<meta property="og:description" content="Odoo 16 imports pkg_resources in odoo/modules/module.py, so odoo-bin fails on setuptools 82+. Tested fix: pin setuptools&lt;81. Odoo 17 has a fallback.">
+<meta property="og:url" content="https://honestkit.github.io/guides/odoo-no-module-named-pkg-resources/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is Odoo 16.0 fixed upstream?", "acceptedAnswer": {"@type": "Answer", "text": "Not as of commit e46fb65 (2026-10-23): module.py line 11 still imports pkg_resources unguarded, and we reproduced the error on that commit."}}, {"@type": "Question", "name": "Does the fix change Odoo behaviour?", "acceptedAnswer": {"@type": "Answer", "text": "No. setuptools 80.10.2 still includes pkg_resources, so Odoo 16 runs exactly as before; it only prints a deprecation warning, which PYTHONWARNINGS can hide."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Odoo: No module named &#x27;pkg_resources&#x27; (tested fix)</h1>
+<p class="lead">Odoo 16.0 does <code>import pkg_resources</code> at the top of <code>odoo/modules/module.py</code>, so on setuptools 82 or newer even <code>odoo-bin --version</code> fails with <code>ModuleNotFoundError: No module named 'pkg_resources'</code>. Tested fix: <code>pip install "setuptools&lt;81"</code>.</p>
+<h2 id="repro">1. The error: Odoo 16.0 with setuptools 84</h2>
+<p>Odoo 16.0 source (branch head e46fb65, 2026-10-23), its <code>requirements.txt</code> installed into a Python 3.11.17 venv, setuptools 84.2.1. Even <code>--version</code> fails, before any config or database is touched:</p>
+<pre><code>$ python odoo-bin --version
+Traceback (most recent call last):
+  File &quot;/opt/odoo/odoo-bin&quot;, line 5, in &lt;module&gt;
+    import odoo
+  File &quot;/opt/odoo/odoo/__init__.py&quot;, line 135, in &lt;module&gt;
+    from . import modules
+  File &quot;/opt/odoo/odoo/modules/__init__.py&quot;, line 8, in &lt;module&gt;
+    from . import db, graph, loading, migration, module, registry, neutralize
+  File &quot;/opt/odoo/odoo/modules/graph.py&quot;, line 10, in &lt;module&gt;
+    import odoo.tools as tools
+  File &quot;/opt/odoo/odoo/tools/__init__.py&quot;, line 23, in &lt;module&gt;
+    from .image import *
+  File &quot;/opt/odoo/odoo/tools/image.py&quot;, line 18, in &lt;module&gt;
+    from odoo.tools.translate import _
+  File &quot;/opt/odoo/odoo/tools/translate.py&quot;, line 30, in &lt;module&gt;
+    from odoo.modules.module import get_resource_path
+  File &quot;/opt/odoo/odoo/modules/module.py&quot;, line 11, in &lt;module&gt;
+    import pkg_resources
+ModuleNotFoundError: No module named &#x27;pkg_resources&#x27;</code></pre>
+<p><code>odoo/modules/module.py</code> line 11 is a plain <code>import pkg_resources</code>, and setuptools 82.0.0 removed that module. Odoo 16's <code>requirements.txt</code> does not list setuptools, so a fresh venv on Python 3.12 or newer (which ships no setuptools) or any venv where setuptools was upgraded hits this.</p>
+<h2 id="pin">2. Fix for Odoo 16 and older: pin setuptools below 81 (tested)</h2>
+<pre><code>$ pip install &quot;setuptools&lt;81&quot;    # gave 80.10.2
+$ python odoo-bin --version
+/opt/odoo/odoo/modules/module.py:11: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools&lt;81.
+  import pkg_resources
+Odoo Server 16.0</code></pre>
+<p>It starts, with the <a href="/guides/pkg-resources-is-deprecated-as-an-api/">pkg_resources is deprecated as an API</a> warning. To hide that too:</p>
+<pre><code>$ PYTHONWARNINGS=&quot;ignore:pkg_resources is deprecated as an API&quot; python odoo-bin --version
+Odoo Server 16.0</code></pre>
+<p>Put the pin in the same place you install Odoo's requirements (for example add <code>setuptools&lt;81</code> to your own requirements file or Dockerfile), or the next <code>pip install -U setuptools</code> brings the error back.</p>
+<h2 id="17">3. Odoo 17 and 18</h2>
+<p>We did not run these; this is from the source. The current 17.0 branch wraps the import in <code>try/except ImportError</code> and falls back to <code>importlib.metadata</code>:</p>
+<pre><code>try:
+    from pkg_resources import DistributionNotFound, VersionConflict, get_distribution
+except ImportError:
+    class DistributionNotFound(Exception):
+        ...</code></pre>
+<p>The 18.0 branch's <code>module.py</code> no longer mentions <code>pkg_resources</code> at all. Older 17.0 checkouts may predate that fallback, so pull the latest 17.0 if you see this error there.</p>
+<p>Our venv used <code>psycopg2-binary</code> at the same pinned version instead of <code>psycopg2</code>, and left out <code>python-ldap</code> (it needs system LDAP headers and is only used by the LDAP login module). Neither touches this import.</p>
+<p>Related: <a href="/guides/python-modulenotfounderror-no-module-named-pkg-resources/">No module named 'pkg_resources' (general fix)</a> · <a href="/guides/home-assistant-no-module-named-pkg-resources/">Home Assistant</a> · <a href="/guides/docker-build-no-module-named-pkg-resources/">docker build</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is Odoo 16.0 fixed upstream?</summary><p>Not as of commit e46fb65 (2026-10-23): module.py line 11 still imports pkg_resources unguarded, and we reproduced the error on that commit.</p></details>
+<details><summary>Does the fix change Odoo behaviour?</summary><p>No. setuptools 80.10.2 still includes pkg_resources, so Odoo 16 runs exactly as before; it only prints a deprecation warning, which PYTHONWARNINGS can hide.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux with Odoo 16.0 (commit e46fb65), CPython 3.11.17, setuptools 80.10.2 and 84.2.1. Output pasted unedited except shortened paths. PlainTables is our extension; Odoo Community is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

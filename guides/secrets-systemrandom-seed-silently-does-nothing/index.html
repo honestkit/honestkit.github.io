@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>secrets.SystemRandom.seed() Silently Does Nothing</title>
+<meta name="description" content="We measured Python 3.13.5: secrets.SystemRandom().seed(42) raises no error but has zero effect -- reseeding to the same value gives different results each time.">
+<link rel="canonical" href="https://honestkit.github.io/guides/secrets-systemrandom-seed-silently-does-nothing/">
+<meta property="og:title" content="secrets.SystemRandom.seed() Silently Does Nothing">
+<meta property="og:description" content="We measured Python 3.13.5: secrets.SystemRandom().seed(42) raises no error but has zero effect -- reseeding to the same value gives different results each time.">
+<meta property="og:url" content="https://honestkit.github.io/guides/secrets-systemrandom-seed-silently-does-nothing/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does secrets.SystemRandom().seed(42) make the output reproducible?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured this directly: calling seed(42) twice in a row and comparing the next random() call each time gave two different values, with no error raised at all."}}, {"@type": "Question", "name": "Why doesn't secrets.SystemRandom.seed() raise an error if it doesn't work?", "acceptedAnswer": {"@type": "Answer", "text": "SystemRandom inherits seed() from random.Random unchanged, so the method exists and accepts arguments -- it's just that SystemRandom pulls values from the OS entropy source (os.urandom()) instead of from seedable internal state, so there's nothing for seed() to set. We confirmed this contrasts with getstate(), which does raise NotImplementedError on SystemRandom."}}, {"@type": "Question", "name": "How can I tell if my 'seeded' SystemRandom test is actually deterministic?", "acceptedAnswer": {"@type": "Answer", "text": "Do what we did: call seed(N), record a value, call seed(N) again, and compare. If the two values differ, the seed isn't having any effect -- which is exactly what we measured for every SystemRandom instance."}}, {"@type": "Question", "name": "What should I use instead of secrets.SystemRandom for reproducible tests?", "acceptedAnswer": {"@type": "Answer", "text": "Use a seeded random.Random() instance, which we confirmed gives identical output across reseeds to the same value. Reserve secrets.SystemRandom and the secrets module's own functions (token_hex, choice, etc.) for randomness that actually needs to be unpredictable, like tokens or passwords."}}, {"@type": "Question", "name": "Is secrets.SystemRandom a subclass of random.Random?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- that's exactly why this is surprising. It inherits the full random.Random API, including seed() and the distribution methods, but overrides the underlying byte source to use OS entropy, which silently breaks the seeding contract those inherited methods imply."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>secrets.SystemRandom.seed() Silently Does Nothing (tested)</h1>
+<p class="lead"><code>secrets.SystemRandom</code> is a subclass of <code>random.Random</code>, so it inherits a <code>.seed()</code> method that looks like it should work the same way: pass the same seed, get the same sequence back, useful for reproducible tests. We measured calling it, and it accepts the call without complaint while doing nothing at all.</p>
+<h2 id="repro1">1. Reseeding SystemRandom to the same value gives different results every time</h2>
+<pre><code>import secrets
+
+sr = secrets.SystemRandom()
+sr.seed(42)
+a = sr.random()
+sr.seed(42)
+b = sr.random()
+print(a == b, a, b)</code></pre>
+<pre><code>False 0.8598569534391595 0.1470295256972317</code></pre>
+<p><strong>Measured:</strong> calling <code>seed(42)</code> twice and comparing the very next <code>random()</code> call each time gives two different numbers. No exception, no warning -- the call to <code>seed()</code> simply has no effect. <code>SystemRandom</code> pulls every value straight from the operating system's entropy source (<code>os.urandom()</code>), which is exactly what you want for security-sensitive randomness, but it means there's no internal state for a seed to set.</p>
+
+<h2 id="repro2">2. The same test against random.Random shows what "working" looks like</h2>
+<pre><code>import random
+
+r = random.Random()
+r.seed(42)
+c = r.random()
+r.seed(42)
+d = r.random()
+print(c == d, c, d)</code></pre>
+<pre><code>True 0.6394267984578837 0.6394267984578837</code></pre>
+<p><strong>Measured:</strong> plain <code>random.Random</code> gives the identical value both times, because its <code>seed()</code> actually resets internal state. This is the behavior a developer reaching for <code>secrets.SystemRandom</code> for "test the same code path with cryptographically strong randomness, but deterministically" would reasonably expect -- and it's exactly what doesn't happen, since the two classes share a method name and signature but not a working contract for it.</p>
+
+<h2 id="repro3">3. Inconsistent failure modes: getstate() raises, seed() doesn't</h2>
+<pre><code>import secrets
+
+sr = secrets.SystemRandom()
+sr.getstate()</code></pre>
+<pre><code>Traceback (most recent call last):
+  ...
+NotImplementedError: System entropy source does not have state.</code></pre>
+<p><strong>Measured:</strong> <code>getstate()</code> correctly tells you it's unsupported by raising <code>NotImplementedError</code>. <code>seed()</code> does not get the same treatment -- it's inherited unchanged from <code>random.Random</code> and silently accepts any argument, including no argument at all, without ever touching the underlying OS entropy source. If you need deterministic, repeatable output for tests, use a seeded <code>random.Random()</code> instance instead and reserve <code>secrets.SystemRandom</code> (or the plain <code>secrets</code> module functions) for anything that actually needs to be unpredictable.</p>
+<aside class="cta"><strong>Writing tests for code that generates tokens or session IDs? Check the real headers your test server sends first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does secrets.SystemRandom().seed(42) make the output reproducible?</summary><p>No -- we measured this directly: calling seed(42) twice in a row and comparing the next random() call each time gave two different values, with no error raised at all.</p></details>
+<details><summary>Why doesn&#x27;t secrets.SystemRandom.seed() raise an error if it doesn&#x27;t work?</summary><p>SystemRandom inherits seed() from random.Random unchanged, so the method exists and accepts arguments -- it&#x27;s just that SystemRandom pulls values from the OS entropy source (os.urandom()) instead of from seedable internal state, so there&#x27;s nothing for seed() to set. We confirmed this contrasts with getstate(), which does raise NotImplementedError on SystemRandom.</p></details>
+<details><summary>How can I tell if my &#x27;seeded&#x27; SystemRandom test is actually deterministic?</summary><p>Do what we did: call seed(N), record a value, call seed(N) again, and compare. If the two values differ, the seed isn&#x27;t having any effect -- which is exactly what we measured for every SystemRandom instance.</p></details>
+<details><summary>What should I use instead of secrets.SystemRandom for reproducible tests?</summary><p>Use a seeded random.Random() instance, which we confirmed gives identical output across reseeds to the same value. Reserve secrets.SystemRandom and the secrets module&#x27;s own functions (token_hex, choice, etc.) for randomness that actually needs to be unpredictable, like tokens or passwords.</p></details>
+<details><summary>Is secrets.SystemRandom a subclass of random.Random?</summary><p>Yes -- that&#x27;s exactly why this is surprising. It inherits the full random.Random API, including seed() and the distribution methods, but overrides the underlying byte source to use OS entropy, which silently breaks the seeding contract those inherited methods imply.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in secrets module: called secrets.SystemRandom().seed(42) twice in a row and compared the next random() call each time, against the same pattern on random.Random() for contrast, then checked SystemRandom.getstate() for comparison. PlainHeaders is our extension; Python&#x27;s secrets module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

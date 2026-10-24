@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gunicorn 500 Internal Server Error: Find the Traceback</title>
+<meta name="description" content="gunicorn returns a bare 500 Internal Server Error page. Reproduced with a raw WSGI app and Flask: what the error log shows and where to look.">
+<link rel="canonical" href="https://honestkit.github.io/guides/gunicorn-500-internal-server-error/">
+<meta property="og:title" content="gunicorn 500 Internal Server Error: Find the Traceback">
+<meta property="og:description" content="gunicorn returns a bare 500 Internal Server Error page. Reproduced with a raw WSGI app and Flask: what the error log shows and where to look.">
+<meta property="og:url" content="https://honestkit.github.io/guides/gunicorn-500-internal-server-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does gunicorn return 500 Internal Server Error?", "acceptedAnswer": {"@type": "Answer", "text": "An unhandled exception in your WSGI app. gunicorn logs it at ERROR level as \"Error handling request GET /path\" with the traceback in its error log."}}, {"@type": "Question", "name": "Why is there no \"Error handling request\" line for my Flask app?", "acceptedAnswer": {"@type": "Answer", "text": "Flask catches the exception and returns its own 500 page; the traceback is logged by Flask as \"ERROR in app: Exception on /path [GET]\" to the same stderr stream."}}, {"@type": "Question", "name": "Where is the gunicorn error log?", "acceptedAnswer": {"@type": "Answer", "text": "stderr by default (journalctl for systemd, docker logs for containers), or the file given by --error-logfile."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>gunicorn 500 Internal Server Error: where the traceback is (tested)</h1>
+<p class="lead">A gunicorn <code>500 Internal Server Error</code> means your app raised an exception; gunicorn itself is fine. The traceback is in gunicorn's <strong>error log</strong> (stderr by default) as <code>Error handling request</code>, or, for Flask, <code>ERROR in app: Exception on /path</code>. Both cases reproduced below.</p>
+<h2 id="repro">1. Reproduce with a plain WSGI app</h2>
+<p><code>app.py</code> raises on <code>/boom</code>:</p>
+<pre><code>def app(environ, start_response):
+    if environ[&#x27;PATH_INFO&#x27;] == &#x27;/boom&#x27;:
+        1 / 0  # unhandled exception in the app
+    start_response(&#x27;200 OK&#x27;, [(&#x27;Content-Type&#x27;, &#x27;text/plain&#x27;)])
+    return [b&#x27;ok&#x27;]</code></pre>
+<p><code>b1.sh</code> starts gunicorn, requests the failing URL, then prints the error log (startup/shutdown INFO lines filtered, timestamps shortened):</p>
+<pre><code>gunicorn app:app --bind 127.0.0.1:8966 --workers 1 &gt; err.log 2&gt;&amp;1 &amp;
+until curl -s -o /dev/null 127.0.0.1:8966/; do :; done
+curl -s -i 127.0.0.1:8966/boom | tr -d &#x27;\r&#x27;
+echo; echo &#x27;--- gunicorn error log ---&#x27;
+kill %1; wait
+grep -v &#x27;Starting\|Listening\|Using worker\|Booting\|Handling signal\|Shutting\|Worker exiting\|Goodbye\|Control socket&#x27; err.log | sed &#x27;s/^\[[^]]*\] \[[0-9]*\]/[time] [pid]/&#x27;</code></pre>
+<p>Output (gunicorn 26.2.0, Python 3.13):</p>
+<pre><code>HTTP/1.1 500 Internal Server Error
+Connection: close
+Content-Type: text/html
+Content-Length: 141
+
+&lt;html&gt;
+  &lt;head&gt;
+    &lt;title&gt;Internal Server Error&lt;/title&gt;
+  &lt;/head&gt;
+  &lt;body&gt;
+    &lt;h1&gt;&lt;p&gt;Internal Server Error&lt;/p&gt;&lt;/h1&gt;
+    
+  &lt;/body&gt;
+&lt;/html&gt;
+
+--- gunicorn error log ---
+[time] [pid] [ERROR] Error handling request GET /boom
+Traceback (most recent call last):
+  File &quot;/tmp/fx384/ve/lib/python3.13/site-packages/gunicorn/workers/sync.py&quot;, line 141, in handle
+    self.handle_request(listener, req, client, addr)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File &quot;/tmp/fx384/ve/lib/python3.13/site-packages/gunicorn/workers/sync.py&quot;, line 184, in handle_request
+    respiter = self.wsgi(environ, resp.start_response)
+  File &quot;/tmp/g5416/app.py&quot;, line 3, in app
+    1 / 0  # unhandled exception in the app
+    ~~^~~
+ZeroDivisionError: division by zero</code></pre>
+<p>The browser only sees gunicorn's bare <code>Internal Server Error</code> page. The cause is in the <strong>error log</strong>: <code>[ERROR] Error handling request GET /boom</code> followed by the full traceback, ending in the exception from your code.</p>
+<h2 id="flask">2. Same bug inside Flask</h2>
+<pre><code>from flask import Flask
+app = Flask(__name__)
+
+@app.get(&#x27;/boom&#x27;)
+def boom():
+    return 1 / 0</code></pre>
+<p><code>b2.sh</code> is the same script with <code>fapp:app</code> on port 8967:</p>
+<pre><code>HTTP/1.1 500 INTERNAL SERVER ERROR
+Server: gunicorn
+Date: Fri, 23 Oct 2026 22:22:45 GMT
+Connection: close
+Content-Type: text/html; charset=utf-8
+Content-Length: 265
+
+&lt;!doctype html&gt;
+&lt;html lang=en&gt;
+&lt;title&gt;500 Internal Server Error&lt;/title&gt;
+&lt;h1&gt;Internal Server Error&lt;/h1&gt;
+&lt;p&gt;The server encountered an internal error and was unable to complete your request. Either the server is overloaded or there is an error in the application.&lt;/p&gt;
+
+--- gunicorn error log ---
+[2026-10-23 23:22:45,915] ERROR in app: Exception on /boom [GET]
+Traceback (most recent call last):
+  File &quot;/tmp/fx384/ve/lib/python3.13/site-packages/flask/app.py&quot;, line 1511, in wsgi_app
+    response = self.full_dispatch_request()
+  File &quot;/tmp/fx384/ve/lib/python3.13/site-packages/flask/app.py&quot;, line 919, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File &quot;/tmp/fx384/ve/lib/python3.13/site-packages/flask/app.py&quot;, line 917, in full_dispatch_request
+    rv = self.dispatch_request()
+  File &quot;/tmp/fx384/ve/lib/python3.13/site-packages/flask/app.py&quot;, line 902, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File &quot;/tmp/g5416/fapp.py&quot;, line 6, in boom
+    return 1 / 0
+           ~~^~~
+ZeroDivisionError: division by zero</code></pre>
+<p>This time Flask catches the exception and renders its own 500 page, so gunicorn never sees it: there is <em>no</em> <code>Error handling request</code> line. The traceback still lands in the same stream because Flask's default logger writes <code>ERROR in app: Exception on /boom [GET]</code> to stderr, which gunicorn's error log captures. Django behaves the same way: with <code>DEBUG=False</code> it returns its own 500 page and logs through the <code>django.request</code> logger (see <a href="/guides/django-500-error-debug-false/">Django 500 error with DEBUG=False</a>).</p>
+<h2 id="fix">3. How to find the cause</h2>
+<ul><li>Look in gunicorn's error log, not the access log: the access log only records the 500 status. By default the error log is stderr (systemd: <code>journalctl -u yourservice</code>; Docker: <code>docker logs</code>). See <a href="/guides/gunicorn-logs-location-access-log-error-log/">where gunicorn logs go</a>.</li>
+<li>Search the log for <code>Error handling request</code> (exception escaped the framework) or <code>Exception on /path</code> (Flask caught it).</li>
+<li>If the log has <code>WORKER TIMEOUT</code> instead of a traceback, the worker was killed mid-request, which is a different problem: <a href="/guides/gunicorn-critical-worker-timeout/">gunicorn WORKER TIMEOUT</a>.</li>
+<li>Fix the exception in your code; gunicorn itself is working correctly when it returns this 500.</li></ul>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does gunicorn return 500 Internal Server Error?</summary><p>An unhandled exception in your WSGI app. gunicorn logs it at ERROR level as &quot;Error handling request GET /path&quot; with the traceback in its error log.</p></details>
+<details><summary>Why is there no &quot;Error handling request&quot; line for my Flask app?</summary><p>Flask catches the exception and returns its own 500 page; the traceback is logged by Flask as &quot;ERROR in app: Exception on /path [GET]&quot; to the same stderr stream.</p></details>
+<details><summary>Where is the gunicorn error log?</summary><p>stderr by default (journalctl for systemd, docker logs for containers), or the file given by --error-logfile.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with gunicorn 26.2.0, Flask 3.1.3 and Python 3.13 on Linux. The scripts ran verbatim and the output was pasted unedited (timestamps/pids masked by the script). PlainTables is our extension; gunicorn and Flask are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

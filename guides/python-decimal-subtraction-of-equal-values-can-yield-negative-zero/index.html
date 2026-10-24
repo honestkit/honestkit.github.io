@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>decimal: Equal Subtraction Can Yield Negative Zero</title>
+<meta name="description" content="We measured Python 3.13.5: Decimal(&#x27;5.00&#x27;) - Decimal(&#x27;5.00&#x27;) gives 0.00 normally, but -0.00 under ROUND_FLOOR -- same inputs, different sign.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-decimal-subtraction-of-equal-values-can-yield-negative-zero/">
+<meta property="og:title" content="decimal: Equal Subtraction Can Yield Negative Zero">
+<meta property="og:description" content="We measured Python 3.13.5: Decimal(&#x27;5.00&#x27;) - Decimal(&#x27;5.00&#x27;) gives 0.00 normally, but -0.00 under ROUND_FLOOR -- same inputs, different sign.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-decimal-subtraction-of-equal-values-can-yield-negative-zero/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can subtracting two equal Decimal values produce a negative zero?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured Decimal('5.00') - Decimal('5.00') giving the plain 0.00 under the default context rounding mode, but -0.00 under ROUND_FLOOR. The sign of an exact-zero arithmetic result depends on the active rounding mode, per IEEE 754 decimal arithmetic rules, not just the operands."}}, {"@type": "Question", "name": "Does Decimal('-0') equal Decimal('0')?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we confirmed Decimal('-0.00') == Decimal('0.00') is True, and bool() on either is False. Equality and truthiness treat signed zero as equivalent to unsigned zero."}}, {"@type": "Question", "name": "Why does my Decimal result print as -0.00 instead of 0.00?", "acceptedAnswer": {"@type": "Answer", "text": "If the value came from an arithmetic operation under a rounding mode like ROUND_FLOOR (rather than from parsing a string), an exact-zero result can carry a negative sign that == doesn't reveal but str() and f-strings do -- we measured both printing the literal '-0.00' text."}}, {"@type": "Question", "name": "How do I avoid printing a negative zero from a Decimal calculation?", "acceptedAnswer": {"@type": "Answer", "text": "Normalize the sign explicitly before display, e.g. by adding Decimal('0') under the default rounding context, or check .is_signed() and strip the sign if the value is zero. We confirmed == and bool() don't catch this on their own since they already treat -0 and 0 as equivalent."}}, {"@type": "Question", "name": "Which Decimal rounding modes can produce a negative zero result?", "acceptedAnswer": {"@type": "Answer", "text": "We measured ROUND_FLOOR producing -0.00 from an exact-zero subtraction where the default context rounding mode produced plain 0.00 from the identical operands -- any rounding mode that rounds toward negative infinity can do the same for a result that lands exactly on zero."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>decimal: Subtracting Equal Values Can Yield -0 Under ROUND_FLOOR (tested)</h1>
+<p class="lead">IEEE 754 decimal arithmetic has a signed zero: <code>-0</code> and <code>0</code> compare equal but aren't the same value, and <code>str()</code> shows the sign. We measured when ordinary-looking Decimal arithmetic produces a negative zero, and what that looks like once it's printed, logged, or exported rather than just compared.</p>
+<h2 id="repro1">1. Equal values subtract to a plain, positive zero by default</h2>
+<pre><code>from decimal import Decimal
+
+a = Decimal("5.00")
+b = Decimal("5.00")
+print(a - b)</code></pre>
+<pre><code>0.00</code></pre>
+<p><strong>Measured:</strong> under the default context, subtracting two equal <code>Decimal</code> values gives the unsigned-looking <code>0.00</code>, exactly what most code expects.</p>
+
+<h2 id="repro2">2. The identical subtraction yields -0.00 under ROUND_FLOOR</h2>
+<pre><code>from decimal import Decimal, localcontext, ROUND_FLOOR
+
+a = Decimal("5.00")
+b = Decimal("5.00")
+with localcontext() as ctx:
+    ctx.rounding = ROUND_FLOOR
+    print(a - b)</code></pre>
+<pre><code>-0.00</code></pre>
+<p><strong>Measured:</strong> same two values, same subtraction, but with the context rounding mode set to <code>ROUND_FLOOR</code> (a mode some code picks deliberately, e.g. to always round monetary results down/conservatively), the result prints as <code>-0.00</code>. The IEEE 754 decimal spec defines the sign of an exact-zero arithmetic result based on the rounding rule in effect, not just the operands -- <code>ROUND_FLOOR</code> rounds toward negative infinity, and that extends to picking the negative zero when a result is exactly zero.</p>
+
+<h2 id="repro3">3. -0 compares equal to 0, but prints differently everywhere</h2>
+<pre><code>from decimal import Decimal
+
+nz = Decimal("-0.00")
+print(nz == Decimal("0.00"))
+print(str(nz))
+print(f"{nz}")
+print(bool(nz))</code></pre>
+<pre><code>True
+-0.00
+-0.00
+False</code></pre>
+<p><strong>Measured:</strong> <code>-0.00 == 0.00</code> is <code>True</code> and <code>bool(nz)</code> is <code>False</code> (both treat it as zero-valued), so equality checks and truthiness are unaffected. But <code>str()</code> and f-string formatting both render the sign, printing the literal text <code>-0.00</code>. A log line, CSV export, or any string-matching/diffing of output that doesn't expect a minus sign on a value that's logically "zero" will see <code>-0.00</code> rather than <code>0.00</code> -- cosmetically wrong even though every numeric check on the value says it's fine. If a result needs a clean sign for display, normalize it explicitly, e.g. <code>result + Decimal('0')</code> under default rounding, or check <code>is_signed()</code> before formatting.</p>
+<aside class="cta"><strong>Subtracting two equal Decimal values and logging or exporting the result? Check the rounding mode first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can subtracting two equal Decimal values produce a negative zero?</summary><p>Yes -- we measured Decimal(&#x27;5.00&#x27;) - Decimal(&#x27;5.00&#x27;) giving the plain 0.00 under the default context rounding mode, but -0.00 under ROUND_FLOOR. The sign of an exact-zero arithmetic result depends on the active rounding mode, per IEEE 754 decimal arithmetic rules, not just the operands.</p></details>
+<details><summary>Does Decimal(&#x27;-0&#x27;) equal Decimal(&#x27;0&#x27;)?</summary><p>Yes -- we confirmed Decimal(&#x27;-0.00&#x27;) == Decimal(&#x27;0.00&#x27;) is True, and bool() on either is False. Equality and truthiness treat signed zero as equivalent to unsigned zero.</p></details>
+<details><summary>Why does my Decimal result print as -0.00 instead of 0.00?</summary><p>If the value came from an arithmetic operation under a rounding mode like ROUND_FLOOR (rather than from parsing a string), an exact-zero result can carry a negative sign that == doesn&#x27;t reveal but str() and f-strings do -- we measured both printing the literal &#x27;-0.00&#x27; text.</p></details>
+<details><summary>How do I avoid printing a negative zero from a Decimal calculation?</summary><p>Normalize the sign explicitly before display, e.g. by adding Decimal(&#x27;0&#x27;) under the default rounding context, or check .is_signed() and strip the sign if the value is zero. We confirmed == and bool() don&#x27;t catch this on their own since they already treat -0 and 0 as equivalent.</p></details>
+<details><summary>Which Decimal rounding modes can produce a negative zero result?</summary><p>We measured ROUND_FLOOR producing -0.00 from an exact-zero subtraction where the default context rounding mode produced plain 0.00 from the identical operands -- any rounding mode that rounds toward negative infinity can do the same for a result that lands exactly on zero.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in decimal module: subtracted two equal Decimal values under the default context rounding mode, then repeated the identical subtraction under ROUND_FLOOR, and checked how the result prints via str() and f-strings. PlainHeaders is our extension; Python&#x27;s decimal module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

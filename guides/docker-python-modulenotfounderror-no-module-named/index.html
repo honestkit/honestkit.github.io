@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker Python ModuleNotFoundError: No Module Named (Tested)</title>
+<meta name="description" content="Python ModuleNotFoundError inside Docker reproduced 3 ways: code not copied, package in a different Python (venv), src layout off sys.path. Fixes for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/docker-python-modulenotfounderror-no-module-named/">
+<meta property="og:title" content="Docker Python ModuleNotFoundError: No Module Named (Tested)">
+<meta property="og:description" content="Python ModuleNotFoundError inside Docker reproduced 3 ways: code not copied, package in a different Python (venv), src layout off sys.path. Fixes for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/docker-python-modulenotfounderror-no-module-named/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why do I get ModuleNotFoundError in Docker but not locally?", "acceptedAnswer": {"@type": "Answer", "text": "Usually the module is not in the image (COPY missed it or .dockerignore excluded it), it was installed into a different Python or venv than the one CMD runs, or the import root is not on sys.path."}}, {"@type": "Question", "name": "How do I fix No module named in a Docker multi-stage build with a venv?", "acceptedAnswer": {"@type": "Answer", "text": "Copy the venv into the final stage and put it first on PATH with ENV PATH=\"/opt/venv/bin:$PATH\", or call /opt/venv/bin/python directly."}}, {"@type": "Question", "name": "How do I set PYTHONPATH in a Dockerfile?", "acceptedAnswer": {"@type": "Answer", "text": "Add ENV PYTHONPATH=/code/src (the folder that contains your top-level package), or set WORKDIR to it and run python -m package.module."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Docker Python ModuleNotFoundError: No module named in a container (tested)</h1>
+<p class="lead">When a Python app works locally but the container says <code>ModuleNotFoundError: No module named ...</code>, the build succeeded and the import failed at start-up. There are three usual reasons: the code was never copied into the image, the package was installed for a different Python, or the import root is not on <code>sys.path</code>. All three are reproduced below with a fix that was run.</p>
+<h2 id="repro">1. Reproduce: three Dockerfiles that build fine and fail at run time</h2>
+<p>Three tiny projects. <code>c1</code> has <code>main.py</code> next to a package <code>app/</code>; <code>c3</code> imports <code>six</code> installed in a virtualenv in a multi-stage build; <code>c4</code> uses a <code>src/</code> layout with <code>src/app/main.py</code> importing <code>app.util</code>. Each has a broken Dockerfile and one or two fixed ones:</p>
+<pre><code># ---- c1/Dockerfile
+FROM python:3-alpine
+WORKDIR /code
+COPY main.py .
+CMD [&quot;python&quot;, &quot;main.py&quot;]
+# ---- c1/Dockerfile.fixed
+FROM python:3-alpine
+WORKDIR /code
+COPY . .
+CMD [&quot;python&quot;, &quot;main.py&quot;]
+# ---- c3/Dockerfile
+FROM python:3-alpine AS build
+RUN python -m venv /opt/venv
+COPY requirements.txt .
+RUN /opt/venv/bin/pip install -q -r requirements.txt
+
+FROM python:3-alpine
+COPY --from=build /opt/venv /opt/venv
+WORKDIR /code
+COPY main.py .
+CMD [&quot;python&quot;, &quot;main.py&quot;]
+# ---- c3/Dockerfile.fixed
+FROM python:3-alpine AS build
+RUN python -m venv /opt/venv
+COPY requirements.txt .
+RUN /opt/venv/bin/pip install -q -r requirements.txt
+
+FROM python:3-alpine
+COPY --from=build /opt/venv /opt/venv
+WORKDIR /code
+COPY main.py .
+ENV PATH=&quot;/opt/venv/bin:$PATH&quot;
+CMD [&quot;python&quot;, &quot;main.py&quot;]
+# ---- c4/Dockerfile
+FROM python:3-alpine
+WORKDIR /code
+COPY src/ src/
+CMD [&quot;python&quot;, &quot;src/app/main.py&quot;]
+# ---- c4/Dockerfile.pythonpath
+FROM python:3-alpine
+WORKDIR /code
+COPY src/ src/
+ENV PYTHONPATH=/code/src
+CMD [&quot;python&quot;, &quot;src/app/main.py&quot;]
+# ---- c4/Dockerfile.module
+FROM python:3-alpine
+WORKDIR /code/src
+COPY src/ .
+CMD [&quot;python&quot;, &quot;-m&quot;, &quot;app.main&quot;]</code></pre>
+<p><code>run.sh</code> builds and runs each one and prints the last lines:</p>
+<pre><code>#!/bin/sh
+# build each variant, run it, show the last lines of output
+t() { dir=$1; df=$2
+  echo &quot;== $dir/$df&quot;
+  docker build -q -t forever-dm410:x -f $dir/$df $dir &gt;/dev/null
+  docker run --rm --name forever-dm410run forever-dm410:x 2&gt;&amp;1 | tail -n 3
+}
+t c1 Dockerfile
+t c1 Dockerfile.fixed
+t c3 Dockerfile
+t c3 Dockerfile.fixed
+t c4 Dockerfile
+t c4 Dockerfile.pythonpath
+t c4 Dockerfile.module</code></pre>
+<p>Output (Docker, <code>python:3-alpine</code> = Python 3.14.7):</p>
+<pre><code>== c1/Dockerfile
+  File &quot;/code/main.py&quot;, line 1, in &lt;module&gt;
+    from app.util import greet
+ModuleNotFoundError: No module named &#x27;app&#x27;
+== c1/Dockerfile.fixed
+hello from app
+== c3/Dockerfile
+  File &quot;/code/main.py&quot;, line 1, in &lt;module&gt;
+    import six
+ModuleNotFoundError: No module named &#x27;six&#x27;
+== c3/Dockerfile.fixed
+six 1.17.0
+== c4/Dockerfile
+  File &quot;/code/src/app/main.py&quot;, line 1, in &lt;module&gt;
+    from app.util import greet
+ModuleNotFoundError: No module named &#x27;app&#x27;
+== c4/Dockerfile.pythonpath
+hello from app
+== c4/Dockerfile.module
+hello from app</code></pre>
+<h2 id="causes">2. The three causes</h2>
+<ul><li><strong>The code is not in the image</strong> (<code>c1</code>). <code>COPY main.py .</code> copies only that file, so <code>app/</code> never reaches <code>/code</code>. The build succeeds because nothing imports anything until the container starts. Copy the whole project (<code>COPY . .</code>) or each package directory.</li>
+<li><strong>The package is installed for a different Python</strong> (<code>c3</code>). <code>six</code> is in <code>/opt/venv</code>, but <code>CMD ["python", ...]</code> finds <code>/usr/local/bin/python</code> first on <code>PATH</code>, which has its own empty site-packages. <code>ENV PATH="/opt/venv/bin:$PATH"</code> (or calling <code>/opt/venv/bin/python</code>) fixes it. The same thing happens with <code>pip install --user</code> as root and then running as another user.</li>
+<li><strong>The import root is not on <code>sys.path</code></strong> (<code>c4</code>). <code>python src/app/main.py</code> puts the script's own folder, <code>/code/src/app</code>, on <code>sys.path</code>, not <code>/code/src</code>, so <code>import app</code> fails even though the files are there. Either set <code>ENV PYTHONPATH=/code/src</code>, or set <code>WORKDIR</code> to the import root and run it as a module with <code>python -m app.main</code>. Both printed <code>hello from app</code>.</li></ul>
+<h2 id="debug">3. Checking inside the container</h2>
+<p>Run a shell in the broken image and ask which interpreter runs and where the package actually is. The last part shows that a <code>.dockerignore</code> line can also leave a package out even with <code>COPY . .</code>:</p>
+<pre><code>#!/bin/sh
+# c3 broken image: which python runs, and where is six?
+docker build -q -t forever-dm410:x -f c3/Dockerfile c3 &gt;/dev/null
+docker run --rm --name forever-dm410run forever-dm410:x sh -c &#x27;
+which python
+python -c &quot;import sys; print(sys.prefix)&quot;
+ls /opt/venv/lib/python3*/site-packages | grep six
+/opt/venv/bin/python main.py&#x27;
+# .dockerignore that excludes the package
+echo &quot;== c1 with .dockerignore containing: app&quot;
+echo app &gt; c1/.dockerignore
+docker build -q -t forever-dm410:x -f c1/Dockerfile.fixed c1 &gt;/dev/null
+docker run --rm --name forever-dm410run forever-dm410:x 2&gt;&amp;1 | tail -n 1
+rm c1/.dockerignore</code></pre>
+<p>Output:</p>
+<pre><code>/usr/local/bin/python
+/usr/local
+six-1.17.0.dist-info
+six.py
+six 1.17.0
+== c1 with .dockerignore containing: app
+ModuleNotFoundError: No module named &#x27;app&#x27;</code></pre>
+<p><code>which python</code> is <code>/usr/local/bin/python</code> (prefix <code>/usr/local</code>), while <code>six.py</code> sits in the venv, and the venv's own interpreter imports it fine. With <code>app</code> in <code>.dockerignore</code>, the "fixed" <code>COPY . .</code> image fails again with <code>No module named 'app'</code>.</p>
+<p>Quick checklist: <code>docker run --rm -it IMAGE sh</code>, then <code>ls</code> the working directory, <code>which python</code>, <code>python -c "import sys; print(sys.path)"</code> and <code>python -m pip list</code>. A mounted volume (<code>-v $PWD:/code</code>) also replaces whatever the image had in that folder at run time.</p>
+<p>Related: <a href="/guides/pip-error-externally-managed-environment/">pip error: externally-managed-environment</a>, <a href="/guides/docker-build-failed/">docker build failed</a>, <a href="/guides/docker-pip-error-externally-managed-environment/">Docker pip externally-managed-environment</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why do I get ModuleNotFoundError in Docker but not locally?</summary><p>Usually the module is not in the image (COPY missed it or .dockerignore excluded it), it was installed into a different Python or venv than the one CMD runs, or the import root is not on sys.path.</p></details>
+<details><summary>How do I fix No module named in a Docker multi-stage build with a venv?</summary><p>Copy the venv into the final stage and put it first on PATH with ENV PATH=&quot;/opt/venv/bin:$PATH&quot;, or call /opt/venv/bin/python directly.</p></details>
+<details><summary>How do I set PYTHONPATH in a Dockerfile?</summary><p>Add ENV PYTHONPATH=/code/src (the folder that contains your top-level package), or set WORKDIR to it and run python -m package.module.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Docker and the python:3-alpine image (Python 3.14.7). The scripts ran verbatim and the output was pasted unedited. PlainTables is our extension; Docker and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

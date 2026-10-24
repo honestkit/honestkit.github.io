@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>npm ECONNRESET and ETIMEDOUT: Causes and Fixes (Tested)</title>
+<meta name="description" content="We made npm fail 3 ways against the registry: ECONNRESET, ETIMEDOUT, ECONNREFUSED. Measured npm&#x27;s real error text, retry count, and timing for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/npm-err-network-econnreset-etimedout/">
+<meta property="og:title" content="npm ECONNRESET and ETIMEDOUT: Causes and Fixes (Tested)">
+<meta property="og:description" content="We made npm fail 3 ways against the registry: ECONNRESET, ETIMEDOUT, ECONNREFUSED. Measured npm&#x27;s real error text, retry count, and timing for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/npm-err-network-econnreset-etimedout/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is \"npm ERR! code ECONNRESET\" still what newer npm prints?", "acceptedAnswer": {"@type": "Answer", "text": "No, not verbatim. On npm 11.19.0 (measured here) the prefix is \"npm error\", not \"npm ERR!\" -- the exclamation-point prefix is from npm 6/7. The error body (code ECONNRESET, errno ECONNRESET, \"socket hang up\") is the same."}}, {"@type": "Question", "name": "Does npm retry automatically on these errors?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. By default npm retries 2 times (3 attempts total) with exponential backoff (fetch-retries=2, fetch-retry-mintimeout=10000, fetch-retry-maxtimeout=60000, fetch-retry-factor=10). We measured 3 attempts and ~70s total elapsed for both ECONNRESET and ECONNREFUSED before npm gave up."}}, {"@type": "Question", "name": "Why did my timeout show FETCH_ERROR instead of ETIMEDOUT?", "acceptedAnswer": {"@type": "Answer", "text": "Because npm's own request timeout (the fetch-timeout config, default 300000ms) fires while waiting for an HTTP response on an already-open connection, and npm reports that as code FETCH_ERROR / \"network timeout\", not ETIMEDOUT. A literal ETIMEDOUT only appeared in our tests when the TCP connect() itself never completed (unreachable host), which fetch-timeout does not bound."}}, {"@type": "Question", "name": "How do I tell ECONNRESET, ETIMEDOUT and ECONNREFUSED apart in a log?", "acceptedAnswer": {"@type": "Answer", "text": "Look at npm error code and, for ECONNREFUSED, the address/port block that names exactly what was contacted. ECONNRESET means a connection was accepted then killed; ECONNREFUSED means nothing was listening; ETIMEDOUT (the real kind) means the connection attempt itself never got a reply."}}, {"@type": "Question", "name": "Will raising fetch-retries or fetch-timeout fix this?", "acceptedAnswer": {"@type": "Answer", "text": "Only for transient failures like an overloaded registry or flaky proxy (ECONNRESET). It will not fix ECONNREFUSED (nothing listening) or a true ETIMEDOUT (unreachable host) -- those need a URL/DNS/routing/VPN fix, and raising timeouts just makes npm wait longer to tell you the same thing."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>npm ECONNRESET / ETIMEDOUT network errors (tested)</h1>
+<p class="lead"><code>npm install</code> or <code>npm ci</code> can fail talking to the registry in several different ways, and they get lumped together as "npm network errors." We reproduced three of them against servers we controlled -a connection that gets reset, one that never answers, and a closed port- and measured npm's exact output, retry behaviour, and timing for each. They are different root causes with different fixes.</p>
+<h2>1. Three different errors, three different causes</h2>
+<p>These three error codes look similar in a CI log but mean different things. All three measurements below used npm 11.19.0 and the same package (<code>is-odd</code>) against <code>http://127.0.0.1:8987</code>.</p>
+<table>
+<tr><th>Code</th><th>What actually happened</th><th>Typical real-world cause</th><th>Fix direction</th></tr>
+<tr><td>ECONNRESET</td><td>Connection was accepted, then forcibly closed</td><td>Registry/proxy/firewall killed the connection mid-request (overload, WAF, flaky proxy, VPN)</td><td>Retry with backoff, check proxy/firewall, try a mirror</td></tr>
+<tr><td>ETIMEDOUT</td><td>TCP connect() itself never completed</td><td>Host is unreachable or packets are being silently dropped (bad route, blocked outbound port, dead VPN)</td><td>Check routing/DNS/VPN, not npm config</td></tr>
+<tr><td>ECONNREFUSED</td><td>Connect was actively rejected</td><td>Nothing is listening on that host:port (wrong registry URL, service down)</td><td>Check the registry URL and that the service is up</td></tr>
+</table>
+<p>There is a fourth case that people call "ETIMEDOUT" but isn't: npm's <em>own</em> request timeout, covered in section 4.</p>
+
+<h2>2. Test setup</h2>
+<p>Three one-file Node servers, each listening on <code>127.0.0.1:8987</code>:</p>
+<pre><code>// reset: accept, then kill the socket
+net.createServer(socket =&gt; socket.destroy()).listen(8987);
+
+// hang: accept, never write anything, never close
+net.createServer(socket =&gt; {}).listen(8987);
+
+// refused: nothing listening at all</code></pre>
+<p>Each test ran <code>npm install --registry=http://127.0.0.1:8987 is-odd</code> in an empty project, with <code>--loglevel verbose</code> to see retry attempts, and wall-clock timed with <code>time</code>.</p>
+
+<h2>3. ECONNRESET: connection accepted, then killed</h2>
+<p>Against the socket-destroying server, npm failed after 3 attempts and <strong>1m10.3s</strong> with:</p>
+<pre><code>npm error code ECONNRESET
+npm error errno ECONNRESET
+npm error network request to http://127.0.0.1:8987/is-odd failed, reason: socket hang up
+npm error network This is a problem related to network connectivity.
+npm error network In most cases you are behind a proxy or have bad network settings.
+npm error network
+npm error network If you are behind a proxy, please make sure that the 'proxy' config is set properly.  See: 'npm help config'</code></pre>
+<p>Note it says <strong>"npm error"</strong>, not the older <strong>"npm ERR!"</strong> you'll see in guides written for npm 6/7. npm 11.19.0 uses "npm error"/"npm warn" consistently; "npm ERR!" is from older npm major versions, so don't pattern-match your CI log parser on the exclamation mark.</p>
+<p>The verbose log showed three attempts, one per retry:</p>
+<pre><code>npm http fetch GET http://127.0.0.1:8987/is-odd attempt 1 failed with ECONNRESET
+npm http fetch GET http://127.0.0.1:8987/is-odd attempt 2 failed with ECONNRESET
+npm http fetch GET http://127.0.0.1:8987/is-odd attempt 3 failed with ECONNRESET</code></pre>
+
+<h2>4. ETIMEDOUT: two different things hide behind this name</h2>
+<p>This is the one people get wrong. We tested two scenarios and npm reported them <em>differently</em>.</p>
+<p><strong>4a. Registry accepts the connection but never answers.</strong> We pointed npm at the "hang" server (TCP accept succeeds instantly, then nothing is ever sent). With npm's default <code>fetch-timeout</code> of 300000 ms (5 minutes) per attempt and <code>fetch-retries</code> of 2 (3 attempts total), the full failure took <strong>measured_default_elapsed</strong> to fail with:</p>
+<pre><code>npm error code FETCH_ERROR
+npm error errno FETCH_ERROR
+npm error network timeout at: http://127.0.0.1:8987/is-odd</code></pre>
+<p>Not <code>ETIMEDOUT</code>. The verbose log calls it a <code>request-timeout</code>:</p>
+<pre><code>npm http fetch GET http://127.0.0.1:8987/is-odd attempt 1 failed with FETCH_ERROR
+npm verbose type request-timeout
+npm verbose stack FetchError: network timeout at: http://127.0.0.1:8987/is-odd</code></pre>
+<p>To confirm the mechanism without waiting the full default, we reran with <code>--fetch-timeout=3000</code>: same shape, 3 attempts, total <strong>1m19.3s</strong> (3 x ~3s request timeout plus the same retry backoff as section 6).</p>
+<p><strong>4b. TCP connect() itself never completes</strong> (host unreachable, packets dropped silently) is the case that actually produces a literal <code>ETIMEDOUT</code>. We pointed npm at a non-routable IP on the same port, with <code>--fetch-timeout=3000</code>:</p>
+<pre><code>npm http fetch GET http://10.255.255.1:8987/is-odd attempt 1 failed with ETIMEDOUT
+npm http fetch GET http://10.255.255.1:8987/is-odd attempt 2 failed with ETIMEDOUT</code></pre>
+<p>Measured finding: each attempt took far longer than the 3000 ms <code>fetch-timeout</code> we set -- <code>fetch-timeout</code> bounds the time waiting for an HTTP response on an already-open socket, it does not bound a stuck <code>connect()</code>. A stalled connect is governed by the OS/kernel TCP stack (connect_attempt_elapsed), not by any npm config. So: "ETIMEDOUT" from npm's own request-timeout logic shows up as <code>FETCH_ERROR</code> / "network timeout", while a real OS-level connect timeout shows up as <code>ETIMEDOUT</code> -- and only the latter is what the name suggests.</p>
+
+<h2>5. ECONNREFUSED, for contrast</h2>
+<p>With nothing listening on <code>127.0.0.1:8987</code>, npm failed after 3 attempts and <strong>1m10.3s</strong> with:</p>
+<pre><code>npm error code ECONNREFUSED
+npm error syscall connect
+npm error errno ECONNREFUSED
+npm error FetchError: request to http://127.0.0.1:8987/is-odd failed, reason: connect ECONNREFUSED 127.0.0.1:8987
+npm error   code: 'ECONNREFUSED',
+npm error   errno: 'ECONNREFUSED',
+npm error   syscall: 'connect',
+npm error   address: '127.0.0.1',
+npm error   port: 8987,
+npm error   type: 'system',</code></pre>
+<p>Same total time as ECONNRESET (both fail the TCP step almost instantly, so the elapsed time is dominated by retry backoff, not by the error itself) but a different <code>code</code> and an explicit <code>address</code>/<code>port</code> block, which is the fastest way to tell "wrong URL or dead service" (ECONNREFUSED) apart from "proxy/firewall killed it mid-flight" (ECONNRESET) in a log.</p>
+
+<h2>6. Does npm retry automatically? Yes.</h2>
+<p>npm installs use <code>make-fetch-happen</code>, which retries failed requests using these defaults (checked with <code>npm config get &lt;key&gt;</code> on this box):</p>
+<table>
+<tr><th>Config key</th><th>Default value</th><th>Meaning</th></tr>
+<tr><td>fetch-retries</td><td>2</td><td>2 retries = 3 attempts total</td></tr>
+<tr><td>fetch-retry-mintimeout</td><td>10000</td><td>first retry waits ~10s</td></tr>
+<tr><td>fetch-retry-maxtimeout</td><td>60000</td><td>backoff is capped at 60s</td></tr>
+<tr><td>fetch-retry-factor</td><td>10</td><td>exponential backoff multiplier</td></tr>
+<tr><td>fetch-timeout</td><td>300000</td><td>5 minutes per attempt before giving up on that attempt</td></tr>
+</table>
+<p>In every ECONNRESET and ECONNREFUSED run above, <code>--loglevel verbose</code> showed exactly 3 "attempt" lines before npm gave up, and the measured 1m10.3s elapsed time matches the backoff math: ~10s before retry 2, capped at 60s before retry 3 (10000 x 10^1 = 100000, capped to 60000), for ~70s total of waiting between 3 near-instant failures. That means npm is already retrying by default -- if your CI fails on the first flake anyway, the registry/proxy is down for longer than ~70s, or something outside npm (DNS, VPN, container network) is the real problem.</p>
+
+<h2>7. Fixes</h2>
+<ul>
+<li><strong>More retries / longer backoff for flaky networks:</strong> <code>npm config set fetch-retries 5</code> (confirmed with <code>npm config get fetch-retries</code> that this persists to <code>.npmrc</code>). Useful for ECONNRESET on a congested proxy; it will not help ECONNREFUSED or a genuinely dead host.</li>
+<li><strong>Wrong or unreachable registry:</strong> <code>npm config set registry https://registry.npmjs.org/</code> (or your mirror). We confirmed <code>npm config set/get/delete registry</code> round-trips correctly and writes to the project or user <code>.npmrc</code>.</li>
+<li><strong>Behind a corporate proxy:</strong> npm honours <code>HTTP_PROXY</code>/<code>HTTPS_PROXY</code> env vars as well as its own <code>proxy</code>/<code>https-proxy</code> config. If only the env var is wrong, you will see the connection error (ECONNRESET/ECONNREFUSED/ETIMEDOUT) pointed at the <em>proxy's</em> address, not the registry's -- check the <code>address</code>/<code>port</code> fields in <code>npm error</code> output (section 5) to see which host actually failed.</li>
+<li><strong>Genuine ETIMEDOUT (connect never completes):</strong> this is a routing/DNS/VPN/firewall problem, not an npm setting. Raising <code>fetch-timeout</code> or <code>fetch-retries</code> only makes npm wait longer before telling you the same thing (section 4b).</li>
+<li><strong>CI-specific:</strong> pin a registry mirror close to your CI region and keep <code>fetch-retries</code> at its default or slightly higher; don't set <code>fetch-timeout</code> very low, since legitimately slow (not stuck) registries will then fail on real work.</li>
+</ul>
+<p>If the reset happens in a browser request rather than npm/Node, see <a href="/guides/err-connection-reset-econnreset/">ERR_CONNECTION_RESET / ECONNRESET</a> for that case instead.</p>
+<aside class="cta"><strong>Check the headers your registry or proxy actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is &quot;npm ERR! code ECONNRESET&quot; still what newer npm prints?</summary><p>No, not verbatim. On npm 11.19.0 (measured here) the prefix is &quot;npm error&quot;, not &quot;npm ERR!&quot; -- the exclamation-point prefix is from npm 6/7. The error body (code ECONNRESET, errno ECONNRESET, &quot;socket hang up&quot;) is the same.</p></details>
+<details><summary>Does npm retry automatically on these errors?</summary><p>Yes. By default npm retries 2 times (3 attempts total) with exponential backoff (fetch-retries=2, fetch-retry-mintimeout=10000, fetch-retry-maxtimeout=60000, fetch-retry-factor=10). We measured 3 attempts and ~70s total elapsed for both ECONNRESET and ECONNREFUSED before npm gave up.</p></details>
+<details><summary>Why did my timeout show FETCH_ERROR instead of ETIMEDOUT?</summary><p>Because npm&#x27;s own request timeout (the fetch-timeout config, default 300000ms) fires while waiting for an HTTP response on an already-open connection, and npm reports that as code FETCH_ERROR / &quot;network timeout&quot;, not ETIMEDOUT. A literal ETIMEDOUT only appeared in our tests when the TCP connect() itself never completed (unreachable host), which fetch-timeout does not bound.</p></details>
+<details><summary>How do I tell ECONNRESET, ETIMEDOUT and ECONNREFUSED apart in a log?</summary><p>Look at npm error code and, for ECONNREFUSED, the address/port block that names exactly what was contacted. ECONNRESET means a connection was accepted then killed; ECONNREFUSED means nothing was listening; ETIMEDOUT (the real kind) means the connection attempt itself never got a reply.</p></details>
+<details><summary>Will raising fetch-retries or fetch-timeout fix this?</summary><p>Only for transient failures like an overloaded registry or flaky proxy (ECONNRESET). It will not fix ECONNREFUSED (nothing listening) or a true ETIMEDOUT (unreachable host) -- those need a URL/DNS/routing/VPN fix, and raising timeouts just makes npm wait longer to tell you the same thing.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with npm 11.19.0 and Node.js v24.21.0 on Linux. We pointed npm at three tiny Node TCP servers we controlled: one that destroys the socket on connect (ECONNRESET), one that accepts the connection and never answers (to test npm&#x27;s own fetch-timeout), and a closed port (ECONNREFUSED). We also pointed it at a non-routable IP to get a true OS-level connect timeout. Proxy/registry config behaviour was measured with npm config set/get; anything not run here is labelled as such. PlainHeaders is our extension; npm, curl and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

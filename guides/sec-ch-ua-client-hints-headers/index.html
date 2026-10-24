@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sec-CH-UA, Sec-CH-UA-Platform and Client Hints: Real Values Measured in Chrome</title>
+<meta name="description" content="What Chromium 153 actually sends in sec-ch-ua, sec-ch-ua-mobile and sec-ch-ua-platform, the Not_A Brand GREASE entry, what Accept-CH and Critical-CH change (and when), getHighEntropyValues output, and why plain-http hosts get no client hints.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sec-ch-ua-client-hints-headers/">
+<meta property="og:title" content="Sec-CH-UA, Sec-CH-UA-Platform and Client Hints: Real Values Measured in Chrome">
+<meta property="og:description" content="What Chromium 153 actually sends in sec-ch-ua, sec-ch-ua-mobile and sec-ch-ua-platform, the Not_A Brand GREASE entry, what Accept-CH and Critical-CH change (and when), getHighEntropyValues output, and why plain-http hosts get no client hints.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sec-ch-ua-client-hints-headers/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the sec-ch-ua header?", "acceptedAnswer": {"@type": "Answer", "text": "A User-Agent Client Hint listing the browser's brands with major versions. Chromium 153 sent \"Chromium\";v=\"153\", \"Not_A Brand\";v=\"8\" by default on every request to a secure origin."}}, {"@type": "Question", "name": "What does Not_A Brand mean in sec-ch-ua?", "acceptedAnswer": {"@type": "Answer", "text": "It is GREASE: an intentionally fake brand entry so servers parse the list instead of matching an exact string. Its name and version can change, so ignore it and look for the brand you care about."}}, {"@type": "Question", "name": "Why is Sec-CH-UA-Platform-Version not sent?", "acceptedAnswer": {"@type": "Answer", "text": "It is a high-entropy hint: the server must request it with Accept-CH first. In Chromium 153 the response carrying Accept-CH did not get it, the following requests did. Add Critical-CH to make the browser retry the first navigation with it. On Linux its value was an empty string."}}, {"@type": "Question", "name": "Why are client hints missing on my site?", "acceptedAnswer": {"@type": "Answer", "text": "They are only sent to secure contexts. localhost and 127.0.0.1 over http got them, but a plain-http host name mapped to 127.0.0.1 got no Sec-CH-UA headers at all, even after Accept-CH, and navigator.userAgentData was undefined."}}, {"@type": "Question", "name": "Are client hints sent to third-party requests?", "acceptedAnswer": {"@type": "Answer", "text": "Only the default three. A cross-origin fetch got sec-ch-ua-arch and sec-ch-ua-full-version-list only after the page delegated them with Permissions-Policy: ch-ua-arch=(self \"origin\")."}}, {"@type": "Question", "name": "Does curl send sec-ch-ua?", "acceptedAnswer": {"@type": "Answer", "text": "No. curl 8.14.1 sent only Host, User-Agent and Accept, and Node.js 24 fetch sent no sec-ch-* headers. Client hints come from browsers."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Sec-CH-UA and User-Agent Client Hints explained (tested in Chromium)</h1>
+<p class="lead">User-Agent Client Hints are the <code>Sec-CH-UA*</code> request headers Chromium-based browsers send alongside (and eventually instead of) the <code>User-Agent</code> string. Three are sent by default; the rest only after the server asks with <code>Accept-CH</code>. We logged every one on a test server to see exactly when each appears.</p>
+<h2>1. What Chromium sends by default</h2>
+<p>First visit to <code>http://localhost:8965/</code> in a fresh profile, with no <code>Accept-CH</code> anywhere. These three low-entropy hints arrived on the navigation, on <code>fetch()</code>, on an <code>&lt;img&gt;</code> and on the favicon request:</p>
+<pre><code>sec-ch-ua: "Chromium";v="153", "Not_A Brand";v="8"
+sec-ch-ua-mobile: ?0
+sec-ch-ua-platform: "Linux"
+user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36</code></pre>
+<ul><li><strong><code>"Not_A Brand";v="8"</code> is GREASE</strong>: a deliberately fake brand that tells servers to parse the list properly instead of matching the whole string. Its spelling and version are not fixed, so never compare against it; look for the brand you need (<code>"Chromium"</code>, <code>"Google Chrome"</code>, <code>"Microsoft Edge"</code>) in the list.</li>
+<li><strong>Only the major version</strong> is in <code>sec-ch-ua</code>. The full version (153.0.8010.12) needs a high-entropy hint.</li>
+<li><strong><code>?0</code> / <code>?1</code></strong> are structured-header booleans: <code>?0</code> means not mobile.</li>
+<li>The headless build put <code>HeadlessChrome</code> in the User-Agent string but still sent <code>"Chromium"</code> in <code>sec-ch-ua</code>, so the two headers can disagree.</li></ul>
+<h2>2. Asking for more with Accept-CH</h2>
+<p>The server answered a page with:</p>
+<pre><code>Accept-CH: Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List, Sec-CH-UA-Arch, Sec-CH-UA-Model</code></pre>
+<table><thead><tr><th>Request</th><th>High-entropy hints received?</th></tr></thead><tbody>
+<tr><td>The navigation whose response carried Accept-CH</td><td><strong>No</strong>, only the default three</td></tr>
+<tr><td><code>fetch()</code>, <code>&lt;img&gt;</code>, favicon from that page</td><td>Yes, all four</td></tr>
+<tr><td>Next navigation on the same origin</td><td>Yes</td></tr>
+<tr><td>A later navigation after a page <em>without</em> Accept-CH</td><td>Yes (the preference was remembered)</td></tr>
+<tr><td><code>http://127.0.0.1:8965</code> (different origin)</td><td>No, only the default three</td></tr>
+<tr><td>Cross-origin <code>fetch()</code> to 127.0.0.1 from that page</td><td>No, only the default three</td></tr>
+</tbody></table>
+<p>Values received on Linux x86_64:</p>
+<pre><code>sec-ch-ua-full-version-list: "Chromium";v="153.0.8010.12", "Not_A Brand";v="8.0.0.0"
+sec-ch-ua-arch: "x86"
+sec-ch-ua-platform-version: ""
+sec-ch-ua-model: ""</code></pre>
+<p>Note the empty strings: platform version was blank on Linux and model is blank on desktop. Code that reads these must handle <code>""</code>. A <code>&lt;meta http-equiv="Accept-CH" content="Sec-CH-UA-Arch"&gt;</code> tag behaved differently from the header: the page's own <code>fetch()</code> got <code>sec-ch-ua-arch</code>, but the next navigation did not, so the meta tag is not remembered.</p>
+<h2>3. Critical-CH: getting hints on the very first request</h2>
+<p>Adding <code>Critical-CH: Sec-CH-UA-Platform-Version</code> next to <code>Accept-CH</code> made Chromium <strong>retry the same navigation</strong>: our server logged <strong>2 hits</strong> for one <code>page.goto()</code>, the first with the default three hints, the second with <code>sec-ch-ua-platform-version</code> and <code>sec-ch-ua-full-version-list</code>. The next navigation was a single hit carrying both hints. Use it only when the first response truly depends on the hint; it costs a full extra round trip on first visit.</p>
+<h2>4. Third-party requests need Permissions-Policy</h2>
+<p>With only <code>Accept-CH</code>, the cross-origin request to <code>127.0.0.1</code> got the default three hints. Adding</p>
+<pre><code>Permissions-Policy: ch-ua-arch=(self "http://127.0.0.1:8966"), ch-ua-full-version-list=(self "http://127.0.0.1:8966")</code></pre>
+<p>to the page response made the same cross-origin <code>fetch()</code> carry <code>sec-ch-ua-arch</code> and <code>sec-ch-ua-full-version-list</code>.</p>
+<h2>5. Secure contexts only</h2>
+<table><thead><tr><th>Origin</th><th><code>isSecureContext</code></th><th>Sec-CH-UA headers</th><th><code>navigator.userAgentData</code></th></tr></thead><tbody>
+<tr><td><code>http://localhost:8965</code></td><td>true</td><td>Yes, Accept-CH honoured</td><td>present</td></tr>
+<tr><td><code>http://127.0.0.1:8965</code></td><td>true</td><td>Yes, Accept-CH honoured</td><td>present</td></tr>
+<tr><td><code>http://plain.test:8965</code> (mapped to 127.0.0.1)</td><td>false</td><td><strong>None</strong>, even after Accept-CH</td><td><code>undefined</code></td></tr>
+</tbody></table>
+<p>So hints work on local dev but disappear on a plain-http staging host. Serve over HTTPS if your code depends on them. curl 8.14.1 sent only <code>host</code>, <code>user-agent: curl/8.14.1</code> and <code>accept: */*</code>, and Node.js 24 <code>fetch()</code> sent no <code>sec-ch-*</code> headers either: non-browser clients send none.</p>
+<h2>6. The JavaScript side</h2>
+<pre><code>navigator.userAgentData.brands
+// [{brand:"Chromium",version:"153"},{brand:"Not_A Brand",version:"8"}]
+await navigator.userAgentData.getHighEntropyValues(
+  ["architecture","bitness","model","platformVersion","fullVersionList","wow64","formFactors"])
+// architecture:"x86", bitness:"64", model:"", platformVersion:"",
+// fullVersionList:[{brand:"Chromium",version:"153.0.8010.12"},{brand:"Not_A Brand",version:"8.0.0.0"}],
+// wow64:false, formFactors:["Desktop"], mobile:false, platform:"Linux", uaFullVersion:"153.0.8010.12"</code></pre>
+<p>No <code>Accept-CH</code> was needed for the JavaScript API. If your response changes based on any hint, add it to <code>Vary</code> (for example <code>Vary: Sec-CH-UA-Mobile</code>) so caches keep the variants apart; see <a href="/guides/vary-origin-header-cors-cache/">Vary and caching</a>. Related request headers: <a href="/guides/sec-fetch-site-mode-dest-headers/">Sec-Fetch-Site, Mode and Dest</a> and <a href="/guides/accept-language-header/">Accept-Language</a>.</p>
+<aside class="cta"><strong>See the request headers your browser sends to a site:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the sec-ch-ua header?</summary><p>A User-Agent Client Hint listing the browser&#x27;s brands with major versions. Chromium 153 sent &quot;Chromium&quot;;v=&quot;153&quot;, &quot;Not_A Brand&quot;;v=&quot;8&quot; by default on every request to a secure origin.</p></details>
+<details><summary>What does Not_A Brand mean in sec-ch-ua?</summary><p>It is GREASE: an intentionally fake brand entry so servers parse the list instead of matching an exact string. Its name and version can change, so ignore it and look for the brand you care about.</p></details>
+<details><summary>Why is Sec-CH-UA-Platform-Version not sent?</summary><p>It is a high-entropy hint: the server must request it with Accept-CH first. In Chromium 153 the response carrying Accept-CH did not get it, the following requests did. Add Critical-CH to make the browser retry the first navigation with it. On Linux its value was an empty string.</p></details>
+<details><summary>Why are client hints missing on my site?</summary><p>They are only sent to secure contexts. localhost and 127.0.0.1 over http got them, but a plain-http host name mapped to 127.0.0.1 got no Sec-CH-UA headers at all, even after Accept-CH, and navigator.userAgentData was undefined.</p></details>
+<details><summary>Are client hints sent to third-party requests?</summary><p>Only the default three. A cross-origin fetch got sec-ch-ua-arch and sec-ch-ua-full-version-list only after the page delegated them with Permissions-Policy: ch-ua-arch=(self &quot;origin&quot;).</p></details>
+<details><summary>Does curl send sec-ch-ua?</summary><p>No. curl 8.14.1 sent only Host, User-Agent and Accept, and Node.js 24 fetch sent no sec-ch-* headers. Client hints come from browsers.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 in headless Chromium 153.0.8010.12 on Linux x86_64 (Playwright, channel &#x27;chromium&#x27;, fresh context per test) against a Node.js 24.21.0 http server on localhost:8965-8966 that logged every Sec-CH-UA* header and counted hits. 127.0.0.1 and a host name mapped to 127.0.0.1 with --host-resolver-rules (plain http, not localhost) were used to test secure-context rules. curl 8.14.1 and Node.js fetch were logged by the same server. Other browsers were not tested. PlainHeaders is our extension; DevTools → Network → Headers shows the same request headers, free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

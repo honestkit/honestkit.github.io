@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>datetime: Two Different Instants Compare Equal at DST Fall-Back</title>
+<meta name="description" content="We measured two zoneinfo-aware datetimes an hour apart in real UTC time (DST fall-back ambiguity) returning == True, equal hash(), and a 0:00:00 subtraction.">
+<link rel="canonical" href="https://honestkit.github.io/guides/datetime-dst-fallback-ambiguous-time-compares-equal-to-different-instant/">
+<meta property="og:title" content="datetime: Two Different Instants Compare Equal at DST Fall-Back">
+<meta property="og:description" content="We measured two zoneinfo-aware datetimes an hour apart in real UTC time (DST fall-back ambiguity) returning == True, equal hash(), and a 0:00:00 subtraction.">
+<meta property="og:url" content="https://honestkit.github.io/guides/datetime-dst-fallback-ambiguous-time-compares-equal-to-different-instant/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Do two different DST fall-back instants really compare as equal in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured datetime.datetime == returning True, hash() matching, and subtraction giving timedelta(0) for two zoneinfo-aware instants that are a full hour apart in real UTC time."}}, {"@type": "Question", "name": "Does this raise any exception or warning?", "acceptedAnswer": {"@type": "Answer", "text": "No -- in our test it compared, hashed and subtracted silently with no indication the two values represent different real-world moments."}}, {"@type": "Question", "name": "What is the fold attribute?", "acceptedAnswer": {"@type": "Answer", "text": "Per PEP 495 and the datetime docs, fold (0 or 1) disambiguates which occurrence of a repeated local wall-clock time a naive-looking local datetime means. We confirmed .astimezone() and .utcoffset() respect it, but == and subtraction between aware datetimes do not."}}, {"@type": "Question", "name": "How do I compare timestamps safely across a DST transition?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed converting both datetimes to UTC (or any fixed-offset zone) with .astimezone() before comparing or subtracting gives the correct, non-ambiguous result."}}, {"@type": "Question", "name": "Does this only affect timezones that observe daylight saving time?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- it only happens during the fall-back transition in DST-observing zones like America/New_York. A fixed-offset zone like UTC has no repeated wall-clock hour, so this ambiguity can't occur there."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Two Different DST Fall-Back Instants Compare Equal in datetime (tested)</h1>
+<p class="lead">Once a year, local clocks in many timezones go back an hour, so a wall-clock time like <code>01:30</code> happens twice. We measured what Python's <code>datetime</code> does when you build both occurrences with <code>zoneinfo</code> and compare them: they are genuinely an hour apart in real time, but <code>==</code> says they're equal.</p>
+<h2 id="repro1">1. Building both occurrences of the ambiguous hour</h2>
+<pre><code>from datetime import datetime
+from zoneinfo import ZoneInfo
+
+tz = ZoneInfo("America/New_York")
+# 2026-11-01: US DST fall-back date, clocks go 1:59:59 -> 1:00:00
+first = datetime(2026, 11, 1, 1, 30, 0, tzinfo=tz)       # fold=0 (default)
+second = first.replace(fold=1)                            # the later, repeated 1:30
+
+print(first.utcoffset(), second.utcoffset())
+print(first.astimezone(ZoneInfo("UTC")))
+print(second.astimezone(ZoneInfo("UTC")))</code></pre>
+<pre><code>-1 day, 20:00:00 -1 day, 19:00:00
+2026-11-01 05:30:00+00:00
+2026-11-01 06:30:00+00:00</code></pre>
+<p><strong>Measured:</strong> the <code>fold</code> attribute (PEP 495) picks which side of the DST transition <code>01:30</code> means. Converted to UTC, <code>first</code> and <code>second</code> are a full hour apart &mdash; they are different real-world instants, and <code>.astimezone()</code> gets this right.</p>
+
+<h2 id="repro2">2. Comparing them directly</h2>
+<pre><code>print("== :", first == second)
+print("< :", first < second)
+print("hash equal:", hash(first) == hash(second))
+print("subtract:", second - first)</code></pre>
+<pre><code>== : True
+< : False
+hash equal: True
+subtract: 0:00:00</code></pre>
+<p><strong>Measured:</strong> <code>first == second</code> is <code>True</code>, their hashes are equal, and subtracting one from the other gives <code>timedelta(0)</code> &mdash; even though they are an hour apart in UTC, as section 1 just showed. No exception, no warning. Aware <code>datetime</code> comparison and arithmetic ignore <code>fold</code> entirely; only <code>.astimezone()</code> (and <code>.utcoffset()</code>) take it into account.</p>
+
+<h2 id="why">3. Why this is dangerous in real code</h2>
+<p>This only matters during the ~1 hour per year each DST-observing timezone falls back, but code that stores or compares local-time timestamps &mdash; a log line, a booking slot, an "events happened in this order" check &mdash; can silently treat two distinct events that occurred an hour apart as the same moment, or compute a zero duration between them, during that window.</p>
+
+<h2 id="fix">4. Fix: compare in UTC, or convert before comparing</h2>
+<pre><code>first_utc = first.astimezone(ZoneInfo("UTC"))
+second_utc = second.astimezone(ZoneInfo("UTC"))
+print("== in UTC:", first_utc == second_utc)
+print("subtract in UTC:", second_utc - first_utc)</code></pre>
+<pre><code>== in UTC: False
+subtract in UTC: 1:00:00</code></pre>
+<p><strong>Measured:</strong> converting both to UTC before comparing gives the correct answer &mdash; not equal, one hour apart. The safe pattern confirmed here: store and compare timestamps in UTC (or any fixed, non-DST-observing offset), and only convert to a local, DST-observing zone for display.</p>
+<aside class="cta"><strong>Debugging a timestamp that compared equal to a request an hour apart? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Do two different DST fall-back instants really compare as equal in Python?</summary><p>Yes -- we measured datetime.datetime == returning True, hash() matching, and subtraction giving timedelta(0) for two zoneinfo-aware instants that are a full hour apart in real UTC time.</p></details>
+<details><summary>Does this raise any exception or warning?</summary><p>No -- in our test it compared, hashed and subtracted silently with no indication the two values represent different real-world moments.</p></details>
+<details><summary>What is the fold attribute?</summary><p>Per PEP 495 and the datetime docs, fold (0 or 1) disambiguates which occurrence of a repeated local wall-clock time a naive-looking local datetime means. We confirmed .astimezone() and .utcoffset() respect it, but == and subtraction between aware datetimes do not.</p></details>
+<details><summary>How do I compare timestamps safely across a DST transition?</summary><p>We confirmed converting both datetimes to UTC (or any fixed-offset zone) with .astimezone() before comparing or subtracting gives the correct, non-ambiguous result.</p></details>
+<details><summary>Does this only affect timezones that observe daylight saving time?</summary><p>Yes -- it only happens during the fall-back transition in DST-observing zones like America/New_York. A fixed-offset zone like UTC has no repeated wall-clock hour, so this ambiguity can&#x27;t occur there.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in datetime and zoneinfo modules under TZ=America/New_York, constructing the two local-time instants that exist during the 2026-11-01 DST fall-back transition (01:30 occurs twice) using the documented fold attribute, then comparing them with ==, &lt;, hash() and subtraction. PlainHeaders is our extension; Python&#x27;s datetime and zoneinfo modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

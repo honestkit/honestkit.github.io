@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>X-Forwarded-For nginx: Get the Real Client IP Behind a Proxy (real_ip, Tested)</title>
+<meta name="description" content="Behind a reverse proxy or load balancer, nginx logs the proxy&#x27;s IP. Use set_real_ip_from and real_ip_header to get the visitor&#x27;s IP, and see the config that lets anyone forge their IP with one header.">
+<link rel="canonical" href="https://honestkit.github.io/guides/x-forwarded-for-real-ip-nginx/">
+<meta property="og:title" content="X-Forwarded-For nginx: Get the Real Client IP Behind a Proxy (real_ip, Tested)">
+<meta property="og:description" content="Behind a reverse proxy or load balancer, nginx logs the proxy&#x27;s IP. Use set_real_ip_from and real_ip_header to get the visitor&#x27;s IP, and see the config that lets anyone forge their IP with one header.">
+<meta property="og:url" content="https://honestkit.github.io/guides/x-forwarded-for-real-ip-nginx/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does nginx log my load balancer's IP instead of the visitor's?", "acceptedAnswer": {"@type": "Answer", "text": "Because the load balancer opens the connection. Add set_real_ip_from (the balancer's address or subnet) and real_ip_header X-Forwarded-For to the nginx that sits behind it."}}, {"@type": "Question", "name": "Can users fake X-Forwarded-For?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Any client can send the header. In our test, trusting all addresses with real_ip_recursive on let a visitor become 1.2.3.4. Trust only your own proxies."}}, {"@type": "Question", "name": "What is the difference between X-Forwarded-For and X-Real-IP?", "acceptedAnswer": {"@type": "Answer", "text": "X-Forwarded-For is a list that each proxy appends to; X-Real-IP is a single address a proxy sets. Either works with real_ip_header, if only your proxy can set it."}}, {"@type": "Question", "name": "Does X-Forwarded-For hide my IP from a website?", "acceptedAnswer": {"@type": "Answer", "text": "No. The server always sees the address that connected. The header only matters to servers set up to trust it."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>X-Forwarded-For in nginx: log the real client IP without trusting forged headers</h1>
+<p class="lead">Behind a proxy, $remote_addr is the proxy. The realip module fixes that, but only trust the header from your own proxies.</p>
+<h2>1. The proxy adds the header</h2>
+<pre><code>server {
+    listen 80;
+    location / {
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://forever-xff-app:80;
+    }
+}</code></pre>
+<p><code>$proxy_add_x_forwarded_for</code> appends the address that connected to the proxy to any X-Forwarded-For header the client already sent. A visitor who sends <code>X-Forwarded-For: 1.2.3.4</code> arrives at your app as <code>1.2.3.4, &lt;real IP&gt;</code>. Only the <strong>last</strong> entry, added by your own proxy, can be trusted.</p>
+<h2>2. The app trusts only that proxy</h2>
+<pre><code>set_real_ip_from 172.29.0.10;   # your proxy / load balancer address(es)
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+
+server {
+    listen 80;
+    location / { return 200 &quot;client=$remote_addr xff=$http_x_forwarded_for\n&quot;; }
+}</code></pre>
+<p><code>set_real_ip_from</code> lists the addresses allowed to tell nginx the client IP: your proxy or load balancer, or its subnet if it has no fixed address. Behind a CDN, list the CDN's published IP ranges. With <code>real_ip_recursive on</code>, nginx reads X-Forwarded-For from right to left, skips trusted addresses, and uses the first one it doesn't trust.</p>
+<h2>3. What we measured</h2>
+<p>The visitor was 172.29.0.1, the proxy 172.29.0.10. "Forged" means the visitor sent <code>X-Forwarded-For: 1.2.3.4</code>.</p>
+<table><thead><tr><th>App config</th><th>$remote_addr, normal</th><th>$remote_addr, forged</th></tr></thead><tbody>
+<tr><td>No realip config</td><td>172.29.0.10 (the proxy)</td><td>172.29.0.10</td></tr>
+<tr><td><code>set_real_ip_from 172.29.0.10</code> + recursive (above)</td><td>172.29.0.1 ✔</td><td>172.29.0.1 ✔ (forgery ignored)</td></tr>
+<tr><td><code>set_real_ip_from 0.0.0.0/0</code> + recursive</td><td>172.29.0.1</td><td><strong>1.2.3.4</strong> ✘ (visitor chose their IP)</td></tr>
+<tr><td><code>set_real_ip_from 0.0.0.0/0</code>, recursive off</td><td>172.29.0.1</td><td>172.29.0.1</td></tr>
+</tbody></table>
+<p>The last row looks fine with one proxy, but trusting <code>0.0.0.0/0</code> means nginx accepts the header from any machine that connects. Someone who reaches the app directly, bypassing the proxy, can then set their own IP. Rate limits, IP allow-lists and logs that rely on <code>$remote_addr</code> would believe them. Always list your real proxies.</p>
+<h2>4. Check it</h2>
+<p>Return the values from a test location, as we did: <code>return 200 "client=$remote_addr xff=$http_x_forwarded_for\n";</code>. Then call it through the proxy with and without <code>-H 'X-Forwarded-For: 1.2.3.4'</code>. The client value must not change when you forge the header.</p>
+<aside class="cta"><strong>Test how your app handles X-Forwarded-For from the browser:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does nginx log my load balancer&#x27;s IP instead of the visitor&#x27;s?</summary><p>Because the load balancer opens the connection. Add set_real_ip_from (the balancer&#x27;s address or subnet) and real_ip_header X-Forwarded-For to the nginx that sits behind it.</p></details>
+<details><summary>Can users fake X-Forwarded-For?</summary><p>Yes. Any client can send the header. In our test, trusting all addresses with real_ip_recursive on let a visitor become 1.2.3.4. Trust only your own proxies.</p></details>
+<details><summary>What is the difference between X-Forwarded-For and X-Real-IP?</summary><p>X-Forwarded-For is a list that each proxy appends to; X-Real-IP is a single address a proxy sets. Either works with real_ip_header, if only your proxy can set it.</p></details>
+<details><summary>Does X-Forwarded-For hide my IP from a website?</summary><p>No. The server always sees the address that connected. The header only matters to servers set up to trust it.</p></details>
+</section>
+<p class="note">Written with AI assistance. All four configs were run with nginx:alpine 1.31.6 (one nginx as reverse proxy, one as the app, on a Docker network) on 2026-10-01, with and without a forged X-Forwarded-For header from the client. PlainHeaders is our extension; the other methods are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

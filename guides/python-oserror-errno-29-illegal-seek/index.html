@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python OSError: [Errno 29] Illegal seek (Fix)</title>
+<meta name="description" content="[Errno 29] Illegal seek: seek() or tell() on a pipe, socket or piped stdin. Tested in Python 3.13: why you may get UnsupportedOperation, and the BytesIO fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-oserror-errno-29-illegal-seek/">
+<meta property="og:title" content="Python OSError: [Errno 29] Illegal seek (Fix)">
+<meta property="og:description" content="[Errno 29] Illegal seek: seek() or tell() on a pipe, socket or piped stdin. Tested in Python 3.13: why you may get UnsupportedOperation, and the BytesIO fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-oserror-errno-29-illegal-seek/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes [Errno 29] Illegal seek?", "acceptedAnswer": {"@type": "Answer", "text": "seek() or tell() on a pipe, socket, terminal or piped stdin. These streams have no position to move to."}}, {"@type": "Question", "name": "Why do I get UnsupportedOperation: File or stream is not seekable instead?", "acceptedAnswer": {"@type": "Answer", "text": "Buffered file objects check seekable() first and raise io.UnsupportedOperation, an OSError subclass. tell() and os.lseek still give Errno 29."}}, {"@type": "Question", "name": "How do I re-read piped input?", "acceptedAnswer": {"@type": "Answer", "text": "Read it once into io.BytesIO or io.StringIO, or into tempfile.TemporaryFile() for large data, then seek on that."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>OSError: [Errno 29] Illegal seek (tested fix)</h1>
+<p class="lead"><code>OSError: [Errno 29] Illegal seek</code> means you called <code>seek()</code> or <code>tell()</code> on something that can only be read forward: a pipe, a socket, or <code>stdin</code> fed by <code>|</code>. We reproduced it in Python 3.13 and tested the fixes.</p>
+<h2 id="cause">1. Seeking on a pipe: which call gives which error</h2>
+<p>Pipes, sockets, terminals and <code>stdin</code> fed by <code>|</code> can only be read forward. What you get depends on the call:</p>
+<pre><code>import io, os, sys
+print(sys.version.split()[0])
+r, w = os.pipe()
+os.write(w, b&quot;hi&quot;); os.close(w)
+for label, fn in ((&quot;os.lseek&quot;, lambda: os.lseek(r, 0, 0)),
+                  (&quot;unbuffered seek&quot;, lambda: os.fdopen(r, &quot;rb&quot;, buffering=0, closefd=False).seek(0)),
+                  (&quot;buffered seek&quot;, lambda: os.fdopen(r, &quot;rb&quot;, closefd=False).seek(0)),
+                  (&quot;buffered tell&quot;, lambda: os.fdopen(r, &quot;rb&quot;, closefd=False).tell())):
+    try:
+        fn(); print(label, &quot;ok&quot;)
+    except OSError as e:
+        print(f&quot;{label:16} {type(e).__name__}: {e}  isinstance OSError={isinstance(e, OSError)}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>3.13.5
+os.lseek         OSError: [Errno 29] Illegal seek  isinstance OSError=True
+unbuffered seek  OSError: [Errno 29] Illegal seek  isinstance OSError=True
+buffered seek    UnsupportedOperation: File or stream is not seekable.  isinstance OSError=True
+buffered tell    OSError: [Errno 29] Illegal seek  isinstance OSError=True</code></pre>
+<p>Raw <code>os.lseek</code>, unbuffered files and <code>tell()</code> give <code>[Errno 29] Illegal seek</code>; a buffered <code>seek()</code> gives <code>io.UnsupportedOperation</code>. Both are <code>OSError</code> subclasses, so <code>except OSError</code> catches both. The message text comes from the C library: on Alpine (musl) the same errno reads <code>Invalid seek</code> (we saw it on python:3.8-alpine and 3.11-alpine).</p>
+<h2 id="check">2. Check with seekable() first</h2>
+<pre><code>import os
+r, w = os.pipe()
+os.write(w, b&quot;hello\n&quot;); os.close(w)
+f = os.fdopen(r, &quot;rb&quot;)
+print(f.seekable())
+try:
+    f.seek(0)
+except OSError as e:
+    print(type(e).__name__, e.errno, e)
+try:
+    f.tell()
+except OSError as e:
+    print(&quot;tell:&quot;, type(e).__name__, e)
+print(f.read())</code></pre>
+<p>Output:</p>
+<pre><code>False
+UnsupportedOperation None File or stream is not seekable.
+tell: OSError [Errno 29] Illegal seek
+b&#x27;hello\n&#x27;</code></pre>
+<h2 id="stdin">3. Piped stdin can't be rewound</h2>
+<pre><code>import subprocess, sys
+child = &quot;import sys; data = sys.stdin.read(); sys.stdin.seek(0); print(&#x27;ok&#x27;)&quot;
+r = subprocess.run([sys.executable, &quot;-c&quot;, child], input=&quot;a,b\n1,2\n&quot;, capture_output=True, text=True)
+print(r.stderr.strip().splitlines()[-1])
+child2 = &quot;import sys; data = sys.stdin.read(); print(&#x27;read twice:&#x27;, repr(data), repr(sys.stdin.read()))&quot;
+r = subprocess.run([sys.executable, &quot;-c&quot;, child2], input=&quot;a,b\n&quot;, capture_output=True, text=True)
+print(r.stdout.strip())</code></pre>
+<p>Output:</p>
+<pre><code>io.UnsupportedOperation: underlying stream is not seekable
+read twice: &#x27;a,b\n&#x27; &#x27;&#x27;</code></pre>
+<p>A script that reads <code>sys.stdin</code> twice gets an empty string the second time, and <code>seek(0)</code> fails. Code that works with <code>&lt; file.csv</code> (a real file) breaks with <code>cat file.csv |</code>.</p>
+<h2 id="fix">4. Fix: read once into memory</h2>
+<pre><code>import io, os
+r, w = os.pipe()
+os.write(w, b&quot;name,age\nann,31\n&quot;); os.close(w)
+raw = os.fdopen(r, &quot;rb&quot;)
+buf = io.BytesIO(raw.read())        # read once into memory
+print(buf.read(4)); buf.seek(0); print(buf.read(4))</code></pre>
+<p>Output:</p>
+<pre><code>b&#x27;name&#x27;
+b&#x27;name&#x27;</code></pre>
+<p>Wrap the data in <code>io.BytesIO</code> (or <code>io.StringIO</code> for text) and you can seek as often as you like. For large streams, write to <code>tempfile.TemporaryFile()</code> instead, which is seekable. Related: <a href="/guides/python-oserror-errno-codes-list/">OSError errno codes list</a> and <a href="/guides/python-oserror-errno-22-invalid-argument/">[Errno 22] Invalid argument</a>.</p>
+
+<aside class="cta"><strong>Debugging a script that calls web APIs? Check what headers a URL actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes [Errno 29] Illegal seek?</summary><p>seek() or tell() on a pipe, socket, terminal or piped stdin. These streams have no position to move to.</p></details>
+<details><summary>Why do I get UnsupportedOperation: File or stream is not seekable instead?</summary><p>Buffered file objects check seekable() first and raise io.UnsupportedOperation, an OSError subclass. tell() and os.lseek still give Errno 29.</p></details>
+<details><summary>How do I re-read piped input?</summary><p>Read it once into io.BytesIO or io.StringIO, or into tempfile.TemporaryFile() for large data, then seek on that.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-22 on Debian with Python 3.13.5 (block 1 also on the official python:3.8-alpine and python:3.11-alpine images): os.lseek, unbuffered and buffered seek and tell on a pipe, piped stdin, seekable(), and io.BytesIO. Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

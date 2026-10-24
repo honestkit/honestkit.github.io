@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FastAPI CORS Error on localhost: 405, 400 Disallowed (Tested)</title>
+<meta name="description" content="FastAPI CORS error from localhost tested: OPTIONS 405 without CORSMiddleware, trailing slash, 127.0.0.1 vs localhost, default allow_methods GET only.">
+<link rel="canonical" href="https://honestkit.github.io/guides/fastapi-cors-error-localhost/">
+<meta property="og:title" content="FastAPI CORS Error on localhost: 405, 400 Disallowed (Tested)">
+<meta property="og:description" content="FastAPI CORS error from localhost tested: OPTIONS 405 without CORSMiddleware, trailing slash, 127.0.0.1 vs localhost, default allow_methods GET only.">
+<meta property="og:url" content="https://honestkit.github.io/guides/fastapi-cors-error-localhost/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does FastAPI return 405 for OPTIONS requests?", "acceptedAnswer": {"@type": "Answer", "text": "No CORSMiddleware is installed, so the browser's preflight OPTIONS request reaches your route, which has no OPTIONS handler."}}, {"@type": "Question", "name": "Why do I get Disallowed CORS origin from FastAPI?", "acceptedAnswer": {"@type": "Answer", "text": "The Origin header does not exactly match an entry in allow_origins. Remove trailing slashes and list both http://localhost:PORT and http://127.0.0.1:PORT if you use both."}}, {"@type": "Question", "name": "Why do I get Disallowed CORS method?", "acceptedAnswer": {"@type": "Answer", "text": "CORSMiddleware's default allow_methods is GET only. Pass allow_methods=['*'] or list POST, PUT, DELETE."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>FastAPI CORS error on localhost (tested)</h1>
+<p class="lead">A FastAPI CORS error from a local frontend usually comes from one of four things we reproduced: no <code>CORSMiddleware</code> (preflight gets 405), an origin with a trailing slash or <code>127.0.0.1</code> instead of <code>localhost</code> (400 Disallowed CORS origin), or the default <code>allow_methods</code>, which only allows GET.</p>
+<p>Each case sends the preflight a browser sends before a JSON <code>POST</code> from <code>http://localhost:3000</code>.</p>
+<h2 id="test">1. Six configurations, one preflight</h2>
+<pre><code>from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.testclient import TestClient
+pre = {&quot;Origin&quot;: &quot;http://localhost:3000&quot;, &quot;Access-Control-Request-Method&quot;: &quot;POST&quot;,
+       &quot;Access-Control-Request-Headers&quot;: &quot;content-type&quot;}
+def make(**cors):
+    app = FastAPI()
+    if cors: app.add_middleware(CORSMiddleware, **cors)
+    @app.post(&quot;/items&quot;)
+    def items(): return {&quot;ok&quot;: True}
+    return TestClient(app)
+def show(label, c):
+    r = c.options(&quot;/items&quot;, headers=pre)
+    print(f&quot;--- {label}: preflight {r.status_code}, allow-origin={r.headers.get(&#x27;access-control-allow-origin&#x27;)}, body={r.text[:40]!r}&quot;)
+show(&quot;no CORSMiddleware&quot;, make())
+show(&quot;allow_origins=[&#x27;http://localhost:3000/&#x27;] (trailing slash)&quot;, make(allow_origins=[&quot;http://localhost:3000/&quot;], allow_methods=[&quot;*&quot;], allow_headers=[&quot;*&quot;]))
+show(&quot;allow_origins=[&#x27;http://127.0.0.1:3000&#x27;]&quot;, make(allow_origins=[&quot;http://127.0.0.1:3000&quot;], allow_methods=[&quot;*&quot;], allow_headers=[&quot;*&quot;]))
+show(&quot;allow_origins=[&#x27;http://localhost:3000&#x27;], default methods&quot;, make(allow_origins=[&quot;http://localhost:3000&quot;]))
+show(&quot;allow_origins=[&#x27;http://localhost:3000&#x27;], methods/headers *&quot;, make(allow_origins=[&quot;http://localhost:3000&quot;], allow_methods=[&quot;*&quot;], allow_headers=[&quot;*&quot;]))
+show(&quot;allow_origins=[&#x27;*&#x27;] + allow_credentials=True&quot;, make(allow_origins=[&quot;*&quot;], allow_credentials=True, allow_methods=[&quot;*&quot;], allow_headers=[&quot;*&quot;]))</code></pre>
+<p>Output:</p>
+<pre><code>--- no CORSMiddleware: preflight 405, allow-origin=None, body=&#x27;{&quot;detail&quot;:&quot;Method Not Allowed&quot;}&#x27;
+--- allow_origins=[&#x27;http://localhost:3000/&#x27;] (trailing slash): preflight 400, allow-origin=None, body=&#x27;Disallowed CORS origin&#x27;
+--- allow_origins=[&#x27;http://127.0.0.1:3000&#x27;]: preflight 400, allow-origin=None, body=&#x27;Disallowed CORS origin&#x27;
+--- allow_origins=[&#x27;http://localhost:3000&#x27;], default methods: preflight 400, allow-origin=http://localhost:3000, body=&#x27;Disallowed CORS method&#x27;
+--- allow_origins=[&#x27;http://localhost:3000&#x27;], methods/headers *: preflight 200, allow-origin=http://localhost:3000, body=&#x27;OK&#x27;
+--- allow_origins=[&#x27;*&#x27;] + allow_credentials=True: preflight 200, allow-origin=http://localhost:3000, body=&#x27;OK&#x27;</code></pre>
+<p>What each result means:</p>
+<ul><li><strong>No CORSMiddleware</strong>: the <code>OPTIONS</code> preflight hits your route and gets <strong>405 Method Not Allowed</strong>. That 405 in your server log is a CORS problem, not a routing one.</li><li><strong>Trailing slash</strong> (<code>http://localhost:3000/</code>) or <strong>127.0.0.1 vs localhost</strong>: origins are compared as exact strings (scheme, host, port, no path), so these give <strong>400 Disallowed CORS origin</strong>.</li><li><strong>Origin right, default <code>allow_methods</code></strong>: the default allows only GET, so a POST preflight gets <strong>400 Disallowed CORS method</strong>. Pass <code>allow_methods=["*"]</code> (and <code>allow_headers=["*"]</code> for <code>Content-Type: application/json</code> or <code>Authorization</code>).</li><li><strong><code>["*"]</code> with <code>allow_credentials=True</code></strong>: Starlette 1.9.0 echoes the request's origin instead of <code>*</code>, so cookies work, but any site can then make credentialed requests. List real origins in production.</li></ul>
+<h2 id="fix">Working setup for local development</h2>
+<pre><code>app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,  # only if you send cookies
+)</code></pre>
+<p>That is the passing configuration from block 1 with the second local origin added. If the browser still reports CORS, check the actual response in the Network tab: a 500 from your endpoint can also arrive without CORS headers, and the browser reports it as a CORS error.</p>
+<p>Related: <a href="/guides/cors-error-messages-explained/">CORS error messages explained</a> · <a href="/guides/cors-preflight-request-options/">CORS preflight (OPTIONS)</a> · <a href="/guides/fastapi-422-unprocessable-entity/">FastAPI 422</a>.</p>
+
+<aside class="cta"><strong>See the CORS headers your API really returns, right in the browser:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does FastAPI return 405 for OPTIONS requests?</summary><p>No CORSMiddleware is installed, so the browser&#x27;s preflight OPTIONS request reaches your route, which has no OPTIONS handler.</p></details>
+<details><summary>Why do I get Disallowed CORS origin from FastAPI?</summary><p>The Origin header does not exactly match an entry in allow_origins. Remove trailing slashes and list both http://localhost:PORT and http://127.0.0.1:PORT if you use both.</p></details>
+<details><summary>Why do I get Disallowed CORS method?</summary><p>CORSMiddleware&#x27;s default allow_methods is GET only. Pass allow_methods=[&#x27;*&#x27;] or list POST, PUT, DELETE.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with FastAPI 0.161.1, Starlette 1.9.0 and Python 3.14.7 (TestClient, python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and FastAPI are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

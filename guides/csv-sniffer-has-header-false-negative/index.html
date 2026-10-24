@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>csv.Sniffer().has_header() False Negative (Tested)</title>
+<meta name="description" content="We measured csv.Sniffer().has_header() return False for a real header like &#x27;fruit,color&#x27; — it only detects a header when column types differ from the body.">
+<link rel="canonical" href="https://honestkit.github.io/guides/csv-sniffer-has-header-false-negative/">
+<meta property="og:title" content="csv.Sniffer().has_header() False Negative (Tested)">
+<meta property="og:description" content="We measured csv.Sniffer().has_header() return False for a real header like &#x27;fruit,color&#x27; — it only detects a header when column types differ from the body.">
+<meta property="og:url" content="https://honestkit.github.io/guides/csv-sniffer-has-header-false-negative/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does csv.Sniffer().has_header() return False for an obvious header row?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that has_header() specifically checks whether each column's type or length in row 1 differs from the following rows \u2014 it does not check anything else about whether row 1 'looks like' a header. A header row like 'fruit,color' over text data like 'apple,red' has no type contrast at all, so it returns False even though row 1 clearly is a header."}}, {"@type": "Question", "name": "When does csv.Sniffer().has_header() correctly return True?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed it returns True when at least one column's apparent type differs between the header row and the data rows \u2014 for example a text header name like 'age' sitting above numeric values like 30, 25 in every data row."}}, {"@type": "Question", "name": "Does a numeric-looking header (like year columns) get detected correctly?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured that a header row of '2020,2021,2022' over purely numeric data also returns False, for the same reason: the header row and every data row are all-numeric, so there's no type contrast for the heuristic to find."}}, {"@type": "Question", "name": "Is has_header() reliable for deciding whether to skip the first CSV row?", "acceptedAnswer": {"@type": "Answer", "text": "Based on what we measured, no \u2014 it only reliably flags a header when the header's column types visibly differ from the data's, which is narrower than 'row 1 is a header.' Most real-world CSVs with simple same-type headers will get a False result even though a header genuinely exists."}}, {"@type": "Question", "name": "What's a better way to detect a CSV header than csv.Sniffer().has_header()?", "acceptedAnswer": {"@type": "Answer", "text": "We'd make the decision explicit where possible (a known format, a filename convention, or an app-level flag) rather than relying on this one heuristic, since it's only accurate for the specific case where header and data column types differ."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>csv.Sniffer().has_header() False Negative (tested)</h1>
+<p class="lead"><code>csv.Sniffer().has_header(sample)</code> is meant to tell you whether a CSV's first row is a header. We fed it <code>"fruit,color\napple,red\nbanana,yellow\n"</code> &mdash; an unambiguous header over text data &mdash; and it returned <code>False</code>. We measured exactly why, and it comes down to a heuristic that most ordinary CSVs don't satisfy.</p>
+<h2 id="repro1">1. A real header, reported as no header</h2>
+<pre><code>import csv
+
+sample = "fruit,color\napple,red\nbanana,yellow\n"
+csv.Sniffer().has_header(sample)
+False</code></pre>
+<p><strong>Measured:</strong> this is as clean a header row as CSV data gets &mdash; column names, then rows of matching text data &mdash; and <code>has_header()</code> says <code>False</code>.</p>
+
+<h2 id="repro2">2. A case it gets right: header types differ from the body</h2>
+<pre><code>sample2 = "name,age,city\nAlice,30,NYC\nBob,25,LA\n"
+csv.Sniffer().has_header(sample2)
+True</code></pre>
+<p><strong>Measured:</strong> this one correctly returns <code>True</code>. The difference from example 1 is that column 2 (<code>age</code>) is text in the header row but numeric in every data row &mdash; <code>has_header()</code>'s actual algorithm checks whether each column's apparent type or length in row 1 differs from the following rows, and flags a header only when it finds that contrast. <code>fruit</code>/<code>color</code> over <code>apple</code>/<code>red</code> has no such contrast: every value in every row is plain text, so there's nothing for the heuristic to detect.</p>
+
+<h2 id="repro3">3. A numeric-looking header fails the same way</h2>
+<pre><code>sample3 = "2020,2021,2022\n100,200,150\n300,100,250\n"
+csv.Sniffer().has_header(sample3)
+False</code></pre>
+<p><strong>Measured:</strong> year columns as headers, followed by numeric data &mdash; a real, common header row &mdash; also comes back <code>False</code>, for the same root reason: the header row and the data rows are both all-numeric, so no type contrast exists between row 1 and the rest.</p>
+
+<h2 id="repro4">4. Both are false negatives, not a quirk of one sample</h2>
+<p>Across these tests, <code>has_header()</code> only answered <code>True</code> for the one sample where the header's column types genuinely differed from the data's. That is a narrower condition than "the first row is a header" &mdash; most real CSVs have simple word headers (<code>fruit</code>, <code>color</code>, <code>name</code> when every column happens to be text, or numeric headers like years, IDs, or codes) that will not trigger it. A caller treating a <code>False</code> result as "there is no header row, start parsing from row 0" will silently include the header text as a data row.</p>
+
+<h2 id="fix">5. What to actually do</h2>
+<p>Don't rely on <code>has_header()</code> alone to decide whether to skip the first row &mdash; it only reliably detects a header when that header's column types visibly differ from the body, which is the exception rather than the rule for hand-labeled CSVs. If you control the source, make the header-or-not decision explicit (a flag, a filename convention, or your own check for whether row 1 contains any value matching a numeric/date pattern that also appears identically in column position later). If you don't control the source, a cheap practical check is to see whether row 1 is unique among the first several rows (headers rarely repeat as data), rather than trusting this one heuristic.</p>
+
+<aside class="cta"><strong>Debugging a CSV an API claims to send but doesn&#x27;t parse right? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does csv.Sniffer().has_header() return False for an obvious header row?</summary><p>We measured that has_header() specifically checks whether each column&#x27;s type or length in row 1 differs from the following rows — it does not check anything else about whether row 1 &#x27;looks like&#x27; a header. A header row like &#x27;fruit,color&#x27; over text data like &#x27;apple,red&#x27; has no type contrast at all, so it returns False even though row 1 clearly is a header.</p></details>
+<details><summary>When does csv.Sniffer().has_header() correctly return True?</summary><p>We confirmed it returns True when at least one column&#x27;s apparent type differs between the header row and the data rows — for example a text header name like &#x27;age&#x27; sitting above numeric values like 30, 25 in every data row.</p></details>
+<details><summary>Does a numeric-looking header (like year columns) get detected correctly?</summary><p>No — we measured that a header row of &#x27;2020,2021,2022&#x27; over purely numeric data also returns False, for the same reason: the header row and every data row are all-numeric, so there&#x27;s no type contrast for the heuristic to find.</p></details>
+<details><summary>Is has_header() reliable for deciding whether to skip the first CSV row?</summary><p>Based on what we measured, no — it only reliably flags a header when the header&#x27;s column types visibly differ from the data&#x27;s, which is narrower than &#x27;row 1 is a header.&#x27; Most real-world CSVs with simple same-type headers will get a False result even though a header genuinely exists.</p></details>
+<details><summary>What&#x27;s a better way to detect a CSV header than csv.Sniffer().has_header()?</summary><p>We&#x27;d make the decision explicit where possible (a known format, a filename convention, or an app-level flag) rather than relying on this one heuristic, since it&#x27;s only accurate for the specific case where header and data column types differ.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in csv module, calling csv.Sniffer().has_header() on CSV samples with a genuine text header row over text data, and a genuine numeric-looking header row (year columns) over numeric data, recording the exact True/False result for each. PlainHeaders is our extension; Python&#x27;s csv module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

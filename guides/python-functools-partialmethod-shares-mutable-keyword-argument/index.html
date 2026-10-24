@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>functools.partialmethod Shares One Mutable Argument (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: partialmethod(configure, options={}) binds the same dict to every instance and call -- mutating it in one leaks into all others.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-functools-partialmethod-shares-mutable-keyword-argument/">
+<meta property="og:title" content="functools.partialmethod Shares One Mutable Argument (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: partialmethod(configure, options={}) binds the same dict to every instance and call -- mutating it in one leaks into all others.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-functools-partialmethod-shares-mutable-keyword-argument/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does functools.partialmethod share a mutable keyword argument across instances?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We measured partialmethod(configure, options={}) on a class: calling the resulting method from two completely separate instances returned the exact same dict object (confirmed with `is`), because the {} literal is evaluated once when the class body runs, not once per call."}}, {"@type": "Question", "name": "Why is this surprising if mutable default arguments are already a known Python pitfall?", "acceptedAnswer": {"@type": "Answer", "text": "Because it doesn't look like a default argument at all -- there's no `def f(x={})` signature to spot in review. The hazard is hidden inside a functools.partialmethod() call, which reads like simple argument currying, not like something that evaluates a mutable literal once and keeps it alive for the life of the class."}}, {"@type": "Question", "name": "How do I avoid functools.partialmethod binding a shared mutable object?", "acceptedAnswer": {"@type": "Answer", "text": "Bind an immutable sentinel such as None through partialmethod, and construct the actual mutable object (list, dict, etc.) inside the method body when the argument is None -- we measured this giving each call an independent object instead of a shared one."}}, {"@type": "Question", "name": "Does this affect functools.partial the same way as partialmethod?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, the same mechanism applies to functools.partial on a plain function -- any mutable object passed as an argument to partial() or partialmethod() is evaluated once at that call site and reused on every subsequent call through the resulting partial."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>functools.partialmethod Binds One Shared Mutable Object to Every Instance (tested)</h1>
+<p class="lead">The classic Python trap is a mutable default argument in a <code>def</code> signature, like <code>def f(x=[])</code> -- experienced developers know to avoid it. <code>functools.partialmethod</code> can create the exact same hazard in a form that doesn't look like a function default at all: a dict or list literal passed as a keyword argument to <code>partialmethod()</code> is evaluated once, when the class body runs, and that one object is bound into every instance's call.</p>
+<h2 id="repro1">1. Two instances, one shared dict</h2>
+<pre><code>import functools
+
+class Widget:
+    def configure(self, options={}):
+        options["touched"] = True
+        return options
+
+    set_default = functools.partialmethod(configure, options={})
+
+w1 = Widget()
+w2 = Widget()
+r1 = w1.set_default()
+r2 = w2.set_default()
+print("r1 is r2:", r1 is r2)
+print("r1:", r1)
+print("r2:", r2)</code></pre>
+<pre><code>r1 is r2: True
+r1: {'touched': True}
+r2: {'touched': True}</code></pre>
+<p><strong>Measured:</strong> <code>w1.set_default()</code> and <code>w2.set_default()</code> -- two different <code>Widget</code> instances, two separate calls -- return the exact same dict object. The <code>options={}</code> literal inside <code>functools.partialmethod(configure, options={})</code> runs exactly once, while the class body executes, and that single dict is stored as part of the <code>partialmethod</code> descriptor itself. Every instance's call passes that same object through to <code>configure()</code>, which is free to mutate it.</p>
+
+<h2 id="repro2">2. A mutation in one call is visible from a completely unrelated instance</h2>
+<pre><code>import functools
+
+class Basket:
+    def add(self, item, items=[]):
+        items.append(item)
+        return items
+
+    add_default = functools.partialmethod(add, items=[])
+
+b1 = Basket()
+b2 = Basket()
+b1.add_default("apple")
+print("b2's basket already has:", b2.add_default("banana"))</code></pre>
+<pre><code>b2's basket already has: ['apple', 'banana']</code></pre>
+<p><strong>Measured:</strong> <code>b2</code> never touched <code>b1</code>, yet calling <code>b2.add_default("banana")</code> returns a list that already contains <code>"apple"</code> from an earlier call on <code>b1</code>. No exception, no warning -- the list keyword argument baked into the <code>partialmethod</code> is one object, shared for the lifetime of the class, across every instance that ever calls it.</p>
+
+<h2 id="repro3">3. The fix: bind nothing mutable, build it inside the method instead</h2>
+<pre><code>import functools
+
+class Basket:
+    def add(self, item, items=None):
+        if items is None:
+            items = []
+        items.append(item)
+        return items
+
+    add_default = functools.partialmethod(add, items=None)
+
+b1 = Basket()
+b2 = Basket()
+b1.add_default("apple")
+print("b2's basket:", b2.add_default("banana"))</code></pre>
+<pre><code>b2's basket: ['banana']</code></pre>
+<p><strong>Measured:</strong> binding <code>items=None</code> through the <code>partialmethod</code> and constructing the actual list inside the method body -- the same fix used for ordinary mutable default arguments -- gives each call its own fresh list. The hazard isn't specific to <code>partialmethod</code>'s mechanics; it's the same "mutable default evaluated once" trap as a plain function signature, just moved somewhere a signature-mutable-default code review wouldn't think to look.</p>
+<aside class="cta"><strong>Using functools.partialmethod to pre-fill a keyword argument with a dict or list literal? Check whether every instance ends up sharing that exact same object first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does functools.partialmethod share a mutable keyword argument across instances?</summary><p>Yes. We measured partialmethod(configure, options={}) on a class: calling the resulting method from two completely separate instances returned the exact same dict object (confirmed with `is`), because the {} literal is evaluated once when the class body runs, not once per call.</p></details>
+<details><summary>Why is this surprising if mutable default arguments are already a known Python pitfall?</summary><p>Because it doesn&#x27;t look like a default argument at all -- there&#x27;s no `def f(x={})` signature to spot in review. The hazard is hidden inside a functools.partialmethod() call, which reads like simple argument currying, not like something that evaluates a mutable literal once and keeps it alive for the life of the class.</p></details>
+<details><summary>How do I avoid functools.partialmethod binding a shared mutable object?</summary><p>Bind an immutable sentinel such as None through partialmethod, and construct the actual mutable object (list, dict, etc.) inside the method body when the argument is None -- we measured this giving each call an independent object instead of a shared one.</p></details>
+<details><summary>Does this affect functools.partial the same way as partialmethod?</summary><p>Yes, the same mechanism applies to functools.partial on a plain function -- any mutable object passed as an argument to partial() or partialmethod() is evaluated once at that call site and reused on every subsequent call through the resulting partial.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in functools.partialmethod: defined a class attribute as partialmethod(method, kwarg={}), created two separate instances, called the partialmethod on each, and checked with `is` whether the two calls received the same dict object. PlainHeaders is our extension; Python&#x27;s functools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

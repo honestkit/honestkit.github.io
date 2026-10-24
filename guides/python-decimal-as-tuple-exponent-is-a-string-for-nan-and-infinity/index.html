@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>decimal: as_tuple() Exponent Is a String for NaN/Inf</title>
+<meta name="description" content="We measured Python 3.13.5: as_tuple()&#x27;s exponent is an int for finite Decimals but &#x27;n&#x27;/&#x27;N&#x27;/&#x27;F&#x27; for NaN/sNaN/Infinity, breaking digits*10**exponent math.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-decimal-as-tuple-exponent-is-a-string-for-nan-and-infinity/">
+<meta property="og:title" content="decimal: as_tuple() Exponent Is a String for NaN/Inf">
+<meta property="og:description" content="We measured Python 3.13.5: as_tuple()&#x27;s exponent is an int for finite Decimals but &#x27;n&#x27;/&#x27;N&#x27;/&#x27;F&#x27; for NaN/sNaN/Infinity, breaking digits*10**exponent math.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-decimal-as-tuple-exponent-is-a-string-for-nan-and-infinity/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Decimal.as_tuple() return for NaN or Infinity?", "acceptedAnswer": {"@type": "Answer", "text": "We measured the exponent field being a string -- 'n' for quiet NaN, 'N' for signaling NaN, and 'F' for Infinity -- instead of the int it is for every finite value. digits is also empty for NaN and a meaningless (0,) for Infinity."}}, {"@type": "Question", "name": "Why does my code crash with 'unsupported operand type for **' after calling Decimal.as_tuple()?", "acceptedAnswer": {"@type": "Answer", "text": "Because you're reconstructing the value with digits * 10**exponent and exponent came back as a string ('n', 'N', or 'F') instead of an int -- we confirmed this happens specifically for NaN and Infinity Decimal values, not for ordinary finite ones."}}, {"@type": "Question", "name": "How do I safely decompose a Decimal that might be NaN or Infinity?", "acceptedAnswer": {"@type": "Answer", "text": "Check d.is_finite() before calling as_tuple() and reconstructing the value, or check isinstance(exponent, int) after. We measured is_finite() as the correct guard since it's False for exactly the NaN/sNaN/Infinity cases where exponent becomes a string."}}, {"@type": "Question", "name": "Is the exponent from Decimal.as_tuple() always an int?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it as an int only for finite Decimal values. For NaN, sNaN, and Infinity it's a single-character string ('n', 'N', or 'F') instead, which breaks any arithmetic that assumes an int exponent."}}, {"@type": "Question", "name": "Does as_tuple() work the same for Infinity as for a regular large number?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured Decimal('Infinity').as_tuple() returning digits=(0,) and exponent='F', not a tuple of actual digits with an int exponent like a large finite Decimal would. The (0,) is a placeholder, not meaningful data."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>decimal: as_tuple()&#x27;s exponent Is a String for NaN/Infinity (tested)</h1>
+<p class="lead"><code>Decimal.as_tuple()</code> decomposes a value into <code>(sign, digits, exponent)</code> -- a common way to serialize a <code>Decimal</code> to JSON or rebuild its numeric value by hand. We measured what that tuple looks like for the special values <code>NaN</code> and <code>Infinity</code>, which is easy to miss if testing only covers ordinary numbers.</p>
+<h2 id="repro1">1. For a normal finite value, exponent is an int</h2>
+<pre><code>from decimal import Decimal
+
+t = Decimal("123.45").as_tuple()
+print(t)
+print(type(t.exponent))</code></pre>
+<pre><code>DecimalTuple(sign=0, digits=(1, 2, 3, 4, 5), exponent=-2)
+&lt;class 'int'&gt;</code></pre>
+<p><strong>Measured:</strong> for an ordinary finite <code>Decimal</code>, <code>as_tuple()</code> gives a <code>sign</code> of <code>0</code> or <code>1</code>, a <code>digits</code> tuple of individual decimal digits, and an <code>exponent</code> that's a plain <code>int</code> -- the value is <code>sign * int(digits) * 10**exponent</code>. This is the shape most code implicitly assumes.</p>
+
+<h2 id="repro2">2. For NaN and Infinity, exponent is a string, not an int</h2>
+<pre><code>from decimal import Decimal
+
+for val in (Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"), Decimal("-Infinity")):
+    t = val.as_tuple()
+    print(val, "->", t, type(t.exponent))</code></pre>
+<pre><code>NaN -> DecimalTuple(sign=0, digits=(), exponent='n') &lt;class 'str'&gt;
+sNaN -> DecimalTuple(sign=0, digits=(), exponent='N') &lt;class 'str'&gt;
+Infinity -> DecimalTuple(sign=0, digits=(0,), exponent='F') &lt;class 'str'&gt;
+-Infinity -> DecimalTuple(sign=1, digits=(0,), exponent='F') &lt;class 'str'&gt;</code></pre>
+<p><strong>Measured:</strong> for these four special values, the <code>exponent</code> field is one of the single-character strings <code>'n'</code> (quiet NaN), <code>'N'</code> (signaling NaN), or <code>'F'</code> (Infinity) -- never an <code>int</code>. <code>digits</code> is also not usable the normal way: empty for both NaN variants, and a meaningless placeholder <code>(0,)</code> for Infinity. Nothing about the field names or types warns that <code>exponent</code> can switch types depending on the value.</p>
+
+<h2 id="repro3">3. The risk: code that reconstructs the value crashes on NaN/Infinity, not on bad input</h2>
+<pre><code>from decimal import Decimal
+
+def to_scaled_int(d):
+    sign, digits, exponent = d.as_tuple()
+    value = int("".join(map(str, digits)) or "0")
+    return (-1 if sign else 1) * value * 10 ** exponent
+
+print(to_scaled_int(Decimal("123.45")))
+print(to_scaled_int(Decimal("NaN")))</code></pre>
+<pre><code>12345
+Traceback (most recent call last):
+  ...
+TypeError: unsupported operand type(s) for ** or pow(): 'int' and 'str'</code></pre>
+<p><strong>Measured:</strong> a helper that decomposes and rescales a <code>Decimal</code> (for storage as a scaled integer, a database column, or a custom JSON encoder) works fine for every ordinary value and then raises a <code>TypeError</code> the moment a <code>NaN</code> or <code>Infinity</code> reaches it -- not because the input was malformed, but because <code>as_tuple()</code>'s own contract changes shape for exactly the values most likely to show up unannounced from a prior calculation (a disabled trap, a bad division). Guard with <code>d.is_finite()</code> before decomposing, or check <code>isinstance(exponent, int)</code>.</p>
+<aside class="cta"><strong>Decomposing a Decimal with as_tuple() for storage or serialization? Check what it returns for NaN and Infinity first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Decimal.as_tuple() return for NaN or Infinity?</summary><p>We measured the exponent field being a string -- &#x27;n&#x27; for quiet NaN, &#x27;N&#x27; for signaling NaN, and &#x27;F&#x27; for Infinity -- instead of the int it is for every finite value. digits is also empty for NaN and a meaningless (0,) for Infinity.</p></details>
+<details><summary>Why does my code crash with &#x27;unsupported operand type for **&#x27; after calling Decimal.as_tuple()?</summary><p>Because you&#x27;re reconstructing the value with digits * 10**exponent and exponent came back as a string (&#x27;n&#x27;, &#x27;N&#x27;, or &#x27;F&#x27;) instead of an int -- we confirmed this happens specifically for NaN and Infinity Decimal values, not for ordinary finite ones.</p></details>
+<details><summary>How do I safely decompose a Decimal that might be NaN or Infinity?</summary><p>Check d.is_finite() before calling as_tuple() and reconstructing the value, or check isinstance(exponent, int) after. We measured is_finite() as the correct guard since it&#x27;s False for exactly the NaN/sNaN/Infinity cases where exponent becomes a string.</p></details>
+<details><summary>Is the exponent from Decimal.as_tuple() always an int?</summary><p>No -- we measured it as an int only for finite Decimal values. For NaN, sNaN, and Infinity it&#x27;s a single-character string (&#x27;n&#x27;, &#x27;N&#x27;, or &#x27;F&#x27;) instead, which breaks any arithmetic that assumes an int exponent.</p></details>
+<details><summary>Does as_tuple() work the same for Infinity as for a regular large number?</summary><p>No -- we measured Decimal(&#x27;Infinity&#x27;).as_tuple() returning digits=(0,) and exponent=&#x27;F&#x27;, not a tuple of actual digits with an int exponent like a large finite Decimal would. The (0,) is a placeholder, not meaningful data.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in decimal module: called as_tuple() on a normal finite Decimal, then on Decimal(&#x27;NaN&#x27;), Decimal(&#x27;sNaN&#x27;), and Decimal(&#x27;Infinity&#x27;)/Decimal(&#x27;-Infinity&#x27;), and inspected the type of the returned exponent field in each case. PlainHeaders is our extension; Python&#x27;s decimal module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

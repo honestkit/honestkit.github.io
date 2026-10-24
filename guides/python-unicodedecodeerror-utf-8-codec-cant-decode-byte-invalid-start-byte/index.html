@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>&#x27;utf-8&#x27; codec can&#x27;t decode byte 0xff: invalid start byte (Fix)</title>
+<meta name="description" content="Fix &#x27;utf-8&#x27; codec can&#x27;t decode byte 0xff/0x80/0x8b in position 0: invalid start byte. Tested: UTF-16 BOM files, gzip/xlsx opened as text, cp1252.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-unicodedecodeerror-utf-8-codec-cant-decode-byte-invalid-start-byte/">
+<meta property="og:title" content="&#x27;utf-8&#x27; codec can&#x27;t decode byte 0xff: invalid start byte (Fix)">
+<meta property="og:description" content="Fix &#x27;utf-8&#x27; codec can&#x27;t decode byte 0xff/0x80/0x8b in position 0: invalid start byte. Tested: UTF-16 BOM files, gzip/xlsx opened as text, cp1252.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-unicodedecodeerror-utf-8-codec-cant-decode-byte-invalid-start-byte/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does byte 0xff in position 0 mean?", "acceptedAnswer": {"@type": "Answer", "text": "The file starts with a UTF-16 byte order mark (ff fe). Open it with encoding='utf-16'."}}, {"@type": "Question", "name": "How do I fix invalid start byte 0x80?", "acceptedAnswer": {"@type": "Answer", "text": "The file is most likely Windows-1252, where 0x80 is the euro sign. Open it with encoding='cp1252'."}}, {"@type": "Question", "name": "Why does reading an .xlsx or .gz file raise UnicodeDecodeError?", "acceptedAnswer": {"@type": "Answer", "text": "They are binary (zip and gzip). Use pandas.read_excel, zipfile or gzip.open(path, 'rt') instead of open() in text mode."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>UnicodeDecodeError: invalid start byte (tested fix)</h1>
+<p class="lead"><code>UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte</code> means the file is not UTF-8 text. The byte value tells you what it is instead: 0xff/0xfe is UTF-16, 0x80-0x9f is usually Windows-1252, and 0x8b or 0x89 means a binary file. We reproduced each case and tested the fix.</p>
+<h2 id="utf16">1. Byte 0xff in position 0: a UTF-16 file</h2>
+<pre><code># Excel/Windows &quot;Unicode text&quot; export: UTF-16 with a BOM (bytes ff fe)
+with open(&quot;export.txt&quot;, &quot;w&quot;, encoding=&quot;utf-16&quot;) as f:
+    f.write(&quot;name\tcity\nZoë\tKöln\n&quot;)
+print(open(&quot;export.txt&quot;, &quot;rb&quot;).read()[:8])
+try:
+    open(&quot;export.txt&quot;).read()          # default encoding is UTF-8
+except UnicodeDecodeError as e:
+    print(f&quot;{type(e).__name__}: {e}&quot;)
+print(repr(open(&quot;export.txt&quot;, encoding=&quot;utf-16&quot;).read()))</code></pre>
+<p>Output:</p>
+<pre><code>b&#x27;\xff\xfen\x00a\x00m\x00&#x27;
+UnicodeDecodeError: &#x27;utf-8&#x27; codec can&#x27;t decode byte 0xff in position 0: invalid start byte
+&#x27;name\tcity\nZoë\tKöln\n&#x27;</code></pre>
+<p><code>0xff 0xfe</code> at the very start is the UTF-16 little-endian byte order mark. Excel's "Unicode Text" export and many Windows tools write this, and every second byte is <code>0x00</code>. No UTF-8 sequence can start with <code>0xff</code>, so decoding fails at position 0. Open it with <code>encoding="utf-16"</code>, which reads the BOM and picks the byte order. (<code>0xfe</code> in position 0 is the same thing, big-endian.)</p>
+<h2 id="binary">2. 0x8b, 0x89, 0xa2...: a binary file opened as text</h2>
+<pre><code># Binary files opened in text mode: gzip, PNG, xlsx (a zip)
+import gzip, zipfile
+gzip.open(&quot;data.csv.gz&quot;, &quot;wt&quot;).write(&quot;a,b\n1,2\n&quot;)
+with zipfile.ZipFile(&quot;book.xlsx&quot;, &quot;w&quot;) as z: z.writestr(&quot;x&quot;, &quot;y&quot;)
+open(&quot;logo.png&quot;, &quot;wb&quot;).write(b&quot;\x89PNG\r\n\x1a\n&quot; + bytes(8))
+for name in [&quot;data.csv.gz&quot;, &quot;book.xlsx&quot;, &quot;logo.png&quot;]:
+    try:
+        open(name).read()
+    except UnicodeDecodeError as e:
+        print(f&quot;{name:12} {open(name,&#x27;rb&#x27;).read(4)!r:22} {e}&quot;)
+print(gzip.open(&quot;data.csv.gz&quot;, &quot;rt&quot;).read())</code></pre>
+<p>Output:</p>
+<pre><code>data.csv.gz  b&#x27;\x1f\x8b\x08\x08&#x27;    &#x27;utf-8&#x27; codec can&#x27;t decode byte 0x8b in position 1: invalid start byte
+book.xlsx    b&#x27;PK\x03\x04&#x27;          &#x27;utf-8&#x27; codec can&#x27;t decode byte 0xa2 in position 10: invalid start byte
+logo.png     b&#x27;\x89PNG&#x27;             &#x27;utf-8&#x27; codec can&#x27;t decode byte 0x89 in position 0: invalid start byte
+a,b
+1,2</code></pre>
+<p>A gzip file starts with <code>1f 8b</code>, so it fails at position 1; a PNG starts with <code>0x89</code>. An .xlsx file is a zip archive, so it fails at whatever compressed byte comes first (position 10 here; it varies by file). These are not text files with the wrong encoding, so no <code>encoding=</code> value fixes them. Open them with the right reader: <code>gzip.open(path, "rt")</code>, <code>zipfile</code> or <code>pandas.read_excel</code>, or <code>open(path, "rb")</code> for raw bytes.</p>
+<h2 id="cp1252">3. Byte 0x80 (or 0x92, 0x96...): a Windows-1252 file</h2>
+<pre><code># Windows-1252 text: the euro sign is the single byte 0x80
+open(&quot;prices.csv&quot;, &quot;w&quot;, encoding=&quot;cp1252&quot;).write(&quot;item,price\nTea,€3\n&quot;)
+try:
+    open(&quot;prices.csv&quot;, encoding=&quot;utf-8&quot;).read()
+except UnicodeDecodeError as e:
+    print(e)
+print(repr(open(&quot;prices.csv&quot;, encoding=&quot;cp1252&quot;).read()))</code></pre>
+<p>Output:</p>
+<pre><code>&#x27;utf-8&#x27; codec can&#x27;t decode byte 0x80 in position 15: invalid start byte
+&#x27;item,price\nTea,€3\n&#x27;</code></pre>
+<p>In Windows-1252 the euro sign, curly quotes and dashes are single bytes from 0x80 to 0x9f. UTF-8 only uses those bytes inside multi-byte characters, never at the start, so they produce "invalid start byte". Use <code>encoding="cp1252"</code>. (Accented letters like <code>0xe9</code> give "invalid continuation byte" instead; see <a href="/guides/python-unicodedecodeerror/">UnicodeDecodeError: all causes</a>.)</p>
+<h2 id="sniff">4. Check the first bytes instead of guessing</h2>
+<pre><code># Sniff the first bytes before guessing an encoding
+import codecs
+def sniff(path):
+    head = open(path, &quot;rb&quot;).read(4)
+    if head.startswith(codecs.BOM_UTF8): return &quot;utf-8-sig&quot;
+    if head.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)): return &quot;utf-16&quot;
+    if head.startswith(b&quot;\x1f\x8b&quot;): return &quot;gzip&quot;
+    if head.startswith(b&quot;PK\x03\x04&quot;): return &quot;zip (xlsx/docx)&quot;
+    if head.startswith(b&quot;\x89PNG&quot;): return &quot;png&quot;
+    return &quot;try utf-8, then cp1252&quot;
+for p in [&quot;export.txt&quot;, &quot;data.csv.gz&quot;, &quot;book.xlsx&quot;, &quot;logo.png&quot;]:
+    print(f&quot;{p:12} -&gt; {sniff(p)}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>export.txt   -&gt; utf-16
+data.csv.gz  -&gt; gzip
+book.xlsx    -&gt; zip (xlsx/docx)
+logo.png     -&gt; png</code></pre>
+<p>Reading the first four bytes in binary mode tells you which case you have. <code>pandas.read_csv</code> takes the same <code>encoding=</code> argument as <code>open()</code>, so once you know the encoding, pass it there too.</p>
+<h2 id="replace">5. Why errors="replace" or latin-1 is not a fix</h2>
+<pre><code># errors=&quot;replace&quot; hides the problem: UTF-16 read as Latin-1 &quot;works&quot;
+text = open(&quot;export.txt&quot;, encoding=&quot;latin-1&quot;).read()
+print(repr(text[:12]))
+text = open(&quot;export.txt&quot;, errors=&quot;replace&quot;).read()
+print(repr(text[:12]))</code></pre>
+<p>Output:</p>
+<pre><code>&#x27;ÿþn\x00a\x00m\x00e\x00\t\x00&#x27;
+&#x27;��n\x00a\x00m\x00e\x00\t\x00&#x27;</code></pre>
+<p>Both stop the exception, but the UTF-16 text comes out as mojibake with <code>\x00</code> between letters. latin-1 never raises because every byte maps to some character, which is why it silently gives the wrong text.</p>
+<p>Related: <a href="/guides/python-unicodedecodeerror/">UnicodeDecodeError (4 causes)</a> · <a href="/guides/subprocess-text-true-raises-unicodedecodeerror-loses-returncode/">subprocess text=True UnicodeDecodeError</a>.</p>
+
+<aside class="cta"><strong>Decoding a download? Check the Content-Type and charset the server sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does byte 0xff in position 0 mean?</summary><p>The file starts with a UTF-16 byte order mark (ff fe). Open it with encoding=&#x27;utf-16&#x27;.</p></details>
+<details><summary>How do I fix invalid start byte 0x80?</summary><p>The file is most likely Windows-1252, where 0x80 is the euro sign. Open it with encoding=&#x27;cp1252&#x27;.</p></details>
+<details><summary>Why does reading an .xlsx or .gz file raise UnicodeDecodeError?</summary><p>They are binary (zip and gzip). Use pandas.read_excel, zipfile or gzip.open(path, &#x27;rt&#x27;) instead of open() in text mode.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Python 3.13.5 on Debian: a UTF-16 file with a BOM, gzip/xlsx/PNG files opened as text, a Windows-1252 file with a euro sign, a first-bytes sniffer, and errors=&quot;replace&quot;. Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

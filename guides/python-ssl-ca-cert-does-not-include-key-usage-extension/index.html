@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python 3.13 SSL: CA cert does not include key usage extension</title>
+<meta name="description" content="Python 3.13 enables VERIFY_X509_STRICT, so a CA without keyUsage fails verification. Reproduced vs 3.11; re-issue the CA or clear the flag. Tested.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-ssl-ca-cert-does-not-include-key-usage-extension/">
+<meta property="og:title" content="Python 3.13 SSL: CA cert does not include key usage extension">
+<meta property="og:description" content="Python 3.13 enables VERIFY_X509_STRICT, so a CA without keyUsage fails verification. Reproduced vs 3.11; re-issue the CA or clear the flag. Tested.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-ssl-ca-cert-does-not-include-key-usage-extension/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Python 3.13 say CA cert does not include key usage extension?", "acceptedAnswer": {"@type": "Answer", "text": "ssl.create_default_context() sets VERIFY_X509_STRICT from 3.13 on; OpenSSL then requires keyUsage on CA certificates. 3.11 accepted the same CA."}}, {"@type": "Question", "name": "How do I fix CA cert does not include key usage extension?", "acceptedAnswer": {"@type": "Answer", "text": "Re-issue the CA with keyUsage=critical,keyCertSign,cRLSign (and basicConstraints CA:TRUE), then re-sign the server certificate."}}, {"@type": "Question", "name": "Can I disable VERIFY_X509_STRICT in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, per context: ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT. Verification of the chain and hostname stays on."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python 3.13: CA cert does not include key usage extension (tested)</h1>
+<p class="lead">Python 3.13 turns on <code>ssl.VERIFY_X509_STRICT</code> by default, so a CA certificate without a <code>keyUsage</code> extension is rejected. Re-issue the CA with <code>keyUsage=critical,keyCertSign,cRLSign</code>, or clear the flag on the SSLContext for that host.</p>
+<p>After upgrading to Python 3.13, HTTPS to an internal server (private CA, corporate proxy, self-made test CA) can start failing with <code>certificate verify failed: CA cert does not include key usage extension</code>, even though nothing changed on the server. We reproduced it with a local HTTPS server whose CA was made with a plain <code>openssl req -x509</code>. <code>common.py</code> starts that server on <code>localhost:8963</code>:</p>
+<pre><code>import subprocess, sys, time, atexit, os
+srv = subprocess.Popen([sys.executable, &quot;/tmp/us397/srv.py&quot;, os.environ.get(&quot;LEAF&quot;, &quot;/tmp/us397/cert.pem&quot;), &quot;/tmp/us397/key.pem&quot;])
+atexit.register(srv.terminate)
+time.sleep(0.8)
+URL = &quot;https://localhost:8963/simple/&quot;
+OLD_CA = &quot;/tmp/us397/ca.pem&quot;     # made with: openssl req -x509 (no keyUsage)
+NEW_CA = &quot;/tmp/us397/ca2.pem&quot;</code></pre>
+<h2 id="error">1. Python 3.13 fails, Python 3.11 works</h2>
+<pre><code>import ssl, sys, urllib.request
+from common import URL, OLD_CA
+print(sys.version.split()[0], ssl.OPENSSL_VERSION)
+ctx = ssl.create_default_context(cafile=OLD_CA)
+try:
+    print(&quot;status:&quot;, urllib.request.urlopen(URL, context=ctx).status)
+except Exception as e:
+    print(type(e).__name__, e)</code></pre>
+<p>Output:</p>
+<pre><code>3.13.5 OpenSSL 3.5.7 9 Jun 2026
+URLError &lt;urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: CA cert does not include key usage extension (_ssl.c:1029)&gt;</code></pre>
+<p>The same script under Python 3.11.17:</p>
+<pre><code>3.11.17 OpenSSL 3.5.9 29 Sep 2026
+status: 200</code></pre>
+<h2 id="why">2. Why: VERIFY_X509_STRICT is on by default in 3.13</h2>
+<pre><code>import ssl
+ctx = ssl.create_default_context()
+print(&quot;VERIFY_X509_STRICT set:&quot;, bool(ctx.verify_flags &amp; ssl.VERIFY_X509_STRICT))
+print(&quot;VERIFY_X509_PARTIAL_CHAIN set:&quot;, bool(ctx.verify_flags &amp; ssl.VERIFY_X509_PARTIAL_CHAIN))</code></pre>
+<p>Output:</p>
+<pre><code>VERIFY_X509_STRICT set: True
+VERIFY_X509_PARTIAL_CHAIN set: True</code></pre>
+<p>Python 3.11.17 printed <code>False</code> for both. Since Python 3.13, <code>ssl.create_default_context()</code> sets <code>VERIFY_X509_STRICT</code>, which makes OpenSSL enforce RFC 5280: a CA certificate must carry a <code>keyUsage</code> extension with <code>keyCertSign</code>. requests (via urllib3) and Poetry failed with the same message in our tests, because they build on this default context.</p>
+<h2 id="check">3. Check the CA certificate</h2>
+<pre><code>import subprocess
+for name in [&quot;ca.pem&quot;, &quot;ca2.pem&quot;]:
+    out = subprocess.run([&quot;openssl&quot;, &quot;x509&quot;, &quot;-in&quot;, f&quot;/tmp/us397/{name}&quot;, &quot;-noout&quot;, &quot;-ext&quot;, &quot;basicConstraints,keyUsage&quot;],
+                         capture_output=True, text=True)
+    print(f&quot;--- {name}\n{(out.stdout + out.stderr).strip()}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>--- ca.pem
+X509v3 Basic Constraints: critical
+    CA:TRUE
+--- ca2.pem
+X509v3 Basic Constraints: critical
+    CA:TRUE
+X509v3 Key Usage: critical
+    Certificate Sign, CRL Sign</code></pre>
+<p><code>ca.pem</code> (the failing CA) has <code>CA:TRUE</code> but no Key Usage. <code>ca2.pem</code> was created with <code>-addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"</code>.</p>
+<h2 id="fix">4. Proper fix: re-issue the CA with keyUsage</h2>
+<pre><code>import os
+os.environ[&quot;LEAF&quot;] = &quot;/tmp/us397/cert2.pem&quot;   # leaf re-issued by the CA that has keyUsage
+import requests
+from common import URL, NEW_CA
+print(requests.get(URL, verify=NEW_CA).status_code)</code></pre>
+<p>Output:</p>
+<pre><code>200</code></pre>
+<p>With a leaf certificate signed by the new CA, requests verified it normally. If you do not control the CA (a vendor appliance, a corporate proxy), ask its owners to re-issue it; old CAs without keyUsage are exactly what the strict mode is meant to reject.</p>
+<h2 id="workaround">5. Workaround: clear VERIFY_X509_STRICT for that context</h2>
+<pre><code>import ssl, urllib.request
+from common import URL, OLD_CA
+
+ctx = ssl.create_default_context(cafile=OLD_CA)
+ctx.verify_flags &amp;= ~ssl.VERIFY_X509_STRICT
+print(&quot;strict off:&quot;, urllib.request.urlopen(URL, context=ctx).status)</code></pre>
+<p>Output:</p>
+<pre><code>strict off: 200</code></pre>
+<p>Clearing the flag on your own <code>SSLContext</code> restores the 3.12 behaviour while still verifying the chain and hostname. Only do this in code that talks to the affected internal host; do not disable verification entirely (<code>verify=False</code>).</p>
+<p>Related: <a href="/guides/python-ssl-certificate-verify-failed/">Python SSL: CERTIFICATE_VERIFY_FAILED</a>, <a href="/guides/self-signed-certificate-in-certificate-chain/">self signed certificate in certificate chain</a>, <a href="/guides/poetry-ignore-ssl-errors-certificate-verify-failed/">Poetry ignore SSL errors</a>, <a href="/guides/python-requests-sslerror-httpsconnectionpool/">requests SSLError HTTPSConnectionPool</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Python 3.13 say CA cert does not include key usage extension?</summary><p>ssl.create_default_context() sets VERIFY_X509_STRICT from 3.13 on; OpenSSL then requires keyUsage on CA certificates. 3.11 accepted the same CA.</p></details>
+<details><summary>How do I fix CA cert does not include key usage extension?</summary><p>Re-issue the CA with keyUsage=critical,keyCertSign,cRLSign (and basicConstraints CA:TRUE), then re-sign the server certificate.</p></details>
+<details><summary>Can I disable VERIFY_X509_STRICT in Python?</summary><p>Yes, per context: ctx.verify_flags &amp;= ~ssl.VERIFY_X509_STRICT. Verification of the chain and hostname stays on.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Python 3.13.5 (OpenSSL 3.5.7), Python 3.11.17 (OpenSSL 3.5.9) and requests 2.34.2 against a local HTTPS server. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

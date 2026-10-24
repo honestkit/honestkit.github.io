@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python Invalid Escape Sequence Warning: Cause and Fix, Tested</title>
+<meta name="description" content="We reproduced Python&#x27;s invalid escape sequence warning from a plain regex string, turned it into a hard error, and tested the exact fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-invalid-escape-sequence-regex/">
+<meta property="og:title" content="Python Invalid Escape Sequence Warning: Cause and Fix, Tested">
+<meta property="og:description" content="We reproduced Python&#x27;s invalid escape sequence warning from a plain regex string, turned it into a hard error, and tested the exact fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-invalid-escape-sequence-regex/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does \\d warn but \\n doesn't?", "acceptedAnswer": {"@type": "Answer", "text": "\\n is on Python's fixed list of recognized string escapes, so it's processed before the regex engine ever sees the string. \\d isn't on that list \u2014 it only means something to the regex engine \u2014 so Python warns that it doesn't recognize the escape and is keeping it literally, which happens to be what the regex engine wants."}}, {"@type": "Question", "name": "Does python3 -W error always turn this into a crash?", "acceptedAnswer": {"@type": "Answer", "text": "On this box, yes: we reproduced the identical file going from a silent warning under plain python3 to a SyntaxError and exit code 1 under python3 -W error, with no other change. Any environment that sets PYTHONWARNINGS=error behaves the same way."}}, {"@type": "Question", "name": "Does prefixing with r always fix it?", "acceptedAnswer": {"@type": "Answer", "text": "In every case we tested, yes \u2014 r\"\\d+\" compiled and matched with zero warnings, even under -W error. The raw-string prefix stops Python from interpreting backslash escapes in that literal at all, so there's nothing left for the warning to flag."}}, {"@type": "Question", "name": "Will this become a hard error in a future Python version, not just a warning?", "acceptedAnswer": {"@type": "Answer", "text": "Per the Python changelog (not something we measured), invalid escape sequences were a DeprecationWarning in older 3.x versions and became SyntaxWarning in 3.12; the documented intent is to eventually make them a syntax error by default. Fix it now rather than waiting."}}, {"@type": "Question", "name": "Is my regex wrong if I see this warning?", "acceptedAnswer": {"@type": "Answer", "text": "Not necessarily \u2014 we measured the exact same match result (span, matched text) with and without the warning, because \\d was already being passed through to the regex engine either way. The warning is about the string literal being ambiguous, not about the regex being incorrect."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python SyntaxWarning: Invalid Escape Sequence (tested)</h1>
+<p class="lead"><code>SyntaxWarning: invalid escape sequence</code> fires when a string literal contains a backslash followed by a letter Python doesn't recognize as a string escape &mdash; most often a regex pattern like <code>"\d+"</code> written without the <code>r</code> prefix. We reproduced it, turned it into a real crash, and tested the fix.</p>
+<h2>1. Reproduced: the plain case</h2>
+<pre><code>$ cat bad.py
+import re
+pattern = re.compile("\d+")
+m = pattern.match("123")
+print(m)
+
+$ python3 bad.py
+&lt;re.Match object; span=(0, 3), match='123'&gt;
+bad.py:2: SyntaxWarning: invalid escape sequence '\d'
+  pattern = re.compile("\d+")</code></pre>
+<p>The script still runs and still matches &mdash; exit code 0. That's what makes this warning easy to ignore: <code>\d</code> inside a plain string isn't a valid Python escape, so Python keeps the backslash and the letter literally, which happens to be exactly what the regex engine wants. It works today by coincidence, not by design, and Python tells you so.</p>
+
+<h2>2. Reproduced: strict mode turns it into a crash</h2>
+<p>Run the identical file with warnings promoted to errors:</p>
+<pre><code>$ python3 -W error bad.py
+  File "bad.py", line 2
+    pattern = re.compile("\d+")
+                          ^^
+SyntaxError: invalid escape sequence '\d'
+$ echo $?
+1</code></pre>
+<p>Same file, same line, but now it's a <code>SyntaxError</code> raised before a single line of the script runs, because the warning fires at compile time, not when <code>re.compile()</code> executes. Some test runners and CI configs enable <code>-W error</code> (or <code>PYTHONWARNINGS=error</code>) by default, so code that "works" interactively can fail in CI the moment this flag is on.</p>
+
+<h2>3. Why some escapes warn and others don't</h2>
+<p>Python string literals recognize a fixed set of backslash escapes: <code>\n</code>, <code>\t</code>, <code>\\</code>, <code>\'</code>, <code>\x41</code>, and a few more. We confirmed a recognized one produces no warning at all:</p>
+<pre><code>$ python3 -W error -c "import re; re.compile('line1\nline2')"
+(no output, exit 0)</code></pre>
+<p><code>\d</code>, <code>\s</code>, <code>\w</code>, <code>\b</code> and similar regex tokens are not in that list. They only mean something to the <em>regex</em> engine, after the string literal has already been parsed. Python has to guess what you meant, and it guesses "probably a typo," which is why it warns.</p>
+
+<h2>4. Reproduced: the fix &mdash; a raw string</h2>
+<pre><code>$ cat fixed.py
+import re
+pattern = re.compile(r"\d+")
+m = pattern.match("123")
+print(m)
+
+$ python3 -W error fixed.py
+&lt;re.Match object; span=(0, 3), match='123'&gt;
+$ echo $?
+0</code></pre>
+<p>The <code>r</code> prefix tells Python not to process backslash escapes at all, so the string is passed to the regex engine exactly as typed, with no warning even under <code>-W error</code>. This is the fix for every case we tested. Prefix every regex pattern string with <code>r</code>, not just the ones that currently warn &mdash; it costs nothing and removes the ambiguity for good.</p>
+
+<h2>5. The other fix: double the backslash</h2>
+<p>Doubling the backslash also silences the warning, because <code>\\</code> is itself a recognized escape (a literal backslash):</p>
+<pre><code>$ cat double_backslash.py
+import re
+p = re.compile("\\d+")
+print(p.match("42"))
+
+$ python3 -W error double_backslash.py
+&lt;re.Match object; span=(0, 2), match='42'&gt;</code></pre>
+<p>This works but reads worse than a raw string once a pattern has more than one or two backslashes &mdash; we'd use <code>r"..."</code> everywhere and reserve double-backslashing for the rare case where you deliberately need the string engine to process other escapes alongside the regex.</p>
+
+<h2>6. A gotcha we measured: filtering the warning doesn't always catch it</h2>
+<p>Because the warning fires when the string literal is <em>compiled</em>, setting a filter at runtime in the same file is too late for code above it, but it does apply to a module compiled afterward, such as one imported later in the same process:</p>
+<pre><code>$ cat warn2.py
+import warnings
+warnings.filterwarnings('error', category=SyntaxWarning)
+import re2mod      # re2mod.py: re.compile("\s\w")
+
+$ python3 warn2.py
+Traceback (most recent call last):
+  File "warn2.py", line 3, in &lt;module&gt;
+    import re2mod
+  File "re2mod.py", line 2
+    re.compile("\s\w")
+                ^^
+SyntaxError: invalid escape sequence '\s'</code></pre>
+<p>If you're trying to catch these warnings deliberately (for example in a test), set the filter before anything with a bad pattern is imported, or run with <code>-W error</code> from the start &mdash; don't rely on a filter set mid-script to catch literals compiled earlier in that same file.</p>
+
+<h2>7. Checklist</h2>
+<ul>
+<li>Any regex pattern written as a plain string: change it to <code>r"..."</code>.</li>
+<li><code>f"\d{{n}}"</code> f-strings need the prefix too: <code>rf"\d{{n}}"</code>.</li>
+<li>If CI fails on this but your machine doesn't, check for <code>PYTHONWARNINGS=error</code> or <code>-W error</code> in the CI config &mdash; that's what's promoting the warning to a crash.</li>
+<li>Don't just double the backslash across a whole codebase to silence it &mdash; a raw string is clearer and we found no case where it didn't work.</li>
+</ul>
+<p>Once your pattern compiles cleanly, make sure it also runs fast on adversarial input &mdash; see <a href="/guides/regex-catastrophic-backtracking/">regex catastrophic backtracking</a> for a different regex failure mode we measured on the same box.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does \d warn but \n doesn&#x27;t?</summary><p>\n is on Python&#x27;s fixed list of recognized string escapes, so it&#x27;s processed before the regex engine ever sees the string. \d isn&#x27;t on that list — it only means something to the regex engine — so Python warns that it doesn&#x27;t recognize the escape and is keeping it literally, which happens to be what the regex engine wants.</p></details>
+<details><summary>Does python3 -W error always turn this into a crash?</summary><p>On this box, yes: we reproduced the identical file going from a silent warning under plain python3 to a SyntaxError and exit code 1 under python3 -W error, with no other change. Any environment that sets PYTHONWARNINGS=error behaves the same way.</p></details>
+<details><summary>Does prefixing with r always fix it?</summary><p>In every case we tested, yes — r&quot;\d+&quot; compiled and matched with zero warnings, even under -W error. The raw-string prefix stops Python from interpreting backslash escapes in that literal at all, so there&#x27;s nothing left for the warning to flag.</p></details>
+<details><summary>Will this become a hard error in a future Python version, not just a warning?</summary><p>Per the Python changelog (not something we measured), invalid escape sequences were a DeprecationWarning in older 3.x versions and became SyntaxWarning in 3.12; the documented intent is to eventually make them a syntax error by default. Fix it now rather than waiting.</p></details>
+<details><summary>Is my regex wrong if I see this warning?</summary><p>Not necessarily — we measured the exact same match result (span, matched text) with and without the warning, because \d was already being passed through to the regex engine either way. The warning is about the string literal being ambiguous, not about the regex being incorrect.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with CPython 3.13.5 on a real Linux box. Every warning, traceback and exit code below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

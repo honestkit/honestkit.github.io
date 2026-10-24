@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>urljoin(): A //host Input Silently Changes the Domain</title>
+<meta name="description" content="We measured urljoin(base, &#x27;//evil.example.com/x&#x27;) returning a URL on evil.example.com, not the base&#x27;s host, with no error. Risky if the 2nd arg is user input.">
+<link rel="canonical" href="https://honestkit.github.io/guides/urljoin-double-slash-input-silently-switches-host/">
+<meta property="og:title" content="urljoin(): A //host Input Silently Changes the Domain">
+<meta property="og:description" content="We measured urljoin(base, &#x27;//evil.example.com/x&#x27;) returning a URL on evil.example.com, not the base&#x27;s host, with no error. Risky if the 2nd arg is user input.">
+<meta property="og:url" content="https://honestkit.github.io/guides/urljoin-double-slash-input-silently-switches-host/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does urljoin() change the domain when I pass a path starting with //?", "acceptedAnswer": {"@type": "Answer", "text": "We measured //host-style input being parsed as a scheme-relative URL per RFC 3986, which replaces the entire authority (host) of the base URL, not just the path. No error is raised."}}, {"@type": "Question", "name": "Is a //evil.com/path input to urljoin() a security risk?", "acceptedAnswer": {"@type": "Answer", "text": "Yes in practice \u2014 we confirmed that if the second argument to urljoin() is user-controlled (e.g. a 'next' redirect parameter), a //host-prefixed value silently redirects to an attacker-chosen domain."}}, {"@type": "Question", "name": "How is //host different from /path in urljoin()?", "acceptedAnswer": {"@type": "Answer", "text": "We measured a single leading slash resolving to an absolute path on the same host as the base URL, while two leading slashes take over the host entirely, keeping only the base's scheme."}}, {"@type": "Question", "name": "How do I stop urljoin() from changing the host?", "acceptedAnswer": {"@type": "Answer", "text": "We verified checking urlparse(result).netloc against the expected host (or an allow-list) after calling urljoin(), since urljoin() itself has no flag to disable scheme-relative resolution."}}, {"@type": "Question", "name": "Does Python's urljoin() validate that the result stays on the same domain?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 in our test it always followed RFC 3986 resolution rules exactly, including host takeover via //, with no built-in same-origin check."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>urljoin() //host Input Silently Switches Host (tested)</h1>
+<p class="lead"><code>urllib.parse.urljoin()</code> is the standard way to resolve a relative link against a base URL. We measured what happens when the "relative" input starts with <code>//</code> instead of a single <code>/</code> &mdash; and it silently resolves to an entirely different domain.</p>
+<h2 id="repro1">1. A //host input replaces the host, not just the path</h2>
+<pre><code>from urllib.parse import urljoin
+
+base = "https://trusted.example.com/path/page.html"
+print(urljoin(base, "//evil.example.com/x"))
+print(urljoin(base, "/absolute"))</code></pre>
+<pre><code>https://evil.example.com/x
+https://trusted.example.com/absolute</code></pre>
+<p><strong>Measured:</strong> a single leading <code>/</code> resolves to an absolute path on the same host, exactly as expected. Two leading slashes do something different: per RFC 3986, <code>//evil.example.com/x</code> is a <strong>scheme-relative</strong> URL &mdash; it keeps the base's scheme (<code>https</code>) but takes its entire authority (host) from the input. The result lands on <code>evil.example.com</code>, not <code>trusted.example.com</code>, with no exception and no warning.</p>
+
+<h2 id="repro2">2. This is a real risk the moment the second argument is user input</h2>
+<pre><code>next_param = "//evil.example.com/phish"
+redirect_target = urljoin("https://trusted.example.com/login", next_param)
+print(redirect_target)</code></pre>
+<pre><code>https://evil.example.com/phish</code></pre>
+<p><strong>Measured:</strong> code that does <code>urljoin(request_base_url, user_supplied_next)</code> to build a post-login redirect &mdash; a common pattern &mdash; sends the user to a completely different domain if <code>user_supplied_next</code> starts with <code>//</code>. It looks like a harmless typo'd absolute path, not a host override, which is exactly what makes it easy to miss in review.</p>
+
+<h2 id="fix">3. Fix: verify the resulting host explicitly with urlparse()</h2>
+<pre><code>from urllib.parse import urlparse
+
+base = "https://trusted.example.com/login"
+joined = urljoin(base, "//evil.example.com/phish")
+same_host = urlparse(joined).netloc == urlparse(base).netloc
+print(joined, "-> same host?", same_host)</code></pre>
+<pre><code>https://evil.example.com/phish -> same host? False</code></pre>
+<p><strong>Measured:</strong> <code>urljoin()</code> itself has no option to forbid a host change &mdash; it's working as RFC 3986 defines. The fix is to check the <strong>output</strong>: parse the joined URL with <code>urlparse()</code> and compare <code>.netloc</code> against the expected host (or an allow-list of hosts) before using the result for a redirect, link, or request. Rejecting any user-supplied "relative" input that starts with <code>//</code> outright is an equally valid, simpler guard for the common redirect-parameter case.</p>
+
+<aside class="cta"><strong>Debugging a redirect or request that ended up on the wrong host? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does urljoin() change the domain when I pass a path starting with //?</summary><p>We measured //host-style input being parsed as a scheme-relative URL per RFC 3986, which replaces the entire authority (host) of the base URL, not just the path. No error is raised.</p></details>
+<details><summary>Is a //evil.com/path input to urljoin() a security risk?</summary><p>Yes in practice — we confirmed that if the second argument to urljoin() is user-controlled (e.g. a &#x27;next&#x27; redirect parameter), a //host-prefixed value silently redirects to an attacker-chosen domain.</p></details>
+<details><summary>How is //host different from /path in urljoin()?</summary><p>We measured a single leading slash resolving to an absolute path on the same host as the base URL, while two leading slashes take over the host entirely, keeping only the base&#x27;s scheme.</p></details>
+<details><summary>How do I stop urljoin() from changing the host?</summary><p>We verified checking urlparse(result).netloc against the expected host (or an allow-list) after calling urljoin(), since urljoin() itself has no flag to disable scheme-relative resolution.</p></details>
+<details><summary>Does Python&#x27;s urljoin() validate that the result stays on the same domain?</summary><p>No — in our test it always followed RFC 3986 resolution rules exactly, including host takeover via //, with no built-in same-origin check.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in urllib.parse module: called urljoin() with a base URL and a //host-style input, comparing the resulting host to a plain /absolute-path input and verifying the fix with urlparse().netloc. PlainHeaders is our extension; Python&#x27;s urllib.parse module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

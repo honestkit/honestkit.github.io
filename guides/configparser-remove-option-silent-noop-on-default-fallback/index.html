@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>configparser: remove_option() Silently No-ops on DEFAULT Keys</title>
+<meta name="description" content="We measured remove_option() returning False and doing nothing on a [DEFAULT]-only key, even though has_option() and &#x27;in&#x27; both say it&#x27;s present.">
+<link rel="canonical" href="https://honestkit.github.io/guides/configparser-remove-option-silent-noop-on-default-fallback/">
+<meta property="og:title" content="configparser: remove_option() Silently No-ops on DEFAULT Keys">
+<meta property="og:description" content="We measured remove_option() returning False and doing nothing on a [DEFAULT]-only key, even though has_option() and &#x27;in&#x27; both say it&#x27;s present.">
+<meta property="og:url" content="https://honestkit.github.io/guides/configparser-remove-option-silent-noop-on-default-fallback/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does configparser's remove_option() return False and do nothing?", "acceptedAnswer": {"@type": "Answer", "text": "We measured remove_option() returning False when the key being removed only existed via [DEFAULT] fallback, not as a value explicitly set on that section. It only ever removes a section's own local options, never a [DEFAULT] value a section is inheriting."}}, {"@type": "Question", "name": "Why does 'key' in section return True if I can't delete key from that section?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed 'in' and has_option() check the merged view, including [DEFAULT] fallback, so they return True for inherited keys. del section[key] and remove_option() only act on the section's own local dict, so they fail or no-op on the exact same key."}}, {"@type": "Question", "name": "How do I remove a config value that's only set in [DEFAULT]?", "acceptedAnswer": {"@type": "Answer", "text": "We verified remove_option('DEFAULT', key) removes it everywhere it was being inherited, not just one section. There is no built-in way to hide a [DEFAULT] value from a single section."}}, {"@type": "Question", "name": "How do I override a DEFAULT value for just one section in configparser?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed calling set(section, key, value) (or writing the key directly under that section in the source) creates a section-local value that shadows [DEFAULT] for that section only, without affecting other sections."}}, {"@type": "Question", "name": "Does del config[section][key] raise an error in configparser?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we measured KeyError on del when key is only present via [DEFAULT] inheritance, even though the same key reads as present through has_option(), 'in', and get() on that same section."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>configparser remove_option() Silent No-op on DEFAULT Fallback (tested)</h1>
+<p class="lead"><code>[DEFAULT]</code> values in <code>configparser</code> are inherited by every section that doesn't set its own override. We measured what happens when you try to remove one of those inherited values from a single section &mdash; and the answer is: nothing happens, and nothing tells you that.</p>
+<h2 id="repro1">1. has_option() and 'in' say the key is there</h2>
+<pre><code>import configparser
+
+c = configparser.ConfigParser()
+c.read_string("""
+[DEFAULT]
+color = blue
+
+[section1]
+other = 1
+""")
+print(c.has_option("section1", "color"))
+print("color" in c["section1"])
+print(c.get("section1", "color"))</code></pre>
+<pre><code>True
+True
+blue</code></pre>
+<p><strong>Measured:</strong> <code>section1</code> never set <code>color</code> itself &mdash; it's purely inherited from <code>[DEFAULT]</code>. But <code>has_option()</code>, the <code>in</code> operator, and <code>get()</code> all agree the key is present and has a value. By every readable signal, <code>color</code> "exists" in <code>section1</code>.</p>
+
+<h2 id="repro2">2. remove_option() and del disagree with has_option() about that same key</h2>
+<pre><code>print(c.remove_option("section1", "color"))
+print(c.get("section1", "color"))
+
+try:
+    del c["section1"]["color"]
+except KeyError as e:
+    print("KeyError:", e)</code></pre>
+<pre><code>False
+blue
+KeyError: 'color'</code></pre>
+<p><strong>Measured:</strong> <code>remove_option()</code> returns <code>False</code> &mdash; its documented meaning is "there was nothing to remove" &mdash; and the value is still <code>blue</code> afterward. No exception, no warning. <code>del c["section1"]["color"]</code>, the more natural-looking removal syntax, raises <code>KeyError: 'color'</code> outright, even though <code>"color" in c["section1"]</code> just returned <code>True</code> one line earlier. Both operations only ever touch a section's own local options; neither one looks at or clears the inherited <code>[DEFAULT]</code> value, and neither one says so.</p>
+
+<h2 id="fix">3. Fix: there's no "unset the inherited value" operation &mdash; set an explicit override instead</h2>
+<pre><code>c.set("section1", "color", "red")
+print(c.get("section1", "color"))
+
+c2 = configparser.ConfigParser()
+c2.read_string("""
+[DEFAULT]
+color = blue
+
+[section1]
+other = 1
+[section2]
+other = 2
+""")
+c2.remove_option("DEFAULT", "color")
+print(c2.get("section1", "color", fallback="(none)"))
+print(c2.get("section2", "color", fallback="(none)"))</code></pre>
+<pre><code>red
+(none)
+(none)
+</code></pre>
+<p><strong>Measured:</strong> <code>configparser</code> has no concept of hiding or deleting an inherited value for just one section &mdash; the two real options are to give that section its own explicit override (<code>set()</code>, confirmed it shadows <code>[DEFAULT]</code> correctly), which fixes one section, or to <code>remove_option("DEFAULT", ...)</code>, which confirmed removing it for every section that was inheriting it, not just one. If you only want to silence it in one place, writing an explicit per-section override is the only tool that does that.</p>
+
+<aside class="cta"><strong>Debugging a config value an API client reads before making a request? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does configparser&#x27;s remove_option() return False and do nothing?</summary><p>We measured remove_option() returning False when the key being removed only existed via [DEFAULT] fallback, not as a value explicitly set on that section. It only ever removes a section&#x27;s own local options, never a [DEFAULT] value a section is inheriting.</p></details>
+<details><summary>Why does &#x27;key&#x27; in section return True if I can&#x27;t delete key from that section?</summary><p>We confirmed &#x27;in&#x27; and has_option() check the merged view, including [DEFAULT] fallback, so they return True for inherited keys. del section[key] and remove_option() only act on the section&#x27;s own local dict, so they fail or no-op on the exact same key.</p></details>
+<details><summary>How do I remove a config value that&#x27;s only set in [DEFAULT]?</summary><p>We verified remove_option(&#x27;DEFAULT&#x27;, key) removes it everywhere it was being inherited, not just one section. There is no built-in way to hide a [DEFAULT] value from a single section.</p></details>
+<details><summary>How do I override a DEFAULT value for just one section in configparser?</summary><p>We confirmed calling set(section, key, value) (or writing the key directly under that section in the source) creates a section-local value that shadows [DEFAULT] for that section only, without affecting other sections.</p></details>
+<details><summary>Does del config[section][key] raise an error in configparser?</summary><p>Yes — we measured KeyError on del when key is only present via [DEFAULT] inheritance, even though the same key reads as present through has_option(), &#x27;in&#x27;, and get() on that same section.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in configparser module: created a ConfigParser with a [DEFAULT] value and a section that never set its own override, then compared &#x27;key&#x27; in section, get(), remove_option(), and del section[key] on that same key. PlainHeaders is our extension; Python&#x27;s configparser module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>git: &quot;Could not resolve host&quot; — Exact Causes and Fixes (Tested)</title>
+<meta name="description" content="We reproduced git&#x27;s DNS-resolution error over https and ssh, compared it to connection-refused, and tested proxy and ssh config fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/git-could-not-resolve-host/">
+<meta property="og:title" content="git: &quot;Could not resolve host&quot; — Exact Causes and Fixes (Tested)">
+<meta property="og:description" content="We reproduced git&#x27;s DNS-resolution error over https and ssh, compared it to connection-refused, and tested proxy and ssh config fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/git-could-not-resolve-host/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is \"Could not resolve host\" a git bug?", "acceptedAnswer": {"@type": "Answer", "text": "No. It means DNS lookup for the hostname in your remote URL failed before git tried to connect. We reproduced the exact message, 'fatal: unable to access ...: Could not resolve host: X', with a deliberately unresolvable hostname on git 2.47.3."}}, {"@type": "Question", "name": "What's the difference between \"Could not resolve host\" and \"Connection refused\"?", "acceptedAnswer": {"@type": "Answer", "text": "Resolve-host means the name never turned into an IP address. Connection refused (or 'Could not connect to server') means the name resolved fine but nothing answered on that IP/port. We measured both: the wording and the exit code (128 either way) differ only in the message text, so read the message carefully."}}, {"@type": "Question", "name": "Why does git over SSH give a different error than git over HTTPS?", "acceptedAnswer": {"@type": "Answer", "text": "HTTPS uses git's own built-in http client, which prints 'Could not resolve host: X'. SSH remotes shell out to your system ssh binary, which prints its own 'ssh: Could not resolve hostname X: Name or service not known', followed by git's generic 'Could not read from remote repository' fallback. We measured both wordings on the same unresolvable host."}}, {"@type": "Question", "name": "How do I tell if it's git's problem or my network's?", "acceptedAnswer": {"@type": "Answer", "text": "Run curl and ping against the exact same hostname. We measured all three failing identically on a bad host (curl: 'Could not resolve host', exit 6; ping: 'Name or service not known', exit 2) and all three succeeding on a real host. If curl/ping work but git fails, suspect a git-specific proxy setting, not system DNS."}}, {"@type": "Question", "name": "Can a bad proxy setting cause this error?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, but with different wording: 'Could not resolve proxy: X' instead of 'Could not resolve host: X'. We reproduced this by setting https_proxy and http.proxy to an unresolvable proxy host. If you see 'proxy' in the message, fix http.proxy / https_proxy, not the remote URL."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Could not resolve host (tested)</h1>
+<p class="lead"><code>fatal: unable to access '...': Could not resolve host 'X'</code> means git's network layer could not turn the hostname in your remote URL into an IP address. It is a DNS failure, not an authentication or permission problem. We reproduced it over both https and ssh, compared it to the connection-refused error people confuse it with, and tested the standard fixes.</p>
+<h2>1. The exact error, measured</h2>
+<p>Cloning a URL with a hostname that does not resolve, over https:</p>
+<pre><code>$ git clone https://no-such-host.invalid/x.git
+Cloning into 'x'...
+fatal: unable to access 'https://no-such-host.invalid/x.git/': Could not resolve host: no-such-host.invalid</code></pre>
+<p>Exit code: <code>128</code>. The message comes from git's http transport (libcurl under the hood), not from your shell or SSH.</p>
+
+<h2>2. Could-not-resolve-host vs. connection-refused: don't confuse them</h2>
+<p>People often blame "DNS" when the real problem is a closed port or a dead server. We tested both back to back so the wording difference is clear.</p>
+<table>
+<tr><th>Scenario</th><th>Command</th><th>git's message</th></tr>
+<tr><td>DNS failure (host doesn't exist)</td><td><code>git clone https://no-such-host.invalid/x.git</code></td><td><code>fatal: unable to access '...': Could not resolve host: no-such-host.invalid</code></td></tr>
+<tr><td>Port closed (host resolves fine)</td><td><code>git clone https://127.0.0.1:1/x.git</code></td><td><code>fatal: unable to access '...': Failed to connect to 127.0.0.1 port 1 after 0 ms: Could not connect to server</code></td></tr>
+</table>
+<p>"Could not resolve host" = the name lookup itself failed, before git ever tried to open a socket. "Could not connect" / "Connection refused" = the name resolved to an IP, but nothing answered on that IP/port. These need completely different fixes: DNS config for the first, checking the server/firewall/URL for the second.</p>
+
+<h2>3. Same failure over SSH looks different</h2>
+<p>The https transport is git's own (libcurl) and prints "Could not resolve host". The ssh transport shells out to your system's <code>ssh</code> binary, which prints its own wording:</p>
+<pre><code>$ git clone git@no-such-host.invalid:x/y.git
+Cloning into 'y'...
+ssh: Could not resolve hostname no-such-host.invalid: Name or service not known
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.</code></pre>
+<p>Exit code: <code>128</code>. Git's own line ("Please make sure you have the correct access rights...") is misleading here &mdash; it is git's generic fallback message for any ssh failure, not a real permissions problem. The real cause is one line above it: <code>ssh: Could not resolve hostname</code>. Running the same hostname through plain <code>ssh</code> confirms it's an ssh-level DNS failure, not a git-specific one:</p>
+<pre><code>$ ssh git@no-such-host.invalid
+ssh: Could not resolve hostname no-such-host.invalid: Name or service not known</code></pre>
+<p>For contrast, ssh to a resolvable host with a closed port gives yet another wording, confirming resolution succeeded:</p>
+<pre><code>$ git clone ssh://git@127.0.0.1:1/x/y.git
+ssh: connect to host 127.0.0.1 port 1: Connection refused
+fatal: Could not read from remote repository.</code></pre>
+
+<h2>4. Isolate git-specific vs. system-wide DNS failure</h2>
+<p>Before changing any git setting, check whether DNS is broken system-wide or only inside git. Run these against the same hostname:</p>
+<table>
+<tr><th>Tool</th><th>Command</th><th>Result on the bad host, measured</th></tr>
+<tr><td>curl</td><td><code>curl -sS https://no-such-host.invalid/</code></td><td><code>curl: (6) Could not resolve host: no-such-host.invalid</code> (exit 6)</td></tr>
+<tr><td>ping</td><td><code>ping -c1 no-such-host.invalid</code></td><td><code>ping: no-such-host.invalid: Name or service not known</code> (exit 2)</td></tr>
+<tr><td>getent</td><td><code>getent hosts no-such-host.invalid</code></td><td>no output, exit 2</td></tr>
+</table>
+<p>All three fail the same way for a genuinely unresolvable name &mdash; that means it's a system/network DNS problem, not git. We confirmed the reverse too: <code>getent hosts github.com</code> returned an IP and <code>curl -sS -o /dev/null -w '%{http_code}\n' https://github.com/</code> returned <code>200</code> on this box, so the resolver itself works fine; only the deliberately-invalid name fails. If <code>curl</code>/<code>ping</code> resolve a host fine but git still says "Could not resolve host" for that exact same host, suspect a git-specific proxy or config override (section 5), not system DNS.</p>
+<p>Also check <code>/etc/resolv.conf</code> for a sane <code>nameserver</code> line (on this box: <code>nameserver 192.168.1.1</code> and <code>nameserver 1.1.1.1</code>). An empty or unreachable resolv.conf breaks every tool, not just git.</p>
+
+<h2>5. Proxies: a different error, and the most common real cause</h2>
+<p>If a proxy variable or <code>http.proxy</code> config points at a proxy host that itself doesn't resolve, git's message changes to name the proxy, not the git remote:</p>
+<pre><code>$ https_proxy="http://no-such-proxy.invalid:8080" git clone https://github.com/git/git.git
+fatal: unable to access 'https://github.com/git/git.git/': Could not resolve proxy: no-such-proxy.invalid</code></pre>
+<p>We reproduced the same "Could not resolve proxy" wording whether the bad proxy came from the <code>https_proxy</code> environment variable or from <code>git -c http.proxy=...</code> / <code>git config --global http.proxy</code>. Note the different word: <strong>proxy</strong> vs. <strong>host</strong>. If you see "Could not resolve proxy", the fix is the proxy setting, not the remote URL.</p>
+<p>When the proxy host resolves but refuses the connection, the message reverts to the same "Failed to connect" / "Could not connect to server" wording as section 2 &mdash; we reproduced this by pointing <code>http_proxy</code> at a closed local port.</p>
+<p>Per widely reported experience (not measured on this box, since we have no such network to test against): the single most common real-world trigger for "Could not resolve host" is a corporate VPN or proxy that intercepts or blocks DNS for git's traffic while a browser on the same machine resolves fine via a different path (e.g. a browser PAC file or built-in proxy-aware resolver that git does not use). If curl and ping also fail from the same shell, it's not git-specific &mdash; it's the network policy, and the usual fix is configuring <code>http.proxy</code>/<code>https_proxy</code> to the VPN's required proxy, or asking network/IT for the correct proxy or DNS settings.</p>
+
+<h2>6. ~/.ssh/config Host aliases, tested</h2>
+<p>If the hostname in your remote URL is wrong or blocked, but you have a different route to the real host, an ssh <code>Host</code> alias can route around it without editing the remote URL. We tested this by pointing an alias at a known-good host:</p>
+<pre><code># ~/.ssh/config
+Host ghalias
+    HostName github.com
+    User git</code></pre>
+<pre><code>$ git clone git@ghalias:git/git.git
+Cloning into 'git'...
+Host key verification failed.
+fatal: Could not read from remote repository.</code></pre>
+<p>Resolution succeeded this time &mdash; there is no "Could not resolve hostname" line. It got all the way to SSH host-key verification (which failed only because the test's isolated <code>known_hosts</code> was empty, an unrelated setup detail). That confirms the alias correctly resolved <code>ghalias</code> &rarr; <code>github.com</code> before ssh even opened a connection.</p>
+
+<h2>7. Fix checklist</h2>
+<ul>
+<li>Re-read the exact error. "Could not resolve <strong>host</strong>" = DNS for the remote. "Could not resolve <strong>proxy</strong>" = DNS for your proxy setting. "Could not connect" / "Connection refused" = DNS was fine, nothing is listening.</li>
+<li>Check the URL itself: a typo'd hostname resolves to nothing, every time. <code>git remote -v</code> to see what's actually configured.</li>
+<li>Isolate git vs. system: run <code>curl -sS https://&lt;same-host&gt;/</code> and <code>ping -c1 &lt;same-host&gt;</code>. If those also fail, it's system/network DNS, not git &mdash; check <code>/etc/resolv.conf</code> and your network connection.</li>
+<li>If curl/ping work but git doesn't, check for a git-specific override: <code>git config --get http.proxy</code>, <code>git config --get --global http.proxy</code>, and the <code>http_proxy</code>/<code>https_proxy</code>/<code>all_proxy</code> environment variables. Unset or fix a bad one with <code>git config --global --unset http.proxy</code>.</li>
+<li>For ssh remotes, test the transport directly: <code>ssh -T git@&lt;host&gt;</code>. If that alone says "Could not resolve hostname", it's ssh's resolver (same system DNS), not git.</li>
+<li>Still stuck behind a corporate VPN/proxy that only your browser can resolve through? Add a <code>Host</code> alias or <code>ProxyCommand</code> in <code>~/.ssh/config</code>, or set <code>http.proxy</code> to the proxy IT gives you, so git uses the same path your browser does.</li>
+</ul>
+<p>If the remote resolves and connects but git still refuses the request, that's a different problem &mdash; see <a href="/tools/dns-lookup/">DNS Lookup</a> to inspect records directly, or <a href="/tools/http-headers/">HTTP Headers</a> to check what a URL actually returns once it is reachable.</p>
+<aside class="cta"><strong>Check the status and headers a URL actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is &quot;Could not resolve host&quot; a git bug?</summary><p>No. It means DNS lookup for the hostname in your remote URL failed before git tried to connect. We reproduced the exact message, &#x27;fatal: unable to access ...: Could not resolve host: X&#x27;, with a deliberately unresolvable hostname on git 2.47.3.</p></details>
+<details><summary>What&#x27;s the difference between &quot;Could not resolve host&quot; and &quot;Connection refused&quot;?</summary><p>Resolve-host means the name never turned into an IP address. Connection refused (or &#x27;Could not connect to server&#x27;) means the name resolved fine but nothing answered on that IP/port. We measured both: the wording and the exit code (128 either way) differ only in the message text, so read the message carefully.</p></details>
+<details><summary>Why does git over SSH give a different error than git over HTTPS?</summary><p>HTTPS uses git&#x27;s own built-in http client, which prints &#x27;Could not resolve host: X&#x27;. SSH remotes shell out to your system ssh binary, which prints its own &#x27;ssh: Could not resolve hostname X: Name or service not known&#x27;, followed by git&#x27;s generic &#x27;Could not read from remote repository&#x27; fallback. We measured both wordings on the same unresolvable host.</p></details>
+<details><summary>How do I tell if it&#x27;s git&#x27;s problem or my network&#x27;s?</summary><p>Run curl and ping against the exact same hostname. We measured all three failing identically on a bad host (curl: &#x27;Could not resolve host&#x27;, exit 6; ping: &#x27;Name or service not known&#x27;, exit 2) and all three succeeding on a real host. If curl/ping work but git fails, suspect a git-specific proxy setting, not system DNS.</p></details>
+<details><summary>Can a bad proxy setting cause this error?</summary><p>Yes, but with different wording: &#x27;Could not resolve proxy: X&#x27; instead of &#x27;Could not resolve host: X&#x27;. We reproduced this by setting https_proxy and http.proxy to an unresolvable proxy host. If you see &#x27;proxy&#x27; in the message, fix http.proxy / https_proxy, not the remote URL.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with git 2.47.3, curl 8.14.1, OpenSSH_10.0p2 (OpenSSL 3.5.7) and iputils ping 20240905 on Debian 13. All clone/fetch commands run against no-such-host.invalid (an unresolvable name) and 127.0.0.1 on a closed port (connection refused, for contrast). The corporate VPN/proxy claim in section 5 is per common reports, not measured here. PlainHeaders is our extension; git, curl, ssh, ping and ping are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

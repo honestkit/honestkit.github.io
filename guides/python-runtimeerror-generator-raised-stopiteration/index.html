@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RuntimeError: generator raised StopIteration (Tested Fix)</title>
+<meta name="description" content="We measured Python&#x27;s RuntimeError: generator raised StopIteration (PEP 479): bare next() in generators, the fixes, and how map() silently truncates instead.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-runtimeerror-generator-raised-stopiteration/">
+<meta property="og:title" content="RuntimeError: generator raised StopIteration (Tested Fix)">
+<meta property="og:description" content="We measured Python&#x27;s RuntimeError: generator raised StopIteration (PEP 479): bare next() in generators, the fixes, and how map() silently truncates instead.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-runtimeerror-generator-raised-stopiteration/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does RuntimeError: generator raised StopIteration mean?", "acceptedAnswer": {"@type": "Answer", "text": "A StopIteration escaped from inside a generator, usually from a bare next() on an exhausted iterator. Since Python 3.7 (PEP 479) that becomes a RuntimeError; we measured it with the original StopIteration as __cause__."}}, {"@type": "Question", "name": "How do I fix generator raised StopIteration?", "acceptedAnswer": {"@type": "Answer", "text": "Use next(it, default) or wrap next() in try/except StopIteration and return. Replace raise StopIteration with return. We measured both fixes on Python 3.13.5."}}, {"@type": "Question", "name": "Why did my code work in Python 3.6 but not 3.7+?", "acceptedAnswer": {"@type": "Answer", "text": "Before 3.7, a StopIteration inside a generator silently ended it. PEP 479 made that an error by default in 3.7; we measured old-style pairing code raising RuntimeError on 3.13."}}, {"@type": "Question", "name": "Can StopIteration cause silent data loss?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, outside generators. We measured a function raising StopIteration inside map() ending the iteration early: three rows in, one result out, no error."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>RuntimeError: generator raised StopIteration (tested)</h1>
+<p class="lead"><code>RuntimeError: generator raised StopIteration</code> means a <code>StopIteration</code>, almost always from a bare <code>next()</code>, escaped from inside a generator. We measured why that's an error since Python 3.7, the fixes, and the related case where nothing is raised at all.</p>
+<h2 id="what">1. What triggers it</h2>
+<pre><code>def first_words(lines):
+    for line in lines:
+        it = iter(line.split())
+        yield next(it)              # empty line -&gt; StopIteration inside a generator
+
+try:
+    print(list(first_words([&quot;hello world&quot;, &quot;&quot;, &quot;bye&quot;])))
+except RuntimeError as e:
+    print(type(e).__name__ + &quot;:&quot;, e)
+    print(&quot;cause:&quot;, repr(e.__cause__))</code></pre>
+<p>Output:</p>
+<pre><code>RuntimeError: generator raised StopIteration
+cause: StopIteration()</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> a bare <code>next()</code> inside a generator ran out (here, on an empty line) and the <code>StopIteration</code> escaped from the generator body. Since Python 3.7 (PEP 479), Python turns that into <code>RuntimeError: generator raised StopIteration</code>; the original <code>StopIteration</code> is kept as <code>__cause__</code>, so the traceback shows the <code>next()</code> line under "The above exception was the direct cause".</p>
+
+<h2 id="old-code">2. Old code that used next() to end the generator</h2>
+<pre><code>def pairs(it):
+    it = iter(it)
+    while True:
+        a = next(it)                # pre-3.7 this quietly ended the generator
+        b = next(it)
+        yield a, b
+
+try:
+    print(list(pairs([1, 2, 3, 4])))
+except RuntimeError as e:
+    print(&quot;RuntimeError:&quot;, e)
+
+def pairs_fixed(it):
+    it = iter(it)
+    while True:
+        try:
+            a = next(it)
+            b = next(it)
+        except StopIteration:
+            return                  # end the generator explicitly
+        yield a, b
+
+print(list(pairs_fixed([1, 2, 3, 4])))
+print(list(pairs_fixed([1, 2, 3, 4, 5])))   # odd item dropped
+print(list(zip(*[iter([1, 2, 3, 4, 5])] * 2)))</code></pre>
+<p>Output:</p>
+<pre><code>RuntimeError: generator raised StopIteration
+[(1, 2), (3, 4)]
+[(1, 2), (3, 4)]
+[(1, 2), (3, 4)]</code></pre>
+<p><strong>Measured:</strong> before 3.7 a <code>StopIteration</code> from <code>next()</code> quietly ended the generator, and a lot of older code (and Stack Overflow answers) relied on that. Now you have to end it yourself: catch <code>StopIteration</code> and <code>return</code>. For this particular job, <code>zip(*[iter(xs)] * 2)</code> or <code>itertools.batched(xs, 2)</code> (3.12+) do it without a generator; our fixed version and <code>zip</code> both drop the odd last item, while <code>batched</code> keeps it as <code>(5,)</code> (checked separately).</p>
+
+<h2 id="fix">3. Fix: next() with a default, and return instead of raise</h2>
+<pre><code>def first_words(lines):
+    for line in lines:
+        w = next(iter(line.split()), None)   # default instead of StopIteration
+        if w is not None:
+            yield w
+
+print(list(first_words([&quot;hello world&quot;, &quot;&quot;, &quot;bye&quot;])))
+
+def gen():
+    yield 1
+    raise StopIteration         # never do this; use return
+try:
+    print(list(gen()))
+except RuntimeError as e:
+    print(&quot;raise StopIteration:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>[&#x27;hello&#x27;, &#x27;bye&#x27;]
+raise StopIteration: generator raised StopIteration</code></pre>
+<p><code>next(iterator, None)</code> returns the default instead of raising, which is usually what you meant. To finish a generator early, write <code>return</code>; <code>raise StopIteration</code> inside a generator is now always the RuntimeError above.</p>
+
+<h2 id="map">4. Outside generators: map() silently truncates</h2>
+<pre><code>def first(xs):
+    return next(iter(xs))           # StopIteration on an empty list
+
+# In a plain call it escapes as StopIteration:
+try:
+    first([])
+except StopIteration as e:
+    print(&quot;plain call:&quot;, repr(e))
+
+# Inside map()/filter(), the SAME exception silently ends the iteration:
+rows = [[1], [], [3]]
+print(&quot;map:&quot;, list(map(first, rows)))
+# A generator expression converts it to RuntimeError instead:
+try:
+    print(list(first(r) for r in rows))
+except RuntimeError as e:
+    print(&quot;genexp:&quot;, e)
+# A list comprehension lets the StopIteration escape:
+try:
+    print([first(r) for r in rows])
+except StopIteration:
+    print(&quot;listcomp: StopIteration escaped&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>plain call: StopIteration()
+map: [1]
+genexp: generator raised StopIteration
+listcomp: StopIteration escaped</code></pre>
+<p><strong>Measured:</strong> PEP 479 only covers generators (and generator expressions). The same <code>StopIteration</code> raised by a function called from <code>map()</code> or <code>filter()</code> just ends the iteration: we got <code>[1]</code> from three rows with no error, losing the third row. A list comprehension lets it escape as a plain <code>StopIteration</code>. If a helper calls <code>next()</code>, give it a default or catch <code>StopIteration</code> inside the helper.</p>
+
+<aside class="cta"><strong>Debugging a Python HTTP script? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does RuntimeError: generator raised StopIteration mean?</summary><p>A StopIteration escaped from inside a generator, usually from a bare next() on an exhausted iterator. Since Python 3.7 (PEP 479) that becomes a RuntimeError; we measured it with the original StopIteration as __cause__.</p></details>
+<details><summary>How do I fix generator raised StopIteration?</summary><p>Use next(it, default) or wrap next() in try/except StopIteration and return. Replace raise StopIteration with return. We measured both fixes on Python 3.13.5.</p></details>
+<details><summary>Why did my code work in Python 3.6 but not 3.7+?</summary><p>Before 3.7, a StopIteration inside a generator silently ended it. PEP 479 made that an error by default in 3.7; we measured old-style pairing code raising RuntimeError on 3.13.</p></details>
+<details><summary>Can StopIteration cause silent data loss?</summary><p>Yes, outside generators. We measured a function raising StopIteration inside map() ending the iteration early: three rows in, one result out, no error.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: bare next() in a generator, old-style pairing code, the next(it, None) and return fixes, raise StopIteration in a generator, and the same StopIteration under map(), a generator expression and a list comprehension. Every block was run verbatim and its output pasted from that run. Pre-3.7 behaviour is from PEP 479, not re-tested. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

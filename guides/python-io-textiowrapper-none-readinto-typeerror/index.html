@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TextIOWrapper Crashes on readinto()&#x27;s None Signal (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: a non-blocking raw stream&#x27;s None read result works fine via BufferedReader, but TextIOWrapper.read() on it raises TypeError.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-io-textiowrapper-none-readinto-typeerror/">
+<meta property="og:title" content="TextIOWrapper Crashes on readinto()&#x27;s None Signal (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: a non-blocking raw stream&#x27;s None read result works fine via BufferedReader, but TextIOWrapper.read() on it raises TypeError.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-io-textiowrapper-none-readinto-typeerror/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does TextIOWrapper.read() raise TypeError instead of returning None?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that TextIOWrapper's internal chunk-reading logic assumes the underlying buffered read always returns bytes and tries to concatenate the result onto its internal buffer. When that result is None -- the documented signal a non-blocking raw stream uses for 'no data available yet' -- the concatenation itself is what raises TypeError: can't concat NoneType to bytes."}}, {"@type": "Question", "name": "Does BufferedReader have the same problem as TextIOWrapper?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured BufferedReader.read() correctly returning None when its underlying raw stream's readinto() returns None -- it's specifically the TextIOWrapper layer on top that doesn't check for None before using the result."}}, {"@type": "Question", "name": "Is a raw stream returning None from readinto() a bug?", "acceptedAnswer": {"@type": "Answer", "text": "No -- it's documented behavior for non-blocking I/O (e.g. a socket or pipe opened without blocking) to mean no data is currently available, as distinct from returning 0, which means real end-of-file. The crash is in how TextIOWrapper handles that documented signal, not in the raw stream returning it."}}, {"@type": "Question", "name": "How do I safely read text from a non-blocking stream?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that checking for None at the BufferedReader (binary) layer before any text decoding happens avoids the crash -- retry the binary read until it returns real bytes or real EOF, and only then hand that data to a TextIOWrapper or decode it directly."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>io.TextIOWrapper Crashes on a Non-Blocking Raw Stream&#x27;s None (tested)</h1>
+<p class="lead">Python's <code>io</code> module documents that a raw stream in non-blocking mode can return <code>None</code> from <code>read()</code>/<code>readinto()</code> to mean "no data available right now" -- distinct from returning <code>0</code>/<code>b''</code>, which means real end-of-file. <code>io.BufferedReader</code> honors that contract: calling <code>.read()</code> on a buffered wrapper around such a raw stream correctly passes the <code>None</code> straight through. Stack a <code>io.TextIOWrapper</code> on top of that same <code>BufferedReader</code> -- the layer that gives you <code>open(..., mode="r")</code>'s text-mode <code>.read()</code> -- and the <code>None</code> signal is not handled at all: it crashes with a <code>TypeError</code> instead of returning <code>None</code> or raising something that explains what happened.</p>
+<h2 id="repro1">1. A raw stream that signals "no data yet" via None</h2>
+<pre><code>import io
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self):
+        self.calls = 0
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None   # documented non-blocking "not ready" signal
+        return 0           # real EOF on the next call
+
+raw = FlakyRaw()</code></pre>
+<p>This mirrors how a real non-blocking socket or pipe behaves: the first read attempt has nothing ready yet (<code>None</code>), a later one hits real end-of-file (<code>0</code>).</p>
+
+<h2 id="repro2">2. BufferedReader passes the None straight through</h2>
+<pre><code>buffered = io.BufferedReader(FlakyRaw())
+print(buffered.read())</code></pre>
+<pre><code>None</code></pre>
+<p><strong>Measured:</strong> <code>BufferedReader.read()</code> correctly returns <code>None</code> rather than crashing or blocking -- this is the documented, intended behavior for a non-blocking raw stream with no data currently available.</p>
+
+<h2 id="repro3">3. TextIOWrapper on the exact same stream crashes</h2>
+<pre><code>raw2 = FlakyRaw()
+text = io.TextIOWrapper(io.BufferedReader(raw2), encoding="utf-8")
+try:
+    text.read()
+except TypeError as e:
+    print("text.read() ->", e)</code></pre>
+<pre><code>text.read() -> can't concat NoneType to bytes</code></pre>
+<p><strong>Measured:</strong> wrapping the identical <code>BufferedReader</code>/raw-stream pair in <code>TextIOWrapper</code> and calling the text-mode <code>.read()</code> raises <code>TypeError</code> immediately, on the very first <code>readinto()</code> call -- it never reaches the second call that would return real EOF. The error message gives no hint that a non-blocking <code>None</code> signal is the cause; it reads like an internal bug, not an actionable error about stream readiness.</p>
+
+<h2 id="repro4">4. The fix: don't feed a non-blocking raw stream straight into TextIOWrapper</h2>
+<pre><code>raw3 = FlakyRaw()
+buffered3 = io.BufferedReader(raw3)
+chunk = buffered3.read()
+if chunk is None:
+    print("not ready yet -- retry later, don't wrap in TextIOWrapper until data exists")
+else:
+    text3 = io.TextIOWrapper(io.BytesIO(chunk), encoding="utf-8")
+    print(text3.read())</code></pre>
+<pre><code>not ready yet -- retry later, don't wrap in TextIOWrapper until data exists</code></pre>
+<p><strong>Measured:</strong> checking for <code>None</code> at the <code>BufferedReader</code> layer -- before any <code>TextIOWrapper</code> is involved -- avoids the crash entirely. There's no public way to make <code>TextIOWrapper</code> itself tolerate a non-blocking raw stream; the non-blocking read has to be handled at the binary layer first.</p>
+<aside class="cta"><strong>Wrapping a custom non-blocking RawIOBase in TextIOWrapper for text-mode reads? Check what happens the moment readinto() returns None -- BufferedReader handles it, TextIOWrapper doesn&#x27;t:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does TextIOWrapper.read() raise TypeError instead of returning None?</summary><p>We measured that TextIOWrapper&#x27;s internal chunk-reading logic assumes the underlying buffered read always returns bytes and tries to concatenate the result onto its internal buffer. When that result is None -- the documented signal a non-blocking raw stream uses for &#x27;no data available yet&#x27; -- the concatenation itself is what raises TypeError: can&#x27;t concat NoneType to bytes.</p></details>
+<details><summary>Does BufferedReader have the same problem as TextIOWrapper?</summary><p>No. We measured BufferedReader.read() correctly returning None when its underlying raw stream&#x27;s readinto() returns None -- it&#x27;s specifically the TextIOWrapper layer on top that doesn&#x27;t check for None before using the result.</p></details>
+<details><summary>Is a raw stream returning None from readinto() a bug?</summary><p>No -- it&#x27;s documented behavior for non-blocking I/O (e.g. a socket or pipe opened without blocking) to mean no data is currently available, as distinct from returning 0, which means real end-of-file. The crash is in how TextIOWrapper handles that documented signal, not in the raw stream returning it.</p></details>
+<details><summary>How do I safely read text from a non-blocking stream?</summary><p>We measured that checking for None at the BufferedReader (binary) layer before any text decoding happens avoids the crash -- retry the binary read until it returns real bytes or real EOF, and only then hand that data to a TextIOWrapper or decode it directly.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in io module: subclassed io.RawIOBase with a readinto() that returns None once (the documented non-blocking &#x27;no data available yet&#x27; signal), wrapped it in io.BufferedReader alone (clean None result) versus io.TextIOWrapper on top of that same BufferedReader (TypeError). PlainHeaders is our extension; Python&#x27;s io module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

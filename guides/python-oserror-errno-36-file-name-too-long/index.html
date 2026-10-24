@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OSError: [Errno 36] File name too long (Python, Tested)</title>
+<meta name="description" content="Python [Errno 36] File name too long: the 255-byte NAME_MAX (bytes, not chars) and 4096-byte PATH_MAX limits. Tested fix: truncate by bytes plus a hash.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-oserror-errno-36-file-name-too-long/">
+<meta property="og:title" content="OSError: [Errno 36] File name too long (Python, Tested)">
+<meta property="og:description" content="Python [Errno 36] File name too long: the 255-byte NAME_MAX (bytes, not chars) and 4096-byte PATH_MAX limits. Tested fix: truncate by bytes plus a hash.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-oserror-errno-36-file-name-too-long/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the maximum file name length on Linux?", "acceptedAnswer": {"@type": "Answer", "text": "255 bytes per component on ext4 and most Linux filesystems, and 4096 bytes for the whole path. os.pathconf('.', 'PC_NAME_MAX') and 'PC_PATH_MAX' report them."}}, {"@type": "Question", "name": "Why does a 130-character name fail?", "acceptedAnswer": {"@type": "Answer", "text": "The limit counts UTF-8 bytes. Accented letters take 2 bytes and CJK characters 3, so 128 '\u00e9' characters are already 256 bytes."}}, {"@type": "Question", "name": "How do I catch Errno 36?", "acceptedAnswer": {"@type": "Answer", "text": "except OSError as e: if e.errno == errno.ENAMETOOLONG. There is no dedicated subclass."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>OSError: [Errno 36] File name too long in Python (tested)</h1>
+<p class="lead"><code>OSError: [Errno 36] File name too long</code> (<code>ENAMETOOLONG</code>) means one path component is over 255 <em>bytes</em> or the whole path is over 4096 bytes on Linux. Non-ASCII names hit the limit sooner because UTF-8 uses several bytes per character. Shorten the name by bytes and add a hash to keep it unique.</p>
+<h2 id="test">1. The error</h2>
+<pre><code>name = &quot;report_&quot; + &quot;x&quot; * 250 + &quot;.csv&quot;
+print(len(name))
+open(name, &quot;w&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>261
+Traceback (most recent call last):
+  File &quot;/tmp/ln372/b1.py&quot;, line 3, in &lt;module&gt;
+    open(name, &quot;w&quot;)
+    ~~~~^^^^^^^^^^^
+OSError: [Errno 36] File name too long: &#x27;report_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.csv&#x27;</code></pre>
+<p>The file name is 261 characters. Linux filesystems such as ext4 allow at most 255 <strong>bytes</strong> per path component (<code>NAME_MAX</code>), so <code>open()</code> fails with <code>ENAMETOOLONG</code>. This usually happens when a file name is built from user input, a URL, a page title or a long list of parameters.</p>
+<h2 id="bytes">2. The limit is 255 bytes, not 255 characters</h2>
+<pre><code>import os
+print(os.pathconf(&quot;.&quot;, &quot;PC_NAME_MAX&quot;), os.pathconf(&quot;.&quot;, &quot;PC_PATH_MAX&quot;))
+ok = &quot;a&quot; * 255
+open(ok, &quot;w&quot;).close()
+print(&quot;255 bytes: ok&quot;)
+os.remove(ok)
+# 128 characters, but each &quot;é&quot; is 2 bytes in UTF-8
+name = &quot;é&quot; * 128
+print(len(name), &quot;chars,&quot;, len(name.encode()), &quot;bytes&quot;)
+try:
+    open(name, &quot;w&quot;)
+except OSError as e:
+    print(type(e).__name__, e.errno, e.strerror)</code></pre>
+<p>Output:</p>
+<pre><code>255 4096
+255 bytes: ok
+128 chars, 256 bytes
+OSError 36 File name too long</code></pre>
+<p>Exactly 255 ASCII bytes works. But 128 characters of <code>é</code> is 256 bytes in UTF-8 and fails, so a <code>len(name) &lt;= 255</code> check is not enough for non-ASCII names (accents, CJK, emoji). Check <code>len(name.encode())</code> instead. <code>os.pathconf(".", "PC_NAME_MAX")</code> reports the limit for the filesystem you are on.</p>
+<h2 id="path">3. The whole path is too long (PATH_MAX 4096)</h2>
+<pre><code>import os
+# each component is only 200 bytes, but the whole path is &gt; 4096 (PATH_MAX)
+path = &quot;/&quot;.join([&quot;d&quot; * 200] * 21) + &quot;/f.txt&quot;
+print(len(path))
+try:
+    os.makedirs(os.path.dirname(path))
+except OSError as e:
+    print(type(e).__name__, e.errno, e.strerror, &quot;| len(filename) =&quot;, len(e.filename))
+depth = 0
+p = &quot;d&quot; * 200
+while os.path.isdir(p):
+    depth += 1
+    p = os.path.join(p, &quot;d&quot; * 200)
+print(&quot;directories created before the failure:&quot;, depth)</code></pre>
+<p>Output:</p>
+<pre><code>4226
+OSError 36 File name too long | len(filename) = 4220
+directories created before the failure: 20</code></pre>
+<p>Each component here is only 200 bytes, but the full path passed to the kernel may not exceed 4096 bytes (<code>PC_PATH_MAX</code>). <code>os.makedirs</code> created 20 levels and then failed on the 21st, so it leaves a partial tree behind. Deeply nested generated directories (cache keys, mirrored URLs) are the usual cause.</p>
+<h2 id="fix">4. Fix: shorten the name by bytes and add a hash</h2>
+<pre><code>import hashlib, os
+
+def safe_filename(name, max_bytes=255):
+    &quot;&quot;&quot;Shorten name to fit NAME_MAX bytes, keeping the extension and a hash.&quot;&quot;&quot;
+    if len(name.encode()) &lt;= max_bytes:
+        return name
+    stem, ext = os.path.splitext(name)
+    digest = hashlib.sha1(name.encode()).hexdigest()[:10]
+    budget = max_bytes - len(ext.encode()) - len(digest) - 1
+    short = stem.encode()[:budget].decode(&quot;utf-8&quot;, &quot;ignore&quot;)
+    return f&quot;{short}-{digest}{ext}&quot;
+
+for n in [&quot;report.csv&quot;, &quot;report_&quot; + &quot;x&quot; * 250 + &quot;.csv&quot;, &quot;é&quot; * 200 + &quot;.txt&quot;]:
+    s = safe_filename(n)
+    print(len(n.encode()), &quot;-&gt;&quot;, len(s.encode()), s[-20:])
+    open(s, &quot;w&quot;).close(); os.remove(s)</code></pre>
+<p>Output:</p>
+<pre><code>10 -&gt; 10 report.csv
+261 -&gt; 255 xxxxx-5c000bdbbb.csv
+404 -&gt; 255 ééééé-c8a0a30f55.txt</code></pre>
+<p>Truncate the UTF-8 bytes, decode with <code>"ignore"</code> so a multi-byte character is not cut in half, keep the extension, and append a short hash of the full name so two long names that share a prefix do not collide. If you need the original name, store it in a sidecar file or database instead of in the file name.</p>
+<h2 id="catch">5. Catch it precisely</h2>
+<pre><code>import errno
+try:
+    open(&quot;y&quot; * 300, &quot;w&quot;)
+except OSError as e:
+    print(type(e).__name__, e.errno == errno.ENAMETOOLONG, errno.errorcode[e.errno])</code></pre>
+<p>Output:</p>
+<pre><code>OSError True ENAMETOOLONG</code></pre>
+<p>It is a plain <code>OSError</code> with no dedicated subclass; check <code>e.errno == errno.ENAMETOOLONG</code>.</p>
+<p>Related: <a href="/guides/python-oserror-errno-22-invalid-argument/">[Errno 22] Invalid argument</a> · <a href="/guides/python-filenotfounderror-errno-2-no-such-file-or-directory/">[Errno 2] No such file or directory</a> · <a href="/guides/python-oserror-errno-39-directory-not-empty/">[Errno 39] Directory not empty</a>.</p>
+
+<aside class="cta"><strong>Collecting data from web tables? Copy them as CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the maximum file name length on Linux?</summary><p>255 bytes per component on ext4 and most Linux filesystems, and 4096 bytes for the whole path. os.pathconf(&#x27;.&#x27;, &#x27;PC_NAME_MAX&#x27;) and &#x27;PC_PATH_MAX&#x27; report them.</p></details>
+<details><summary>Why does a 130-character name fail?</summary><p>The limit counts UTF-8 bytes. Accented letters take 2 bytes and CJK characters 3, so 128 &#x27;é&#x27; characters are already 256 bytes.</p></details>
+<details><summary>How do I catch Errno 36?</summary><p>except OSError as e: if e.errno == errno.ENAMETOOLONG. There is no dedicated subclass.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Python 3.13.5 on Linux (Debian 13, ext4). Each block was run verbatim and the output pasted unedited. PlainTables is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

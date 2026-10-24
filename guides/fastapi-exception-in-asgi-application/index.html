@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FastAPI &quot;ERROR: Exception in ASGI application&quot;: How to Fix</title>
+<meta name="description" content="uvicorn&#x27;s Exception in ASGI application tested on FastAPI 0.161: find the real error, ResponseValidationError, non-JSON return values, and a JSON 500 handler.">
+<link rel="canonical" href="https://honestkit.github.io/guides/fastapi-exception-in-asgi-application/">
+<meta property="og:title" content="FastAPI &quot;ERROR: Exception in ASGI application&quot;: How to Fix">
+<meta property="og:description" content="uvicorn&#x27;s Exception in ASGI application tested on FastAPI 0.161: find the real error, ResponseValidationError, non-JSON return values, and a JSON 500 handler.">
+<meta property="og:url" content="https://honestkit.github.io/guides/fastapi-exception-in-asgi-application/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Exception in ASGI application mean?", "acceptedAnswer": {"@type": "Answer", "text": "uvicorn caught an unhandled exception from your app and returned a 500. The real error is the last line of the traceback in the server log."}}, {"@type": "Question", "name": "What is ResponseValidationError in FastAPI?", "acceptedAnswer": {"@type": "Answer", "text": "Your endpoint's return value does not match its response_model; the loc, e.g. ('response', 'name'), shows the missing or wrong field."}}, {"@type": "Question", "name": "How do I return JSON for FastAPI 500 errors?", "acceptedAnswer": {"@type": "Answer", "text": "Register @app.exception_handler(Exception) that logs the exception and returns JSONResponse(..., status_code=500)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>FastAPI / uvicorn Exception in ASGI application (tested)</h1>
+<p class="lead"><code>ERROR: Exception in ASGI application</code> is uvicorn reporting that an exception escaped your FastAPI app; the client just gets a plain-text 500. The cause is at the <strong>bottom</strong> of the traceback: usually a bug in the endpoint, a <code>ResponseValidationError</code>, or a return value that can't be encoded as JSON.</p>
+<h2 id="repro">1. Reproduce it: three ways to get the 500</h2>
+<p>The app (<code>app.py</code>), run with <code>python -m uvicorn app:app</code>:</p>
+<pre><code>from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+app = FastAPI()
+class Out(BaseModel):
+    id: int
+    name: str
+@app.get(&quot;/boom&quot;)
+def boom():
+    return {&quot;ratio&quot;: 1 / 0}
+@app.get(&quot;/http&quot;)
+def http():
+    raise HTTPException(status_code=404, detail=&quot;no such item&quot;)
+@app.get(&quot;/model&quot;, response_model=Out)
+def model():
+    return {&quot;id&quot;: 1}            # &#x27;name&#x27; missing from the response
+@app.get(&quot;/obj&quot;)
+def obj():
+    return object()</code></pre>
+<p>A client hitting each route:</p>
+<pre><code>import urllib.request, urllib.error
+for path in (&quot;/boom&quot;, &quot;/http&quot;, &quot;/model&quot;, &quot;/obj&quot;):
+    try:
+        r = urllib.request.urlopen(&quot;http://127.0.0.1:8000&quot; + path)
+        print(path, r.status, r.read().decode())
+    except urllib.error.HTTPError as e:
+        print(path, e.code, e.headers[&quot;content-type&quot;], e.read().decode())</code></pre>
+<p>Output:</p>
+<pre><code>/boom 500 text/plain; charset=utf-8 Internal Server Error
+/http 404 application/json {&quot;detail&quot;:&quot;no such item&quot;}
+/model 500 text/plain; charset=utf-8 Internal Server Error
+/obj 500 text/plain; charset=utf-8 Internal Server Error</code></pre>
+<p>The client only ever sees a plain-text <code>Internal Server Error</code>. The real error is in the <strong>server log</strong>. Here it is with the ~60 lines of uvicorn/Starlette/FastAPI frames in each traceback cut out (everything else is verbatim):</p>
+<pre><code>INFO:     ... &quot;GET /boom HTTP/1.1&quot; 500 Internal Server Error
+ERROR:    Exception in ASGI application
+Traceback (most recent call last):
+  ... (about 60 framework lines) ...
+  File &quot;/w/app.py&quot;, line 9, in boom
+    return {&quot;ratio&quot;: 1 / 0}
+                     ~~^~~
+ZeroDivisionError: division by zero
+INFO:     ... &quot;GET /http HTTP/1.1&quot; 404 Not Found
+INFO:     ... &quot;GET /model HTTP/1.1&quot; 500 Internal Server Error
+ERROR:    Exception in ASGI application
+Traceback (most recent call last):
+  ... (about 60 framework lines) ...
+fastapi.exceptions.ResponseValidationError: 1 validation error:
+  {&#x27;type&#x27;: &#x27;missing&#x27;, &#x27;loc&#x27;: (&#x27;response&#x27;, &#x27;name&#x27;), &#x27;msg&#x27;: &#x27;Field required&#x27;, &#x27;input&#x27;: {&#x27;id&#x27;: 1}}
+  File &quot;/w/app.py&quot;, line 13, in model
+INFO:     ... &quot;GET /obj HTTP/1.1&quot; 500 Internal Server Error
+ERROR:    Exception in ASGI application
+Traceback (most recent call last):
+  ... (about 60 framework lines) ...
+    return jsonable_encoder(response_content)
+  File &quot;/usr/local/lib/python3.14/site-packages/fastapi/encoders.py&quot;, line 355, in jsonable_encoder
+    raise ValueError(errors) from e
+ValueError: [TypeError(&quot;&#x27;object&#x27; object is not iterable&quot;), TypeError(&#x27;vars() argument must have __dict__ attribute&#x27;)]</code></pre>
+<p>"Exception in ASGI application" is just uvicorn saying an exception escaped your app. <strong>Ignore the framework frames and read the last line</strong> (the exception) and the last <code>File</code> line that points into your own code. The three cases above are the common ones:</p>
+<ul><li><strong>A bug in the endpoint</strong> (here <code>ZeroDivisionError</code>): fix the code; the frame just above the last line is your file and line number.</li><li><strong><code>ResponseValidationError</code></strong>: what you returned does not match <code>response_model</code> (or the return annotation). The <code>loc</code> starts with <code>response</code>, e.g. <code>('response', 'name')</code>; return the missing field or fix the model.</li><li><strong><code>ValueError</code> from <code>jsonable_encoder</code></strong>: you returned an object FastAPI cannot turn into JSON. Return a dict, a Pydantic model, or a <code>Response</code>.</li></ul>
+<p><code>HTTPException</code> is not an error in this sense: <code>/http</code> returned a clean 404 JSON response and logged only the access line, no traceback.</p>
+<h2 id="handler">2. Return JSON instead of plain text, and log it your way</h2>
+<pre><code>import logging
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+log = logging.getLogger(&quot;app&quot;)
+app = FastAPI()
+@app.exception_handler(Exception)
+async def unhandled(request: Request, exc: Exception):
+    log.exception(&quot;unhandled error on %s&quot;, request.url.path)
+    return JSONResponse({&quot;detail&quot;: &quot;internal error&quot;}, status_code=500)
+@app.get(&quot;/boom&quot;)
+def boom():
+    return {&quot;ratio&quot;: 1 / 0}
+c = TestClient(app, raise_server_exceptions=False)
+r = c.get(&quot;/boom&quot;)
+print(r.status_code, r.headers[&quot;content-type&quot;], r.text)
+try:
+    TestClient(app).get(&quot;/boom&quot;)
+except ZeroDivisionError as e:
+    print(&quot;default TestClient re-raises:&quot;, repr(e))</code></pre>
+<p>Output:</p>
+<pre><code>500 application/json {&quot;detail&quot;:&quot;internal error&quot;}
+default TestClient re-raises: ZeroDivisionError(&#x27;division by zero&#x27;)</code></pre>
+<p>An <code>@app.exception_handler(Exception)</code> turns the plain-text 500 into a JSON one and gives you a place to log with your own logger (<code>log.exception</code> records the traceback). Note the second line: Starlette's <code>TestClient</code> re-raises server exceptions by default, so in tests you see the real exception directly; pass <code>raise_server_exceptions=False</code> to test the 500 response itself.</p>
+<h2 id="checklist">Checklist</h2>
+<ul><li>Read the last line of the traceback and the last frame in your own file; skip the uvicorn/starlette frames.</li><li><code>ResponseValidationError</code> with <code>loc</code> starting <code>response</code>: your return value does not match <code>response_model</code>.</li><li><code>ValueError</code> in <code>jsonable_encoder</code>: you returned a non-serialisable object.</li><li>Want expected errors to be 4xx, not 500? Raise <code>HTTPException</code>.</li><li>App won't even start? That is a different error: see <a href="/guides/uvicorn-error-loading-asgi-app-could-not-import-module/">uvicorn "Error loading ASGI app"</a>.</li></ul>
+<p>Related: <a href="/guides/fastapi-422-unprocessable-entity/">FastAPI 422 Unprocessable Entity</a>, <a href="/guides/pydantic-field-required-type-missing/">Pydantic "Field required"</a>.</p>
+
+<aside class="cta"><strong>See the status and headers a URL really returns, right in the browser:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Exception in ASGI application mean?</summary><p>uvicorn caught an unhandled exception from your app and returned a 500. The real error is the last line of the traceback in the server log.</p></details>
+<details><summary>What is ResponseValidationError in FastAPI?</summary><p>Your endpoint&#x27;s return value does not match its response_model; the loc, e.g. (&#x27;response&#x27;, &#x27;name&#x27;), shows the missing or wrong field.</p></details>
+<details><summary>How do I return JSON for FastAPI 500 errors?</summary><p>Register @app.exception_handler(Exception) that logs the exception and returns JSONResponse(..., status_code=500).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with FastAPI 0.161.1, uvicorn 0.54.0 and Python 3.14.7 (python:3-alpine in Docker). Blocks were run verbatim; the server log is unedited except for the framework frames marked as cut. PlainHeaders is our extension; Python, FastAPI and uvicorn are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

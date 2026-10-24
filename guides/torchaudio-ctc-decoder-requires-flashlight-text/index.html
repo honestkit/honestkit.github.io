@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>torchaudio: CTC Decoder suit requires flashlight-text package</title>
+<meta name="description" content="torchaudio ctc_decoder fails without flashlight-text. Tested: pip install flashlight-text; on Python 3.13 (no wheel) the exact env vars that make it build.">
+<link rel="canonical" href="https://honestkit.github.io/guides/torchaudio-ctc-decoder-requires-flashlight-text/">
+<meta property="og:title" content="torchaudio: CTC Decoder suit requires flashlight-text package">
+<meta property="og:description" content="torchaudio ctc_decoder fails without flashlight-text. Tested: pip install flashlight-text; on Python 3.13 (no wheel) the exact env vars that make it build.">
+<meta property="og:url" content="https://honestkit.github.io/guides/torchaudio-ctc-decoder-requires-flashlight-text/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Do I need KenLM for torchaudio ctc_decoder?", "acceptedAnswer": {"@type": "Answer", "text": "Only to decode with an n-gram language model (lm=...). Lexicon-free decoding without an LM ran with the plain flashlight-text wheel, and also with a USE_KENLM=0 source build."}}, {"@type": "Question", "name": "Why does pip install flashlight-text fail on Python 3.13?", "acceptedAnswer": {"@type": "Answer", "text": "flashlight-text 0.0.7 has wheels for CPython 3.6-3.12 only, so 3.13 builds the sdist. We needed CMake, Python headers, USE_KENLM=0 (or KenLM installed) and CMAKE_POLICY_VERSION_MINIMUM=3.5 for CMake 4."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>CTC Decoder suit requires flashlight-text package (fix)</h1>
+<p class="lead"><code>from torchaudio.models.decoder import ctc_decoder</code> raises <code>RuntimeError: CTC Decoder suit requires flashlight-text package and optionally KenLM. Please install them.</code> (after <code>No module named &#x27;flashlight&#x27;</code>). We reproduced it, fixed it on Python 3.11, and got the source build working on Python 3.13.</p>
+<h2 id="error">1. The error</h2>
+<p>A tiny lexicon-free decode (no acoustic model needed; four fake frames):</p>
+<pre><code>import torch, torchaudio
+from torchaudio.models.decoder import ctc_decoder
+tokens = [&quot;-&quot;, &quot;|&quot;, &quot;h&quot;, &quot;i&quot;]
+decoder = ctc_decoder(lexicon=None, tokens=tokens, blank_token=&quot;-&quot;, sil_token=&quot;|&quot;, unk_word=&quot;&lt;unk&gt;&quot;)
+# fake acoustic model output: frames favour h, h, i, blank
+emissions = torch.log_softmax(torch.tensor([[[0, 0, 5, 0], [0, 0, 5, 0], [0, 0, 0, 5], [5, 0, 0, 0]]], dtype=torch.float32), dim=-1)
+best = decoder(emissions)[0][0]
+print(torchaudio.__version__, decoder.idxs_to_tokens(best.tokens))</code></pre>
+<p>torchaudio 2.9.0, fresh venv (2.8.0 gives the same error):</p>
+<pre><code>Traceback (most recent call last):
+  ...
+ModuleNotFoundError: No module named &#x27;flashlight&#x27;
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  ...
+RuntimeError: CTC Decoder suit requires flashlight-text package and optionally KenLM. Please install them.</code></pre>
+<p>The decoder lives in torchaudio but its engine is the separate <code>flashlight-text</code> package, which torchaudio does not install for you.</p>
+<h2 id="fix">2. Fix: pip install flashlight-text</h2>
+<pre><code>pip install flashlight-text</code></pre>
+<p>On Python 3.11 that installed a prebuilt wheel (0.0.7) and the same script ran:</p>
+<pre><code>2.9.0+cpu [&#x27;|&#x27;, &#x27;h&#x27;, &#x27;i&#x27;, &#x27;|&#x27;]</code></pre>
+<p>KenLM is only needed for decoding with an n-gram language model; the PyPI wheel already includes it (<code>from flashlight.lib.text.decoder import KenLM</code> worked).</p>
+<h2 id="py313">3. Python 3.13: no wheel, so it builds from source</h2>
+<p>flashlight-text 0.0.7 publishes wheels for CPython 3.6 to 3.12 only. On 3.13 pip falls back to the sdist, and the build failed three ways in a row for us:</p>
+<pre><code>RuntimeError: CMake must be installed to build the following extensions: flashlight.lib.text.decoder, flashlight.lib.text.dictionary</code></pre>
+<p>After <code>pip install cmake</code>:</p>
+<pre><code>RuntimeError: (&#x27;KenLM is not installed or failed to import. &#x27;, ... &#x27;set the environment &#x27;, &#x27;variable USE_KENLM=0.&#x27;)</code></pre>
+<p>With <code>USE_KENLM=0</code>, CMake 4 (what <code>pip install cmake</code> gives now) refused the old pybind11 it downloads:</p>
+<pre><code>Compatibility with CMake &lt; 3.5 has been removed from CMake.</code></pre>
+<p>(A Python without development headers, like a distro python3.13 without <code>python3.13-dev</code>, first fails with <code>Could NOT find Python3 (missing: Python3_INCLUDE_DIRS Development.Module)</code>.) This built in 18 seconds with g++ installed:</p>
+<pre><code>pip install cmake
+USE_KENLM=0 CMAKE_POLICY_VERSION_MINIMUM=3.5 pip install flashlight-text</code></pre>
+<p>Then the script above on Python 3.13.17 with torch/torchaudio 2.9.0 CPU (a NumPy-missing warning cut):</p>
+<pre><code>2.9.0+cpu [&#x27;|&#x27;, &#x27;h&#x27;, &#x27;i&#x27;, &#x27;|&#x27;]</code></pre>
+<p><code>USE_KENLM=0</code> means no n-gram LM in that build: importing <code>KenLM</code> from it raised <code>ImportError: Installed Flashlight Text Python bindings were built without KenLM support</code>. If you need one, use Python 3.12 or older and the wheel instead.</p>
+<p>Related: <a href="/guides/torchaudio-utils-has-no-attribute-download-asset/">torchaudio.utils has no attribute download_asset</a> · <a href="/guides/torchaudio-no-module-named-io/">No module named torchaudio.io</a> · <a href="/guides/torchaudio-no-module-named-backend/">No module named torchaudio.backend</a></p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Do I need KenLM for torchaudio ctc_decoder?</summary><p>Only to decode with an n-gram language model (lm=...). Lexicon-free decoding without an LM ran with the plain flashlight-text wheel, and also with a USE_KENLM=0 source build.</p></details>
+<details><summary>Why does pip install flashlight-text fail on Python 3.13?</summary><p>flashlight-text 0.0.7 has wheels for CPython 3.6-3.12 only, so 3.13 builds the sdist. We needed CMake, Python headers, USE_KENLM=0 (or KenLM installed) and CMAKE_POLICY_VERSION_MINIMUM=3.5 for CMake 4.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux with CPython 3.11.17 and 3.13.17, torch/torchaudio 2.8.0 and 2.9.0, flashlight-text 0.0.7 (wheel on 3.11, built from sdist on 3.13 with g++ and CMake 4.4). Output pasted unedited except shortened paths and cut tracebacks. PlainTables is our extension; torchaudio and flashlight-text are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jupyter 403 Forbidden / _xsrf Argument Missing (Tested)</title>
+<meta name="description" content="Jupyter 403 reproduced: missing or wrong token gives Forbidden; cookie login without _xsrf gives &quot;_xsrf argument missing from POST&quot;. Tested fixes for both.">
+<link rel="canonical" href="https://honestkit.github.io/guides/jupyter-error-403-forbidden-xsrf-argument-missing/">
+<meta property="og:title" content="Jupyter 403 Forbidden / _xsrf Argument Missing (Tested)">
+<meta property="og:description" content="Jupyter 403 reproduced: missing or wrong token gives Forbidden; cookie login without _xsrf gives &quot;_xsrf argument missing from POST&quot;. Tested fixes for both.">
+<meta property="og:url" content="https://honestkit.github.io/guides/jupyter-error-403-forbidden-xsrf-argument-missing/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Jupyter return 403 Forbidden?", "acceptedAnswer": {"@type": "Answer", "text": "The request has no token or a wrong one (often from an older server run). Send Authorization: token TOKEN or ?token=TOKEN; jupyter server list shows the current token."}}, {"@type": "Question", "name": "How do I fix \"_xsrf argument missing from POST\" in Jupyter?", "acceptedAnswer": {"@type": "Answer", "text": "Cookie-authenticated POSTs need the _xsrf cookie echoed in an X-XSRFToken header. In a browser, reload or log in again; in scripts, authenticate with the token header instead."}}, {"@type": "Question", "name": "Does the Jupyter token header need an XSRF token?", "acceptedAnswer": {"@type": "Answer", "text": "No. In the test, a POST with Authorization: token got 201 without any _xsrf value."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Jupyter error 403 Forbidden and &#x27;_xsrf&#x27; argument missing from POST (tested)</h1>
+<p class="lead">A Jupyter server answers <code>403</code> for two different reasons: the request has no valid token (<code>Forbidden</code>), or it is logged in by cookie but lacks the anti-forgery value (<code>'_xsrf' argument missing from POST</code>). Both are reproduced against a real server below, with the requests that fixed them.</p>
+<h2 id="repro">1. Reproduce: the two kinds of Jupyter 403</h2>
+<p><code>run.py</code> starts a Jupyter server with a known token (<code>abc123</code>, demo only) and calls its REST API the ways scripts and browsers do:</p>
+<pre><code>import json, os, subprocess, sys, time, urllib.request, urllib.error, http.cookiejar
+# start a Jupyter server with a known token (demo only)
+os.makedirs(&#x27;/tmp/j403/root&#x27;, exist_ok=True)
+env = dict(os.environ, JUPYTER_DATA_DIR=&#x27;/tmp/j403/data&#x27;, JUPYTER_RUNTIME_DIR=&#x27;/tmp/j403/rt&#x27;, JUPYTER_CONFIG_DIR=&#x27;/tmp/j403/cfg&#x27;)
+srv = subprocess.Popen([sys.executable, &#x27;-m&#x27;, &#x27;jupyter_server&#x27;, &#x27;--port=8963&#x27;, &#x27;--no-browser&#x27;,
+                        &#x27;--IdentityProvider.token=abc123&#x27;, &#x27;--ServerApp.root_dir=/tmp/j403/root&#x27;],
+                       env=env, stdout=subprocess.DEVNULL, stderr=open(&#x27;/tmp/j403/server.log&#x27;, &#x27;w&#x27;))
+B = &#x27;http://127.0.0.1:8963&#x27;
+for _ in range(100):
+    try: urllib.request.urlopen(B + &#x27;/api&#x27;, timeout=1); break
+    except Exception: time.sleep(0.2)
+
+jar = http.cookiejar.CookieJar()
+op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+def call(label, path, method=&#x27;GET&#x27;, headers={}, body=None):
+    req = urllib.request.Request(B + path, method=method, headers=headers,
+                                 data=json.dumps(body).encode() if body is not None else None)
+    try:
+        r = op.open(req, timeout=10); print(f&#x27;{label}: {r.status}&#x27;)
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode()[:120].replace(&#x27;\n&#x27;, &#x27; &#x27;)
+        print(f&#x27;{label}: {e.code} {msg}&#x27;)
+
+call(&#x27;1 no token          GET /api/contents&#x27;, &#x27;/api/contents&#x27;)
+call(&#x27;2 wrong token       GET /api/contents&#x27;, &#x27;/api/contents&#x27;, headers={&#x27;Authorization&#x27;: &#x27;token nope&#x27;})
+call(&#x27;3 ?token=           GET /api/contents&#x27;, &#x27;/api/contents?token=abc123&#x27;)
+call(&#x27;4 header token      POST /api/contents&#x27;, &#x27;/api/contents&#x27;, &#x27;POST&#x27;, {&#x27;Authorization&#x27;: &#x27;token abc123&#x27;}, {&#x27;type&#x27;: &#x27;notebook&#x27;})
+# log in like a browser: the token in the URL sets a login cookie
+call(&#x27;5 token in URL      GET /api/status?token=&#x27;, &#x27;/api/status?token=abc123&#x27;)
+print(&#x27;  cookies:&#x27;, sorted(c.name for c in jar))
+call(&#x27;6 cookie, no _xsrf  POST /api/contents&#x27;, &#x27;/api/contents&#x27;, &#x27;POST&#x27;, {}, {&#x27;type&#x27;: &#x27;notebook&#x27;})
+call(&#x27;  load a page         GET /login&#x27;, &#x27;/login&#x27;)
+print(&#x27;  cookies:&#x27;, sorted(c.name for c in jar))
+xsrf = next((c.value for c in jar if c.name == &#x27;_xsrf&#x27;), None)
+if xsrf:
+    call(&#x27;7 cookie + X-XSRFToken POST /api/contents&#x27;, &#x27;/api/contents&#x27;, &#x27;POST&#x27;, {&#x27;X-XSRFToken&#x27;: xsrf}, {&#x27;type&#x27;: &#x27;notebook&#x27;})
+srv.terminate(); srv.wait()
+print(&#x27;--- server log lines with 403:&#x27;)
+for line in open(&#x27;/tmp/j403/server.log&#x27;):
+    if &#x27; 403 &#x27; in line or &#x27;xsrf&#x27; in line.lower(): print(line.rstrip()[:160])</code></pre>
+<p>Output (jupyter_server 2.21.1, Python 3.13 on Linux):</p>
+<pre><code>1 no token          GET /api/contents: 403 {&quot;message&quot;: &quot;Forbidden&quot;, &quot;reason&quot;: null}
+2 wrong token       GET /api/contents: 403 {&quot;message&quot;: &quot;Forbidden&quot;, &quot;reason&quot;: null}
+3 ?token=           GET /api/contents: 200
+4 header token      POST /api/contents: 201
+5 token in URL      GET /api/status?token=: 200
+  cookies: [&#x27;username-127-0-0-1-8963&#x27;]
+6 cookie, no _xsrf  POST /api/contents: 403 {&quot;message&quot;: &quot;&#x27;_xsrf&#x27; argument missing from POST&quot;, &quot;reason&quot;: null}
+  load a page         GET /login: 200
+  cookies: [&#x27;_xsrf&#x27;, &#x27;username-127-0-0-1-8963&#x27;]
+7 cookie + X-XSRFToken POST /api/contents: 201
+--- server log lines with 403:
+[W 2026-10-23 22:22:21.624 ServerApp] 403 GET /api/contents (@127.0.0.1) 0.58ms referer=None
+[W 2026-10-23 22:22:21.625 ServerApp] 403 GET /api/contents (@127.0.0.1) 0.45ms referer=None
+[W 2026-10-23 22:22:21.692 ServerApp] 403 POST /api/contents (127.0.0.1): &#x27;_xsrf&#x27; argument missing from POST
+[W 2026-10-23 22:22:21.692 ServerApp] wrote error: &quot;&#x27;_xsrf&#x27; argument missing from POST&quot;
+[W 2026-10-23 22:22:21.692 ServerApp] 403 POST /api/contents (b775a7775f134829b517104863dae9c2@127.0.0.1) 0.58ms referer=None</code></pre>
+<h2 id="token">2. "403 Forbidden": no token or the wrong token</h2>
+<p>Requests 1 and 2 got <code>403 {"message": "Forbidden"}</code>, and the server log shows <code>403 GET /api/contents (@127.0.0.1)</code> with an empty user before the <code>@</code>: the request was not logged in at all. Fixes:</p>
+<ul><li>Send the token: <code>Authorization: token &lt;TOKEN&gt;</code> header (request 4) or <code>?token=&lt;TOKEN&gt;</code> in the URL (request 3).</li>
+<li>Get the right token with <code>jupyter server list</code> (or <code>jupyter notebook list</code> / <code>jupyter lab list</code>); each server start generates a new one unless you set it. A token from an older run gives the same 403.</li>
+<li>In VS Code or another client connecting to a remote server, paste the full URL including <code>?token=...</code>.</li></ul>
+<h2 id="xsrf">3. "'_xsrf' argument missing from POST": logged in by cookie</h2>
+<p>After the token was used in the URL, the server set a login cookie (<code>username-127-0-0-1-8963</code>). A POST using only that cookie (request 6) was refused with <code>403 '_xsrf' argument missing from POST</code>: cookie-authenticated requests must also prove they came from a Jupyter page. Loading a page (<code>GET /login</code>) set an <code>_xsrf</code> cookie, and echoing it back in an <code>X-XSRFToken</code> header (request 7) gave 201. Requests that authenticate with the <code>Authorization: token</code> header (request 4) are not checked for <code>_xsrf</code>.</p>
+<ul><li>Scripts: use the token header instead of cookies.</li>
+<li>Browsers: this usually means a stale tab or blocked cookies. Reload the page (or log in again) so a fresh <code>_xsrf</code> cookie is set, and check that a proxy or browser extension is not stripping cookies or headers.</li></ul>
+<p>Related: <a href="/guides/jupyter-notebook-kernel-not-found-nosuchkernel/">Jupyter kernel not found</a>, <a href="/guides/jupyter-notebook-kernel-keeps-dying-deadkernelerror/">Jupyter kernel keeps dying</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Jupyter return 403 Forbidden?</summary><p>The request has no token or a wrong one (often from an older server run). Send Authorization: token TOKEN or ?token=TOKEN; jupyter server list shows the current token.</p></details>
+<details><summary>How do I fix &quot;_xsrf argument missing from POST&quot; in Jupyter?</summary><p>Cookie-authenticated POSTs need the _xsrf cookie echoed in an X-XSRFToken header. In a browser, reload or log in again; in scripts, authenticate with the token header instead.</p></details>
+<details><summary>Does the Jupyter token header need an XSRF token?</summary><p>No. In the test, a POST with Authorization: token got 201 without any _xsrf value.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with jupyter_server 2.21.1 and Python 3.13 on Linux. The script ran verbatim and the output was pasted unedited. PlainTables is our extension; Jupyter is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

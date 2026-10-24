@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remove the Server Response Header in nginx and Apache (Hide the Version)</title>
+<meta name="description" content="Stop nginx and Apache from sending their version number in the Server response header: server_tokens off, ServerTokens Prod, why &#x27;Header unset Server&#x27; does nothing in Apache, and how to check the result with curl.">
+<link rel="canonical" href="https://honestkit.github.io/guides/remove-server-header-nginx-apache/">
+<meta property="og:title" content="Remove the Server Response Header in nginx and Apache (Hide the Version)">
+<meta property="og:description" content="Stop nginx and Apache from sending their version number in the Server response header: server_tokens off, ServerTokens Prod, why &#x27;Header unset Server&#x27; does nothing in Apache, and how to check the result with curl.">
+<meta property="og:url" content="https://honestkit.github.io/guides/remove-server-header-nginx-apache/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is showing the server version a vulnerability?", "acceptedAnswer": {"@type": "Answer", "text": "Not by itself, but it tells attackers which known bugs to try, and most scanners report it. Hiding it takes one line."}}, {"@type": "Question", "name": "Can I remove the Server header completely in nginx?", "acceptedAnswer": {"@type": "Answer", "text": "Not with open-source nginx alone: server_tokens off still sends 'nginx'. The third-party headers-more module can clear it (not tested by us)."}}, {"@type": "Question", "name": "Why doesn't Header unset Server work in Apache?", "acceptedAnswer": {"@type": "Answer", "text": "Apache adds the Server header itself. In our test both 'Header unset Server' and 'Header always unset Server' left 'Server: Apache'. Use ServerTokens Prod."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to hide or remove the Server header in nginx and Apache</h1>
+<p class="lead">By default both servers tell every visitor their exact version. One line hides it; removing the header completely needs more than that.</p>
+<h2>1. Check what you send now</h2>
+<pre><code>curl -sI https://your-site.com/ | grep -i '^server'</code></pre>
+<p>Our tests with the default Docker images gave <code>Server: nginx/1.31.6</code> and <code>Server: Apache/2.4.68 (Unix)</code>: the exact version, which security scanners flag as information disclosure.</p>
+<h2>2. nginx: server_tokens off</h2>
+<pre><code>http {
+    server_tokens off;
+    ...
+}</code></pre>
+<p>It also works inside a <code>server</code> block. Reload (<code>nginx -t &amp;&amp; nginx -s reload</code>) and the header becomes <code>Server: nginx</code>: the version is gone, the name stays. Open-source nginx has no setting to drop the name. People use the third-party headers-more module (<code>more_clear_headers Server;</code>) for that; we did not test it here.</p>
+<h2>3. Apache: ServerTokens Prod</h2>
+<pre><code>ServerTokens Prod
+ServerSignature Off</code></pre>
+<p>Put these in the main server config (httpd.conf or apache2.conf), not in .htaccess, and restart. The header becomes <code>Server: Apache</code>. <code>ServerSignature Off</code> is a precaution for Apache's own error pages; it was already off in the official image.</p>
+<p><strong>Header unset Server does not work.</strong> We added both <code>Header unset Server</code> and <code>Header always unset Server</code> (mod_headers loaded): the response still said <code>Server: Apache</code>. Apache sets this header itself, and mod_headers can't remove it.</p>
+<h2>4. X-Powered-By from your app, behind nginx</h2>
+<p>PHP, Express and other app servers often add <code>X-Powered-By</code> (for example <code>PHP/8.3.0</code>). nginx passes it through unchanged. Hide it at the proxy:</p>
+<pre><code>server {
+    listen 80;
+    server_tokens off;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_hide_header X-Powered-By;
+    }
+}</code></pre>
+<p>In our test the backend sent <code>X-Powered-By: PHP/8.3.0</code>. Without <code>proxy_hide_header</code> visitors received it; with it, the header was gone. The backend's own Server header was replaced by the proxy's (<code>Server: nginx</code>). You can also switch it off at the source: <code>expose_php = Off</code> in php.ini, or <code>app.disable('x-powered-by')</code> in Express.</p>
+<h2>5. Results</h2>
+<table><thead><tr><th>Config</th><th>Server header sent</th></tr></thead><tbody>
+<tr><td>nginx default</td><td><code>nginx/1.31.6</code></td></tr>
+<tr><td>nginx + server_tokens off</td><td><code>nginx</code></td></tr>
+<tr><td>Apache default</td><td><code>Apache/2.4.68 (Unix)</code></td></tr>
+<tr><td>Apache + ServerTokens Prod</td><td><code>Apache</code></td></tr>
+<tr><td>Apache + Header unset Server</td><td><code>Apache</code> (unchanged)</td></tr>
+</tbody></table>
+<p>Behind a CDN or load balancer, visitors see the proxy's Server header instead. Run the curl check against the public URL, not only the origin. Hiding the version doesn't patch anything, so keep the server updated. To check the rest of your headers (CSP, HSTS, X-Content-Type-Options), use the free <a href="/tools/security-headers/">security headers generator</a>.</p>
+<aside class="cta"><strong>Test header changes in your browser before editing the server:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is showing the server version a vulnerability?</summary><p>Not by itself, but it tells attackers which known bugs to try, and most scanners report it. Hiding it takes one line.</p></details>
+<details><summary>Can I remove the Server header completely in nginx?</summary><p>Not with open-source nginx alone: server_tokens off still sends &#x27;nginx&#x27;. The third-party headers-more module can clear it (not tested by us).</p></details>
+<details><summary>Why doesn&#x27;t Header unset Server work in Apache?</summary><p>Apache adds the Server header itself. In our test both &#x27;Header unset Server&#x27; and &#x27;Header always unset Server&#x27; left &#x27;Server: Apache&#x27;. Use ServerTokens Prod.</p></details>
+</section>
+<p class="note">Written with AI assistance. All configs were run in the official nginx:alpine (1.31.6) and httpd:alpine (2.4.68) Docker images on 2026-10-01 and checked with curl -I; the X-Powered-By test used an nginx backend that sent the header. The php.ini and Express settings are from their documentation, not tested here. PlainHeaders is our extension; the other methods are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

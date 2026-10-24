@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pytest mock patch not working: patch where it&#x27;s used</title>
+<meta name="description" content="Why mock.patch doesn&#x27;t take effect in pytest (from-imports), fixture &#x27;mocker&#x27; not found, does not have the attribute, and expected call not found.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pytest-mock-patch-not-working/">
+<meta property="og:title" content="pytest mock patch not working: patch where it&#x27;s used">
+<meta property="og:description" content="Why mock.patch doesn&#x27;t take effect in pytest (from-imports), fixture &#x27;mocker&#x27; not found, does not have the attribute, and expected call not found.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pytest-mock-patch-not-working/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is my mock.patch not working?", "acceptedAnswer": {"@type": "Answer", "text": "The code under test looks the name up somewhere else. Patch the name in the module that uses it (e.g. myapp.module.get), especially after 'from x import y'."}}, {"@type": "Question", "name": "How do I fix fixture 'mocker' not found?", "acceptedAnswer": {"@type": "Answer", "text": "Install pytest-mock in the same environment that runs pytest: python -m pip install pytest-mock."}}, {"@type": "Question", "name": "What does 'does not have the attribute' mean in mock.patch?", "acceptedAnswer": {"@type": "Answer", "text": "The patch target string names an attribute that does not exist on that module or class, usually a typo or the wrong module path."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pytest mock.patch not working (tested fixes)</h1>
+<p class="lead">If <code>mock.patch</code> has no effect, you patched the wrong name: after <code>from requests import get</code>, patch <code>"yourmodule.get"</code>, not <code>"requests.get"</code>. <code>fixture 'mocker' not found</code> means <code>pytest-mock</code> is not installed in the environment running pytest.</p>
+<p>Most "mock not working" bugs in pytest are one of four things: patching the wrong name, the <code>mocker</code> fixture missing, a typo in the target or assertion, or a call that differs from what you assert. Measured on pytest 9.1.1, pytest-mock 3.17.0, requests 2.34.2, Python 3.13.5.</p>
+<h2 id="where">1. Patch where the name is looked up, not where it is defined</h2>
+<pre><code>$ cat weather.py
+import requests
+from requests import get
+
+def temp_module(city):
+    return requests.get(f&quot;https://api.example/{city}&quot;).json()[&quot;t&quot;]
+
+def temp_from(city):
+    return get(f&quot;https://api.example/{city}&quot;).json()[&quot;t&quot;]
+$ cat test_weather.py
+from unittest import mock
+import weather
+
+def test_patch_library():                       # patches requests.get
+    with mock.patch(&quot;requests.get&quot;) as g:
+        g.return_value.json.return_value = {&quot;t&quot;: 21}
+        assert weather.temp_module(&quot;oslo&quot;) == 21
+        assert weather.temp_from(&quot;oslo&quot;) == 21   # &#x27;from requests import get&#x27; kept the real one
+
+def test_patch_where_used():                    # patches the name weather looks up
+    with mock.patch(&quot;weather.get&quot;) as g:
+        g.return_value.json.return_value = {&quot;t&quot;: 21}
+        assert weather.temp_from(&quot;oslo&quot;) == 21
+$ pytest -q --tb=line | tail -2
+FAILED test_weather.py::test_patch_library - requests.exceptions.ConnectionEr...
+1 failed, 1 passed in 0.08s</code></pre>
+<p><code>mock.patch("requests.get")</code> replaces the attribute on the <code>requests</code> module. <code>temp_module</code> looks up <code>requests.get</code> at call time, so it sees the mock. <code>temp_from</code> did <code>from requests import get</code>, which bound the real function into <code>weather</code> at import time, so the test made a real HTTP request (here it failed to resolve the host). Patch <code>"weather.get"</code>, the module that <em>uses</em> it.</p>
+<h2 id="mocker">2. fixture 'mocker' not found</h2>
+<pre><code>$ cat test_m.py
+def test_m(mocker):
+    mocker.patch(&quot;os.getcwd&quot;, return_value=&quot;/x&quot;)
+$ pytest -q -p no:pytest_mock | grep -E &quot;not found|passed|failed|error&quot;
+E       fixture &#x27;mocker&#x27; not found
+1 error in 0.00s
+$ pytest -q | tail -1
+1 passed in 0.00s</code></pre>
+<p><code>mocker</code> comes from the <code>pytest-mock</code> plugin, not pytest itself. <code>-p no:pytest_mock</code> above disables the installed plugin to show what you get when it is missing. Install <code>pytest-mock</code> into the same environment that runs pytest (<code>python -m pip install pytest-mock</code>), or use <code>unittest.mock.patch</code> directly.</p>
+<h2 id="typos">3. AttributeError: does not have the attribute, not a valid assertion, autospec TypeError</h2>
+<pre><code>$ cat test_typos.py
+from unittest import mock
+import json
+
+def test_wrong_target():
+    with mock.patch(&quot;json.lods&quot;):
+        pass
+
+def test_typo_assert():
+    m = mock.Mock()
+    m.save(1)
+    m.asert_called_once_with(2)
+
+def test_autospec():
+    with mock.patch(&quot;json.loads&quot;, autospec=True) as m:
+        json.loads(&quot;{}&quot;, &quot;extra&quot;, &quot;args&quot;)
+$ pytest -q | grep -E &quot;^E  |passed|failed&quot;
+E           AttributeError: &lt;module &#x27;json&#x27; from &#x27;/usr/lib/python3.13/json/__init__.py&#x27;&gt; does not have the attribute &#x27;lods&#x27;
+E               AttributeError: &#x27;asert_called_once_with&#x27; is not a valid assertion. Use a spec for the mock if &#x27;asert_called_once_with&#x27; is meant to be an attribute.. Did you mean: &#x27;assert_called_once_with&#x27;?
+E                       TypeError: too many positional arguments
+3 failed in 0.17s</code></pre>
+<p>A misspelled patch target raises <code>AttributeError ... does not have the attribute</code> (add <code>create=True</code> only if the attribute really should not exist yet). A misspelled assertion method on a <code>Mock</code> raises instead of silently passing. With <code>autospec=True</code> the mock keeps the real signature, so a wrong call fails with <code>TypeError</code> instead of being accepted.</p>
+<h2 id="called">4. AssertionError: expected call not found</h2>
+<pre><code>$ cat test_called.py
+from unittest import mock
+
+def test_called():
+    m = mock.Mock()
+    m.save(&quot;a.txt&quot;, mode=&quot;w&quot;)
+    m.save.assert_called_once_with(&quot;a.txt&quot;, mode=&quot;wb&quot;)
+$ pytest -q | grep -E &quot;^E  |passed|failed&quot; | head -4
+E       AssertionError: expected call not found.
+E       Expected: save(&#x27;a.txt&#x27;, mode=&#x27;wb&#x27;)
+E         Actual: save(&#x27;a.txt&#x27;, mode=&#x27;w&#x27;)
+E</code></pre>
+<p>The message prints <code>Expected</code> and <code>Actual</code> calls; positional and keyword arguments must match exactly. Use <code>m.save.call_args</code> or <code>m.mock_calls</code> to see what really happened, or <code>mock.ANY</code> for arguments you do not care about.</p>
+<p>Related: <a href="/guides/pytest-fixture-not-found/">pytest fixture not found</a>, <a href="/guides/pytest-error-importing-plugin/">pytest error importing plugin</a>, <a href="/guides/pytest-caplog-assert-logger-error/">pytest caplog</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is my mock.patch not working?</summary><p>The code under test looks the name up somewhere else. Patch the name in the module that uses it (e.g. myapp.module.get), especially after &#x27;from x import y&#x27;.</p></details>
+<details><summary>How do I fix fixture &#x27;mocker&#x27; not found?</summary><p>Install pytest-mock in the same environment that runs pytest: python -m pip install pytest-mock.</p></details>
+<details><summary>What does &#x27;does not have the attribute&#x27; mean in mock.patch?</summary><p>The patch target string names an attribute that does not exist on that module or class, usually a typo or the wrong module path.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with pytest 9.1.1, pytest-mock 3.17.0 and requests 2.34.2 on Python 3.13.5 in a clean virtualenv. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and pytest are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

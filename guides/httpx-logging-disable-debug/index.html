@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx logging: disable &#x27;HTTP Request&#x27; lines or enable debug</title>
+<meta name="description" content="Silence httpx&#x27;s INFO &#x27;HTTP Request: GET ...&#x27; log lines, turn on httpcore debug logging, and log requests with event hooks. Tested with httpx 0.28.1.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-logging-disable-debug/">
+<meta property="og:title" content="httpx logging: disable &#x27;HTTP Request&#x27; lines or enable debug">
+<meta property="og:description" content="Silence httpx&#x27;s INFO &#x27;HTTP Request: GET ...&#x27; log lines, turn on httpcore debug logging, and log requests with event hooks. Tested with httpx 0.28.1.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-logging-disable-debug/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I stop httpx logging every request?", "acceptedAnswer": {"@type": "Answer", "text": "logging.getLogger(\"httpx\").setLevel(logging.WARNING). The INFO line only appears when the root logger is at INFO or lower."}}, {"@type": "Question", "name": "How do I enable httpx debug logging?", "acceptedAnswer": {"@type": "Answer", "text": "Set logging.getLogger(\"httpcore\").setLevel(logging.DEBUG) (or basicConfig(level=logging.DEBUG)); httpcore.connection and httpcore.http11 log each connection step."}}, {"@type": "Question", "name": "Why do my AsyncClient event hooks raise TypeError?", "acceptedAnswer": {"@type": "Answer", "text": "AsyncClient awaits every hook; a sync def hook returns None, which cannot be awaited. Make the hook async def."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx logging: disable INFO lines, enable debug (tested)</h1>
+<p class="lead">The <code>INFO:httpx:HTTP Request: ...</code> line appears whenever root logging is at INFO. Hide it with <code>logging.getLogger("httpx").setLevel(logging.WARNING)</code>; for connection-level detail set <code>"httpcore"</code> to DEBUG.</p>
+<p>httpx logs through the standard <code>logging</code> module: the <code>httpx</code> logger writes one INFO line per request, and the <code>httpcore</code> loggers write connection-level DEBUG lines. Neither has handlers or a level of its own, so what you see depends entirely on your root logging config. Measured with httpx 0.28.1 on Python 3.13.5 against a local http.server.</p>
+<h2 id="info">1. Where the "HTTP Request: GET ..." INFO line comes from</h2>
+<pre><code>import logging, httpx, srv
+url = srv.start()
+logging.basicConfig(level=logging.INFO)
+httpx.get(url + &quot;/users&quot;)
+print(&quot;logger names:&quot;, sorted(n for n in logging.root.manager.loggerDict if n.startswith((&quot;httpx&quot;, &quot;httpcore&quot;))))</code></pre>
+<p>Output:</p>
+<pre><code>INFO:httpx:HTTP Request: GET http://127.0.0.1:8964/users &quot;HTTP/1.1 200 OK&quot;
+logger names: [&#x27;httpcore&#x27;, &#x27;httpcore.connection&#x27;, &#x27;httpcore.http11&#x27;, &#x27;httpcore.proxy&#x27;, &#x27;httpx&#x27;]</code></pre>
+<p>As soon as anything calls <code>logging.basicConfig(level=logging.INFO)</code> (your app, a framework, or a library such as an SDK built on httpx), every request prints this line. The <code>srv</code> module in these blocks is a small local test server.</p>
+<h2 id="disable">2. Disable / suppress httpx logging</h2>
+<pre><code>import logging, httpx, srv
+url = srv.start()
+logging.basicConfig(level=logging.INFO)
+logging.getLogger(&quot;httpx&quot;).setLevel(logging.WARNING)
+httpx.get(url + &quot;/users&quot;)
+logging.getLogger(&quot;myapp&quot;).info(&quot;my own INFO line still shows&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>INFO:myapp:my own INFO line still shows</code></pre>
+<p>Raise the level of just the <code>httpx</code> logger. Your own INFO logging is unaffected. Do this after <code>basicConfig</code> or anywhere at startup; the order does not matter because the level lives on the logger. To silence connection debug output too, do the same for <code>"httpcore"</code>.</p>
+<h2 id="debug">3. httpx debug logging: see the connection steps</h2>
+<pre><code>import logging, httpx, srv
+url = srv.start()
+logging.basicConfig(level=logging.DEBUG, format=&quot;%(name)s %(levelname)s %(message)s&quot;)
+with httpx.Client() as c:
+    c.get(url + &quot;/users&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>httpcore.connection DEBUG connect_tcp.started host=&#x27;127.0.0.1&#x27; port=8964 local_address=None timeout=5.0 socket_options=None
+httpcore.connection DEBUG connect_tcp.complete return_value=&lt;httpcore._backends.sync.SyncStream object at 0x7f82acbc7620&gt;
+httpcore.http11 DEBUG send_request_headers.started request=&lt;Request [b&#x27;GET&#x27;]&gt;
+httpcore.http11 DEBUG send_request_headers.complete
+httpcore.http11 DEBUG send_request_body.started request=&lt;Request [b&#x27;GET&#x27;]&gt;
+httpcore.http11 DEBUG send_request_body.complete
+httpcore.http11 DEBUG receive_response_headers.started request=&lt;Request [b&#x27;GET&#x27;]&gt;
+httpcore.http11 DEBUG receive_response_headers.complete return_value=(b&#x27;HTTP/1.1&#x27;, 200, b&#x27;OK&#x27;, [(b&#x27;Server&#x27;, b&#x27;BaseHTTP/0.6 Python/3.13.5&#x27;), (b&#x27;Date&#x27;, b&#x27;Fri, 23 Oct 2026 14:14:41 GMT&#x27;), (b&#x27;Content-Length&#x27;, b&#x27;2&#x27;)])
+httpx INFO HTTP Request: GET http://127.0.0.1:8964/users &quot;HTTP/1.1 200 OK&quot;
+httpcore.http11 DEBUG receive_response_body.started request=&lt;Request [b&#x27;GET&#x27;]&gt;
+httpcore.http11 DEBUG receive_response_body.complete
+httpcore.http11 DEBUG response_closed.started
+httpcore.http11 DEBUG response_closed.complete
+httpcore.connection DEBUG close.started
+httpcore.connection DEBUG close.complete</code></pre>
+<p>At DEBUG level <code>httpcore.connection</code> shows TCP connect and close, and <code>httpcore.http11</code> shows each stage of the request with the raw response headers. This is the quickest way to see whether a hang is in connect, sending, or waiting for response headers. Over HTTPS there are also TLS steps. Turn it on for one logger only with <code>logging.getLogger("httpcore").setLevel(logging.DEBUG)</code> while root stays at INFO.</p>
+<h2 id="default">4. Default: nothing is logged</h2>
+<pre><code>import logging, httpx, srv
+url = srv.start()
+logging.basicConfig(level=logging.WARNING, format=&quot;%(name)s %(levelname)s %(message)s&quot;)
+for name in (&quot;httpx&quot;, &quot;httpcore&quot;):
+    print(name, logging.getLogger(name).getEffectiveLevel(), logging.getLogger(name).handlers)
+httpx.get(url + &quot;/users&quot;)
+print(&quot;nothing logged at WARNING&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>httpx 30 []
+httpcore 30 []
+nothing logged at WARNING</code></pre>
+<p>Both loggers have no handlers and inherit WARNING (30) from root, so a plain script prints nothing. If you see request lines you did not ask for, something set the root level to INFO or lower.</p>
+<h2 id="hooks">5. Custom request/response logging with event hooks</h2>
+<pre><code>import logging, time, httpx, srv
+url = srv.start()
+logging.basicConfig(level=logging.INFO, format=&quot;%(name)s %(message)s&quot;)
+logging.getLogger(&quot;httpx&quot;).setLevel(logging.WARNING)
+log = logging.getLogger(&quot;api&quot;)
+
+def log_request(request):
+    request.extensions[&quot;t0&quot;] = time.perf_counter()
+    log.info(&quot;-&gt; %s %s&quot;, request.method, request.url)
+
+def log_response(response):
+    ms = (time.perf_counter() - response.request.extensions[&quot;t0&quot;]) * 1000
+    log.info(&quot;&lt;- %s %s (%d bytes, %s)&quot;, response.status_code, response.request.url,
+             len(response.read()), &quot;fast&quot; if ms &lt; 1000 else &quot;slow&quot;)
+
+with httpx.Client(event_hooks={&quot;request&quot;: [log_request], &quot;response&quot;: [log_response]}) as c:
+    c.get(url + &quot;/users&quot;, params={&quot;page&quot;: 2})</code></pre>
+<p>Output:</p>
+<pre><code>api -&gt; GET http://127.0.0.1:8964/users?page=2
+api &lt;- 200 http://127.0.0.1:8964/users?page=2 (2 bytes, fast)</code></pre>
+<p>Event hooks run for every request on the client. The response hook runs before the body is read: <code>response.content</code> there raises <code>ResponseNotRead</code>, so call <code>response.read()</code> first if you need the body or its size.</p>
+<h2 id="async">6. AsyncClient event hooks must be async</h2>
+<pre><code>import asyncio, logging, httpx, srv
+url = srv.start()
+
+def sync_hook(response):
+    print(&quot;sync hook got&quot;, response.status_code)
+
+async def async_hook(response):
+    print(&quot;async hook got&quot;, response.status_code)
+
+async def main():
+    async with httpx.AsyncClient(event_hooks={&quot;response&quot;: [async_hook]}) as c:
+        await c.get(url + &quot;/users&quot;)
+    async with httpx.AsyncClient(event_hooks={&quot;response&quot;: [sync_hook]}) as c:
+        try:
+            await c.get(url + &quot;/users&quot;)
+        except TypeError as e:
+            print(&quot;TypeError:&quot;, e)
+
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>async hook got 200
+sync hook got 200
+TypeError: object NoneType can&#x27;t be used in &#x27;await&#x27; expression</code></pre>
+<p>With <code>AsyncClient</code>, a plain <code>def</code> hook still runs, then httpx tries to await its <code>None</code> return value and raises <code>TypeError</code>. Use <code>async def</code> hooks (and <code>await response.aread()</code> for the body).</p>
+<p>Related: <a href="/guides/httpx-raise-for-status-httpstatuserror/">httpx raise_for_status in a response hook</a>, <a href="/guides/httpx-timeout-default-readtimeout/">httpx timeout</a>, <a href="/guides/httpx-mock-transport-pytest/">httpx MockTransport for tests</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests differences</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I stop httpx logging every request?</summary><p>logging.getLogger(&quot;httpx&quot;).setLevel(logging.WARNING). The INFO line only appears when the root logger is at INFO or lower.</p></details>
+<details><summary>How do I enable httpx debug logging?</summary><p>Set logging.getLogger(&quot;httpcore&quot;).setLevel(logging.DEBUG) (or basicConfig(level=logging.DEBUG)); httpcore.connection and httpcore.http11 log each connection step.</p></details>
+<details><summary>Why do my AsyncClient event hooks raise TypeError?</summary><p>AsyncClient awaits every hook; a sync def hook returns None, which cannot be awaited. Make the hook async def.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5 against a local http.server. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

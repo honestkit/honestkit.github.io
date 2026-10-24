@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>“Out of Memory: Killed Process” Explained and Reproduced (Tested)</title>
+<meta name="description" content="We reproduced a real OOM kill with a memory cgroup, captured the exit code and systemd&#x27;s log line, and show why it&#x27;s different from a Python MemoryError.">
+<link rel="canonical" href="https://honestkit.github.io/guides/out-of-memory-killed/">
+<meta property="og:title" content="“Out of Memory: Killed Process” Explained and Reproduced (Tested)">
+<meta property="og:description" content="We reproduced a real OOM kill with a memory cgroup, captured the exit code and systemd&#x27;s log line, and show why it&#x27;s different from a Python MemoryError.">
+<meta property="og:url" content="https://honestkit.github.io/guides/out-of-memory-killed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does exit code 137 mean?", "acceptedAnswer": {"@type": "Answer", "text": "137 = 128 + 9, where 9 is SIGKILL. We measured this exact exit code when our test process was killed by a 50 MB memory cgroup limit. It shows up for both container/cgroup OOM kills and a genuine system-wide kernel OOM kill \u2014 check your container runtime's logs or journalctl to tell them apart."}}, {"@type": "Question", "name": "Is 'Killed' with no error message always an OOM kill?", "acceptedAnswer": {"@type": "Answer", "text": "In our test, yes \u2014 the process printed nothing itself, just stopped, and the shell reported 'Killed'. The confirmation came from journalctl ('A process of this unit has been killed by the OOM killer'), Docker's OOMKilled flag, or dmesg \u2014 not from the process's own output, since SIGKILL gives it no chance to log anything."}}, {"@type": "Question", "name": "Why did mysqld / mariadb get killed instead of another process?", "acceptedAnswer": {"@type": "Answer", "text": "Per the kernel docs, the OOM killer scores processes mainly by how much resident memory (anon-rss) they hold, adjusted by each process's oom_score_adj. Databases typically hold the largest working set on a box, so they're statistically likely victims when memory is genuinely tight \u2014 independent of whether they're actually the cause."}}, {"@type": "Question", "name": "Is a Python MemoryError the same as an OOM kill?", "acceptedAnswer": {"@type": "Answer", "text": "No, and we measured both to show the difference. A cgroup OOM kill ends the process instantly via SIGKILL (exit 137, nothing catchable). A MemoryError happens when a process hits its own RLIMIT_AS virtual-memory limit (ulimit -v) or genuinely fails an allocation \u2014 it's a normal Python exception your code can catch and handle."}}, {"@type": "Question", "name": "How do I stop my container from being OOM-killed?", "acceptedAnswer": {"@type": "Answer", "text": "First confirm it's actually hitting a limit (docker inspect shows OOMKilled: true; kubectl describe pod shows OOMKilled). Then either raise the container's memory limit to match real peak usage, or reduce the app's own memory footprint (for databases, lower buffer/cache settings so the engine stays under the ceiling itself instead of letting the kernel enforce it with SIGKILL)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Out of Memory: Killed Process (tested)</h1>
+<p class="lead"><code>Out of memory: Killed process</code> is a line the Linux kernel writes when it kills a process to free RAM. Seeing it for mysqld, a Python script, Java or any other process usually means something hit a memory limit, not that your code crashed on its own. We built a small allocator, ran it inside a 50 MB memory cgroup until it got killed, and captured exactly what that looks like — then ran the same script with a generous limit to prove the limit, not a real system-wide shortage, caused the kill.</p>
+<h2>1. What "Out of memory: Killed process" actually means</h2>
+<p>This message comes from the Linux kernel's OOM (out-of-memory) killer. When available memory (RAM plus swap, within whatever boundary applies) runs out, the kernel does not let the system grind to a halt. Instead it picks one process, logs a line like the one below, and sends it <code>SIGKILL</code>. The process gets no chance to clean up; it just disappears.</p>
+<p>The exact wording readers see for mysqld, mariadb, python3 or java is a per-process line the kernel prints when it fires. We did not have permission to read the live kernel ring buffer on this box (<code>dmesg</code> returned <code>Operation not permitted</code> for an unprivileged user — normal on a locked-down machine), so this exact format is per the kernel source / docs, not captured by us today:</p>
+<pre><code>Out of memory: Killed process 12345 (mysqld) total-vm:2145332kB, anon-rss:1823456kB, file-rss:0kB, shmem-rss:0kB, UID:999 pgtables:4568kB oom_score_adj:0</code></pre>
+<p><code>total-vm</code> is the process's total virtual address space; <code>anon-rss</code> is the anonymous (heap/stack, non-file-backed) resident memory it actually held in RAM — that second number is the one that matters for "how much RAM did it really use."</p>
+
+<h2>2. We reproduced a real OOM kill, safely, with a memory cgroup</h2>
+<p>Letting a process actually exhaust a shared machine's RAM is destructive to everything else running on it, so we did not do that. Instead we used the same mechanism Docker's <code>--memory</code> and Kubernetes pod memory limits use under the hood: a Linux memory cgroup with a hard cap, created with <code>systemd-run --user --scope</code>. This confines the kill to one disposable process tree; nothing else on the box was touched.</p>
+<p>Our script, <code>hog.py</code>, just grows a list of 5&nbsp;MB <code>bytearray</code> chunks in a loop and prints progress:</p>
+<pre><code>chunks = []
+total_mb = 0
+while True:
+    chunks.append(bytearray(5 * 1024 * 1024))
+    total_mb += 5
+    print(f"allocated {total_mb} MB", flush=True)</code></pre>
+<p>We ran it capped at 50&nbsp;MB, with swap disabled for that cgroup so the kill happens fast and cleanly instead of being delayed by swapping:</p>
+<pre><code>$ systemd-run --user --scope -p MemoryMax=50M -p MemorySwapMax=0 -- python3 hog.py
+Running as unit: run-p1953945-i6146989.scope
+allocated 5 MB
+allocated 10 MB
+allocated 15 MB
+allocated 20 MB
+allocated 25 MB
+allocated 30 MB
+allocated 35 MB
+allocated 40 MB
+allocated 45 MB
+Killed
+$ echo $?
+137</code></pre>
+<p>Exit code <strong>137</strong> is the standard signature of this kind of kill: 128&nbsp;+&nbsp;9 (<code>SIGKILL</code>). It stopped at 45–50&nbsp;MB, right at the 50&nbsp;MB cap we set — the Python interpreter itself, plus the already-allocated list, used up the rest of the headroom.</p>
+
+<h2>3. The systemd journal confirms it was the OOM killer, not a crash</h2>
+<p>Because this is a user-scoped unit, we checked only our own user journal (<code>journalctl --user</code>), not the system-wide log. It recorded the kill plainly:</p>
+<pre><code>$ journalctl --user -xe -n 20 --no-pager
+systemd[965]: run-p1953945-i6146989.scope: A process of this unit has been killed by the OOM killer.
+systemd[965]: run-p1953945-i6146989.scope: Failed with result 'oom-kill'.</code></pre>
+<p>That <code>result 'oom-kill'</code> field is the reliable way to tell "my process was OOM-killed" apart from a normal crash or an uncaught exception — check it before assuming a bug in your own code.</p>
+
+<h2>4. Proof it's the limit, not a real system-wide shortage</h2>
+<p>To show the 50&nbsp;MB cap — not a genuine lack of RAM on the box — caused the kill, we ran the identical script again with a 2&nbsp;GB cap instead, cut off after 5 seconds by our own test harness:</p>
+<pre><code>$ timeout 5 systemd-run --user --scope -p MemoryMax=2G -p MemorySwapMax=0 -- python3 hog.py
+allocated 5 MB
+...
+allocated 440 MB
+allocated 445 MB
+$ echo $?
+124</code></pre>
+<p>Exit 124 is <code>timeout</code> ending our own test, not an OOM kill. The same code sailed past 445&nbsp;MB — nearly 9x the point where it died under the 50&nbsp;MB cap — with no sign of memory pressure. The box has 15&nbsp;GB of RAM; at no point was the machine itself short of memory. The only thing that changed between the two runs was the cgroup's <code>MemoryMax</code>, which is exactly how Docker's <code>--memory=50m</code> or a Kubernetes <code>resources.limits.memory: 50Mi</code> produce the same kind of kill in containers: a per-container (per-cgroup) ceiling, enforced the same way we enforced ours.</p>
+
+<h2>5. A different mechanism: RLIMIT_AS / <code>ulimit -v</code> gives a clean exception instead</h2>
+<p>Readers also hit memory errors from a process's own soft limit (<code>ulimit -v</code>, <code>RLIMIT_AS</code>), and it's easy to confuse this with an OOM kill — the symptoms look similar but the mechanism and the error you get back are different. We ran the same allocator under a 50,000&nbsp;KB virtual-memory limit instead of a cgroup:</p>
+<pre><code>$ bash -c 'ulimit -v 51200; python3 hog.py'
+allocated 20 MB
+allocated 25 MB
+allocated 30 MB
+allocated 35 MB
+MemoryError at ~35 MB</code></pre>
+<p>No <code>SIGKILL</code>, no exit 137, no journal entry — Python's own allocator asked the kernel for more address space, got refused, and raised a catchable <code>MemoryError</code> inside the process. The process exits cleanly (or keeps running if you catch the exception). That is a world away from the kernel killer: with <code>ulimit -v</code> your own process enforces its own ceiling and can react; with a cgroup OOM kill, something outside the process (the kernel) ends it with no warning and no chance to catch anything.</p>
+<table>
+<tr><th>Mechanism</th><th>Trigger</th><th>What the process sees</th><th>Typical exit</th></tr>
+<tr><td>Cgroup OOM kill (Docker <code>--memory</code>, k8s limits, systemd <code>MemoryMax</code>)</td><td>cgroup's memory accounting hits its cap</td><td>Nothing — killed instantly by <code>SIGKILL</code></td><td>137 (measured)</td></tr>
+<tr><td>System-wide kernel OOM killer</td><td>whole machine's RAM+swap exhausted</td><td>Nothing — killed instantly by <code>SIGKILL</code>, kernel logs total-vm/anon-rss</td><td>137 (per kernel docs, not reproduced here — would require exhausting the whole box)</td></tr>
+<tr><td><code>ulimit -v</code> / RLIMIT_AS</td><td>process's own virtual memory soft limit</td><td>Catchable allocation failure (<code>MemoryError</code> in Python, <code>malloc</code> returning NULL in C)</td><td>Whatever your code does with the exception (measured: clean exit)</td></tr>
+</table>
+
+<h2>6. Container vs whole-machine OOM, and how the kernel picks a victim</h2>
+<p>Everything in sections 2–4 is the same mechanism Docker and Kubernetes use: a memory cgroup with a hard limit, scoped to one container or pod. That is overwhelmingly the kind of "out of memory killed" report people hit in practice (mysqld in a small container, a Java service with a tight pod limit, a Python worker in a 512&nbsp;MB dyno) because container memory limits are deliberately set tight to pack more workloads onto shared hardware.</p>
+<p>A genuine whole-machine OOM — where the kernel kills something because the entire box, not a container, is out of RAM and swap — is rarer in day-to-day operation, because most servers either have enough headroom or are themselves inside a container/VM limit that gets hit first. Per the kernel docs (not something we could safely reproduce on a shared box), when this does happen the kernel's OOM killer scores every process using (per the Linux docs) its <code>oom_score</code>, which factors in memory usage and is adjusted by <code>oom_score_adj</code> (range -1000 to 1000, readable/writable at <code>/proc/<pid>/oom_score_adj</code>). A process at -1000 is never killed by the OOM killer; one at 1000 is killed first. This is how systems protect critical daemons (set a very negative <code>oom_score_adj</code>) while letting large, replaceable batch jobs or caches be sacrificed first (a less negative or positive value). Databases are frequently the victim in low-memory systems simply because they tend to hold the most <code>anon-rss</code> of anything running.</p>
+
+<h2>7. What to do about it</h2>
+<ul>
+<li><strong>Check which mechanism you hit first.</strong> Exit 137 plus a cgroup/container log (<code>docker inspect</code> shows <code>OOMKilled: true</code>; <code>kubectl describe pod</code> shows <code>OOMKilled</code>; <code>journalctl --user</code> or <code>journalctl -k</code> shows "killed by the OOM killer") means a memory limit, not a code bug. A Python <code>MemoryError</code> / Java <code>OutOfMemoryError</code> exception you can catch means your own process's allocator gave up, which is a different fix (handle it, or raise <em>your own</em> limit).</li>
+<li><strong>Raise or right-size the container/cgroup limit</strong> (Docker <code>--memory</code>, k8s <code>resources.limits.memory</code>) once you know the real working-set size, rather than guessing.</li>
+<li><strong>Find the real peak usage</strong> before changing limits: for a cgroup, <code>systemd-run</code> and <code>systemctl --user status</code> report a "memory peak"; for containers, <code>docker stats</code>.</li>
+<li><strong>For databases specifically</strong> (mysqld, mariadb, postgres), tune the engine's own memory settings (e.g. MySQL's <code>innodb_buffer_pool_size</code>) to fit comfortably inside the container limit — the database doesn't know about the cgroup ceiling and will keep allocating until it hits it.</li>
+<li><strong>For a genuinely memory-tight host</strong>, set <code>oom_score_adj</code> deliberately on processes you never want killed, and add swap or more RAM rather than relying on the OOM killer's default choice.</li>
+</ul>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does exit code 137 mean?</summary><p>137 = 128 + 9, where 9 is SIGKILL. We measured this exact exit code when our test process was killed by a 50 MB memory cgroup limit. It shows up for both container/cgroup OOM kills and a genuine system-wide kernel OOM kill — check your container runtime&#x27;s logs or journalctl to tell them apart.</p></details>
+<details><summary>Is &#x27;Killed&#x27; with no error message always an OOM kill?</summary><p>In our test, yes — the process printed nothing itself, just stopped, and the shell reported &#x27;Killed&#x27;. The confirmation came from journalctl (&#x27;A process of this unit has been killed by the OOM killer&#x27;), Docker&#x27;s OOMKilled flag, or dmesg — not from the process&#x27;s own output, since SIGKILL gives it no chance to log anything.</p></details>
+<details><summary>Why did mysqld / mariadb get killed instead of another process?</summary><p>Per the kernel docs, the OOM killer scores processes mainly by how much resident memory (anon-rss) they hold, adjusted by each process&#x27;s oom_score_adj. Databases typically hold the largest working set on a box, so they&#x27;re statistically likely victims when memory is genuinely tight — independent of whether they&#x27;re actually the cause.</p></details>
+<details><summary>Is a Python MemoryError the same as an OOM kill?</summary><p>No, and we measured both to show the difference. A cgroup OOM kill ends the process instantly via SIGKILL (exit 137, nothing catchable). A MemoryError happens when a process hits its own RLIMIT_AS virtual-memory limit (ulimit -v) or genuinely fails an allocation — it&#x27;s a normal Python exception your code can catch and handle.</p></details>
+<details><summary>How do I stop my container from being OOM-killed?</summary><p>First confirm it&#x27;s actually hitting a limit (docker inspect shows OOMKilled: true; kubectl describe pod shows OOMKilled). Then either raise the container&#x27;s memory limit to match real peak usage, or reduce the app&#x27;s own memory footprint (for databases, lower buffer/cache settings so the engine stays under the ceiling itself instead of letting the kernel enforce it with SIGKILL).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Python 3.13, systemd 257 (systemd-run --user --scope), on Debian 13 / Linux 6.12. We triggered a real cgroup OOM kill with MemoryMax, read systemd&#x27;s own journal record of it, and contrasted it with Python&#x27;s RLIMIT_AS MemoryError and a generous-limit control run. We could not read dmesg (Operation not permitted, unprivileged user) so the classic kernel log line with total-vm/anon-rss is quoted from the kernel docs, not captured live. PlainHeaders is our extension; curl, Python and systemd are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

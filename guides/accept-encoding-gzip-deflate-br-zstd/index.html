@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Accept-Encoding: gzip, deflate, br, zstd: Who Sends It, Brotli vs gzip Sizes (Tested)</title>
+<meta name="description" content="Tested: Chromium 153 sends &#x27;gzip, deflate, br, zstd&#x27; on https and localhost but only &#x27;gzip, deflate&#x27; on plain http, and br it did not ask for fails with ERR_CONTENT_DECODING_FAILED. curl, Python requests and Node fetch compared, plus measured Brotli vs gzip vs zstd sizes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/accept-encoding-gzip-deflate-br-zstd/">
+<meta property="og:title" content="Accept-Encoding: gzip, deflate, br, zstd: Who Sends It, Brotli vs gzip Sizes (Tested)">
+<meta property="og:description" content="Tested: Chromium 153 sends &#x27;gzip, deflate, br, zstd&#x27; on https and localhost but only &#x27;gzip, deflate&#x27; on plain http, and br it did not ask for fails with ERR_CONTENT_DECODING_FAILED. curl, Python requests and Node fetch compared, plus measured Brotli vs gzip vs zstd sizes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/accept-encoding-gzip-deflate-br-zstd/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Chrome send Accept-Encoding: gzip, deflate, br, zstd?", "acceptedAnswer": {"@type": "Answer", "text": "It can decode all four. In our Chromium 153 test it sent that list on https and on http://localhost, but only 'gzip, deflate' on plain http to a non-localhost address."}}, {"@type": "Question", "name": "Is Brotli (br) better than gzip?", "acceptedAnswer": {"@type": "Answer", "text": "At high quality, yes: br 11 made a 245,232-byte script 47,313 bytes vs 57,868 for gzip 9 (18% smaller) but took 466 ms vs 15 ms. At quality 4 it was no smaller than gzip 6. Pre-compress static files with br 11."}}, {"@type": "Question", "name": "What causes ERR_CONTENT_DECODING_FAILED?", "acceptedAnswer": {"@type": "Answer", "text": "The Content-Encoding header does not match the body or the client: a gzip body labelled br, a plain body labelled gzip, or br sent to a Chromium page on plain http that only offered gzip, deflate. All three failed in our test."}}, {"@type": "Question", "name": "Does curl support Brotli?", "acceptedAnswer": {"@type": "Answer", "text": "Yes if built with it: curl 8.14.1 on Debian lists brotli and zstd in Features. With --compressed it sends 'deflate, gzip, br, zstd' and decodes them; without it it sends no Accept-Encoding."}}, {"@type": "Question", "name": "Does Python requests decode br?", "acceptedAnswer": {"@type": "Answer", "text": "Only with the brotli package installed. Without it requests 2.32.3 sent 'gzip, deflate', and a br response came back as raw compressed bytes. Node 24 fetch decoded br and zstd even though it only advertised gzip, deflate."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Accept-Encoding: gzip, deflate, br, zstd (tested)</h1>
+<p class="lead">Accept-Encoding is the list of compressions the client can unpack; the server answers with one of them in Content-Encoding. We checked what browsers and common clients actually advertise, what breaks, and how much Brotli saves over gzip.</p>
+<h2>1. What each client sent</h2>
+<table><thead><tr><th>Client</th><th>Accept-Encoding sent</th><th>Decoded br / zstd?</th></tr></thead><tbody>
+<tr><td>Chromium 153, <code>https://</code> (self-signed, localhost)</td><td><code>gzip, deflate, br, zstd</code></td><td>yes / yes</td></tr>
+<tr><td>Chromium 153, <code>http://localhost</code></td><td><code>gzip, deflate, br, zstd</code></td><td>yes / yes</td></tr>
+<tr><td>Chromium 153, plain <code>http://</code> to a LAN IP</td><td><strong><code>gzip, deflate</code></strong></td><td><strong>no: ERR_CONTENT_DECODING_FAILED</strong></td></tr>
+<tr><td>curl 8.14.1 (no flags)</td><td>none sent</td><td>no, prints the raw bytes</td></tr>
+<tr><td>curl 8.14.1 <code>--compressed</code></td><td><code>deflate, gzip, br, zstd</code></td><td>yes / yes</td></tr>
+<tr><td>Python requests 2.32.3 (no brotli package)</td><td><code>gzip, deflate</code></td><td>no: <code>.content</code> was the raw 53-byte br body</td></tr>
+<tr><td>Python urllib.request 3.13</td><td><code>identity</code></td><td>no (not even gzip)</td></tr>
+<tr><td>Node 24.21.0 <code>fetch</code></td><td><code>gzip, deflate</code></td><td>yes / yes, although it did not ask</td></tr>
+</tbody></table>
+<p>The key result: <strong>Chromium only offers br and zstd on secure origins</strong> (https and localhost). Testing on <code>http://localhost</code> shows br working, then the same server on a plain-http IP or hostname gets <code>gzip, deflate</code>. Always pick the encoding from the request's Accept-Encoding; never send br because "all browsers support it".</p>
+<h2>2. What breaks</h2>
+<table><thead><tr><th>Server sends</th><th>Chromium 153</th><th>curl --compressed</th></tr></thead><tbody>
+<tr><td>Correct gzip, br, zstd or deflate (advertised)</td><td>OK</td><td>OK</td></tr>
+<tr><td><code>Content-Encoding: br</code> to a client that offered only gzip, deflate</td><td><code>net::ERR_CONTENT_DECODING_FAILED</code></td><td>n/a</td></tr>
+<tr><td>gzip body labelled <code>br</code> (or br body labelled gzip)</td><td><code>net::ERR_CONTENT_DECODING_FAILED</code>; <code>fetch()</code> rejects with <code>TypeError: Failed to fetch</code></td><td>exit 61, 0 bytes</td></tr>
+<tr><td>Uncompressed body labelled <code>gzip</code></td><td><code>net::ERR_CONTENT_DECODING_FAILED</code></td><td>exit 61</td></tr>
+<tr><td>Unknown value <code>Content-Encoding: xyz</code>, plain body</td><td>shown as-is, no error</td><td>-</td></tr>
+</tbody></table>
+<p>Node fetch on the mislabelled body threw <code>TypeError: terminated</code> with cause <code>Decompression failed</code>. ERR_CONTENT_DECODING_FAILED almost always means the label and the bytes disagree: typically a proxy or app compresses a body that is already compressed, or strips the compression but keeps the header.</p>
+<h2>3. Brotli vs gzip vs zstd: measured sizes</h2>
+<table><thead><tr><th>Setting</th><th>12,941-byte HTML page</th><th>245,232-byte JS (acorn.js)</th><th>Time for the JS</th></tr></thead><tbody>
+<tr><td>gzip level 6</td><td>4,010</td><td>58,156</td><td>6.4 ms</td></tr>
+<tr><td>gzip level 9</td><td>4,010</td><td>57,868</td><td>15.4 ms</td></tr>
+<tr><td>br quality 4</td><td>4,042</td><td>59,818</td><td>3.6 ms</td></tr>
+<tr><td>br quality 11</td><td><strong>3,296</strong></td><td><strong>47,313</strong></td><td>466 ms</td></tr>
+<tr><td>zstd level 3</td><td>4,211</td><td>63,246</td><td>1.4 ms</td></tr>
+<tr><td>zstd level 19</td><td>3,949</td><td>50,455</td><td>102 ms</td></tr>
+</tbody></table>
+<p>Brotli's advantage comes from high quality: br 11 was 18% smaller than gzip 9 on the script, but about 30 times slower. At fast settings (br 4, zstd 3) the output was about the same size as gzip 6 or slightly larger. So: <strong>pre-compress static files with br 11 at build time</strong>, and use gzip, a low br quality or zstd for responses compressed on the fly.</p>
+<h2>4. Serving pre-compressed files (tested Node example)</h2>
+<pre><code>import http from 'node:http'; import fs from 'node:fs';
+http.createServer((req, res) =&gt; {
+  const file = 'dist/app.js';                // map req.url to a file in real code
+  const ae = req.headers['accept-encoding'] || '';
+  const headers = { 'Content-Type': 'text/javascript', 'Vary': 'Accept-Encoding' };
+  let path = file;
+  if (/\bbr\b/.test(ae) &amp;&amp; fs.existsSync(file + '.br')) { path += '.br'; headers['Content-Encoding'] = 'br'; }
+  else if (/\bgzip\b/.test(ae) &amp;&amp; fs.existsSync(file + '.gz')) { path += '.gz'; headers['Content-Encoding'] = 'gzip'; }
+  headers['Content-Length'] = fs.statSync(path).size;
+  res.writeHead(200, headers); fs.createReadStream(path).pipe(res);
+}).listen(8080);</code></pre>
+<p>Results with curl: no Accept-Encoding gave 245,232 bytes uncompressed, <code>gzip, deflate</code> gave gzip at 57,868 bytes, and Chrome's <code>gzip, deflate, br, zstd</code> gave br at 47,313 bytes; the <code>--compressed</code> output was byte-identical to the original. Create the files with <code>zlib.brotliCompressSync(buf, {params: {[zlib.constants.BROTLI_PARAM_QUALITY]: 11}})</code> and <code>zlib.gzipSync(buf, {level: 9})</code>. <code>Vary: Accept-Encoding</code> stops shared caches from serving br to a client that cannot read it. This simple regex ignores <code>q=0</code>; a full parser should honour it.</p>
+<h2>5. Checking with curl</h2>
+<pre><code># ask like Chrome on https, show what came back
+curl -s -o /dev/null -D- -H 'Accept-Encoding: gzip, deflate, br, zstd' https://example.com/ | grep -i -E 'content-encoding|vary'
+
+# download and decode (curl 8.14.1 built with brotli and zstd: check 'curl --version' Features)
+curl --compressed -o page.html https://example.com/</code></pre>
+<p>Without <code>--compressed</code> curl sends no Accept-Encoding and, if a server compresses anyway, writes the compressed bytes to your terminal. For nginx specifically (stock image has no Brotli module) see <a href="/guides/content-encoding-gzip-vs-br-nginx/">Content-Encoding gzip vs br in nginx</a>. Related: <a href="/guides/vary-origin-header-cors-cache/">Vary and caching</a>, <a href="/guides/content-length-header-mismatch/">Content-Length mismatches</a> and <a href="/guides/transfer-encoding-chunked-vs-content-length/">chunked vs Content-Length</a>.</p>
+<aside class="cta"><strong>See which Content-Encoding a URL really sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Chrome send Accept-Encoding: gzip, deflate, br, zstd?</summary><p>It can decode all four. In our Chromium 153 test it sent that list on https and on http://localhost, but only &#x27;gzip, deflate&#x27; on plain http to a non-localhost address.</p></details>
+<details><summary>Is Brotli (br) better than gzip?</summary><p>At high quality, yes: br 11 made a 245,232-byte script 47,313 bytes vs 57,868 for gzip 9 (18% smaller) but took 466 ms vs 15 ms. At quality 4 it was no smaller than gzip 6. Pre-compress static files with br 11.</p></details>
+<details><summary>What causes ERR_CONTENT_DECODING_FAILED?</summary><p>The Content-Encoding header does not match the body or the client: a gzip body labelled br, a plain body labelled gzip, or br sent to a Chromium page on plain http that only offered gzip, deflate. All three failed in our test.</p></details>
+<details><summary>Does curl support Brotli?</summary><p>Yes if built with it: curl 8.14.1 on Debian lists brotli and zstd in Features. With --compressed it sends &#x27;deflate, gzip, br, zstd&#x27; and decodes them; without it it sends no Accept-Encoding.</p></details>
+<details><summary>Does Python requests decode br?</summary><p>Only with the brotli package installed. Without it requests 2.32.3 sent &#x27;gzip, deflate&#x27;, and a br response came back as raw compressed bytes. Node 24 fetch decoded br and zstd even though it only advertised gzip, deflate.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 with headless Chromium 153.0.8010.12 (Playwright), curl 8.14.1 (libcurl with brotli 1.1.0 and zstd 1.5.7), Python 3.13 with requests 2.32.3 / urllib3 2.3.0 (no brotli or zstandard package installed) and Node 24.21.0 (fetch and zlib) against a Node test server on http://localhost, http on a non-localhost IP, and https://localhost with a self-signed certificate. Sizes and times are Node zlib on one machine; compare settings, not absolute numbers. PlainHeaders is our extension; curl and Node are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

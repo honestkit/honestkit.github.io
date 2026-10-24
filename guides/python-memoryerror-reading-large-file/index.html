@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python MemoryError When Reading a Large File, Tested</title>
+<meta name="description" content="We measured Python MemoryError on a 300 MB file under a 200 MB cap: read() and readlines() fail, line iteration works unless the file has no newlines.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-memoryerror-reading-large-file/">
+<meta property="og:title" content="Python MemoryError When Reading a Large File, Tested">
+<meta property="og:description" content="We measured Python MemoryError on a 300 MB file under a 200 MB cap: read() and readlines() fail, line iteration works unless the file has no newlines.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-memoryerror-reading-large-file/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Python raise MemoryError with no message?", "acceptedAnswer": {"@type": "Answer", "text": "MemoryError usually has empty args. We measured bytearray, list and str allocations of 10**13 all raising a bare MemoryError() on Python 3.13.5."}}, {"@type": "Question", "name": "How do I read a large file in Python without MemoryError?", "acceptedAnswer": {"@type": "Answer", "text": "Iterate over it line by line or read fixed-size chunks. Under a 200 MB cap we measured read() and readlines() failing on a 300 MB file while for line in f worked."}}, {"@type": "Question", "name": "Why does for line in f still give MemoryError?", "acceptedAnswer": {"@type": "Answer", "text": "The file has no line breaks, so the whole file is one line. We measured that on a 300 MB single-line file; 1 MB chunks worked."}}, {"@type": "Question", "name": "How much memory does f.read() use?", "acceptedAnswer": {"@type": "Answer", "text": "More than the file. We measured a peak of 580 MB for a 300 MB text file with read(), 446 MB with readlines(), and 11 MB iterating lines."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python MemoryError reading a large file (tested)</h1>
+<p class="lead"><code>MemoryError</code> when reading a file means you loaded more of it at once than the process can hold. We capped a Python 3.13.5 process at 200 MB, read a 300 MB file five ways, and measured how much memory each really uses.</p>
+<h2 id="empty">1. MemoryError has no message</h2>
+<pre><code>for expr in [&quot;bytearray(10**13)&quot;, &quot;[0] * 10**13&quot;, &quot;&#x27;x&#x27; * 10**13&quot;]:
+    try:
+        eval(expr)
+    except MemoryError as e:
+        print(f&quot;{expr:20} -&gt; MemoryError({e!r}) args={e.args}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>bytearray(10**13)    -&gt; MemoryError(MemoryError()) args=()
+[0] * 10**13         -&gt; MemoryError(MemoryError()) args=()
+&#x27;x&#x27; * 10**13         -&gt; MemoryError(MemoryError()) args=()</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> a single allocation that can never fit raises <code>MemoryError</code> straight away, with empty args, so the traceback ends in a bare <code>MemoryError</code>. The line it points to is the allocation that failed, which is not always the thing using most of the memory.</p>
+
+<h2 id="large-file">2. Reading a file bigger than your memory</h2>
+<pre><code>import resource
+# Two 300 MB files: one with normal lines, one with no newline at all
+with open(&quot;lines.txt&quot;, &quot;w&quot;) as f:
+    for _ in range(300):
+        f.write((&quot;x&quot; * 99 + &quot;\n&quot;) * 10_000)
+with open(&quot;oneline.txt&quot;, &quot;w&quot;) as f:
+    for _ in range(300):
+        f.write(&quot;x&quot; * 1_000_000)
+
+# Cap this process at 200 MB of address space
+cap = 200 * 1024 * 1024
+resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
+
+def attempt(name, fn):
+    try:
+        print(f&quot;{name:32} -&gt; {fn()}&quot;)
+    except MemoryError as e:
+        print(f&quot;{name:32} -&gt; MemoryError({e!r})&quot;)
+
+attempt(&quot;lines.txt: f.read()&quot;, lambda: len(open(&quot;lines.txt&quot;).read()))
+attempt(&quot;lines.txt: f.readlines()&quot;, lambda: len(open(&quot;lines.txt&quot;).readlines()))
+attempt(&quot;lines.txt: for line in f&quot;, lambda: sum(1 for _ in open(&quot;lines.txt&quot;)))
+attempt(&quot;oneline.txt: for line in f&quot;, lambda: sum(1 for _ in open(&quot;oneline.txt&quot;)))
+def chunks(path, size=1 &lt;&lt; 20):
+    with open(path) as f:
+        while chunk := f.read(size):
+            yield chunk
+
+attempt(&quot;oneline.txt: 1 MB chunks&quot;, lambda: sum(1 for _ in chunks(&quot;oneline.txt&quot;)))</code></pre>
+<p>Output:</p>
+<pre><code>lines.txt: f.read()              -&gt; MemoryError(MemoryError())
+lines.txt: f.readlines()         -&gt; MemoryError(MemoryError())
+lines.txt: for line in f         -&gt; 3000000
+oneline.txt: for line in f       -&gt; MemoryError(MemoryError())
+oneline.txt: 1 MB chunks         -&gt; 287</code></pre>
+<p><strong>Measured:</strong> with the process capped at 200 MB, <code>read()</code> and <code>readlines()</code> on a 300 MB file raised <code>MemoryError</code>, while <code>for line in f</code> counted all 3,000,000 lines. But line iteration only helps if the file has line breaks: on a 300 MB file with no newline, <code>for line in f</code> is one 300 MB line and fails the same way. Reading fixed-size chunks works for any file.</p>
+
+<h2 id="peak">3. How much memory each approach really uses</h2>
+<pre><code>import subprocess, sys
+# Peak memory (max RSS) of each approach, each in a fresh process, no cap
+snippets = {
+    &quot;f.read()&quot;:       &quot;len(open(&#x27;lines.txt&#x27;).read())&quot;,
+    &quot;f.readlines()&quot;:  &quot;len(open(&#x27;lines.txt&#x27;).readlines())&quot;,
+    &quot;for line in f&quot;:  &quot;sum(1 for _ in open(&#x27;lines.txt&#x27;))&quot;,
+}
+for name, code in snippets.items():
+    prog = code + &quot;\nimport resource; print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024)&quot;
+    mb = subprocess.run([sys.executable, &quot;-c&quot;, prog], capture_output=True, text=True).stdout.strip()
+    print(f&quot;{name:15} peak {mb} MB for a 300 MB file&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>f.read()        peak 580 MB for a 300 MB file
+f.readlines()   peak 446 MB for a 300 MB file
+for line in f   peak 11 MB for a 300 MB file</code></pre>
+<p><strong>Measured:</strong> <code>read()</code> peaked at almost twice the file size and <code>readlines()</code> at about 1.5x; iterating line by line stayed at 11 MB. Python's text decoding and per-line string objects add overhead on top of the raw bytes, so "the file fits in RAM" is not enough. Process the file as a stream, and write results out as you go instead of collecting them in a list.</p>
+
+<p>On Linux without a memory cap, a process that runs out of memory is often killed by the kernel instead of getting a <code>MemoryError</code>; see our <a href="/guides/out-of-memory-killed/">out of memory killed guide</a>.</p>
+
+<aside class="cta"><strong>Downloading a big file before reading it? Check its Content-Length and headers first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Python raise MemoryError with no message?</summary><p>MemoryError usually has empty args. We measured bytearray, list and str allocations of 10**13 all raising a bare MemoryError() on Python 3.13.5.</p></details>
+<details><summary>How do I read a large file in Python without MemoryError?</summary><p>Iterate over it line by line or read fixed-size chunks. Under a 200 MB cap we measured read() and readlines() failing on a 300 MB file while for line in f worked.</p></details>
+<details><summary>Why does for line in f still give MemoryError?</summary><p>The file has no line breaks, so the whole file is one line. We measured that on a 300 MB single-line file; 1 MB chunks worked.</p></details>
+<details><summary>How much memory does f.read() use?</summary><p>More than the file. We measured a peak of 580 MB for a 300 MB text file with read(), 446 MB with readlines(), and 11 MB iterating lines.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: 10**13-sized allocations, two 300 MB files read five ways under a 200 MB RLIMIT_AS cap, and peak RSS of read(), readlines() and line iteration. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

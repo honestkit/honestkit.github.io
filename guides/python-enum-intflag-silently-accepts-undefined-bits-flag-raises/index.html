@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>enum: IntFlag Silently Accepts Undefined Bits, Flag Raises</title>
+<meta name="description" content="We measured Python 3.13.5: IntFlag(8) on a 3-bit flag returns 8 with no error, while the equivalent Flag raises ValueError for the same invalid value.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-enum-intflag-silently-accepts-undefined-bits-flag-raises/">
+<meta property="og:title" content="enum: IntFlag Silently Accepts Undefined Bits, Flag Raises">
+<meta property="og:description" content="We measured Python 3.13.5: IntFlag(8) on a 3-bit flag returns 8 with no error, while the equivalent Flag raises ValueError for the same invalid value.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-enum-intflag-silently-accepts-undefined-bits-flag-raises/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does enum.IntFlag raise an error for undefined bits like enum.Flag does?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured enum.IntFlag(13) on a 3-bit flag (1, 2, 4) returning 13 with no error, silently keeping the undefined 4th bit, while the equivalent enum.Flag(13) raised ValueError."}}, {"@type": "Question", "name": "Why do IntFlag and Flag behave differently for invalid values?", "acceptedAnswer": {"@type": "Answer", "text": "Because they have different default boundary settings as of Python 3.11: Flag defaults to boundary=STRICT (rejects undefined bits), IntFlag defaults to boundary=KEEP (keeps them silently) for backward compatibility with pre-3.11 int-like behavior."}}, {"@type": "Question", "name": "How do I make IntFlag reject undefined bits like Flag does?", "acceptedAnswer": {"@type": "Answer", "text": "Pass boundary=enum.STRICT when defining the class, e.g. class Perm(enum.IntFlag, boundary=enum.STRICT): ... -- we confirmed this makes IntFlag raise ValueError on the same invalid integers that pass silently by default."}}, {"@type": "Question", "name": "Is it safe to parse an external bitmask directly into an IntFlag?", "acceptedAnswer": {"@type": "Answer", "text": "Not with the default boundary -- we measured that IntFlag(external_int) accepts any integer, including ones with bits outside every defined member, with no indication anything was wrong. Use boundary=STRICT or boundary=CONFORM if the value comes from outside your program."}}, {"@type": "Question", "name": "What does boundary=CONFORM do differently from the IntFlag default?", "acceptedAnswer": {"@type": "Answer", "text": "CONFORM masks off any undefined bits instead of keeping or rejecting them, per the enum module's design -- it's a middle option between KEEP (default, silent) and STRICT (raises) for handling unexpected bits."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>enum.IntFlag Silently Accepts Undefined Bits, enum.Flag Raises (tested)</h1>
+<p class="lead"><code>IntFlag</code> and <code>Flag</code> look like interchangeable ways to define bitwise flag enums -- one is just also an int. We measured what happens when you construct each from an integer that sets bits beyond the ones you defined, the shape you'd see parsing a permissions bitmask from a database column or external API. One class raises immediately. The other lets it through silently.</p>
+<h2 id="repro1">1. Flag raises ValueError on an undefined bit</h2>
+<pre><code>import enum
+
+class Perm(enum.Flag):
+    READ = 1
+    WRITE = 2
+    EXEC = 4
+
+external = 13  # READ(1) + EXEC(4) + an undefined bit(8)
+Perm(external)</code></pre>
+<pre><code>ValueError: &lt;flag 'Perm'&gt; invalid value 13
+    given 0b0 1101
+  allowed 0b0 0111</code></pre>
+<p><strong>Measured:</strong> <code>enum.Flag</code> defaults to <code>boundary=STRICT</code> (as of Python 3.11), so constructing it from any integer with bits outside the ones you defined raises <code>ValueError</code> immediately, naming exactly which bits were given versus allowed.</p>
+
+<h2 id="repro2">2. IntFlag accepts the identical integer with no error</h2>
+<pre><code>import enum
+
+class IntPerm(enum.IntFlag):
+    READ = 1
+    WRITE = 2
+    EXEC = 4
+
+external = 13
+p = IntPerm(external)
+print(p, int(p))
+print(IntPerm.READ in p)
+print(list(IntPerm))</code></pre>
+<pre><code>13 13
+True
+[&lt;IntPerm.READ: 1&gt;, &lt;IntPerm.WRITE: 2&gt;, &lt;IntPerm.EXEC: 4&gt;]</code></pre>
+<p><strong>Measured:</strong> <code>enum.IntFlag</code> defaults to <code>boundary=KEEP</code>, so the same invalid integer 13 constructs without error. <code>p</code> silently carries the undefined 8-bit alongside the two valid ones -- it prints as the bare int <code>13</code> instead of a readable flag combination, and <code>list(IntPerm)</code> still only shows the three defined members, giving no hint that an extra bit is set. Membership checks for defined bits (<code>Perm.READ in p</code>) still work correctly; there is just no signal that <code>p</code> also contains something you never defined.</p>
+
+<h2 id="repro3">3. The fix: pass boundary=enum.STRICT explicitly, or validate with Flag</h2>
+<pre><code>import enum
+
+class StrictIntPerm(enum.IntFlag, boundary=enum.STRICT):
+    READ = 1
+    WRITE = 2
+    EXEC = 4
+
+try:
+    StrictIntPerm(13)
+except ValueError as e:
+    print("rejected:", e)</code></pre>
+<pre><code>rejected: &lt;flag 'StrictIntPerm'&gt; invalid value 13
+    given 0b0 1101
+  allowed 0b0 0111</code></pre>
+<p><strong>Measured:</strong> passing <code>boundary=enum.STRICT</code> to an <code>IntFlag</code> subclass restores the same rejection <code>Flag</code> gives by default. If you're parsing an external bitmask into an <code>IntFlag</code> specifically because you need int arithmetic or storage compatibility, add <code>boundary=enum.STRICT</code> (or <code>enum.CONFORM</code> to mask off the extra bits instead of raising) -- the plain default silently keeps whatever garbage bits arrive.</p>
+<aside class="cta"><strong>Parsing a permissions bitmask from a DB or API into an Enum? Check which flag base class you&#x27;re using:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does enum.IntFlag raise an error for undefined bits like enum.Flag does?</summary><p>No -- we measured enum.IntFlag(13) on a 3-bit flag (1, 2, 4) returning 13 with no error, silently keeping the undefined 4th bit, while the equivalent enum.Flag(13) raised ValueError.</p></details>
+<details><summary>Why do IntFlag and Flag behave differently for invalid values?</summary><p>Because they have different default boundary settings as of Python 3.11: Flag defaults to boundary=STRICT (rejects undefined bits), IntFlag defaults to boundary=KEEP (keeps them silently) for backward compatibility with pre-3.11 int-like behavior.</p></details>
+<details><summary>How do I make IntFlag reject undefined bits like Flag does?</summary><p>Pass boundary=enum.STRICT when defining the class, e.g. class Perm(enum.IntFlag, boundary=enum.STRICT): ... -- we confirmed this makes IntFlag raise ValueError on the same invalid integers that pass silently by default.</p></details>
+<details><summary>Is it safe to parse an external bitmask directly into an IntFlag?</summary><p>Not with the default boundary -- we measured that IntFlag(external_int) accepts any integer, including ones with bits outside every defined member, with no indication anything was wrong. Use boundary=STRICT or boundary=CONFORM if the value comes from outside your program.</p></details>
+<details><summary>What does boundary=CONFORM do differently from the IntFlag default?</summary><p>CONFORM masks off any undefined bits instead of keeping or rejecting them, per the enum module&#x27;s design -- it&#x27;s a middle option between KEEP (default, silent) and STRICT (raises) for handling unexpected bits.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in enum module: constructed an IntFlag and a plain Flag with the same 3 defined bits (1, 2, 4), then passed each the integer 13 (which sets an undefined 4th bit alongside two valid ones) and compared the results, plus checked each class&#x27;s ._boundary_ attribute. PlainHeaders is our extension; Python&#x27;s enum module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

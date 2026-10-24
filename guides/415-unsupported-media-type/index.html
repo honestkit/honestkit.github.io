@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>415 Unsupported Media Type: Causes and Fixes in Express, Flask, fetch (Tested)</title>
+<meta name="description" content="fetch with a JSON.stringify body sent text/plain;charset=UTF-8, curl -d sent form-urlencoded, requests data= sent none. Flask 3.1 answered 415, Express 5 gave req.body undefined with 200, FastAPI gave 422. Measured fixes for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/415-unsupported-media-type/">
+<meta property="og:title" content="415 Unsupported Media Type: Causes and Fixes in Express, Flask, fetch (Tested)">
+<meta property="og:description" content="fetch with a JSON.stringify body sent text/plain;charset=UTF-8, curl -d sent form-urlencoded, requests data= sent none. Flask 3.1 answered 415, Express 5 gave req.body undefined with 200, FastAPI gave 422. Measured fixes for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/415-unsupported-media-type/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes 415 Unsupported Media Type?", "acceptedAnswer": {"@type": "Answer", "text": "The server rejected the body because of its Content-Type, charset or Content-Encoding. In our tests Flask 3.1.3 returned 415 for text/plain, form-urlencoded or a missing header on request.get_json(), and Express 5.2.1 returned 415 for charset=latin1 or Content-Encoding: foo."}}, {"@type": "Question", "name": "Why does fetch with JSON.stringify get a 415?", "acceptedAnswer": {"@type": "Answer", "text": "Without a headers option, fetch in Node 24 and Chromium 153 sent the string as text/plain;charset=UTF-8. Add headers: {'Content-Type': 'application/json'}."}}, {"@type": "Question", "name": "What Content-Type does curl -d send?", "acceptedAnswer": {"@type": "Answer", "text": "curl 8.14.1 sent application/x-www-form-urlencoded for -d. curl --json sent application/json and Accept: application/json."}}, {"@type": "Question", "name": "Why is req.body undefined in Express instead of a 415?", "acceptedAnswer": {"@type": "Answer", "text": "express.json() in Express 5.2.1 skips requests whose Content-Type is not application/json and leaves req.body undefined with no error. Fix the client, widen the type option, or check req.is('application/json') and return 415 yourself."}}, {"@type": "Question", "name": "Does FastAPI return 415 for the wrong Content-Type?", "acceptedAnswer": {"@type": "Answer", "text": "Not in FastAPI 0.142.2: a Pydantic body sent as text/plain or without a Content-Type returned 422 with the JSON shown as a string in the input field. request.json() parsed it anyway."}}, {"@type": "Question", "name": "Does Content-Type: application/json trigger a CORS preflight?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Chromium 153 sent an OPTIONS request with Access-Control-Request-Headers: content-type, and the POST failed unless the server replied Access-Control-Allow-Headers: Content-Type."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>415 Unsupported Media Type (tested)</h1>
+<p class="lead">A <code>415 Unsupported Media Type</code> means the server refused the request body because of its <code>Content-Type</code> (or its charset or <code>Content-Encoding</code>). Almost always the body is valid JSON and the header is wrong or missing. We sent the same <code>{"a":1}</code> from five clients and into three frameworks: only Flask returned 415 for a missing JSON header; Express and FastAPI failed differently, which is why this bug is easy to misread.</p>
+<h2>1. What each client sends by default</h2>
+<p>Logged by a Node.js echo server. The body was always the JSON text <code>{"a":1}</code> unless noted:</p>
+<table><thead><tr><th>Client call</th><th>Content-Type received</th></tr></thead><tbody>
+<tr><td>Node 24 <code>fetch(url, {method:'POST', body: JSON.stringify(obj)})</code></td><td><strong><code>text/plain;charset=UTF-8</code></strong></td></tr>
+<tr><td>Chromium 153 <code>fetch</code>, same call</td><td><strong><code>text/plain;charset=UTF-8</code></strong></td></tr>
+<tr><td><code>fetch</code> with <code>body: new URLSearchParams({a:'1'})</code></td><td><code>application/x-www-form-urlencoded;charset=UTF-8</code></td></tr>
+<tr><td><code>fetch</code> with <code>body: new FormData()</code></td><td><code>multipart/form-data; boundary=...</code></td></tr>
+<tr><td><code>fetch</code> with <code>body: new Blob(['{}'])</code></td><td>(none sent)</td></tr>
+<tr><td><code>curl -d '{"a":1}'</code></td><td><strong><code>application/x-www-form-urlencoded</code></strong></td></tr>
+<tr><td><code>curl --json '{"a":1}'</code></td><td><code>application/json</code> (and <code>Accept: application/json</code>)</td></tr>
+<tr><td>Python requests <code>post(url, data='{"a":1}')</code> (a string)</td><td><strong>(none sent)</strong></td></tr>
+<tr><td>Python requests <code>post(url, data={'a': 1})</code> (a dict)</td><td><code>application/x-www-form-urlencoded</code>, body <code>a=1</code></td></tr>
+<tr><td>Python requests <code>post(url, json={'a': 1})</code></td><td><code>application/json</code></td></tr>
+</tbody></table>
+<p>So <code>fetch</code> plus <code>JSON.stringify</code> without a header, <code>curl -d</code>, and requests <code>data=</code> with a string all send JSON labelled as something else. The client fixes:</p>
+<pre><code>// fetch
+fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(obj)});
+
+# curl (measured with 8.14.1)
+curl --json '{"a":1}' https://api.example.com/x
+# or
+curl -H 'Content-Type: application/json' -d '{"a":1}' https://api.example.com/x
+
+# Python requests
+requests.post(url, json=obj)</code></pre>
+<h2>2. Flask 3.1.3: real 415</h2>
+<table><thead><tr><th>Content-Type sent</th><th><code>request.get_json()</code> / <code>request.json</code></th><th><code>get_json(silent=True)</code></th><th><code>get_json(force=True)</code></th></tr></thead><tbody>
+<tr><td><code>application/json</code></td><td>200, parsed</td><td>parsed</td><td>parsed</td></tr>
+<tr><td><code>application/vnd.api+json</code>, <code>application/problem+json</code></td><td>200, parsed</td><td>parsed</td><td>parsed</td></tr>
+<tr><td><code>text/plain;charset=UTF-8</code></td><td><strong>415</strong></td><td><code>None</code></td><td>parsed</td></tr>
+<tr><td><code>application/x-www-form-urlencoded</code></td><td><strong>415</strong></td><td><code>None</code></td><td>parsed</td></tr>
+<tr><td>(none sent)</td><td><strong>415</strong></td><td><code>None</code></td><td>parsed</td></tr>
+</tbody></table>
+<p>The 415 page says: <code>Did not attempt to load JSON data because the request Content-Type was not 'application/json'.</code> Flask accepts any <code>application/*+json</code> type (<code>request.is_json</code> was <code>True</code> for both). Malformed JSON with the right header is a different error: 400 Bad Request. Fix the client; use <code>force=True</code> only if you must accept clients you cannot change.</p>
+<h2>3. Express 5.2.1: no 415, just an empty body</h2>
+<p><code>express.json()</code> skips any request whose type does not match and calls the next handler with <code>req.body</code> left <code>undefined</code>:</p>
+<table><thead><tr><th>Request</th><th><code>express.json()</code></th></tr></thead><tbody>
+<tr><td><code>application/json</code> or <code>application/json; charset=utf-8</code></td><td>200, <code>req.body = {a: 1}</code></td></tr>
+<tr><td><code>text/plain;charset=UTF-8</code> (fetch default)</td><td>200, <code>req.body</code> <strong>undefined</strong></td></tr>
+<tr><td><code>application/x-www-form-urlencoded</code> (curl -d)</td><td>200, <code>req.body</code> undefined</td></tr>
+<tr><td><code>application/vnd.api+json</code></td><td>200, <code>req.body</code> undefined (unlike Flask)</td></tr>
+<tr><td>No body at all</td><td>200, <code>req.body</code> undefined</td></tr>
+<tr><td><code>application/json; charset=latin1</code></td><td><strong>415</strong>, <code>unsupported charset "LATIN1"</code> (type <code>charset.unsupported</code>)</td></tr>
+<tr><td><code>Content-Encoding: foo</code></td><td><strong>415</strong>, <code>unsupported content encoding "foo"</code></td></tr>
+</tbody></table>
+<p>The usual symptom is therefore a 500, not a 415: a handler doing <code>const {a} = req.body</code> threw <code>TypeError: Cannot destructure property 'a' of 'req.body' as it is undefined.</code> Three fixes, all measured:</p>
+<pre><code>// a) Accept extra types as JSON (text/plain then parsed to {a: 1})
+app.use(express.json({type: ['application/json', 'text/plain']}));
+
+// b) Reject wrong types explicitly with a real 415
+app.post('/items', (req, res, next) =&gt; {
+  if (!req.is('application/json'))
+    return res.status(415).json({error: 'Content-Type must be application/json'});
+  next();
+}, express.json(), handler);
+
+// c) Fix the client (section 1) - the right answer when you own both sides</code></pre>
+<p>Option (b) returned 415 for <code>text/plain</code>, form-urlencoded and a missing header, and 200 for <code>application/json; charset=utf-8</code>. For <code>application/*+json</code> types use <code>express.json({type: ['application/json', 'application/*+json']})</code>.</p>
+<h2>4. FastAPI 0.142.2: 422, not 415</h2>
+<table><thead><tr><th>Content-Type sent</th><th>Pydantic model or <code>dict = Body()</code> parameter</th><th><code>await request.json()</code></th></tr></thead><tbody>
+<tr><td><code>application/json</code>, <code>application/vnd.api+json</code></td><td>200</td><td>200</td></tr>
+<tr><td><code>application/json; charset=latin1</code></td><td>200 (charset ignored)</td><td>200</td></tr>
+<tr><td><code>text/plain</code>, form-urlencoded or none</td><td><strong>422</strong></td><td>200 (parses anyway)</td></tr>
+</tbody></table>
+<p>The 422 body is easy to misread because it shows your JSON as a string: <code>{"type":"model_attributes_type","loc":["body"],"msg":"Input should be a valid dictionary or object to extract fields from","input":"{\"a\":1}"}</code>. If <code>input</code> is a quoted string of your JSON, the Content-Type was wrong; fix it on the client.</p>
+<h2>5. Browsers: the JSON header triggers a CORS preflight</h2>
+<p>In Chromium 153, from <code>http://127.0.0.1:8985</code> to <code>http://localhost:8986</code> (an API that sent <code>Access-Control-Allow-Origin: *</code>):</p>
+<table><thead><tr><th>fetch POST</th><th>Requests the server saw</th><th>Result</th></tr></thead><tbody>
+<tr><td>no header (body sent as <code>text/plain;charset=UTF-8</code>)</td><td>POST only</td><td>200</td></tr>
+<tr><td><code>Content-Type: text/plain</code></td><td>POST only</td><td>200</td></tr>
+<tr><td><code>Content-Type: application/json</code>, no <code>Access-Control-Allow-Headers</code></td><td>OPTIONS with <code>Access-Control-Request-Headers: content-type</code>, then nothing</td><td><code>TypeError: Failed to fetch</code></td></tr>
+<tr><td><code>Content-Type: application/json</code>, server allows <code>Content-Type</code></td><td>OPTIONS, then POST</td><td>200</td></tr>
+</tbody></table>
+<p>The console said: <code>Request header field content-type is not allowed by Access-Control-Allow-Headers in preflight response.</code> Do not "fix" a 415 by dropping the header to avoid the preflight; that just moves you to the Express or FastAPI failure above. Answer the <code>OPTIONS</code> request with <code>Access-Control-Allow-Headers: Content-Type</code> instead.</p>
+<h2>6. Checklist</h2>
+<ul>
+<li>Look at the request in DevTools Network or with <code>curl -v</code>: is the <code>Content-Type</code> line there, and is it <code>application/json</code>?</li>
+<li>fetch: add <code>headers: {'Content-Type': 'application/json'}</code>. curl: use <code>--json</code>. requests: use <code>json=</code>.</li>
+<li>A charset other than UTF-8 (Express) or an unknown <code>Content-Encoding</code> also gives 415; send <code>application/json</code> or <code>application/json; charset=utf-8</code>.</li>
+<li>Uploads: send the file's real type (<code>multipart/form-data</code> via <code>FormData</code>, without setting the header yourself, so the boundary is added).</li>
+</ul>
+<p>For the JSON header itself see <a href="/guides/content-type-application-json-header/">Content-Type: application/json</a>, and for charset decoding see <a href="/guides/content-type-charset-utf-8/">Content-Type charset=utf-8</a>.</p>
+<aside class="cta"><strong>Add or fix the Content-Type header on a request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes 415 Unsupported Media Type?</summary><p>The server rejected the body because of its Content-Type, charset or Content-Encoding. In our tests Flask 3.1.3 returned 415 for text/plain, form-urlencoded or a missing header on request.get_json(), and Express 5.2.1 returned 415 for charset=latin1 or Content-Encoding: foo.</p></details>
+<details><summary>Why does fetch with JSON.stringify get a 415?</summary><p>Without a headers option, fetch in Node 24 and Chromium 153 sent the string as text/plain;charset=UTF-8. Add headers: {&#x27;Content-Type&#x27;: &#x27;application/json&#x27;}.</p></details>
+<details><summary>What Content-Type does curl -d send?</summary><p>curl 8.14.1 sent application/x-www-form-urlencoded for -d. curl --json sent application/json and Accept: application/json.</p></details>
+<details><summary>Why is req.body undefined in Express instead of a 415?</summary><p>express.json() in Express 5.2.1 skips requests whose Content-Type is not application/json and leaves req.body undefined with no error. Fix the client, widen the type option, or check req.is(&#x27;application/json&#x27;) and return 415 yourself.</p></details>
+<details><summary>Does FastAPI return 415 for the wrong Content-Type?</summary><p>Not in FastAPI 0.142.2: a Pydantic body sent as text/plain or without a Content-Type returned 422 with the JSON shown as a string in the input field. request.json() parsed it anyway.</p></details>
+<details><summary>Does Content-Type: application/json trigger a CORS preflight?</summary><p>Yes. Chromium 153 sent an OPTIONS request with Access-Control-Request-Headers: content-type, and the POST failed unless the server replied Access-Control-Allow-Headers: Content-Type.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 (built-in fetch, and an http.createServer echo server on localhost:8985-8986 that logged the Content-Type of every request), curl 8.14.1, Python 3.13.5 with requests 2.32.3, Express 5.2.1 (body-parser 2.3.0), Flask 3.1.3 (Werkzeug 3.1.9), FastAPI 0.142.2 (Starlette 1.7.0, Pydantic 2.13.5, uvicorn 0.54.0) and headless Chromium 153.0.8010.12 (Playwright) for the CORS preflight test. Every request body was the same JSON string {&quot;a&quot;:1}; only the Content-Type changed. Spring and ASP.NET Core were not run here. PlainHeaders is our extension; Node.js, curl, Python, Express, Flask, FastAPI and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

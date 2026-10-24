@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>struct.pack()&#x27;s Native Padding Silently Corrupts unpack()</title>
+<meta name="description" content="We measured Python 3.13.5: struct.pack(&#x27;bi&#x27;,...) with no prefix adds invisible padding -- unpack(&#x27;&lt;bi&#x27;,...) then errors, or returns a wrong phantom field.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-struct-native-format-padding-breaks-unpack/">
+<meta property="og:title" content="struct.pack()&#x27;s Native Padding Silently Corrupts unpack()">
+<meta property="og:description" content="We measured Python 3.13.5: struct.pack(&#x27;bi&#x27;,...) with no prefix adds invisible padding -- unpack(&#x27;&lt;bi&#x27;,...) then errors, or returns a wrong phantom field.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-struct-native-format-padding-breaks-unpack/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does struct.pack() add padding bytes by default?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, when the format string has no byte-order prefix (or uses '@' explicitly) -- we measured 'bi' producing 8 bytes instead of the 5 you'd get from the field sizes alone, because 3 bytes of native alignment padding get inserted before the int."}}, {"@type": "Question", "name": "Why does struct.unpack() fail with a buffer-size error that doesn't mention padding?", "acceptedAnswer": {"@type": "Answer", "text": "Because struct.error only reports the byte-count mismatch between what calcsize() expects and what you supplied -- we measured the exact message ('unpack requires a buffer of 5 bytes') giving no hint that native alignment padding, not a wrong format string, is the real cause."}}, {"@type": "Question", "name": "Can struct.unpack() succeed but return the wrong values because of native padding?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured packing 'hi' (short, int) natively into 8 padded bytes, then unpacking those same bytes with '<hhi' (3 unpadded fields totalling the same 8 bytes): it succeeded and returned (7, 0, 99999), silently turning the 2 padding bytes into a bogus extra field."}}, {"@type": "Question", "name": "How do you avoid struct's native padding footgun?", "acceptedAnswer": {"@type": "Answer", "text": "Always start the format string with an explicit '<', '>', '=' or '!' for any data you serialize, store, or send across a process/network boundary -- we measured those four prefixes never inserting padding, unlike no-prefix or '@', which should be reserved for in-process interop with C structs on the same machine."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>struct: Native Format Padding Silently Breaks unpack() (tested)</h1>
+<p class="lead">A <code>struct</code> format string with no byte-order character, or an explicit <code>@</code>, uses the platform's native size and alignment -- which means it can silently insert padding bytes between fields that don't exist in <code>&lt;</code>, <code>&gt;</code>, <code>=</code> or <code>!</code> (standard, no-padding) formats. We measured what that padding actually does to the byte layout and to unpacking.</p>
+<h2 id="repro1">1. The same format string, with and without a byte-order prefix, isn't the same size</h2>
+<pre><code>import struct
+
+native = struct.pack('bi', 1, 2)      # no prefix = native (same as '@')
+standard = struct.pack('=bi', 1, 2)   # explicit standard, no padding
+
+print(len(native), native.hex())
+print(len(standard), standard.hex())
+print(struct.calcsize('bi'), struct.calcsize('=bi'))</code></pre>
+<pre><code>8 0100000002000000
+5 0102000000
+8 5</code></pre>
+<p><strong>Measured:</strong> packing a <code>byte</code> then an <code>int</code> with no prefix produces 8 bytes -- 3 invisible padding bytes get inserted after the <code>byte</code> so the <code>int</code> starts on a 4-byte-aligned offset, which is how C structs are laid out on this platform. The <code>=bi</code> version has no alignment rules and packs exactly 5 bytes: 1 for the byte, 4 for the int, nothing else. Nothing in the format string <code>'bi'</code> itself hints that 3 extra bytes exist.</p>
+
+<h2 id="repro2">2. Unpacking native-packed bytes with a standard prefix fails on size, not on content</h2>
+<pre><code>import struct
+
+packed = struct.pack('bi', 1, 2)   # 8 bytes, native padding included
+
+try:
+    struct.unpack('=bi', packed)
+except struct.error as e:
+    print("error:", e)</code></pre>
+<pre><code>error: unpack requires a buffer of 5 bytes</code></pre>
+<p><strong>Measured:</strong> the error says nothing about padding or alignment -- it just reports a buffer-size mismatch (8 bytes supplied, 5 expected), which reads like the format string is wrong rather than like a byte-order/padding mismatch between writer and reader. Debugging this by staring at the format string <code>'bi'</code>/<code>'=bi'</code> alone won't reveal the real cause.</p>
+
+<h2 id="repro3">3. When sizes happen to line up anyway, unpack succeeds with a silent phantom field</h2>
+<pre><code>import struct
+
+packed = struct.pack('hi', 7, 99999)   # native: short, 2 pad bytes, int = 8 bytes
+print(len(packed), packed.hex())
+
+print(struct.calcsize('<hhi'))          # also 8 bytes, but shaped as 3 fields
+vals = struct.unpack('<hhi', packed)
+print(vals)</code></pre>
+<pre><code>8 070000009f860100
+8
+(7, 0, 99999)</code></pre>
+<p><strong>Measured:</strong> <code>struct.calcsize('&lt;hhi')</code> happens to equal the native-padded size of <code>'hi'</code>, so <code>unpack('&lt;hhi', packed)</code> raises no error at all -- it just returns three values instead of two. The middle value, <code>0</code>, is the native alignment padding being silently reinterpreted as a real short field. Any code expecting exactly the two values it originally packed gets a plausible-looking but wrong three-value result instead.</p>
+<aside class="cta"><strong>Packing binary data with struct and not sure if your format string has a byte-order prefix? Check the size first -- native packing silently adds padding bytes:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does struct.pack() add padding bytes by default?</summary><p>Yes, when the format string has no byte-order prefix (or uses &#x27;@&#x27; explicitly) -- we measured &#x27;bi&#x27; producing 8 bytes instead of the 5 you&#x27;d get from the field sizes alone, because 3 bytes of native alignment padding get inserted before the int.</p></details>
+<details><summary>Why does struct.unpack() fail with a buffer-size error that doesn&#x27;t mention padding?</summary><p>Because struct.error only reports the byte-count mismatch between what calcsize() expects and what you supplied -- we measured the exact message (&#x27;unpack requires a buffer of 5 bytes&#x27;) giving no hint that native alignment padding, not a wrong format string, is the real cause.</p></details>
+<details><summary>Can struct.unpack() succeed but return the wrong values because of native padding?</summary><p>Yes -- we measured packing &#x27;hi&#x27; (short, int) natively into 8 padded bytes, then unpacking those same bytes with &#x27;&lt;hhi&#x27; (3 unpadded fields totalling the same 8 bytes): it succeeded and returned (7, 0, 99999), silently turning the 2 padding bytes into a bogus extra field.</p></details>
+<details><summary>How do you avoid struct&#x27;s native padding footgun?</summary><p>Always start the format string with an explicit &#x27;&lt;&#x27;, &#x27;&gt;&#x27;, &#x27;=&#x27; or &#x27;!&#x27; for any data you serialize, store, or send across a process/network boundary -- we measured those four prefixes never inserting padding, unlike no-prefix or &#x27;@&#x27;, which should be reserved for in-process interop with C structs on the same machine.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in struct module on x86-64 Linux: packed values with the native format (no prefix, same as &#x27;@&#x27;) and unpacked the same bytes with explicit byte-order prefixes (&#x27;&lt;&#x27;, &#x27;=&#x27;) to compare sizes and results. PlainHeaders is our extension; Python&#x27;s struct module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

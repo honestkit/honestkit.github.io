@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>304 Not Modified: What It Means and How to Force a 200 (Tested)</title>
+<meta name="description" content="We served files with Express and sent conditional requests from curl, Node fetch and headless Chromium. When a 304 happens, what the 304 keeps, why JS sees 200, and why Node fetch with If-None-Match got a 200.">
+<link rel="canonical" href="https://honestkit.github.io/guides/304-not-modified/">
+<meta property="og:title" content="304 Not Modified: What It Means and How to Force a 200 (Tested)">
+<meta property="og:description" content="We served files with Express and sent conditional requests from curl, Node fetch and headless Chromium. When a 304 happens, what the 304 keeps, why JS sees 200, and why Node fetch with If-None-Match got a 200.">
+<meta property="og:url" content="https://honestkit.github.io/guides/304-not-modified/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is a 304 Not Modified an error?", "acceptedAnswer": {"@type": "Answer", "text": "No. It means the client's cached copy is still current, so the server sent headers only. In our test the 304 body was 0 bytes and the browser served its cached copy."}}, {"@type": "Question", "name": "Why does my fetch() show 200 when the server logged 304?", "acceptedAnswer": {"@type": "Answer", "text": "The browser cache sent If-None-Match, got the 304, and handed JS the cached body as a 200. In headless Chromium, JS saw a raw 304 only when we added If-None-Match ourselves."}}, {"@type": "Question", "name": "Which headers does a 304 keep?", "acceptedAnswer": {"@type": "Answer", "text": "From express.static we got ETag, Last-Modified, Cache-Control and Accept-Ranges. Content-Type and Content-Length were not sent."}}, {"@type": "Question", "name": "Does a W/ weak ETag prefix break 304s?", "acceptedAnswer": {"@type": "Answer", "text": "Not in Express 5.2.1. Sending the ETag with or without W/ both got 304. Other servers or CDNs may compare strictly, so check yours."}}, {"@type": "Question", "name": "Why does Node fetch get 200 even with If-None-Match?", "acceptedAnswer": {"@type": "Answer", "text": "Node 24 fetch added Cache-Control: no-cache and Pragma: no-cache to the request, and Express answered with a full 200. Setting cache-control: max-age=0 yourself gave a 304."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>304 Not Modified (tested)</h1>
+<p class="lead"><code>304 Not Modified</code> means "your cached copy is still good, so here are no bytes". The server only sends it when the request carries a validator: <code>If-None-Match</code> (an ETag) or <code>If-Modified-Since</code> (a date). It is normal and it saves bandwidth. We tested it with curl, Node fetch and headless Chromium.</p>
+<h2>1. The basic round trip</h2>
+<p>We served a 19-byte file with <code>express.static</code> (Express 5.2.1). The first request had no conditional headers and got a 200 with two validators:</p>
+<pre><code>$ curl -sv http://127.0.0.1:8983/index.html
+&lt; HTTP/1.1 200 OK
+&lt; Cache-Control: public, max-age=0
+&lt; Last-Modified: Fri, 02 Oct 2026 02:45:13 GMT
+&lt; ETag: W/"13-1a0fa80667e"
+&lt; Content-Length: 19</code></pre>
+<p>Then we sent the ETag back in <code>If-None-Match</code>:</p>
+<pre><code>$ curl -s -D - -o /dev/null -w 'size=%{size_download}\n' \
+    -H 'If-None-Match: W/"13-1a0fa80667e"' http://127.0.0.1:8983/index.html
+HTTP/1.1 304 Not Modified
+Accept-Ranges: bytes
+Cache-Control: public, max-age=0
+Last-Modified: Fri, 02 Oct 2026 02:45:13 GMT
+ETag: W/"13-1a0fa80667e"
+size=0</code></pre>
+<p>The 304 had a body of 0 bytes. It kept <code>ETag</code>, <code>Last-Modified</code> and <code>Cache-Control</code>. It dropped <code>Content-Type</code> and <code>Content-Length</code>. A request with no conditional headers always got 200 in our run. Express never sent 304 unprompted.</p>
+<p>More on the two validators: <a href="/guides/etag-header-explained/">ETag</a>, <a href="/guides/last-modified-header/">Last-Modified</a> and <a href="/guides/if-modified-since-header/">If-Modified-Since</a>.</p>
+
+<h2>2. Which conditional requests got a 304</h2>
+<table>
+<tr><th>Request headers sent to express.static</th><th>Status</th></tr>
+<tr><td>(none)</td><td>200</td></tr>
+<tr><td><code>If-None-Match: W/"13-1a0fa80667e"</code> (exact)</td><td>304</td></tr>
+<tr><td><code>If-None-Match: "13-1a0fa80667e"</code> (W/ prefix removed)</td><td>304</td></tr>
+<tr><td><code>If-None-Match: W/"other"</code></td><td>200</td></tr>
+<tr><td><code>If-None-Match: *</code></td><td>304</td></tr>
+<tr><td><code>If-Modified-Since</code> = the Last-Modified date</td><td>304</td></tr>
+<tr><td><code>If-None-Match: "zzz"</code> + matching <code>If-Modified-Since</code></td><td>200</td></tr>
+<tr><td>Matching <code>If-None-Match</code> + <code>Cache-Control: no-cache</code></td><td>200</td></tr>
+<tr><td>HEAD with matching <code>If-None-Match</code></td><td>304</td></tr>
+</table>
+<p>Three things stand out. Express uses weak comparison, so a CDN or proxy that adds or strips the <code>W/</code> prefix (common after gzip) did not break 304s here. When <code>If-None-Match</code> is present and does not match, a matching <code>If-Modified-Since</code> is ignored. And a request <code>Cache-Control: no-cache</code> makes Express send a full 200 even when the ETag matches. Dynamic routes behave the same: <code>res.send()</code> set <code>ETag: W/"1e-rsN2..."</code> and returned 304 when we sent it back.</p>
+<p>Other servers may compare ETags strictly. That is from the docs, not measured: RFC 9110 says <code>If-None-Match</code> uses weak comparison, but some servers and CDNs get this wrong.</p>
+
+<h2>3. What JavaScript sees in the browser</h2>
+<p>We loaded a page in headless Chromium and called <code>fetch('/index.html')</code> three times. The server logged each hit:</p>
+<table>
+<tr><th>Call</th><th>Server saw</th><th>JS saw</th></tr>
+<tr><td>fetch #1</td><td>200, no If-None-Match</td><td>200</td></tr>
+<tr><td>fetch #2</td><td>304, If-None-Match sent</td><td>200</td></tr>
+<tr><td>fetch #3</td><td>304, If-None-Match sent</td><td>200</td></tr>
+<tr><td><code>fetch(url, {cache:'no-store'})</code></td><td>200, no If-None-Match</td><td>200</td></tr>
+<tr><td><code>fetch(url, {cache:'no-cache'})</code></td><td>304</td><td>200</td></tr>
+<tr><td>fetch with a hand-written If-None-Match header</td><td>304</td><td>304, empty body</td></tr>
+</table>
+<p>The browser cache adds <code>If-None-Match</code> by itself. When the server answers 304, the browser serves the cached body and JS sees 200. Every call still reached the server, because <code>max-age=0</code> means "revalidate every time". JS only saw a raw 304 when we added the conditional header ourselves. Then the body was empty.</p>
+
+<h2>4. Node fetch has no cache</h2>
+<p>Three plain <code>fetch()</code> calls in Node.js 24 all reached the server with no <code>If-None-Match</code>, and all got 200. Node fetch never revalidates on its own.</p>
+<p>Adding <code>If-None-Match</code> by hand in Node had a surprise: we still got 200. We logged the raw request and found that Node fetch also sent <code>Cache-Control: no-cache</code> and <code>Pragma: no-cache</code>. Express treats that as "send me a fresh copy".</p>
+<pre><code>// What Node 24 fetch actually sent with {headers:{'If-None-Match':'x'}}
+"if-none-match":"x", "pragma":"no-cache", "cache-control":"no-cache"</code></pre>
+<p>Setting <code>'cache-control': 'max-age=0'</code> yourself overrides it. With that, Node fetch got the 304.</p>
+
+<h2>5. Why you see 304 in DevTools and logs</h2>
+<p>A 304 in the Network panel or access log is normal. It means the browser had a copy and asked "has it changed?". The answer was no, so only headers came back. It is not an error.</p>
+<p>To force a full 200:</p>
+<ul>
+<li>curl: send no conditional headers. Plain <code>curl URL</code> got 200 every time.</li>
+<li>Browser fetch: use <code>{cache: 'no-store'}</code>. It sent no validator and got 200 from the server.</li>
+<li>Any client: add <code>Cache-Control: no-cache</code> to the request. Express then returned 200 even with a matching ETag.</li>
+<li>DevTools: tick "Disable cache" (from the docs, not measured).</li>
+</ul>
+<p>To stop the browser from storing the response in the first place, the server sends <code>Cache-Control: no-store</code>. See <a href="/guides/cache-control-no-cache-vs-no-store/">no-cache vs no-store</a>.</p>
+<aside class="cta"><strong>See the ETag, Last-Modified and Cache-Control headers your server sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is a 304 Not Modified an error?</summary><p>No. It means the client&#x27;s cached copy is still current, so the server sent headers only. In our test the 304 body was 0 bytes and the browser served its cached copy.</p></details>
+<details><summary>Why does my fetch() show 200 when the server logged 304?</summary><p>The browser cache sent If-None-Match, got the 304, and handed JS the cached body as a 200. In headless Chromium, JS saw a raw 304 only when we added If-None-Match ourselves.</p></details>
+<details><summary>Which headers does a 304 keep?</summary><p>From express.static we got ETag, Last-Modified, Cache-Control and Accept-Ranges. Content-Type and Content-Length were not sent.</p></details>
+<details><summary>Does a W/ weak ETag prefix break 304s?</summary><p>Not in Express 5.2.1. Sending the ETag with or without W/ both got 304. Other servers or CDNs may compare strictly, so check yours.</p></details>
+<details><summary>Why does Node fetch get 200 even with If-None-Match?</summary><p>Node 24 fetch added Cache-Control: no-cache and Pragma: no-cache to the request, and Express answered with a full 200. Setting cache-control: max-age=0 yourself gave a 304.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with curl 8.14.1, Node.js 24 (built-in fetch), Express 5.2.1 (express.static and res.send) on 127.0.0.1:8983, and headless Chromium driven by Playwright 1.63.0. The server logged every request&#x27;s status and If-None-Match header. PlainHeaders is our extension; curl, Node.js, Express and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

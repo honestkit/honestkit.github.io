@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>103 Early Hints: How to Send It and Which Clients Use It (Tested)</title>
+<meta name="description" content="Node.js 24 writeEarlyHints sent a 103 with a Link preload, then the 200 a second later. curl shows both, http.get fires an &#x27;information&#x27; event, fetch hides it. Chromium 153 fetched the CSS early over HTTP/2 but not HTTP/1.1.">
+<link rel="canonical" href="https://honestkit.github.io/guides/103-early-hints/">
+<meta property="og:title" content="103 Early Hints: How to Send It and Which Clients Use It (Tested)">
+<meta property="og:description" content="Node.js 24 writeEarlyHints sent a 103 with a Link preload, then the 200 a second later. curl shows both, http.get fires an &#x27;information&#x27; event, fetch hides it. Chromium 153 fetched the CSS early over HTTP/2 but not HTTP/1.1.">
+<meta property="og:url" content="https://honestkit.github.io/guides/103-early-hints/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is HTTP 103 Early Hints?", "acceptedAnswer": {"@type": "Answer", "text": "An informational status the server sends before the final response, usually with Link preload or preconnect headers. In our Node.js 24 test the 103 arrived at 16 ms and the 200 at 1,013 ms on the same request."}}, {"@type": "Question", "name": "Does Chrome support 103 Early Hints over HTTP/1.1?", "acceptedAnswer": {"@type": "Answer", "text": "No. Chromium 153 ignored our 103 on HTTP/1.1 and fetched the stylesheet only after the HTML arrived (1,018 ms). Over HTTP/2 it requested the stylesheet at 14 ms, about one second before the HTML."}}, {"@type": "Question", "name": "How do I see a 103 response with curl?", "acceptedAnswer": {"@type": "Answer", "text": "Use curl -v. It prints the HTTP/1.1 103 Early Hints block with its Link header, then the 200 block. Both appear for a single request."}}, {"@type": "Question", "name": "Why does fetch() not show the 103?", "acceptedAnswer": {"@type": "Answer", "text": "Node.js 24 fetch() skips 1xx responses and resolves only with the final 200. Use http.get and listen for the 'information' event to read the 103 and its headers."}}, {"@type": "Question", "name": "How do I send Early Hints in Node.js?", "acceptedAnswer": {"@type": "Answer", "text": "Call res.writeEarlyHints({ link: '</style.css>; rel=preload; as=style' }) before res.writeHead. It worked unchanged on both http.createServer and http2.createSecureServer in Node.js 24.21.0."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>103 Early Hints (tested)</h1>
+<p class="lead"><code>103 Early Hints</code> is an informational response a server sends <em>before</em> the real one, usually carrying <code>Link: rel=preload</code> or <code>rel=preconnect</code> headers so the browser can start fetching CSS, fonts or scripts while the server is still building the page. We sent real 103s from Node.js 24 over HTTP/1.1 and HTTP/2, delayed the 200 by one second, and logged exactly when each client asked for the preloaded file.</p>
+<h2>1. Sending a 103 from Node.js</h2>
+<p>Node.js 24.21.0 has <code>response.writeEarlyHints()</code> on both <code>http</code> and <code>http2</code> servers. Our test handler sent the hint, waited 1,000 ms (standing in for a slow database query), then sent the page:</p>
+<pre><code>function handler(req, res) {
+  if (req.url === '/') {
+    res.writeEarlyHints({ link: '&lt;/style.css&gt;; rel=preload; as=style' });
+    setTimeout(() =&gt; {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('&lt;!doctype html&gt;&lt;link rel=stylesheet href=/style.css&gt;&lt;p&gt;hi');
+    }, 1000);
+  }
+}</code></pre>
+<p>The same handler worked unchanged with <code>http.createServer</code> and <code>http2.createSecureServer</code>.</p>
+<h2>2. What curl shows</h2>
+<p><code>curl -v http://127.0.0.1:8983/</code> printed two complete header blocks on one request:</p>
+<pre><code>&lt; HTTP/1.1 103 Early Hints
+&lt; Link: &lt;/style.css&gt;; rel=preload; as=style
+&lt;
+&lt; HTTP/1.1 200 OK
+&lt; content-type: text/html
+&lt; Connection: keep-alive
+&lt; Transfer-Encoding: chunked</code></pre>
+<p>Over HTTP/2 (<code>curl -kv --http2 https://127.0.0.1:8984/</code>) it was <code>HTTP/2 103</code> with a lowercase <code>link:</code> header, then <code>HTTP/2 200</code>. Note the 103 carries only the headers you pass to <code>writeEarlyHints</code>; it has no body and does not replace the final response. If you only look at the last header block (for example with <code>curl -I</code> output piped to <code>grep</code>), you will not notice the 103 at all.</p>
+<h2>3. What Node.js clients expose</h2>
+<table><thead><tr><th>Client</th><th>Sees the 103?</th><th>Measured</th></tr></thead><tbody>
+<tr><td><code>http.get</code></td><td>Yes, as an <code>'information'</code> event</td><td><code>information 103 { link: '&lt;/style.css&gt;; rel=preload; as=style' }</code> at 16 ms, <code>response 200</code> at 1,013 ms</td></tr>
+<tr><td>Built-in <code>fetch()</code></td><td>No</td><td>Resolved once with status 200 at 1,016 ms; no <code>link</code> header in the result</td></tr>
+</tbody></table>
+<pre><code>http.get(url, res =&gt; { /* the 200 */ })
+  .on('information', info =&gt; console.log(info.statusCode, info.headers));</code></pre>
+<p>If you need to test that your server really sends Early Hints, use <code>curl -v</code> or <code>http.get</code> with the <code>'information'</code> listener. <code>fetch()</code> silently skips 1xx responses.</p>
+<h2>4. Does Chromium act on it? HTTP/1.1 vs HTTP/2</h2>
+<p>We loaded the page in headless Chromium 153 and logged, on the server, when <code>/style.css</code> was requested relative to the page request. The 200 was held back for 1,000 ms, so a CSS request well under 1,000 ms can only have come from the 103.</p>
+<table><thead><tr><th>Protocol</th><th>Server saw <code>/style.css</code> at</th><th>Acted on the 103?</th></tr></thead><tbody>
+<tr><td>HTTP/1.1, <code>http://127.0.0.1:8983</code></td><td>1,018 ms (once, after the HTML arrived)</td><td><strong>No</strong></td></tr>
+<tr><td>HTTP/2, <code>https://localhost:8984</code> (self-signed, <code>ignoreHTTPSErrors</code>)</td><td><strong>14 ms</strong>, then again at 1,018 ms</td><td><strong>Yes</strong>, preload started ~1 s before the HTML</td></tr>
+</tbody></table>
+<p>This matches Chromium's documentation (from the docs, not measured beyond this test): Chrome only processes Early Hints on HTTP/2 or HTTP/3 navigations, and ignores them on HTTP/1.1. A plain HTTP/1.1 origin gets no benefit, so measure through the protocol your users actually get (often HTTP/2 or HTTP/3 at a CDN edge).</p>
+<p>Two things we saw but did not dig into:</p>
+<ul>
+<li>Over HTTP/2 the stylesheet was requested <strong>twice</strong>: the early preload at 14 ms and a normal request at 1,018 ms. The likely reason is that our self-signed certificate (accepted via <code>ignoreHTTPSErrors</code>) stops Chromium from reusing the preloaded response; we did not verify this. On a real site, check the Network panel or your access log for a duplicate request before declaring a win.</li>
+<li>Playwright's <code>page.on('request')</code> did not report the early preload at all, and the page's <code>performance</code> resource timing listed the CSS starting at 1,044 ms. Server logs were the only reliable signal in our test.</li>
+</ul>
+<h2>5. Practical rules</h2>
+<ul>
+<li>Only hint resources the final page will actually use, and keep the same <code>as=</code> type as the real tag, or the browser wastes a request.</li>
+<li>Early Hints only helps when there is "think time" between the request and the 200. If your HTML is served instantly from cache, a 103 buys nothing.</li>
+<li>Headers that matter for security (<code>Content-Security-Policy</code>, cookies) belong on the final response; a 103 is not a place to set them.</li>
+<li>From the docs, not measured: many CDNs (for example Cloudflare) can generate 103s from the <code>Link</code> headers of earlier final responses, so you may not need to change your origin at all.</li>
+<li>Check what your server returns with the <a href="/tools/http-headers/">HTTP headers checker</a>; for connection reuse behaviour see our <a href="/guides/keep-alive-header-connection/">keep-alive guide</a>.</li>
+</ul>
+<aside class="cta"><strong>See the status and headers your server actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is HTTP 103 Early Hints?</summary><p>An informational status the server sends before the final response, usually with Link preload or preconnect headers. In our Node.js 24 test the 103 arrived at 16 ms and the 200 at 1,013 ms on the same request.</p></details>
+<details><summary>Does Chrome support 103 Early Hints over HTTP/1.1?</summary><p>No. Chromium 153 ignored our 103 on HTTP/1.1 and fetched the stylesheet only after the HTML arrived (1,018 ms). Over HTTP/2 it requested the stylesheet at 14 ms, about one second before the HTML.</p></details>
+<details><summary>How do I see a 103 response with curl?</summary><p>Use curl -v. It prints the HTTP/1.1 103 Early Hints block with its Link header, then the 200 block. Both appear for a single request.</p></details>
+<details><summary>Why does fetch() not show the 103?</summary><p>Node.js 24 fetch() skips 1xx responses and resolves only with the final 200. Use http.get and listen for the &#x27;information&#x27; event to read the 103 and its headers.</p></details>
+<details><summary>How do I send Early Hints in Node.js?</summary><p>Call res.writeEarlyHints({ link: &#x27;&lt;/style.css&gt;; rel=preload; as=style&#x27; }) before res.writeHead. It worked unchanged on both http.createServer and http2.createSecureServer in Node.js 24.21.0.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 (http.createServer on localhost:8983, http2.createSecureServer with a self-signed cert on localhost:8984, response.writeEarlyHints, a 1,000 ms delay before the 200), curl 8.14.1, Node&#x27;s http.get and built-in fetch, and headless Chromium 153.0.8010.12 (Playwright). We logged the time of every request the server received. Chromium&#x27;s HTTP/2-only rule and the CDN notes are from the docs, not measured. PlainHeaders is our extension; Node.js, curl and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

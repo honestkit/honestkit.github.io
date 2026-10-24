@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix &quot;error: RPC failed&quot; on git push: postBuffer tested</title>
+<meta name="description" content="git push over HTTPS fails on large commits with RPC failed or HTTP 400. We reproduced the real cause on a live git-http-backend and tested the postBuffer fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/git-rpc-failed/">
+<meta property="og:title" content="Fix &quot;error: RPC failed&quot; on git push: postBuffer tested">
+<meta property="og:description" content="git push over HTTPS fails on large commits with RPC failed or HTTP 400. We reproduced the real cause on a live git-http-backend and tested the postBuffer fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/git-rpc-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does curl error 56 mean in \"RPC failed; curl 56\"?", "acceptedAnswer": {"@type": "Answer", "text": "It is CURLE_RECV_ERROR: curl was reading the HTTP response and the connection failed or was reset before it finished. On a git push this usually happens right as git switches to streaming (chunked) upload for a large pack, and the server or a proxy in between drops the connection partway through."}}, {"@type": "Question", "name": "What is http.postBuffer and what is its default?", "acceptedAnswer": {"@type": "Answer", "text": "It is the maximum number of bytes git will buffer before switching an HTTP POST to chunked Transfer-Encoding. Per git's docs, if unset it defaults to 1 MiB (1,048,576 bytes). We confirmed on git 2.47.3 that the config key is empty/unset by default."}}, {"@type": "Question", "name": "Does raising http.postBuffer always fix RPC failed?", "acceptedAnswer": {"@type": "Answer", "text": "It fixes the cases caused by the buffered-vs-chunked switch, which is what we reproduced. It does not fix a hard size cap set by a proxy or load balancer in front of the git server (that shows as 413, not something postBuffer controls) or failures caused by an unstable network connection."}}, {"@type": "Question", "name": "Is there a downside to setting http.postBuffer very high?", "acceptedAnswer": {"@type": "Answer", "text": "No meaningful one for normal use. It only raises the threshold before git streams instead of buffers; it does not pre-allocate that much memory for small pushes. Setting it to e.g. 500 MiB globally is a common, safe default."}}, {"@type": "Question", "name": "Why does the same push work over SSH but fail over HTTPS?", "acceptedAnswer": {"@type": "Answer", "text": "SSH's transport does not have a buffered-vs-chunked-HTTP boundary at all, so there is nothing for a postBuffer-style limit to trip. If HTTPS pushes keep failing on large commits and you cannot change server-side limits, switching the remote URL to SSH sidesteps the problem entirely."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>error: RPC failed; curl 56 / HTTP 400 on git push (tested)</h1>
+<p class="lead"><code>error: RPC failed; curl 56 ...</code> and <code>error: RPC failed; HTTP 400</code> both show up on <code>git push</code> over HTTP(S) when a commit is large. Both come from the same place: git's HTTP client switches from one buffered request to a streamed (chunked) one once the push exceeds <code>http.postBuffer</code>, and plenty of real servers and proxies choke on that. We set up a real smart-HTTP git server and pushed large commits at different postBuffer sizes to show it happening.</p>
+<h2>1. What the error means</h2>
+<p><code>RPC failed</code> means the HTTP request that carries your push data (the "git-receive-pack RPC") did not complete normally. curl error 56 is <code>CURLE_RECV_ERROR</code>, "failure receiving network data" &mdash; the connection dropped mid-read. A following <code>HTTP 400</code> or <code>413</code> means a server or proxy in the middle rejected the request outright. Per git's docs and source, the common trigger for both is the same: a large push forces git to stream the request body instead of sending it as one buffered chunk, and something between client and server does not handle that well.</p>
+
+<h2>2. Our test setup</h2>
+<p>We built a real (not simulated) git smart-HTTP server: a small Python CGI wrapper that runs the system's <code>git-http-backend</code> for each request, backed by a bare repo, listening on <code>127.0.0.1:8990</code>. We cloned it, committed a single large binary file (29 MB, then 40 MB), and pushed with <code>git push</code> at different <code>http.postBuffer</code> settings, capturing the exact client output and server log each time.</p>
+<pre><code>$ git --version
+git version 2.47.3
+$ git config --get http.postBuffer
+(empty &mdash; unset)</code></pre>
+<p>Per the git docs, an unset <code>http.postBuffer</code> defaults to 1 MiB (1,048,576 bytes). Below that size, git buffers the whole request and sends a normal <code>Content-Length</code> POST. Above it, git switches to <code>Transfer-Encoding: chunked</code> so it never has to hold the full pack in memory.</p>
+
+<h2>3. Reproducing the failure</h2>
+<p>With the default (unset, 1 MiB) postBuffer and a 40 MB commit, the push failed every time:</p>
+<pre><code>$ git push origin master
+send-pack: unexpected disconnect while reading sideband packet
+fatal: the remote end hung up unexpectedly</code></pre>
+<p>The server log showed the POST carrying the pack came back, then the connection was torn down before git's receive-pack report-status could be read. We also saw this with <code>http.postBuffer</code> explicitly set to 100 or 200 bytes against a 29 MB commit &mdash; same client error, same point of failure: as soon as the request stops fitting in the buffer and git starts chunked streaming, our server (a minimal CGI wrapper, representative of many hand-rolled or older git-http-backend setups) cannot keep up and the connection drops.</p>
+<p>This is the same family as <code>error: RPC failed; curl 56 ... Recv failure: Connection reset by peer</code> and <code>error: RPC failed; HTTP 400</code> reported against real servers: curl 56 is what the client reports when the drop happens while still receiving the response; HTTP 400/413 is what it reports when a proxy or load balancer in front of the git server rejects the oversized or chunked request outright. Per git's own issue tracker and widely-reported cases against GitLab/Apache/nginx-fronted git servers, both are triggered by the same chunked-vs-buffered boundary we reproduced here &mdash; we are labelling the exact wording "curl 56" / "HTTP 400" as per those reports, not measured verbatim on our minimal test server, because our server's own error path produced the disconnect above instead of forwarding a clean 400.</p>
+
+<h2>4. The fix: raise http.postBuffer</h2>
+<p>Raising <code>http.postBuffer</code> above the size of your largest push makes git send it as one buffered request again, avoiding the chunked path that trips up the server. We set it to 50 MiB and re-ran the same 29 MB push:</p>
+<pre><code>$ git config http.postBuffer 52428800
+$ git push origin master
+To http://127.0.0.1:8990/remote.git
+ * [new branch]      master -> master</code></pre>
+<p>Exit code 0, and the commit was confirmed present in the remote bare repo afterward (<code>git show-ref</code> listed it). The fix is global per-repo (or use <code>--global</code> for every repo):</p>
+<pre><code># this repo only
+git config http.postBuffer 524288000
+
+# every repo for this user
+git config --global http.postBuffer 524288000</code></pre>
+<p>524288000 is 500 MiB; size it to comfortably exceed your largest expected push. There is no real downside to a large value for normal use &mdash; it only changes how big a request can be before git switches to streaming, not memory used for small pushes.</p>
+
+<h2>5. If raising postBuffer does not fix it</h2>
+<ul>
+<li><strong>Check for a size-limited proxy or load balancer.</strong> If you are behind nginx, Apache, or a corporate proxy in front of your git server, it may cap request body size (nginx's <code>client_max_body_size</code>, for example) independently of git. That produces a real <a href="/guides/413-request-entity-too-large/">413 Request Entity Too Large</a>, which postBuffer cannot fix &mdash; the proxy limit has to be raised too.</li>
+<li><strong>Check the connection itself.</strong> Flaky Wi-Fi, VPNs, or corporate SSL-inspection proxies that buffer and re-encode traffic are common real-world causes of curl 56 on large pushes, independent of postBuffer. Try a wired connection or a different network as a test.</li>
+<li><strong>Split the push.</strong> Push smaller batches of commits (<code>git push origin HEAD~20:master</code> then advance) so each individual RPC is small regardless of postBuffer.</li>
+<li><strong>Switch transport.</strong> Pushing over SSH instead of HTTPS avoids this entire class of problem, since SSH does not have an equivalent postBuffer/chunking boundary.</li>
+<li><strong>Keep large binaries out of git history.</strong> Use Git LFS for large files going forward; postBuffer only manages the symptom; repeatedly pushing large blobs through the normal object store is the underlying cause.</li>
+</ul>
+<p>If the server side is timing out rather than rejecting the size, see <a href="/guides/504-gateway-timeout/">504 Gateway Timeout</a>. If the issue is the server refusing to resolve or connect at all, see <a href="/guides/git-could-not-resolve-host/">git could not resolve host</a>.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does curl error 56 mean in &quot;RPC failed; curl 56&quot;?</summary><p>It is CURLE_RECV_ERROR: curl was reading the HTTP response and the connection failed or was reset before it finished. On a git push this usually happens right as git switches to streaming (chunked) upload for a large pack, and the server or a proxy in between drops the connection partway through.</p></details>
+<details><summary>What is http.postBuffer and what is its default?</summary><p>It is the maximum number of bytes git will buffer before switching an HTTP POST to chunked Transfer-Encoding. Per git&#x27;s docs, if unset it defaults to 1 MiB (1,048,576 bytes). We confirmed on git 2.47.3 that the config key is empty/unset by default.</p></details>
+<details><summary>Does raising http.postBuffer always fix RPC failed?</summary><p>It fixes the cases caused by the buffered-vs-chunked switch, which is what we reproduced. It does not fix a hard size cap set by a proxy or load balancer in front of the git server (that shows as 413, not something postBuffer controls) or failures caused by an unstable network connection.</p></details>
+<details><summary>Is there a downside to setting http.postBuffer very high?</summary><p>No meaningful one for normal use. It only raises the threshold before git streams instead of buffers; it does not pre-allocate that much memory for small pushes. Setting it to e.g. 500 MiB globally is a common, safe default.</p></details>
+<details><summary>Why does the same push work over SSH but fail over HTTPS?</summary><p>SSH&#x27;s transport does not have a buffered-vs-chunked-HTTP boundary at all, so there is nothing for a postBuffer-style limit to trip. If HTTPS pushes keep failing on large commits and you cannot change server-side limits, switching the remote URL to SSH sidesteps the problem entirely.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with git 2.47.3 (client and server, same binary), against a real smart-HTTP git server: a Python 3.13 CGI wrapper around the system&#x27;s /usr/lib/git-core/git-http-backend, serving a bare repo over plain HTTP on 127.0.0.1. Pushes of 29-40 MB single-file commits were run with different http.postBuffer values. The literal strings &quot;RPC failed; curl 56&quot; and &quot;HTTP 400&quot; were not produced by our minimal test server (see note in section 3); they are documented from git&#x27;s source and widely-reported issue threads, labelled accordingly below. PlainHeaders is our extension; curl, git and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

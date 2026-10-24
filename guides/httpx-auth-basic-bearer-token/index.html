@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx auth: basic auth, bearer token, refresh on 401 (tested)</title>
+<meta name="description" content="httpx auth=(&#x27;user&#x27;,&#x27;pass&#x27;) for Basic auth, a small httpx.Auth subclass for Bearer tokens, auth_flow to refresh on 401. A string auth= raises TypeError.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-auth-basic-bearer-token/">
+<meta property="og:title" content="httpx auth: basic auth, bearer token, refresh on 401 (tested)">
+<meta property="og:description" content="httpx auth=(&#x27;user&#x27;,&#x27;pass&#x27;) for Basic auth, a small httpx.Auth subclass for Bearer tokens, auth_flow to refresh on 401. A string auth= raises TypeError.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-auth-basic-bearer-token/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I use basic auth with httpx?", "acceptedAnswer": {"@type": "Answer", "text": "Pass auth=('user', 'password') or auth=httpx.BasicAuth('user', 'password') to the request or the Client."}}, {"@type": "Question", "name": "How do I send a Bearer token with httpx?", "acceptedAnswer": {"@type": "Answer", "text": "Set headers={'Authorization': f'Bearer {token}'} on the Client, or subclass httpx.Auth and set the header in auth_flow(). auth='Bearer x' raises TypeError."}}, {"@type": "Question", "name": "Does httpx raise an error on 401 Unauthorized?", "acceptedAnswer": {"@type": "Answer", "text": "No. It returns the 401 response; call r.raise_for_status() to get httpx.HTTPStatusError."}}, {"@type": "Question", "name": "How do I refresh an OAuth token automatically in httpx?", "acceptedAnswer": {"@type": "Answer", "text": "Write an httpx.Auth subclass whose auth_flow yields the request, checks for 401, yields a token request, updates the header and yields the request again."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx auth: Basic, Bearer token and refresh on 401 (tested)</h1>
+<p class="lead">Use <code>httpx.get(url, auth=("user", "pass"))</code> for Basic auth. For a Bearer token, set the <code>Authorization</code> header on the client or write a small <code>httpx.Auth</code> subclass; its <code>auth_flow</code> can also refresh the token on a 401.</p>
+<p>httpx takes credentials through <code>auth=</code>: a <code>(user, password)</code> tuple for Basic auth, <code>httpx.DigestAuth</code> for Digest, or your own <code>httpx.Auth</code> subclass for Bearer tokens. Measured with httpx 0.28.1 on Python 3.13.5 against a local <code>http.server</code> (<code>srv.py</code>) that accepts Basic <code>ada:s3cret</code> on <code>/basic</code>, Bearer <code>t2</code> on <code>/bearer</code>, and issues <code>t2</code> from <code>POST /token</code>.</p>
+<h2 id="basic">1. httpx auth basic</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+r = httpx.get(base + &quot;/basic&quot;)
+print(r.status_code, r.headers[&quot;www-authenticate&quot;])
+
+r = httpx.get(base + &quot;/basic&quot;, auth=(&quot;ada&quot;, &quot;s3cret&quot;))
+print(r.status_code, r.json())
+
+r = httpx.get(base + &quot;/basic&quot;, auth=httpx.BasicAuth(&quot;ada&quot;, &quot;wrong&quot;))
+print(r.status_code)
+r.raise_for_status()</code></pre>
+<p>Output:</p>
+<pre><code>401 Basic realm=&quot;api&quot;
+200 {&#x27;auth&#x27;: &#x27;Basic YWRhOnMzY3JldA==&#x27;}
+401
+Traceback (most recent call last):
+  File &quot;/tmp/ha394/b1.py&quot;, line 13, in &lt;module&gt;
+    r.raise_for_status()
+    ~~~~~~~~~~~~~~~~~~^^
+  File &quot;/tmp/fx384/ve/lib/python3.13/site-packages/httpx/_models.py&quot;, line 829, in raise_for_status
+    raise HTTPStatusError(message, request=request, response=self)
+httpx.HTTPStatusError: Client error &#x27;401 Unauthorized&#x27; for url &#x27;http://127.0.0.1:8963/basic&#x27;
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/401</code></pre>
+<p>A tuple is shorthand for <code>httpx.BasicAuth</code>. Wrong credentials are not an exception: you get a 401 response, and only <code>raise_for_status()</code> turns it into <code>httpx.HTTPStatusError</code>.</p>
+<h2 id="client">2. Client and per-request auth</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+with httpx.Client(base_url=base, auth=(&quot;ada&quot;, &quot;s3cret&quot;)) as client:
+    print(client.get(&quot;/basic&quot;).status_code)
+    # per-request auth overrides the client&#x27;s
+    print(client.get(&quot;/basic&quot;, auth=(&quot;ada&quot;, &quot;nope&quot;)).status_code)</code></pre>
+<p>Output:</p>
+<pre><code>200
+401</code></pre>
+<p><code>auth=</code> on the <code>Client</code> applies to every request; <code>auth=</code> on a single call replaces it for that call.</p>
+<h2 id="bearer">3. Bearer token: a small httpx.Auth class</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+class BearerAuth(httpx.Auth):
+    def __init__(self, token):
+        self.token = token
+    def auth_flow(self, request):
+        request.headers[&quot;Authorization&quot;] = f&quot;Bearer {self.token}&quot;
+        yield request
+
+r = httpx.get(base + &quot;/bearer&quot;, auth=BearerAuth(&quot;t2&quot;))
+print(r.status_code, r.json())
+
+# a plain string is not accepted as auth
+try:
+    httpx.get(base + &quot;/bearer&quot;, auth=&quot;Bearer t2&quot;)
+except TypeError as e:
+    print(&quot;TypeError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>200 {&#x27;auth&#x27;: &#x27;Bearer t2&#x27;}
+TypeError: Invalid &quot;auth&quot; argument: &#x27;Bearer t2&#x27;</code></pre>
+<p>httpx has no built-in Bearer class, and a string is rejected with <code>TypeError: Invalid "auth" argument</code>. Either set <code>headers={"Authorization": f"Bearer {token}"}</code> on the client, or subclass <code>httpx.Auth</code> and set the header in <code>auth_flow()</code> as above.</p>
+<h2 id="refresh">4. Refresh an expired token on 401</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+class RefreshingAuth(httpx.Auth):
+    requires_response_body = True
+    def __init__(self, token):
+        self.token = token
+    def auth_flow(self, request):
+        request.headers[&quot;Authorization&quot;] = f&quot;Bearer {self.token}&quot;
+        response = yield request
+        if response.status_code == 401:
+            print(&quot;401 with&quot;, self.token, &quot;-&gt; refreshing&quot;)
+            refresh = yield httpx.Request(&quot;POST&quot;, base + &quot;/token&quot;)
+            self.token = refresh.json()[&quot;access_token&quot;]
+            request.headers[&quot;Authorization&quot;] = f&quot;Bearer {self.token}&quot;
+            yield request
+
+with httpx.Client(auth=RefreshingAuth(&quot;expired&quot;)) as client:
+    r = client.get(base + &quot;/bearer&quot;)
+    print(r.status_code, r.json())
+    r = client.get(base + &quot;/bearer&quot;)
+    print(r.status_code, r.json())</code></pre>
+<p>Output:</p>
+<pre><code>401 with expired -&gt; refreshing
+200 {&#x27;auth&#x27;: &#x27;Bearer t2&#x27;}
+200 {&#x27;auth&#x27;: &#x27;Bearer t2&#x27;}</code></pre>
+<p><code>auth_flow</code> is a generator: each <code>yield</code> sends a request and receives its response, so the class can retry once with a fresh token. <code>requires_response_body = True</code> is needed to read <code>refresh.json()</code> inside the flow. The new token is stored on the instance, so the second call goes straight through.</p>
+<h2 id="async">5. httpx asyncclient auth</h2>
+<pre><code>import asyncio, httpx
+from srv import start
+base = start()
+
+async def main():
+    async with httpx.AsyncClient(base_url=base, auth=(&quot;ada&quot;, &quot;s3cret&quot;)) as client:
+        r = await client.get(&quot;/basic&quot;)
+        print(r.status_code, r.json())
+
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>200 {&#x27;auth&#x27;: &#x27;Basic YWRhOnMzY3JldA==&#x27;}</code></pre>
+<p>The same <code>auth=</code> values work with <code>AsyncClient</code>. A custom class whose <code>auth_flow</code> only yields requests (no blocking I/O) works for both sync and async clients.</p>
+<p>Related: <a href="/guides/httpx-headers-client-default-response/">httpx headers</a>, <a href="/guides/httpx-params-query-parameters/">httpx params</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests differences</a>, <a href="/guides/httpx-retry-transport-retries/">httpx retries</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I use basic auth with httpx?</summary><p>Pass auth=(&#x27;user&#x27;, &#x27;password&#x27;) or auth=httpx.BasicAuth(&#x27;user&#x27;, &#x27;password&#x27;) to the request or the Client.</p></details>
+<details><summary>How do I send a Bearer token with httpx?</summary><p>Set headers={&#x27;Authorization&#x27;: f&#x27;Bearer {token}&#x27;} on the Client, or subclass httpx.Auth and set the header in auth_flow(). auth=&#x27;Bearer x&#x27; raises TypeError.</p></details>
+<details><summary>Does httpx raise an error on 401 Unauthorized?</summary><p>No. It returns the 401 response; call r.raise_for_status() to get httpx.HTTPStatusError.</p></details>
+<details><summary>How do I refresh an OAuth token automatically in httpx?</summary><p>Write an httpx.Auth subclass whose auth_flow yields the request, checks for 401, yields a token request, updates the header and yields the request again.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5 against a local http.server that checks Basic and Bearer credentials. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>openpyxl IllegalCharacterError: cannot be used in worksheets</title>
+<meta name="description" content="openpyxl IllegalCharacterError tested on 3.1.5: which control characters fail, stripping them with ILLEGAL_CHARACTERS_RE, and the pandas to_excel fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/openpyxl-illegalcharactererror-cannot-be-used-in-worksheets/">
+<meta property="og:title" content="openpyxl IllegalCharacterError: cannot be used in worksheets">
+<meta property="og:description" content="openpyxl IllegalCharacterError tested on 3.1.5: which control characters fail, stripping them with ILLEGAL_CHARACTERS_RE, and the pandas to_excel fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/openpyxl-illegalcharactererror-cannot-be-used-in-worksheets/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Which characters cause openpyxl IllegalCharacterError?", "acceptedAnswer": {"@type": "Answer", "text": "ASCII control characters 0-8, 11-12 and 14-31: NUL, bell, ESC (terminal colour codes), form feed and so on. Tab, newline and carriage return are allowed."}}, {"@type": "Question", "name": "How do I remove illegal characters for openpyxl?", "acceptedAnswer": {"@type": "Answer", "text": "from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE, then ILLEGAL_CHARACTERS_RE.sub('', value) on each string."}}, {"@type": "Question", "name": "How do I fix IllegalCharacterError in pandas to_excel?", "acceptedAnswer": {"@type": "Answer", "text": "Clean string cells first: df.map(lambda v: ILLEGAL_CHARACTERS_RE.sub('', v) if isinstance(v, str) else v).to_excel(...)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>openpyxl IllegalCharacterError: cannot be used in worksheets (tested)</h1>
+<p class="lead"><code>openpyxl.utils.exceptions.IllegalCharacterError: ... cannot be used in worksheets</code> means a string contains an ASCII control character (NUL, bell, ESC and others below space, except tab, newline and carriage return). Remove them with openpyxl's own <code>ILLEGAL_CHARACTERS_RE</code> before writing.</p>
+<h2 id="repro">1. Which characters trigger it</h2>
+<pre><code>from openpyxl import Workbook
+wb = Workbook(); ws = wb.active
+for value in [&quot;ok&quot;, &quot;tab\tand newline\n are fine&quot;, &quot;bell \x07 char&quot;, &quot;NUL \x00 byte&quot;, &quot;ESC \x1b[31m colour&quot;]:
+    try:
+        ws.append([value])
+        print(f&quot;{value!r}: ok&quot;)
+    except Exception as e:
+        print(f&quot;{value!r}: {type(e).__module__}.{type(e).__name__}: {str(e)!r}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>&#x27;ok&#x27;: ok
+&#x27;tab\tand newline\n are fine&#x27;: ok
+&#x27;bell \x07 char&#x27;: openpyxl.utils.exceptions.IllegalCharacterError: &#x27;bell \x07 char cannot be used in worksheets.&#x27;
+&#x27;NUL \x00 byte&#x27;: openpyxl.utils.exceptions.IllegalCharacterError: &#x27;NUL \x00 byte cannot be used in worksheets.&#x27;
+&#x27;ESC \x1b[31m colour&#x27;: openpyxl.utils.exceptions.IllegalCharacterError: &#x27;ESC \x1b[31m colour cannot be used in worksheets.&#x27;</code></pre>
+<p>The error is raised when the value is assigned to a cell (<code>append</code>, <code>cell.value = ...</code>), not at <code>save()</code>. Tab, newline and carriage return are allowed; other ASCII control characters are not, because the XML format inside <code>.xlsx</code> cannot store them. Typical sources: terminal colour codes (<code>\x1b[31m</code>) in log text, NUL bytes from binary or badly decoded data, and form feeds or bells from scraped or PDF-extracted text. The real message contains the raw character, which is why it often looks like an ordinary string in your terminal.</p>
+<h2 id="clean">2. Strip them with openpyxl's own regex</h2>
+<pre><code>from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+print(ILLEGAL_CHARACTERS_RE.pattern)
+def clean(v):
+    return ILLEGAL_CHARACTERS_RE.sub(&quot;&quot;, v) if isinstance(v, str) else v
+from openpyxl import Workbook, load_workbook
+wb = Workbook(); ws = wb.active
+ws.append([clean(&quot;bell \x07 char&quot;), clean(&quot;ESC \x1b[31m colour&quot;), 42])
+wb.save(&quot;/tmp/clean.xlsx&quot;)
+print([c.value for c in load_workbook(&quot;/tmp/clean.xlsx&quot;).active[1]])</code></pre>
+<p>Output:</p>
+<pre><code>[\000-\010]|[\013-\014]|[\016-\037]
+[&#x27;bell  char&#x27;, &#x27;ESC [31m colour&#x27;, 42]</code></pre>
+<p><code>ILLEGAL_CHARACTERS_RE</code> covers octal 000-010, 013-014 and 016-037: everything below space except tab (011), newline (012) and carriage return (015). Using it means you remove exactly what openpyxl rejects, nothing more. Replace with <code>""</code>, or with a visible marker such as <code>"?"</code> if you need to see where data was lost.</p>
+<h2 id="pandas">3. pandas to_excel raises the same error</h2>
+<pre><code>import pandas as pd
+df = pd.DataFrame({&quot;log&quot;: [&quot;fine&quot;, &quot;ESC \x1b[0m reset&quot;, &quot;NUL \x00&quot;], &quot;n&quot;: [1, 2, 3]})
+try:
+    df.to_excel(&quot;/tmp/out.xlsx&quot;, index=False)
+except Exception as e:
+    print(f&quot;{type(e).__name__}: {str(e)!r}&quot;)
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+clean = df.map(lambda v: ILLEGAL_CHARACTERS_RE.sub(&quot;&quot;, v) if isinstance(v, str) else v)
+clean.to_excel(&quot;/tmp/out.xlsx&quot;, index=False)
+print(pd.read_excel(&quot;/tmp/out.xlsx&quot;).to_dict(&quot;records&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>IllegalCharacterError: &#x27;ESC \x1b[0m reset cannot be used in worksheets.&#x27;
+[{&#x27;log&#x27;: &#x27;fine&#x27;, &#x27;n&#x27;: 1}, {&#x27;log&#x27;: &#x27;ESC [0m reset&#x27;, &#x27;n&#x27;: 2}, {&#x27;log&#x27;: &#x27;NUL &#x27;, &#x27;n&#x27;: 3}]</code></pre>
+<p><code>DataFrame.to_excel()</code> writes through openpyxl, so one bad cell anywhere fails the whole export. Clean every string cell with <code>DataFrame.map</code> before exporting (<code>applymap</code> on pandas older than 2.1). Non-string cells are left alone.</p>
+<h2 id="source">Better: fix it at the source</h2>
+<ul><li>Logs: strip ANSI escape sequences (the whole <code>\x1b[...m</code>, not just <code>\x1b</code>, or you are left with <code>[31m</code> as in block 2).</li><li>NUL bytes usually mean the text was decoded with the wrong encoding (for example UTF-16 read as UTF-8); fix the decode instead of deleting NULs.</li><li>If you need the raw data intact, write CSV instead: CSV has no such restriction.</li></ul>
+<p>Related: <a href="/guides/openpyxl-invalidfileexception-does-not-support-file-format/">openpyxl InvalidFileException</a> · <a href="/guides/pandas-read-excel-missing-optional-dependency-openpyxl/">Missing optional dependency openpyxl</a>.</p>
+
+<aside class="cta"><strong>Building a spreadsheet from web tables? Copy them as CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Which characters cause openpyxl IllegalCharacterError?</summary><p>ASCII control characters 0-8, 11-12 and 14-31: NUL, bell, ESC (terminal colour codes), form feed and so on. Tab, newline and carriage return are allowed.</p></details>
+<details><summary>How do I remove illegal characters for openpyxl?</summary><p>from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE, then ILLEGAL_CHARACTERS_RE.sub(&#x27;&#x27;, value) on each string.</p></details>
+<details><summary>How do I fix IllegalCharacterError in pandas to_excel?</summary><p>Clean string cells first: df.map(lambda v: ILLEGAL_CHARACTERS_RE.sub(&#x27;&#x27;, v) if isinstance(v, str) else v).to_excel(...).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with openpyxl 3.1.5, pandas 3.1.0 and Python 3.15.1 (python:3-slim in Docker). Each block was run verbatim and the output pasted unedited (error messages printed with repr so the control characters are visible). PlainTables is our extension; Python and openpyxl are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

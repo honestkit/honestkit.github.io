@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TensorFlow ResourceExhaustedError: OOM When Allocating Tensor</title>
+<meta name="description" content="&quot;ResourceExhaustedError: OOM when allocating tensor with shape[...]&quot; reproduced on TensorFlow 2.21, how to read the shape, and a batched fix that ran.">
+<link rel="canonical" href="https://honestkit.github.io/guides/tensorflow-resourceexhaustederror-oom-when-allocating-tensor/">
+<meta property="og:title" content="TensorFlow ResourceExhaustedError: OOM When Allocating Tensor">
+<meta property="og:description" content="&quot;ResourceExhaustedError: OOM when allocating tensor with shape[...]&quot; reproduced on TensorFlow 2.21, how to read the shape, and a batched fix that ran.">
+<meta property="og:url" content="https://honestkit.github.io/guides/tensorflow-resourceexhaustederror-oom-when-allocating-tensor/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does OOM when allocating tensor mean in TensorFlow?", "acceptedAnswer": {"@type": "Answer", "text": "A single tensor of the shape and dtype in the message did not fit in the memory of that device (CPU RAM or GPU memory)."}}, {"@type": "Question", "name": "How do I fix ResourceExhaustedError in TensorFlow?", "acceptedAnswer": {"@type": "Answer", "text": "Reduce the batch size, process data in tf.data batches and keep only reduced results, use float32 or float16, and shrink oversized layers."}}, {"@type": "Question", "name": "How big was the tensor that failed?", "acceptedAnswer": {"@type": "Answer", "text": "Multiply the numbers in shape[...] and then by the dtype size: 4 bytes for float32, 8 for float64, 2 for float16."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TensorFlow ResourceExhaustedError: OOM when allocating tensor (tested)</h1>
+<p class="lead"><code>tf.errors.ResourceExhaustedError: OOM when allocating tensor with shape[...] and type float on ...device:CPU:0 by allocator cpu</code> means one tensor did not fit in memory. Below: reproduced on TensorFlow 2.21, how to compute the size from the message, and a batched <code>tf.data</code> loop that handled a 64 GB computation in 200 MB steps.</p>
+<h2 id="repro">1. Reproduce</h2>
+<p><code>b1.py</code> asks TensorFlow for one 400 GB tensor on the CPU:</p>
+<pre><code>import tensorflow as tf
+
+try:
+    x = tf.zeros([100_000, 100_000, 10])  # 10^11 float32 = 400 GB
+except tf.errors.ResourceExhaustedError as e:
+    print(type(e).__name__)
+    print(str(e)[:300])</code></pre>
+<pre><code>ResourceExhaustedError
+{{function_node __wrapped__Fill_device_/job:localhost/replica:0/task:0/device:CPU:0}} OOM when allocating tensor with shape[100000,100000,10] and type float on /job:localhost/replica:0/task:0/device:CPU:0 by allocator cpu [Op:Fill] name:</code></pre>
+<p>The message tells you the exact <strong>shape</strong>, <strong>dtype</strong> and <strong>device</strong> that failed. Multiply the shape by the dtype size (float32 = 4 bytes) to see how much memory that one tensor needed: here 100,000 &times; 100,000 &times; 10 &times; 4 bytes = 400 GB. Before raising, TensorFlow also logs <code>Allocation of 400000000000 exceeds 10% of free system memory</code> and <code>OP_REQUIRES failed at constant_op.cc:176 : RESOURCE_EXHAUSTED</code> to stderr.</p>
+<h2 id="fix">2. Fix: process in batches and keep only what you need</h2>
+<p>The usual real cause is feeding the whole dataset (or a huge batch) through a layer at once. <code>b2.py</code> runs a <code>Dense(500_000)</code> layer over 32,000 rows: in one call the output alone is 64 GB. Batching it with <code>tf.data</code> (100 rows = 200 MB per step) and keeping only the <code>argmax</code> works:</p>
+<pre><code>import time
+import numpy as np
+import tensorflow as tf
+
+X = np.random.default_rng(0).random((32_000, 4), dtype=np.float32)
+layer = tf.keras.layers.Dense(500_000)  # 32_000 x 500_000 float32 output = 64 GB
+
+try:
+    layer(X)  # whole dataset in one call
+except tf.errors.ResourceExhaustedError as e:
+    print(&quot;all at once:&quot;, type(e).__name__, &quot;-&quot;, str(e).split(&quot;}}&quot;)[-1].split(&quot; on /job&quot;)[0].strip())
+
+t = time.time()
+best = []
+for batch in tf.data.Dataset.from_tensor_slices(X).batch(100):
+    logits = layer(batch)                  # 100 x 500_000 = 200 MB
+    best.append(tf.argmax(logits, axis=1))  # keep only what you need
+best = tf.concat(best, axis=0)
+print(&quot;batched:&quot;, best.shape, best.dtype.name, f&quot;{time.time() - t:.0f}s&quot;)</code></pre>
+<pre><code>all at once: ResourceExhaustedError - OOM when allocating tensor with shape[32000,500000] and type float
+batched: (32000,) int64 63s</code></pre>
+<ul><li><strong>Training:</strong> lower <code>batch_size</code> in <code>model.fit</code> until the error stops; halving it halves activation memory.</li>
+<li><strong>Inference:</strong> <code>model.predict(x, batch_size=...)</code> batches the forward pass, but still concatenates all outputs, so if the <em>output</em> is the huge part, loop over batches and reduce each one, as above.</li>
+<li><strong>Inputs:</strong> stream from disk with <code>tf.data</code> instead of loading a giant NumPy array; use float32 (or float16) instead of float64.</li>
+<li><strong>Model size:</strong> a huge <code>Dense</code> after <code>Flatten</code> on big images is a common cause; add pooling or reduce units.</li>
+<li><strong>GPU:</strong> the same error appears with <code>device:GPU:0</code> and <code>allocator GPU_0_bfc</code>; the same batching fixes apply. We only measured on CPU.</li></ul>
+<p>Related: <a href="/guides/tensorflow-function-triggered-tf-function-retracing/">tf.function retracing warning</a>, <a href="/guides/tensorflow-keras-error-keras-3-imports/">TensorFlow Keras errors after Keras 3</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does OOM when allocating tensor mean in TensorFlow?</summary><p>A single tensor of the shape and dtype in the message did not fit in the memory of that device (CPU RAM or GPU memory).</p></details>
+<details><summary>How do I fix ResourceExhaustedError in TensorFlow?</summary><p>Reduce the batch size, process data in tf.data batches and keep only reduced results, use float32 or float16, and shrink oversized layers.</p></details>
+<details><summary>How big was the tensor that failed?</summary><p>Multiply the numbers in shape[...] and then by the dtype size: 4 bytes for float32, 8 for float64, 2 for float16.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 with tensorflow-cpu 2.21.0, NumPy 2.5.4 and Python 3.13.5 on Linux (b2.py ran under ulimit -v 8 GB so it could not eat the machine). The scripts ran verbatim and the output was pasted unedited (TensorFlow startup log lines filtered). PlainTables is our extension; TensorFlow is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

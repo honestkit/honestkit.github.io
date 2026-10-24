@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>inspect.getmembers: AttributeError Skips, Else Crashes (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: a property raising AttributeError is silently skipped by getmembers(), but ValueError (or any other exception) aborts the whole call.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-inspect-getmembers-property-exception-crashes-everything/">
+<meta property="og:title" content="inspect.getmembers: AttributeError Skips, Else Crashes (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: a property raising AttributeError is silently skipped by getmembers(), but ValueError (or any other exception) aborts the whole call.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-inspect-getmembers-property-exception-crashes-everything/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does inspect.getmembers() skip a property that raises an exception?", "acceptedAnswer": {"@type": "Answer", "text": "It depends on the exception type. We measured that a property raising AttributeError is silently skipped (treated as if the attribute doesn't exist), but a property raising any other exception -- ValueError, TypeError, a custom exception -- aborts the entire getmembers() call, discarding results for every other attribute too."}}, {"@type": "Question", "name": "Why does only AttributeError get swallowed?", "acceptedAnswer": {"@type": "Answer", "text": "Because inspect._getmembers(), the shared implementation behind getmembers(), wraps its getattr() calls in try/except AttributeError specifically -- confirmed by reading the actual CPython 3.13.5 source with inspect.getsource(inspect._getmembers). No other exception type is caught."}}, {"@type": "Question", "name": "How do I safely introspect an object that might have a buggy property?", "acceptedAnswer": {"@type": "Answer", "text": "Don't rely on getmembers() alone for untrusted/buggy classes -- catch exceptions around the call itself, or iterate dir(object) and call getattr(object, name, default) with a sentinel default per-attribute instead, which isolates one failing attribute from the rest."}}, {"@type": "Question", "name": "Does this affect inspect.getmembers_static too?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured getmembers_static() returning successfully for the same buggy class, because it's documented to skip the descriptor protocol entirely: for a property it returns the property object itself from the class dict, without ever calling the getter, so the getter's exception never has a chance to fire."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>inspect.getmembers Silently Skips AttributeError but Crashes on Any Other Exception (tested)</h1>
+<p class="lead"><code>inspect.getmembers()</code> works by calling <code>getattr()</code> on every name <code>dir()</code> reports and collecting whatever doesn't fail. Its source wraps that call in <code>try/except AttributeError</code> only -- nothing broader. A property getter that raises <code>AttributeError</code> is treated as "this attribute doesn't really exist" and silently dropped from the results, matching normal <code>getattr()</code> semantics. A property getter that raises anything else -- <code>ValueError</code>, a custom exception, a typo'd <code>KeyError</code> -- is not caught at all, so it propagates straight out of <code>getmembers()</code> and aborts the entire call, discarding every other attribute it already found.</p>
+<h2 id="repro1">1. One buggy property takes down introspection of the whole object</h2>
+<pre><code>import inspect
+
+class Widget:
+    @property
+    def ok(self):
+        return 42
+    @property
+    def broken(self):
+        raise ValueError("not ready yet")
+
+w = Widget()
+try:
+    members = inspect.getmembers(w)
+    print("got", len(members), "members")
+except Exception as e:
+    print("getmembers() raised:", type(e).__name__, e)</code></pre>
+<pre><code>getmembers() raised: ValueError not ready yet</code></pre>
+<p><strong>Measured:</strong> <code>getmembers()</code> never returns -- not even the perfectly healthy <code>ok</code> property survives. A single buggy property anywhere on the object (or any of its base classes) is enough to make introspecting the <em>entire</em> object fail, which is a surprising amount of blast radius for a function usually reached for specifically because something needs debugging.</p>
+
+<h2 id="repro2">2. The one exception type that fails quietly: AttributeError</h2>
+<pre><code>import inspect
+
+class Widget:
+    @property
+    def ok(self):
+        return 42
+    @property
+    def missing(self):
+        raise AttributeError("not available right now")
+
+w = Widget()
+members = inspect.getmembers(w)
+names = [n for n, v in members]
+print("ok" in names, "missing" in names)</code></pre>
+<pre><code>True False</code></pre>
+<p><strong>Measured:</strong> with <code>AttributeError</code> specifically, <code>getmembers()</code> completes normally -- it just omits <code>missing</code> from the results, as if the attribute genuinely didn't exist. Swap that one exception type for <code>ValueError</code>, <code>TypeError</code>, or anything else, and the entire call aborts instead, per experiment 1. The two cases look like they should behave the same way from the caller's side -- "a property getter failed" -- but only one of them degrades gracefully.</p>
+
+<h2 id="repro3">3. Why: the standard library only catches AttributeError</h2>
+<pre><code>import inspect
+print(inspect.getsource(inspect._getmembers))</code></pre>
+<p><strong>Measured:</strong> <code>inspect._getmembers()</code> (the shared implementation behind <code>getmembers</code> and <code>getmembers_static</code>) wraps each <code>getattr()</code> call in <code>try: ... except AttributeError: ...</code> with no other exception type handled -- confirmed directly from the CPython 3.13.5 source via <code>inspect.getsource</code>. Any property, <code>__getattr__</code>, or descriptor that can raise something other than <code>AttributeError</code> on failure is a latent landmine for any code that calls <code>getmembers()</code> on instances of that class, including generic debugging/logging utilities that weren't written with that specific class in mind.</p>
+<aside class="cta"><strong>Calling inspect.getmembers() on an object for debugging or introspection and one property has a bug? Check which exception type it raises first -- only one kind fails quietly:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does inspect.getmembers() skip a property that raises an exception?</summary><p>It depends on the exception type. We measured that a property raising AttributeError is silently skipped (treated as if the attribute doesn&#x27;t exist), but a property raising any other exception -- ValueError, TypeError, a custom exception -- aborts the entire getmembers() call, discarding results for every other attribute too.</p></details>
+<details><summary>Why does only AttributeError get swallowed?</summary><p>Because inspect._getmembers(), the shared implementation behind getmembers(), wraps its getattr() calls in try/except AttributeError specifically -- confirmed by reading the actual CPython 3.13.5 source with inspect.getsource(inspect._getmembers). No other exception type is caught.</p></details>
+<details><summary>How do I safely introspect an object that might have a buggy property?</summary><p>Don&#x27;t rely on getmembers() alone for untrusted/buggy classes -- catch exceptions around the call itself, or iterate dir(object) and call getattr(object, name, default) with a sentinel default per-attribute instead, which isolates one failing attribute from the rest.</p></details>
+<details><summary>Does this affect inspect.getmembers_static too?</summary><p>No -- we measured getmembers_static() returning successfully for the same buggy class, because it&#x27;s documented to skip the descriptor protocol entirely: for a property it returns the property object itself from the class dict, without ever calling the getter, so the getter&#x27;s exception never has a chance to fire.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in inspect.getmembers: created a class with three properties -- one that returns normally, one that raises AttributeError, and one that raises ValueError -- then called inspect.getmembers() on an instance and compared the outcome with each property present. PlainHeaders is our extension; Python&#x27;s inspect module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

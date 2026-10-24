@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>React Error #310: Rendered More Hooks Than Previous Render</title>
+<meta name="description" content="We reproduced React error #310 for real: a hook inside an if-block threw &#x27;Rendered more hooks than during the previous render.&#x27; Exact error, stack, and fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/react-error-310-rendered-more-hooks/">
+<meta property="og:title" content="React Error #310: Rendered More Hooks Than Previous Render">
+<meta property="og:description" content="We reproduced React error #310 for real: a hook inside an if-block threw &#x27;Rendered more hooks than during the previous render.&#x27; Exact error, stack, and fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/react-error-310-rendered-more-hooks/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does 'Rendered more hooks than during the previous render' mean?", "acceptedAnswer": {"@type": "Answer", "text": "React tracks hooks as an ordered list built on first render. On every later render it walks that same list in order. If a render calls one more hook than the list has slots for \u2014 most often because a hook sits inside an if, after an early return, or in a loop \u2014 React has no slot to read from and throws this error. We reproduced it with a useState call inside an if block."}}, {"@type": "Question", "name": "Is this the same as 'React has detected a change in the order of Hooks'?", "acceptedAnswer": {"@type": "Answer", "text": "They are two different messages from the same underlying cause. React first logs the order-change warning, with a before/after table of which hook slot changed, then throws 'Rendered more hooks than during the previous render' (or its minified form, error #310) once it can no longer continue reconciling. We captured both in the same repro run."}}, {"@type": "Question", "name": "What is minified React error #310?", "acceptedAnswer": {"@type": "Answer", "text": "It is the production-build version of the same throw. We confirmed by grepping react-dom.production.min.js 18.3.1 for the literal site: 'if(null===a)throw Error(p(310))' inside the same hook-list-walking code as the dev-mode updateWorkInProgressHook function that produces the English message."}}, {"@type": "Question", "name": "How do I fix a conditional hook without changing behavior?", "acceptedAnswer": {"@type": "Answer", "text": "Call the hook unconditionally every render, and move the condition inside it: for useState, call it always and branch on the value when you use it; for useEffect, put the if-check inside the effect callback and add the condition's inputs to the dependency array instead of guarding the useEffect call itself."}}, {"@type": "Question", "name": "Can this happen from an early return instead of an if block?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. A common pattern is 'if (!data) return null;' placed before a hook call further down the component. While data is loading, that hook is skipped; once data arrives, the component takes the other branch and calls a hook it didn't call before, which is the same hook-count mismatch we reproduced here."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>React error #310 (tested)</h1>
+<p class="lead">React error #310, <code>Rendered more hooks than during the previous render</code>, fires when a component calls a different number of hooks on one render than it did on the last one. We built a component that calls <code>useState</code> inside an <code>if</code> block, re-rendered it with the condition flipped, and captured the real dev-mode error and React's own diagnostic warning.</p>
+<h2>1. The exact error we triggered</h2>
+<p>We rendered this component tree with <code>react-dom/client</code> under <code>@testing-library/react</code> (jsdom), first with <code>showExtra=false</code>, then re-rendered the same mounted tree with <code>showExtra=true</code>:</p>
+<pre><code>function Child({ showExtra }) {
+  const [base] = useState('base');
+  if (showExtra) {
+    const [extra] = useState('extra'); // only called on some renders
+    return &lt;div&gt;{base}{extra}&lt;/div&gt;;
+  }
+  return &lt;div&gt;{base}&lt;/div&gt;;
+}
+
+function Parent({ showExtra }) {
+  return &lt;Child showExtra={showExtra} /&gt;;
+}</code></pre>
+<p>First render (<code>showExtra=false</code>) mounted fine: <code>&lt;div&gt;base&lt;/div&gt;</code>, one hook call. Re-rendering the same <code>Child</code> instance with <code>showExtra=true</code> added a second <code>useState</code> call that did not run on the previous render. React caught it immediately and threw, in dev mode, with this exact message and stack:</p>
+<pre><code>Error: Rendered more hooks than during the previous render.
+    at updateWorkInProgressHook (react-dom.development.js:15688:13)
+    at updateReducer (react-dom.development.js:15749:14)
+    at updateState (react-dom.development.js:16185:10)
+    at Object.useState (react-dom.development.js:17096:16)
+    at useState (react.development.js:1622:21)
+    at Child (repro.mjs:12:21)
+    at renderWithHooks (react-dom.development.js:15486:18)
+    at updateFunctionComponent (react-dom.development.js:19617:20)
+    at beginWork (react-dom.development.js:21640:16)</code></pre>
+<p>Before that throw, React also logged a separate diagnostic warning to <code>console.error</code>, with a before/after table pinpointing which hook slot changed:</p>
+<pre><code>Warning: React has detected a change in the order of Hooks called by Child. This will
+lead to bugs and errors if not fixed. For more information, read the Rules of Hooks:
+https://reactjs.org/link/rules-of-hooks
+
+   Previous render            Next render
+   ------------------------------------------------------
+1. useState                   useState
+2. undefined                  useState
+   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+    at Child (repro.mjs:9:18)
+    at Parent (repro.mjs:18:19)</code></pre>
+<p>That table is the fastest way to find the bug in a real app: row 2 shows slot 2 was <code>undefined</code> (not called) on the previous render and <code>useState</code> (called) on this render. That is the conditional hook, named exactly.</p>
+
+<h2>2. Why this happens</h2>
+<p>React does not know your hooks by name. Internally each component has a linked list of hook records, and every <code>useState</code>/<code>useEffect</code>/<code>useRef</code>/etc. call reads the next node in that list, in call order. The list is built on the first render and then walked, in the same order, on every re-render. If a render calls one more hook than the list has nodes for, <code>updateWorkInProgressHook</code> finds no next node and throws <code>Error(p(310))</code> — React's minified error #310, "Rendered more hooks than during the previous render."</p>
+<p>This is also why the official rule is "call hooks in the same order every render," not "call the same hooks." Wrapping a hook in <code>if</code>, putting it after an early <code>return</code>, or calling it inside a loop with a variable iteration count all change the count or order of list nodes between renders.</p>
+
+<h2>3. Confirming the minified mapping</h2>
+<p>Production React ships minified, so the message in a production error is just <code>Minified React error #310</code> with a link to the decoder. We confirmed the mapping is real, not guessed, by grepping the installed <code>react-dom.production.min.js</code> (v18.3.1) for the literal throw site:</p>
+<pre><code>...if(null!==b)O=b,N=a;else{if(null===a)throw Error(p(310));N=a;a={memoizedState:...</code></pre>
+<p>That <code>throw Error(p(310))</code> sits inside the same hook-list-walking logic as <code>updateWorkInProgressHook</code> in the dev build — when the next node in the list is missing, production throws error #310 instead of the English message. Same bug, same code path, different build.</p>
+
+<h2>4. The fix: move the condition inside the hook, not around it</h2>
+<p>Call every hook unconditionally, at the top level of the component, in the same order every render. Put the conditional logic inside the hook's callback or arguments instead:</p>
+<pre><code>// Before (throws #310 when showExtra flips)
+function Child({ showExtra }) {
+  const [base] = useState('base');
+  if (showExtra) {
+    const [extra] = useState('extra');
+    return &lt;div&gt;{base}{extra}&lt;/div&gt;;
+  }
+  return &lt;div&gt;{base}&lt;/div&gt;;
+}
+
+// After: always call the hook, branch on the value instead
+function Child({ showExtra }) {
+  const [base] = useState('base');
+  const [extra] = useState('extra'); // always called, same slot every render
+  return &lt;div&gt;{base}{showExtra &amp;&amp; extra}&lt;/div&gt;;
+}</code></pre>
+<p>For <code>useEffect</code> specifically, put the condition inside the effect body, not around the call:</p>
+<pre><code>// Before
+if (cond) {
+  useEffect(() =&gt; { doThing(); }, []);
+}
+
+// After
+useEffect(() =&gt; {
+  if (cond) doThing();
+}, [cond]);</code></pre>
+<p>We re-ran our repro with the hook moved outside the <code>if</code> and the same prop flip: no warning, no throw, both renders completed and the tree updated correctly.</p>
+
+<h2>5. Where this bug usually hides</h2>
+<ul>
+<li><strong>Early returns above a hook.</strong> A loading-state <code>if (!data) return null;</code> placed before a <code>useEffect</code> or <code>useState</code> call further down means that hook is skipped while loading and added back once data arrives — the exact shape we reproduced.</li>
+<li><strong>Hooks inside <code>&amp;&amp;</code> or ternaries used for early bailout.</strong> Same problem as an early return, just inline.</li>
+<li><strong>Hooks inside loops over props/state whose length changes.</strong> <code>items.map(i =&gt; useSomething(i))</code> changes hook count whenever <code>items.length</code> changes.</li>
+<li><strong>A hook added or removed by a conditional import or feature flag</strong> that changes which branch of a component runs between renders.</li>
+</ul>
+<p>If the crash only happens after server-side rendering specifically, you may be hitting a hydration mismatch instead — see <a href="/guides/minified-react-error-130/">Minified React error #130</a>, which covers the FAQ mention of this error, or <a href="/guides/react-hydration-error-nextjs/">React hydration error (Next.js)</a> for hydration-specific mismatches (error #418).</p>
+
+<h2>6. Quick checklist</h2>
+<ul>
+<li>Search the failing component for any hook call (<code>use</code>-prefixed) that is not at the top level of the function body.</li>
+<li>Check every <code>if</code>, <code>return</code> above a hook, and every loop around a hook.</li>
+<li>Read React's own before/after hook table in the console warning — it names the exact slot that changed, which usually points straight at the offending line.</li>
+<li>Fix by moving the condition inside the hook (its callback, its dependency array, or a value used in render), never around the hook call itself.</li>
+</ul>
+<aside class="cta"><strong>Check the headers your own React app&#x27;s server actually serves:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &#x27;Rendered more hooks than during the previous render&#x27; mean?</summary><p>React tracks hooks as an ordered list built on first render. On every later render it walks that same list in order. If a render calls one more hook than the list has slots for — most often because a hook sits inside an if, after an early return, or in a loop — React has no slot to read from and throws this error. We reproduced it with a useState call inside an if block.</p></details>
+<details><summary>Is this the same as &#x27;React has detected a change in the order of Hooks&#x27;?</summary><p>They are two different messages from the same underlying cause. React first logs the order-change warning, with a before/after table of which hook slot changed, then throws &#x27;Rendered more hooks than during the previous render&#x27; (or its minified form, error #310) once it can no longer continue reconciling. We captured both in the same repro run.</p></details>
+<details><summary>What is minified React error #310?</summary><p>It is the production-build version of the same throw. We confirmed by grepping react-dom.production.min.js 18.3.1 for the literal site: &#x27;if(null===a)throw Error(p(310))&#x27; inside the same hook-list-walking code as the dev-mode updateWorkInProgressHook function that produces the English message.</p></details>
+<details><summary>How do I fix a conditional hook without changing behavior?</summary><p>Call the hook unconditionally every render, and move the condition inside it: for useState, call it always and branch on the value when you use it; for useEffect, put the if-check inside the effect callback and add the condition&#x27;s inputs to the dependency array instead of guarding the useEffect call itself.</p></details>
+<details><summary>Can this happen from an early return instead of an if block?</summary><p>Yes. A common pattern is &#x27;if (!data) return null;&#x27; placed before a hook call further down the component. While data is loading, that hook is skipped; once data arrives, the component takes the other branch and calls a hook it didn&#x27;t call before, which is the same hook-count mismatch we reproduced here.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Node.js 24.21.0, React 18.3.1, react-dom 18.3.1, @testing-library/react 16.3.3 and jsdom 30.1.1 (global-jsdom). We rendered a real component tree with react-dom&#x27;s client renderer, flipped a prop to change which branch ran, and captured the actual thrown error and React&#x27;s dev warning. curl and the headers tool are free; Node.js and React are free and open-source.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

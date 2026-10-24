@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>statistics: correlation() Crashes on Pure Decimal Input</title>
+<meta name="description" content="We measured Python 3.13.5: mean()/variance() work fine on Decimal data, but correlation(), covariance(), and linear_regression() all raise TypeError on it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-statistics-correlation-crashes-on-pure-decimal-input/">
+<meta property="og:title" content="statistics: correlation() Crashes on Pure Decimal Input">
+<meta property="og:description" content="We measured Python 3.13.5: mean()/variance() work fine on Decimal data, but correlation(), covariance(), and linear_regression() all raise TypeError on it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-statistics-correlation-crashes-on-pure-decimal-input/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does statistics.correlation() work with Decimal input?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured correlation() raising TypeError: unsupported operand type(s) for -: 'decimal.Decimal' and 'float' on pure Decimal data, even though mean() and variance() work fine on the same data."}}, {"@type": "Question", "name": "Is the error from statistics.correlation() on Decimal input a StatisticsError?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it as a plain TypeError, not the module's own StatisticsError, so an except StatisticsError clause around the call won't catch it."}}, {"@type": "Question", "name": "Why does correlation() crash on Decimal but mean() doesn't?", "acceptedAnswer": {"@type": "Answer", "text": "correlation(), covariance(), and linear_regression() all compute an internal mean using the same float-coercing logic as fmean(), then subtract that float mean from each Decimal value -- and Python's Decimal type doesn't support arithmetic with float at all, which raises the TypeError."}}, {"@type": "Question", "name": "How do I compute correlation on Decimal data without it crashing?", "acceptedAnswer": {"@type": "Answer", "text": "We measured converting the data to float or Fraction first as working around the crash -- Fraction input runs without error, though it still returns a plain float result rather than an exact one (a separate, documented quirk of these three functions)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>statistics: correlation() Crashes on Pure Decimal Input (tested)</h1>
+<p class="lead"><code>statistics.mean()</code> and <code>variance()</code> both work with <code>Decimal</code> data, which makes it reasonable to expect the newer <code>correlation()</code>, <code>covariance()</code>, and <code>linear_regression()</code> functions (added in Python 3.10) to work too. We measured all three on pure <code>Decimal</code> input, and none of them run at all.</p>
+<h2 id="repro1">1. mean() and variance() handle Decimal input fine</h2>
+<pre><code>from decimal import Decimal
+import statistics as st
+
+x = [Decimal("1"), Decimal("2"), Decimal("3")]
+
+print(st.mean(x))
+print(st.variance(x))</code></pre>
+<pre><code>2
+1</code></pre>
+<p><strong>Measured:</strong> both functions run cleanly on a list of <code>Decimal</code> values and return correct results, giving no reason to expect a problem elsewhere in the same module.</p>
+
+<h2 id="repro2">2. correlation(), covariance(), and linear_regression() all raise TypeError on the exact same data</h2>
+<pre><code>from decimal import Decimal
+import statistics as st
+
+x = [Decimal("1"), Decimal("2"), Decimal("3")]
+y = [Decimal("2"), Decimal("4"), Decimal("6")]
+
+try:
+    st.correlation(x, y)
+except TypeError as e:
+    print("correlation:", e)
+
+try:
+    st.covariance(x, y)
+except TypeError as e:
+    print("covariance:", e)
+
+try:
+    st.linear_regression(x, y)
+except TypeError as e:
+    print("linear_regression:", e)</code></pre>
+<pre><code>correlation: unsupported operand type(s) for -: 'decimal.Decimal' and 'float'
+covariance: unsupported operand type(s) for -: 'decimal.Decimal' and 'float'
+linear_regression: unsupported operand type(s) for -: 'decimal.Decimal' and 'float'</code></pre>
+<p><strong>Measured:</strong> all three raise the identical <code>TypeError</code>, not <code>StatisticsError</code> -- so code that wraps these calls in <code>except StatisticsError</code> to catch bad-input cases (modeled on the module's own documented exception type) won't catch this at all. <code>Decimal</code> values flat-out can't be mixed with <code>float</code> in arithmetic, and that's exactly what breaks here.</p>
+
+<h2 id="repro3">3. The cause is internal: these functions compute their mean via the float-coercing path</h2>
+<pre><code>from decimal import Decimal
+import statistics as st
+
+x = [Decimal("1"), Decimal("2"), Decimal("3")]
+print(st.fmean(x))        # float, by design (see the fmean guide)
+print(type(st.fmean(x)))</code></pre>
+<pre><code>2.0
+<class 'float'></code></pre>
+<p><strong>Measured:</strong> <code>correlation()</code>, <code>covariance()</code>, and <code>linear_regression()</code> subtract each value from the data's mean internally -- and that mean comes out as a plain <code>float</code> (the same float-coercion <code>fmean()</code> always applies). Subtracting a <code>float</code> from a <code>Decimal</code> is where Python's arithmetic draws the line, so the crash traces back to the same internal design choice covered in the <code>fmean()</code>/Decimal guide, just surfacing as an outright crash here instead of silent precision loss. Converting the data to <code>float</code> or <code>Fraction</code> first avoids the crash -- <code>Fraction</code> at least runs (see the separate <code>covariance()</code>-always-returns-<code>float</code> guide), though it still won't preserve exactness.</p>
+<aside class="cta"><strong>Feeding Decimal data into correlation(), covariance(), or linear_regression()? Check it works at all first -- mean() working doesn&#x27;t mean these do:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does statistics.correlation() work with Decimal input?</summary><p>No -- we measured correlation() raising TypeError: unsupported operand type(s) for -: &#x27;decimal.Decimal&#x27; and &#x27;float&#x27; on pure Decimal data, even though mean() and variance() work fine on the same data.</p></details>
+<details><summary>Is the error from statistics.correlation() on Decimal input a StatisticsError?</summary><p>No -- we measured it as a plain TypeError, not the module&#x27;s own StatisticsError, so an except StatisticsError clause around the call won&#x27;t catch it.</p></details>
+<details><summary>Why does correlation() crash on Decimal but mean() doesn&#x27;t?</summary><p>correlation(), covariance(), and linear_regression() all compute an internal mean using the same float-coercing logic as fmean(), then subtract that float mean from each Decimal value -- and Python&#x27;s Decimal type doesn&#x27;t support arithmetic with float at all, which raises the TypeError.</p></details>
+<details><summary>How do I compute correlation on Decimal data without it crashing?</summary><p>We measured converting the data to float or Fraction first as working around the crash -- Fraction input runs without error, though it still returns a plain float result rather than an exact one (a separate, documented quirk of these three functions).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in statistics module: called mean(), variance(), correlation(), covariance(), and linear_regression() on the same pure-Decimal data. PlainHeaders is our extension; Python&#x27;s statistics module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

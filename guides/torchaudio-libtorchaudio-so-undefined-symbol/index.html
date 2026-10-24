@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>torchaudio libtorchaudio.so undefined symbol: fix</title>
+<meta name="description" content="OSError libtorchaudio.so: undefined symbol (or libtorch_cuda.so not found) means torch and torchaudio don&#x27;t match. Tested diagnosis and fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/torchaudio-libtorchaudio-so-undefined-symbol/">
+<meta property="og:title" content="torchaudio libtorchaudio.so undefined symbol: fix">
+<meta property="og:description" content="OSError libtorchaudio.so: undefined symbol (or libtorch_cuda.so not found) means torch and torchaudio don&#x27;t match. Tested diagnosis and fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/torchaudio-libtorchaudio-so-undefined-symbol/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does libtorchaudio.so have an undefined symbol?", "acceptedAnswer": {"@type": "Answer", "text": "It was built against a different torch version than the one installed. torchaudio 2.9.0 needs torch 2.9.0, 2.8.0 needs 2.8.0; any other pair fails at import."}}, {"@type": "Question", "name": "Why libtorch_cuda.so: cannot open shared object file?", "acceptedAnswer": {"@type": "Answer", "text": "torch is a CPU build but torchaudio is a CUDA build of the same version. pip check does not flag it; reinstall torchaudio from the same index as torch (e.g. the /whl/cpu index)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>torchaudio libtorchaudio.so undefined symbol (fix)</h1>
+<p class="lead"><code>import torchaudio</code> fails with <code>OSError: .../torchaudio/lib/libtorchaudio.so: undefined symbol: _ZNK3c106SymInt...</code>, <code>Could not load this library: ...libtorchaudio.so</code> or <code>libtorch_cuda.so: cannot open shared object file</code>. We reproduced all three; each is a torch/torchaudio mismatch.</p>
+<h2 id="errors">1. The three errors</h2>
+<p>A two-line test that prints what pip thinks is installed and then imports torchaudio:</p>
+<pre><code>import importlib.metadata as m
+print(&quot;torch&quot;, m.version(&quot;torch&quot;), &quot;| torchaudio&quot;, m.version(&quot;torchaudio&quot;))
+import torchaudio
+print(&quot;imported torchaudio&quot;, torchaudio.__version__)</code></pre>
+<p><b>torch 2.8.0 with torchaudio 2.9.0</b> (traceback trimmed):</p>
+<pre><code>torch 2.8.0+cpu | torchaudio 2.9.0+cpu
+Traceback (most recent call last):
+  ...
+OSError: .../site-packages/torchaudio/lib/libtorchaudio.so: undefined symbol: _ZNK3c106SymInt22maybe_as_int_slow_pathEv</code></pre>
+<p><b>torch 2.9.0 with torchaudio 2.8.0</b>: the same undefined symbol (a different one), then torch wraps it in &quot;Could not load this library&quot;:</p>
+<pre><code>torch 2.9.0+cpu | torchaudio 2.8.0+cpu
+Traceback (most recent call last):
+  ...
+OSError: .../site-packages/torchaudio/lib/libtorchaudio.so: undefined symbol: _ZNK3c106SymInt6sym_neERKS0_
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  ...
+OSError: Could not load this library: .../site-packages/torchaudio/lib/libtorchaudio.so</code></pre>
+<p><b>Same version, different build</b>: torch 2.8.0+cpu with the CUDA torchaudio 2.8.0 wheel from PyPI (built for cu128):</p>
+<pre><code>torch 2.8.0+cpu | torchaudio 2.8.0
+Traceback (most recent call last):
+  ...
+OSError: libtorch_cuda.so: cannot open shared object file: No such file or directory</code></pre>
+<p>All three have one cause: <code>libtorchaudio.so</code> is compiled against one exact torch build and loads C++ symbols from it. torchaudio 2.9.0 declares <code>torch==2.9.0</code> and 2.8.0 declares <code>torch==2.8.0</code>, but <code>pip install --no-deps</code>, a second index URL or a conda/pip mix can still leave a mismatched pair. <code>pip check</code> catches the version mismatch:</p>
+<pre><code>torchaudio 2.9.0+cpu has requirement torch==2.9.0, but you have torch 2.8.0+cpu.</code></pre>
+<p>but not the CPU/CUDA mix: in the third case it printed <code>No broken requirements found.</code>, because the PyPI wheel&#x27;s metadata says plain <code>2.8.0</code>.</p>
+<h2 id="diagnose">2. See what you have without importing torchaudio</h2>
+<p>This reads torchaudio&#x27;s requirement and its built-in version file (which keeps the <code>+cpu</code>/<code>+cu128</code> tag) and compares them with torch:</p>
+<pre><code># Diagnose without importing torchaudio: versions AND build tags must match
+import importlib.metadata as m, importlib.util, pathlib, torch
+need = [r for r in (m.requires(&quot;torchaudio&quot;) or []) if r.startswith(&quot;torch&quot;)]
+print(&quot;torchaudio requires:&quot;, need)
+ta_dir = pathlib.Path(importlib.util.find_spec(&quot;torchaudio&quot;).origin).parent
+print(&quot;torchaudio build:&quot;, (ta_dir / &quot;version.py&quot;).read_text().splitlines()[0])
+print(&quot;torch build:      &quot;, torch.__version__, &quot;| CUDA:&quot;, torch.version.cuda)</code></pre>
+<p>CPU/CUDA mix:</p>
+<pre><code>torchaudio requires: [&#x27;torch==2.8.0&#x27;]
+torchaudio build: __version__ = &#x27;2.8.0+cu128&#x27;
+torch build:       2.8.0+cpu | CUDA: None</code></pre>
+<p>Version mismatch (torch 2.9.0, torchaudio 2.8.0):</p>
+<pre><code>torchaudio requires: [&#x27;torch==2.8.0&#x27;]
+torchaudio build: __version__ = &#x27;2.8.0+cpu&#x27;
+torch build:       2.9.0+cpu | CUDA: None</code></pre>
+<p>The two must agree on the version (<code>2.8.0</code>) and the build tag (<code>+cpu</code>, <code>+cu128</code>, ...). If torch says <code>CUDA: None</code>, torchaudio needs a <code>+cpu</code> build.</p>
+<h2 id="fix">3. Fix: reinstall torchaudio to match torch</h2>
+<p>Pick the torchaudio with the same version and build tag as your torch, from the same index, and force it in. For the CPU/CUDA mix above (torch 2.8.0+cpu):</p>
+<pre><code>pip install --force-reinstall --no-deps torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cpu</code></pre>
+<p>Then <code>b1.py</code> printed:</p>
+<pre><code>torch 2.8.0+cpu | torchaudio 2.8.0+cpu
+imported torchaudio 2.8.0+cpu</code></pre>
+<p><code>--force-reinstall</code> matters: without it, <code>pip install torch==2.8.0 torchaudio==2.8.0 --index-url .../whl/cpu</code> treated the installed CUDA build as already satisfying <code>==2.8.0</code>, and the import still failed with <code>libtorch_cuda.so</code>. For a CUDA torch, use its tag in the URL (e.g. <code>/whl/cu128</code>). For a version mismatch, install the torchaudio version that equals torch&#x27;s; after fixing the torch 2.8.0 / torchaudio 2.9.0 pair, <code>b2.py</code> printed:</p>
+<pre><code>torchaudio requires: [&#x27;torch==2.8.0&#x27;]
+torchaudio build: __version__ = &#x27;2.8.0+cpu&#x27;
+torch build:       2.8.0+cpu | CUDA: None</code></pre>
+<p>The torch 2.9.0 pair imported the same way (<code>imported torchaudio 2.9.0+cpu</code>). If you can&#x27;t change torch (another package pins it), install the torchaudio that matches it rather than the newest one; if you&#x27;re on torchaudio 2.9, also see what it removed below.</p>
+<p>Related: <a href="/guides/torchcodec-could-not-load-libtorchcodec/">Could not load libtorchcodec</a> (the same kind of mismatch for TorchCodec) · <a href="/guides/runtimeerror-operator-torchvision-nms-does-not-exist/">operator torchvision::nms does not exist</a> (the same mismatch for torchvision) · <a href="/guides/torchaudio-no-module-named-backend/">No module named torchaudio.backend</a> · <a href="/guides/torchaudio-has-no-attribute-info/">torchaudio has no attribute info</a></p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does libtorchaudio.so have an undefined symbol?</summary><p>It was built against a different torch version than the one installed. torchaudio 2.9.0 needs torch 2.9.0, 2.8.0 needs 2.8.0; any other pair fails at import.</p></details>
+<details><summary>Why libtorch_cuda.so: cannot open shared object file?</summary><p>torch is a CPU build but torchaudio is a CUDA build of the same version. pip check does not flag it; reinstall torchaudio from the same index as torch (e.g. the /whl/cpu index).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux with CPython 3.11.17, torch 2.8.0/2.9.0 CPU wheels, torchaudio 2.8.0/2.9.0 CPU wheels and the PyPI torchaudio 2.8.0 (cu128) wheel. Output pasted unedited except shortened paths and trimmed tracebacks. PlainTables is our extension; torch and torchaudio are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

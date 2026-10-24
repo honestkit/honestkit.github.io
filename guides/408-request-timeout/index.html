@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>408 Request Timeout: What Triggers It and Who Retries (Tested)</title>
+<meta name="description" content="Node.js 24 with requestTimeout 3000 sent 408 plus Connection: close at 3,012 ms to a client trickling a 100-byte body. curl, fetch and Chromium did not retry a 408; curl --retry 3 sent 4 requests. 408 vs 504 vs client timeouts.">
+<link rel="canonical" href="https://honestkit.github.io/guides/408-request-timeout/">
+<meta property="og:title" content="408 Request Timeout: What Triggers It and Who Retries (Tested)">
+<meta property="og:description" content="Node.js 24 with requestTimeout 3000 sent 408 plus Connection: close at 3,012 ms to a client trickling a 100-byte body. curl, fetch and Chromium did not retry a 408; curl --retry 3 sent 4 requests. 408 vs 504 vs client timeouts.">
+<meta property="og:url" content="https://honestkit.github.io/guides/408-request-timeout/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does 408 Request Timeout mean?", "acceptedAnswer": {"@type": "Answer", "text": "The server stopped waiting for the client to finish sending its request. Node.js 24 with requestTimeout 3000 sent 408 with Connection: close at 3,012 ms to a client that sent headers and then trickled the body one byte every 400 ms."}}, {"@type": "Question", "name": "Is 408 a client or server problem?", "acceptedAnswer": {"@type": "Answer", "text": "It is a 4xx code, so the server blames the client: the request arrived too slowly or not at all. A slow backend shows up as 504 Gateway Timeout from a proxy instead."}}, {"@type": "Question", "name": "Does the browser or curl retry a 408 automatically?", "acceptedAnswer": {"@type": "Answer", "text": "In our test, no: curl 8.14.1, Node.js 24 fetch and Chromium 153 each sent 1 request and showed the 408. curl --retry 3 retried it, sending 4 requests. From Chromium's source, not measured: it retries silently when the 408 arrives on a reused keep-alive connection."}}, {"@type": "Question", "name": "What is the default request timeout in Node.js?", "acceptedAnswer": {"@type": "Answer", "text": "server.requestTimeout is 300000 ms (5 minutes) and server.headersTimeout is 60000 ms in Node.js 24.21.0. Setting requestTimeout lower also lowered headersTimeout to the same value."}}, {"@type": "Question", "name": "Is a client-side timeout a 408?", "acceptedAnswer": {"@type": "Answer", "text": "No. curl --max-time ends with error 28 and exit code 28, and fetch with AbortSignal.timeout throws a TimeoutError. No status code is received at all."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>408 Request Timeout (tested)</h1>
+<p class="lead"><code>408 Request Timeout</code> means the <em>server</em> gave up waiting for the client to finish sending its request. It is not a slow-backend error (that is <code>504</code>), and it is not what you see when your own client times out (that is an exception, not a status code). We made Node.js 24 send real 408s, checked which clients retry them, and measured what client-side timeouts look like instead.</p>
+<h2>1. What makes Node.js send a 408</h2>
+<p>Node.js 24.21.0 has two request timers. <code>headersTimeout</code> (default 60000 ms) limits how long the request headers may take; that case is measured in our <a href="/guides/keep-alive-header-connection/">keep-alive guide</a>. <code>requestTimeout</code> (default 300000 ms) limits the whole request, headers and body. We set it low and sent valid headers with <code>Content-Length: 100</code>, then one body byte every 400 ms from a raw TCP socket:</p>
+<pre><code>const server = http.createServer(
+  { requestTimeout: 3000, connectionsCheckingInterval: 500 },
+  handler);</code></pre>
+<table><thead><tr><th>Client behaviour</th><th>Result</th><th>After</th></tr></thead><tbody>
+<tr><td>Headers sent, body trickled 1 byte / 400 ms (8 of 100 bytes arrived)</td><td><code>HTTP/1.1 408 Request Timeout</code> + <code>Connection: close</code>, socket closed</td><td>3,012 ms</td></tr>
+<tr><td>Connected, sent nothing at all</td><td><code>408 Request Timeout</code> + <code>Connection: close</code></td><td>3,501 ms</td></tr>
+<tr><td>One complete request, then idle on the keep-alive socket</td><td>Normal <code>200</code>, then closed <strong>silently</strong> (no 408)</td><td>6,004 ms</td></tr>
+</tbody></table>
+<p>The full 408 response was just the status line and <code>Connection: close</code>, no body. Your handler never ran, so your logging middleware never saw these requests.</p>
+<p>Two details we hit:</p>
+<ul>
+<li>Setting <code>requestTimeout: 3000</code> also lowered <code>server.headersTimeout</code> to 3000 (we read it back from the server object). Node.js keeps <code>headersTimeout</code> at or below <code>requestTimeout</code>, which is why the "sent nothing" connection also got a 408.</li>
+<li>An idle connection <em>between</em> requests is governed by <code>keepAliveTimeout</code>, not these timers, and is closed without any response. A 408 only goes out while a request is in progress (or before the first one).</li>
+</ul>
+<p>With the defaults, a client uploading a large body over a slow link gets a 408 after 5 minutes. If you accept big uploads, raise <code>requestTimeout</code> (or set it to 0 and enforce limits elsewhere) and cap size separately; see <a href="/guides/413-request-entity-too-large/">413 Request Entity Too Large</a>.</p>
+<h2>2. Do clients retry a 408?</h2>
+<p>A test server answered every request with <code>408</code> and <code>Connection: close</code> and counted hits:</p>
+<table><thead><tr><th>Client</th><th>Status seen</th><th>Requests sent</th></tr></thead><tbody>
+<tr><td>curl 8.14.1</td><td>408</td><td>1</td></tr>
+<tr><td>curl 8.14.1 <code>--retry 3 --retry-delay 1</code></td><td>408</td><td><strong>4</strong> (curl treats 408 as transient)</td></tr>
+<tr><td>Node.js 24 <code>fetch()</code></td><td>408</td><td>1</td></tr>
+<tr><td>Chromium 153, <code>page.goto</code></td><td>408</td><td>1</td></tr>
+<tr><td>Chromium 153, <code>fetch()</code> inside the page</td><td>408</td><td>1</td></tr>
+</tbody></table>
+<p>From the Chromium source, not measured: Chromium silently retries a request when a 408 arrives on a <em>reused</em> keep-alive connection, treating it like a server that closed the idle socket. On a fresh connection, as in our test, it shows you the 408. Never assume a retry happened: if your API client should retry, add it yourself, and only for idempotent requests (GET, PUT, DELETE) or with an idempotency key.</p>
+<h2>3. 408 vs 504 vs client-side timeouts</h2>
+<table><thead><tr><th>What you see</th><th>Who gave up</th><th>Waiting for</th></tr></thead><tbody>
+<tr><td><code>408 Request Timeout</code></td><td>The server</td><td>The client to finish sending the request</td></tr>
+<tr><td><code>504 Gateway Timeout</code></td><td>A proxy or load balancer</td><td>The upstream app to respond</td></tr>
+<tr><td>curl <code>(28) Operation timed out after 1001 milliseconds with 0 bytes received</code>, exit code 28</td><td>Your client (<code>--max-time 1</code>)</td><td>The response</td></tr>
+<tr><td>Node.js fetch throws <code>TimeoutError: The operation was aborted due to timeout</code></td><td>Your client (<code>AbortSignal.timeout(1000)</code>)</td><td>The response</td></tr>
+</tbody></table>
+<p>The last two rows are measured against a handler that waited 5 s before answering. No status code exists in either case: the client abandoned the request. If your logs show 408s, look at the client side (slow uploads, stalled mobile networks, a client that sends <code>Content-Length</code> larger than the body it actually sends). If they show 504s, look at your app's response time.</p>
+<h2>4. nginx (from the docs, not measured)</h2>
+<p>nginx returns 408 when <code>client_header_timeout</code> (default 60s) or <code>client_body_timeout</code> (default 60s) expires. The body timeout is measured between two successive reads, not for the whole body, so a slow but steady upload does not trigger it. <code>proxy_read_timeout</code> (default 60s) is the one that produces 504 when your upstream is slow. Clients that send <code>Expect: 100-continue</code> wait before sending a body; see <a href="/guides/expect-100-continue-curl/">Expect: 100-continue</a>.</p>
+<h2>5. Fixing it</h2>
+<ul>
+<li><strong>Uploads cut off at exactly 5 minutes on Node.js:</strong> raise <code>server.requestTimeout</code>.</li>
+<li><strong>408s on a mostly idle service:</strong> often clients that open a connection and never send a request (pre-connects, health checkers). Usually harmless.</li>
+<li><strong>Behind a proxy:</strong> the 408 may come from the proxy, not your app. Check which component's timeout matches the delay you see.</li>
+<li><strong>Client code:</strong> handle 408 like a connection error: retry once, with a fresh connection, for idempotent requests.</li>
+</ul>
+<aside class="cta"><strong>See the status and headers your server actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does 408 Request Timeout mean?</summary><p>The server stopped waiting for the client to finish sending its request. Node.js 24 with requestTimeout 3000 sent 408 with Connection: close at 3,012 ms to a client that sent headers and then trickled the body one byte every 400 ms.</p></details>
+<details><summary>Is 408 a client or server problem?</summary><p>It is a 4xx code, so the server blames the client: the request arrived too slowly or not at all. A slow backend shows up as 504 Gateway Timeout from a proxy instead.</p></details>
+<details><summary>Does the browser or curl retry a 408 automatically?</summary><p>In our test, no: curl 8.14.1, Node.js 24 fetch and Chromium 153 each sent 1 request and showed the 408. curl --retry 3 retried it, sending 4 requests. From Chromium&#x27;s source, not measured: it retries silently when the 408 arrives on a reused keep-alive connection.</p></details>
+<details><summary>What is the default request timeout in Node.js?</summary><p>server.requestTimeout is 300000 ms (5 minutes) and server.headersTimeout is 60000 ms in Node.js 24.21.0. Setting requestTimeout lower also lowered headersTimeout to the same value.</p></details>
+<details><summary>Is a client-side timeout a 408?</summary><p>No. curl --max-time ends with error 28 and exit code 28, and fetch with AbortSignal.timeout throws a TimeoutError. No status code is received at all.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 (http.createServer on localhost:8987-8988, a raw TCP client, built-in fetch), curl 8.14.1 and headless Chromium 153.0.8010.12 (Playwright). We counted server hits to detect retries. nginx timeouts and Chromium&#x27;s keep-alive retry rule are quoted from documentation and source, not measured. PlainHeaders is our extension; Node.js, curl and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

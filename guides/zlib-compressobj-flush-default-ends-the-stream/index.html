@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zlib&#x27;s compressobj.flush() Permanently Ends the Stream</title>
+<meta name="description" content="We measured compressobj().flush() with no argument, then compress() again, raising &quot;inconsistent stream state&quot; — default flush ends the stream for good.">
+<link rel="canonical" href="https://honestkit.github.io/guides/zlib-compressobj-flush-default-ends-the-stream/">
+<meta property="og:title" content="zlib&#x27;s compressobj.flush() Permanently Ends the Stream">
+<meta property="og:description" content="We measured compressobj().flush() with no argument, then compress() again, raising &quot;inconsistent stream state&quot; — default flush ends the stream for good.">
+<meta property="og:url" content="https://honestkit.github.io/guides/zlib-compressobj-flush-default-ends-the-stream/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does compressobj().flush() let you keep compressing afterward?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured flush() with no argument (which defaults to Z_FINISH) ending the stream permanently. The next compress() call raises zlib.error: inconsistent stream state."}}, {"@type": "Question", "name": "What flush mode lets you push out data without ending the stream?", "acceptedAnswer": {"@type": "Answer", "text": "We measured flush(zlib.Z_SYNC_FLUSH) working correctly \u2014 it flushes pending compressed bytes while leaving the compressor object usable for further compress() calls."}}, {"@type": "Question", "name": "Why does zlib's flush() behave differently from file-object flush()?", "acceptedAnswer": {"@type": "Answer", "text": "Based on the Python docs, zlib's flush() takes an optional mode argument that defaults to Z_FINISH, which explicitly ends the stream \u2014 unlike io module flush() methods, which just push buffered bytes without closing anything."}}, {"@type": "Question", "name": "Can you reuse a compressobj after calling flush() with no argument?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured both compress() and a second flush() call on the same object raising the identical \"inconsistent stream state\" error once the default Z_FINISH flush has run."}}, {"@type": "Question", "name": "How do I correctly flush mid-stream when compressing data incrementally?", "acceptedAnswer": {"@type": "Answer", "text": "We'd call flush(zlib.Z_SYNC_FLUSH) (or Z_FULL_FLUSH) for every intermediate flush, and only call plain flush() once at the very end to finalize the stream."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>zlib compressobj flush() Ends the Stream (tested)</h1>
+<p class="lead"><code>compressobj().flush()</code> sounds like flushing a file buffer &mdash; getting pending bytes out so you can keep going. We measured what actually happens when you call it with no argument: the stream is over, permanently, and the next <code>compress()</code> call raises an error.</p>
+<h2 id="repro1">1. flush() with no argument finishes the stream</h2>
+<pre><code>import zlib
+
+c = zlib.compressobj()
+out1 = c.compress(b"hello")
+out2 = c.flush()
+len(out1 + out2)
+13
+
+c.compress(b"world")
+Traceback (most recent call last):
+zlib.error: Error -2 while compressing data: inconsistent stream state</code></pre>
+<p><strong>Measured:</strong> <code>flush()</code> called with no argument defaults to <code>zlib.Z_FINISH</code>, which writes the final compressed block and closes out the stream. The object isn't reset or reusable afterward &mdash; calling <code>compress()</code> again raises <code>zlib.error: ... inconsistent stream state</code>, and calling <code>flush()</code> a second time raises the identical error for the same reason.</p>
+
+<h2 id="repro2">2. Z_SYNC_FLUSH is the one that lets you keep compressing</h2>
+<pre><code>c2 = zlib.compressobj()
+out1 = c2.compress(b"hello ")
+out2 = c2.flush(zlib.Z_SYNC_FLUSH)
+out3 = c2.compress(b"world")
+out4 = c2.flush()
+zlib.decompress(out1 + out2 + out3 + out4)
+b'hello world'</code></pre>
+<p><strong>Measured:</strong> passing <code>zlib.Z_SYNC_FLUSH</code> explicitly pushes out all pending compressed data (useful for a streaming protocol where the other end needs bytes now) while leaving the compressor object usable &mdash; <code>compress()</code> works fine afterward, and a final no-argument <code>flush()</code> at the very end correctly closes the stream. The round-trip decompresses back to the exact original bytes.</p>
+
+<h2 id="repro3">3. Why the name is misleading</h2>
+<p>Per the <a href="https://docs.python.org/3/library/zlib.html#zlib.Compress.flush">Python zlib docs</a>, <code>flush([mode])</code> takes an optional mode that defaults to <code>Z_FINISH</code> &mdash; and <code>Z_FINISH</code> is explicitly documented to end the compressed stream. Unlike <code>io</code> module <code>flush()</code> methods (which push buffered bytes out without ending anything), zlib's default <code>flush()</code> is a one-way, irreversible operation on the object, not a lightweight "send what you have so far."</p>
+
+<h2 id="fix">4. What to actually do</h2>
+<p>If you need to push out compressed data mid-stream and keep compressing afterward (e.g. a chunked HTTP response, a long-lived socket), call <code>flush(zlib.Z_SYNC_FLUSH)</code> or <code>flush(zlib.Z_FULL_FLUSH)</code>, never bare <code>flush()</code>, until the very last chunk. Only call plain <code>flush()</code> (or equivalently <code>flush(zlib.Z_FINISH)</code>) once, when you're actually done and want to finalize the stream &mdash; treat the compressobj as single-use after that call.</p>
+
+<aside class="cta"><strong>Debugging a compressed payload an API streams back in pieces? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does compressobj().flush() let you keep compressing afterward?</summary><p>No — we measured flush() with no argument (which defaults to Z_FINISH) ending the stream permanently. The next compress() call raises zlib.error: inconsistent stream state.</p></details>
+<details><summary>What flush mode lets you push out data without ending the stream?</summary><p>We measured flush(zlib.Z_SYNC_FLUSH) working correctly — it flushes pending compressed bytes while leaving the compressor object usable for further compress() calls.</p></details>
+<details><summary>Why does zlib&#x27;s flush() behave differently from file-object flush()?</summary><p>Based on the Python docs, zlib&#x27;s flush() takes an optional mode argument that defaults to Z_FINISH, which explicitly ends the stream — unlike io module flush() methods, which just push buffered bytes without closing anything.</p></details>
+<details><summary>Can you reuse a compressobj after calling flush() with no argument?</summary><p>No — we measured both compress() and a second flush() call on the same object raising the identical &quot;inconsistent stream state&quot; error once the default Z_FINISH flush has run.</p></details>
+<details><summary>How do I correctly flush mid-stream when compressing data incrementally?</summary><p>We&#x27;d call flush(zlib.Z_SYNC_FLUSH) (or Z_FULL_FLUSH) for every intermediate flush, and only call plain flush() once at the very end to finalize the stream.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in zlib module: called compressobj().flush() with no argument (the default) and then tried compress() and flush() again on the same object, comparing against calling flush(zlib.Z_SYNC_FLUSH) instead. PlainHeaders is our extension; Python&#x27;s zlib module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

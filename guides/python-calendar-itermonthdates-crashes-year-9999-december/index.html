@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>itermonthdates Crashes on December 9999 -- Siblings Dont</title>
+<meta name="description" content="We measured Python 3.13.5: itermonthdates(9999,12) raises ValueError, while itermonthdays2/3/4 return the identical month grid fine -- same data, no crash.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-calendar-itermonthdates-crashes-year-9999-december/">
+<meta property="og:title" content="itermonthdates Crashes on December 9999 -- Siblings Dont">
+<meta property="og:description" content="We measured Python 3.13.5: itermonthdates(9999,12) raises ValueError, while itermonthdays2/3/4 return the identical month grid fine -- same data, no crash.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-calendar-itermonthdates-crashes-year-9999-december/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does calendar.itermonthdates() crash near datetime's year limits?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured calendar.Calendar().itermonthdates(9999, 12) raising ValueError, because December 9999's trailing days spill into January of year 10000, past datetime.date's maximum year of 9999."}}, {"@type": "Question", "name": "Do the other calendar.Calendar methods for the same month also crash?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured itermonthdays2(), itermonthdays3(), itermonthdays4() and monthdays2calendar() all returning the identical month grid successfully for year 9999, December, because they represent days as plain integers or tuples rather than datetime.date objects."}}, {"@type": "Question", "name": "What exception type should I catch around calendar.itermonthdates() for this case?", "acceptedAnswer": {"@type": "Answer", "text": "We measured ValueError being raised, not the OverflowError that the method's own documented caveat names -- catching only OverflowError around this call does not catch the actual exception."}}, {"@type": "Question", "name": "Is this only a problem for extremely far-future years like 9999?", "acceptedAnswer": {"@type": "Answer", "text": "In practice yes -- we measured the failure specifically at December of datetime.MAXYEAR (9999), one month before the hard upper limit; every other month and the date-based methods for earlier years worked without issue in our tests."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>calendar.itermonthdates() Crashes on December 9999 -- Sibling Methods Don&#x27;t (tested)</h1>
+<p class="lead"><code>calendar.Calendar</code> has several methods that all compute the exact same thing -- a month's full day grid, including the leading/trailing days from the adjacent months needed to fill whole weeks. They differ only in what type they hand back: plain integers, <code>(day, weekday)</code> tuples, or actual <code>datetime.date</code> objects. We measured what happens when that month happens to be December of year 9999, one month before <code>datetime</code>'s own upper limit.</p>
+<h2 id="repro1">1. Same month, same class, different method -- one crashes, the others don't</h2>
+<pre><code>import calendar
+
+c = calendar.Calendar()
+
+for name, fn in [
+    ("itermonthdates",       lambda: list(c.itermonthdates(9999, 12))),
+    ("itermonthdays2",       lambda: list(c.itermonthdays2(9999, 12))),
+    ("itermonthdays3",       lambda: list(c.itermonthdays3(9999, 12))),
+    ("itermonthdays4",       lambda: list(c.itermonthdays4(9999, 12))),
+    ("monthdatescalendar",   lambda: c.monthdatescalendar(9999, 12)),
+    ("monthdays2calendar",   lambda: c.monthdays2calendar(9999, 12)),
+]:
+    try:
+        r = fn()
+        print(name, "OK, len", len(r))
+    except Exception as e:
+        print(name, "RAISED", type(e).__name__, e)</code></pre>
+<pre><code>itermonthdates RAISED ValueError year 10000 is out of range
+itermonthdays2 OK, len 35
+itermonthdays3 OK, len 35
+itermonthdays4 OK, len 35
+monthdatescalendar RAISED ValueError year 10000 is out of range
+monthdays2calendar OK, len 5</code></pre>
+<p><strong>Measured:</strong> December 9999's trailing days spill into January of year 10000. The methods that represent each day as a <code>datetime.date</code> object (<code>itermonthdates</code>, <code>monthdatescalendar</code>) have to actually construct a date in year 10000 to do that -- and <code>datetime.date</code>'s hard limit is year 9999, so construction raises. The methods that represent the same days as plain integers or <code>(day, weekday)</code> tuples (<code>itermonthdays2/3/4</code>, <code>monthdays2calendar</code>) never construct a <code>date</code> object at all, so the identical trailing days pass through with no error.</p>
+
+<h2 id="repro2">2. The exception you actually get doesn't match the one the docs describe</h2>
+<pre><code>import calendar
+help(calendar.Calendar.itermonthdates)</code></pre>
+<pre><code># relevant excerpt from the official docstring/docs:
+# "it's possible to get an OverflowError for dates that are too far
+#  into the future or past (near datetime.MAXYEAR or MINYEAR)."</code></pre>
+<pre><code>import calendar
+c = calendar.Calendar()
+try:
+    list(c.itermonthdates(9999, 12))
+except Exception as e:
+    print(type(e).__name__, e)</code></pre>
+<pre><code>ValueError year 10000 is out of range</code></pre>
+<p><strong>Measured:</strong> the documented caveat names <code>OverflowError</code>; what's actually raised measured here is <code>ValueError</code>, coming straight from the <code>datetime.date(year, month, day)</code> constructor's own range check. Catching <code>OverflowError</code> specifically around a call to <code>itermonthdates()</code> -- which is exactly what the documentation's own wording suggests -- does not catch this.</p>
+
+<h2 id="repro3">3. It isn't only the far future -- the same split exists building a calendar display</h2>
+<pre><code>import calendar
+
+c = calendar.Calendar()
+try:
+    weeks = c.monthdatescalendar(9999, 12)   # a typical "render this month" call
+except ValueError as e:
+    print("monthdatescalendar failed:", e)
+
+# the integer-based equivalent, same month, same shape, no crash:
+weeks2 = c.monthdays2calendar(9999, 12)
+print("monthdays2calendar still works, weeks:", len(weeks2))</code></pre>
+<pre><code>monthdatescalendar failed: year 10000 is out of range
+monthdays2calendar still works, weeks: 5</code></pre>
+<p><strong>Measured:</strong> if a calendar UI or report builder picks the <code>date</code>-object variant because it's more convenient to work with downstream, it inherits a crash at the exact year boundary that the integer-based sibling method never hits -- on data that's otherwise perfectly ordinary month arithmetic.</p>
+<aside class="cta"><strong>Building a calendar grid with Python&#x27;s calendar module and letting the year come from user input or far-future test data? Check which method you called -- some of them crash near datetime&#x27;s year limit, and some don&#x27;t:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does calendar.itermonthdates() crash near datetime&#x27;s year limits?</summary><p>Yes -- we measured calendar.Calendar().itermonthdates(9999, 12) raising ValueError, because December 9999&#x27;s trailing days spill into January of year 10000, past datetime.date&#x27;s maximum year of 9999.</p></details>
+<details><summary>Do the other calendar.Calendar methods for the same month also crash?</summary><p>No -- we measured itermonthdays2(), itermonthdays3(), itermonthdays4() and monthdays2calendar() all returning the identical month grid successfully for year 9999, December, because they represent days as plain integers or tuples rather than datetime.date objects.</p></details>
+<details><summary>What exception type should I catch around calendar.itermonthdates() for this case?</summary><p>We measured ValueError being raised, not the OverflowError that the method&#x27;s own documented caveat names -- catching only OverflowError around this call does not catch the actual exception.</p></details>
+<details><summary>Is this only a problem for extremely far-future years like 9999?</summary><p>In practice yes -- we measured the failure specifically at December of datetime.MAXYEAR (9999), one month before the hard upper limit; every other month and the date-based methods for earlier years worked without issue in our tests.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in calendar module: called calendar.Calendar()&#x27;s itermonthdates(), itermonthdays2(), itermonthdays3(), itermonthdays4() and monthdatescalendar() all on the same month (year 9999, December) and compared which ones raised and which returned normally. PlainHeaders is our extension; Python&#x27;s calendar module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

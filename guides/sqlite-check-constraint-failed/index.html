@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLite &#x27;CHECK Constraint Failed&#x27; — Tested</title>
+<meta name="description" content="We reproduced sqlite3&#x27;s CHECK constraint error and measured that the message echoes the exact expression, and that NULL silently bypasses CHECK entirely.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite-check-constraint-failed/">
+<meta property="og:title" content="SQLite &#x27;CHECK Constraint Failed&#x27; — Tested">
+<meta property="og:description" content="We reproduced sqlite3&#x27;s CHECK constraint error and measured that the message echoes the exact expression, and that NULL silently bypasses CHECK entirely.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite-check-constraint-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does the CHECK constraint error tell you which rule failed?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we measured that the error message reprints the exact CHECK expression from the table definition (e.g. 'age >= 0'), not just a generic message or the column name, making it one of the more directly actionable errors in this series."}}, {"@type": "Question", "name": "Does inserting NULL violate a CHECK constraint?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed NULL silently bypasses CHECK entirely and the insert succeeds. This is standard SQL behavior (a NULL comparison evaluates to NULL, which CHECK treats as passing), not an SQLite-specific quirk. Add NOT NULL separately if NULL should be rejected too."}}, {"@type": "Question", "name": "Can a CHECK constraint reference more than one column?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we tested CHECK(lo <= hi) across two columns in the same row and it failed correctly when lo was greater than hi, confirming CHECK isn't limited to single-column validation against a constant."}}, {"@type": "Question", "name": "What exception class does sqlite3 raise for this?", "acceptedAnswer": {"@type": "Answer", "text": "IntegrityError \u2014 we confirmed it's the same exception class used for NOT NULL and UNIQUE violations, not OperationalError, which most of the other sqlite3 errors in this series raise instead."}}, {"@type": "Question", "name": "Is a pattern-based CHECK (like LIKE) evaluated the same way as a numeric one?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we tested CHECK(email LIKE \"%@%\") and it failed identically to the numeric age example, with the exact LIKE expression echoed back in the error message."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLite: CHECK constraint failed (tested)</h1>
+<p class="lead"><code>sqlite3.IntegrityError: CHECK constraint failed: &lt;expr&gt;</code> fires when a row violates a CHECK you defined on the table. We measured what the error message actually tells you, and one standard-SQL behavior that surprises people.</p>
+<h2 id="repro1">1. The error echoes the exact CHECK expression</h2>
+<pre><code>con.execute("CREATE TABLE t (id INTEGER, age INTEGER CHECK(age >= 0))")
+con.execute("INSERT INTO t (id, age) VALUES (1, -5)")
+sqlite3.IntegrityError: CHECK constraint failed: age >= 0</code></pre>
+<p><strong>Measured:</strong> unlike some of sqlite3's other constraint errors, this one doesn't just name the column &mdash; it reprints the literal CHECK expression from the table definition, which makes it one of the more immediately diagnosable errors in this series. A pattern-based CHECK behaves the same way:</p>
+<pre><code>con.execute('CREATE TABLE t2 (id INTEGER, email TEXT CHECK(email LIKE "%@%"))')
+con.execute('INSERT INTO t2 (id, email) VALUES (1, "notanemail")')
+sqlite3.IntegrityError: CHECK constraint failed: email LIKE "%@%"</code></pre>
+
+<h2 id="repro2">2. NULL silently bypasses CHECK entirely</h2>
+<p>Using the same <code>age INTEGER CHECK(age &gt;= 0)</code> column, we inserted NULL instead of a negative number:</p>
+<pre><code>con.execute("INSERT INTO t (id, age) VALUES (2, NULL)")
+# no error &mdash; row stored as (2, None)</code></pre>
+<p><strong>Measured:</strong> this is standard SQL CHECK semantics, not an SQLite quirk &mdash; a CHECK expression that evaluates to NULL (which comparing NULL to anything does) is treated as passing, not failing. If you need to actually require a value, you need a separate <code>NOT NULL</code> constraint on the same column; <code>CHECK</code> alone does not imply it.</p>
+
+<h2 id="repro3">3. CHECK can reference multiple columns in the same row</h2>
+<pre><code>con.execute("CREATE TABLE t3 (lo INTEGER, hi INTEGER, CHECK(lo <= hi))")
+con.execute("INSERT INTO t3 (lo, hi) VALUES (10, 5)")
+sqlite3.IntegrityError: CHECK constraint failed: lo <= hi</code></pre>
+<p>This confirms CHECK isn't limited to validating one column against a constant; it can enforce a relationship between two or more columns in the same row.</p>
+
+<h2 id="fix">4. The fix: read the expression in the error, and add NOT NULL if needed</h2>
+<p>Since the message already contains the exact failing expression, the fix is usually immediate: correct the value to satisfy that literal expression. If NULL values shouldn't be allowed to slip through unchecked, add <code>NOT NULL</code> explicitly &mdash; we confirmed CHECK alone does not reject NULL.</p>
+
+<aside class="cta"><strong>Debugging an app that talks to an API instead of a database? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does the CHECK constraint error tell you which rule failed?</summary><p>Yes — we measured that the error message reprints the exact CHECK expression from the table definition (e.g. &#x27;age &gt;= 0&#x27;), not just a generic message or the column name, making it one of the more directly actionable errors in this series.</p></details>
+<details><summary>Does inserting NULL violate a CHECK constraint?</summary><p>No — we confirmed NULL silently bypasses CHECK entirely and the insert succeeds. This is standard SQL behavior (a NULL comparison evaluates to NULL, which CHECK treats as passing), not an SQLite-specific quirk. Add NOT NULL separately if NULL should be rejected too.</p></details>
+<details><summary>Can a CHECK constraint reference more than one column?</summary><p>Yes — we tested CHECK(lo &lt;= hi) across two columns in the same row and it failed correctly when lo was greater than hi, confirming CHECK isn&#x27;t limited to single-column validation against a constant.</p></details>
+<details><summary>What exception class does sqlite3 raise for this?</summary><p>IntegrityError — we confirmed it&#x27;s the same exception class used for NOT NULL and UNIQUE violations, not OperationalError, which most of the other sqlite3 errors in this series raise instead.</p></details>
+<details><summary>Is a pattern-based CHECK (like LIKE) evaluated the same way as a numeric one?</summary><p>Yes — we tested CHECK(email LIKE &quot;%@%&quot;) and it failed identically to the numeric age example, with the exact LIKE expression echoed back in the error message.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in sqlite3 module, using a single-column CHECK, a pattern-based CHECK, a NULL value against a CHECK&#x27;d column, and a multi-column CHECK. Every error string below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s sqlite3 is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>React &quot;unique key prop&quot; Warning: Cause and Fix (Tested)</title>
+<meta name="description" content="We reproduced React&#x27;s exact unique key prop warning, proved index keys silence it, and measured why that still breaks lists on reorder.">
+<link rel="canonical" href="https://honestkit.github.io/guides/react-key-prop-warning/">
+<meta property="og:title" content="React &quot;unique key prop&quot; Warning: Cause and Fix (Tested)">
+<meta property="og:description" content="We reproduced React&#x27;s exact unique key prop warning, proved index keys silence it, and measured why that still breaks lists on reorder.">
+<meta property="og:url" content="https://honestkit.github.io/guides/react-key-prop-warning/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the exact React key warning text?", "acceptedAnswer": {"@type": "Answer", "text": "We measured: 'Warning: Each child in a list should have a unique \"key\" prop.' followed by a blank line, 'Check the top-level render call using <tag>. See https://reactjs.org/link/warning-keys for more information.', then a stack trace naming the components involved."}}, {"@type": "Question", "name": "Does using the array index as the key remove the warning?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, measured: React's runtime console warning does not fire at all when you pass the array index as key. It only checks that some key is present, not that it is stable identity."}}, {"@type": "Question", "name": "If the warning is gone, is my list safe?", "acceptedAnswer": {"@type": "Answer", "text": "Not necessarily. The warning being gone just means a key prop exists. An index key still breaks state association when the list is reordered, filtered, or has items inserted/removed anywhere but the end."}}, {"@type": "Question", "name": "Is index-as-key also an ESLint error?", "acceptedAnswer": {"@type": "Answer", "text": "Per the eslint-plugin-react docs, the separate rule react/no-array-index-key flags index keys at lint time as a best-practice warning. That is independent of React's own runtime console warning covered above."}}, {"@type": "Question", "name": "What should I use as a key instead of the index?", "acceptedAnswer": {"@type": "Answer", "text": "A stable id from your data, such as a database primary key or a UUID generated once when the item is created. Avoid deriving the key from the item's position in the array."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>React key prop warning (tested)</h1>
+<p class="lead"><code>Warning: Each child in a list should have a unique "key" prop.</code> is a development-only console warning React prints when you render an array of elements with <code>.map()</code> and forget the <code>key</code> prop. We reproduced the exact text, proved that an array index as key removes the warning without removing the underlying risk, and measured the stack trace React gives you to find the culprit.</p>
+<h2>1. The exact warning, reproduced</h2>
+<p>We rendered this with no <code>key</code> at all, using <code>react-dom/server</code>'s <code>renderToStaticMarkup</code> under <code>NODE_ENV=development</code>:</p>
+<pre><code>function App() {
+  const items = ['a', 'b', 'c'];
+  return React.createElement('ul', null, items.map(item =&gt;
+    React.createElement('li', null, item)
+  ));
+}</code></pre>
+<p>React printed this to <code>console.error</code>, verbatim (newlines preserved):</p>
+<pre><code>Warning: Each child in a list should have a unique "key" prop.
+
+Check the top-level render call using &lt;ul&gt;. See https://reactjs.org/link/warning-keys for more information.
+    at li
+    at App</code></pre>
+<p>The second line names where to look. When the list lives inside a child component instead of at the top level, we measured that the message names that component instead. Rendering the same list inside a component called <code>Child</code>, itself rendered by <code>Parent</code>, gave:</p>
+<pre><code>Check the top-level render call using &lt;div&gt;.
+    at span
+    at Child (file:///tmp/reactkeytest/repro2.mjs:24:17)
+    at Parent</code></pre>
+<p>The stack trace is the fastest way to find the offending <code>.map()</code>: read the component names under "at", not just the warning's own wording.</p>
+
+<h2>2. Index-as-key: no runtime warning, but not actually fixed</h2>
+<p>We re-ran the same component, this time passing the array index as <code>key</code>:</p>
+<pre><code>items.map((item, i) =&gt;
+  React.createElement('li', { key: i }, item)
+)</code></pre>
+<p>Result: zero <code>console.error</code> calls. We captured <code>console.error</code> itself during the render and counted 0 invocations. This confirms a common point of confusion precisely: <strong>React's runtime warning only checks that a <code>key</code> prop is present and, at dev speed, flags obviously-duplicated keys</strong> &mdash; it does not know whether your keys are stable across re-renders, so <code>key={"index"}</code> satisfies it completely.</p>
+<p>Separately, <strong>per the eslint-plugin-react docs (not measured on this box)</strong>, the lint rule <code>react/no-array-index-key</code> flags <code>key={i}</code> on <code>.map()</code> output as a best-practice warning at lint time. That is a static-analysis opinion about index keys specifically, not the same check as React's runtime warning above: you can have one without the other in either direction (a stable non-index key passes both; a missing key fails only the runtime one; an index key fails only the lint rule).</p>
+
+<h2>3. Why index keys still cause bugs (explained, not measured in this guide)</h2>
+<p>React uses <code>key</code> to match array items across renders so it can keep each item's DOM node and internal state attached to the right data, instead of re-creating everything. An index is really "position", not "identity". If the list can be reordered, have items inserted/removed anywhere but the end, or be filtered, the index of a given logical item changes even though the item itself didn't &mdash; so React pairs each position's old state with a <em>different</em> item than before.</p>
+<p>Concretely: a list of todo rows, each with its own <code>&lt;input&gt;</code> holding draft text, keyed by index. Delete row 0. Every remaining row shifts up one index. React sees "index 0 still exists, index 1 still exists, ..." and assumes those are the same components, so it keeps each <code>&lt;input&gt;</code>'s DOM node and its live text &mdash; just now attached to the wrong row's data. The result is draft text (or focus, or scroll position, or an uncontrolled input's value) appearing to "jump" to the wrong row after a delete, insert at the start/middle, or sort. A stable key (e.g. a database id or UUID) makes React move the right DOM node with the right item instead of reusing a slot by position.</p>
+
+<h2>4. The fix</h2>
+<ul>
+<li>Use a stable, unique identifier from the data itself: <code>key={item.id}</code>, not the array index.</li>
+<li>If your data truly has no id, generate one when the item is created (e.g. <code>crypto.randomUUID()</code>) and store it with the item &mdash; don't compute it from position during render.</li>
+<li>Index keys are fine only for lists that are always static: never reordered, never filtered, never spliced mid-list, and never conditionally rendered. That is rare enough that it is safer to default to a real id.</li>
+<li>If the warning points at a component you don't own (e.g. inside a library), check that you're not spreading props over an array of children without a key at the call site.</li>
+</ul>
+<p>If React is throwing a numbered production error instead of printing this warning, see <a href="/guides/minified-react-error-130/">Minified React error #130</a>. For a different list/key confusion that only shows up with server rendering, see <a href="/guides/react-hydration-error-nextjs/">React hydration error in Next.js</a>.</p>
+<aside class="cta"><strong>Check the headers your own React app&#x27;s server actually serves:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the exact React key warning text?</summary><p>We measured: &#x27;Warning: Each child in a list should have a unique &quot;key&quot; prop.&#x27; followed by a blank line, &#x27;Check the top-level render call using &lt;tag&gt;. See https://reactjs.org/link/warning-keys for more information.&#x27;, then a stack trace naming the components involved.</p></details>
+<details><summary>Does using the array index as the key remove the warning?</summary><p>Yes, measured: React&#x27;s runtime console warning does not fire at all when you pass the array index as key. It only checks that some key is present, not that it is stable identity.</p></details>
+<details><summary>If the warning is gone, is my list safe?</summary><p>Not necessarily. The warning being gone just means a key prop exists. An index key still breaks state association when the list is reordered, filtered, or has items inserted/removed anywhere but the end.</p></details>
+<details><summary>Is index-as-key also an ESLint error?</summary><p>Per the eslint-plugin-react docs, the separate rule react/no-array-index-key flags index keys at lint time as a best-practice warning. That is independent of React&#x27;s own runtime console warning covered above.</p></details>
+<details><summary>What should I use as a key instead of the index?</summary><p>A stable id from your data, such as a database primary key or a UUID generated once when the item is created. Avoid deriving the key from the item&#x27;s position in the array.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Node.js 24.21.0, React 18 and react-dom 18 (server) via react-dom/server renderToStaticMarkup, NODE_ENV=development, calling React.createElement directly (no JSX/Babel step). ESLint behaviour is per the eslint-plugin-react docs, not measured. PlainHeaders is our extension; React, react-dom and Node.js are free and open source.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

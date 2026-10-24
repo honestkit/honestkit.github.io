@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pipenv No module named &#x27;pkg_resources&#x27; (tested fix)</title>
+<meta name="description" content="pipenv install fails with &#x27;dependencies could not be resolved&#x27; but the cause is a hidden No module named &#x27;pkg_resources&#x27;. Tested fix: PIP_BUILD_CONSTRAINT.">
+<link rel="canonical" href="https://honestkit.github.io/guides/no-module-named-pkg-resources-pipenv/">
+<meta property="og:title" content="pipenv No module named &#x27;pkg_resources&#x27; (tested fix)">
+<meta property="og:description" content="pipenv install fails with &#x27;dependencies could not be resolved&#x27; but the cause is a hidden No module named &#x27;pkg_resources&#x27;. Tested fix: PIP_BUILD_CONSTRAINT.">
+<meta property="og:url" content="https://honestkit.github.io/guides/no-module-named-pkg-resources-pipenv/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does pipenv say my dependencies could not be resolved?", "acceptedAnswer": {"@type": "Answer", "text": "Here it was not a version conflict. A package's sdist build failed because its setup.py imports pkg_resources, and pipenv reports the failure as a resolution error. Run pipenv run pip install <package> to see the real error."}}, {"@type": "Question", "name": "Why doesn't installing setuptools in the pipenv venv fix it?", "acceptedAnswer": {"@type": "Answer", "text": "pip builds the package in a separate isolated env with the newest setuptools. Use PIP_BUILD_CONSTRAINT with setuptools<81 to cap setuptools in that build env."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pipenv: No module named &#x27;pkg_resources&#x27; (hidden lock error, tested)</h1>
+<p class="lead"><code>pipenv install</code> fails with &quot;Locking Failed! Your dependencies could not be resolved&quot;, and the hidden cause is <code>ModuleNotFoundError: No module named 'pkg_resources'</code> in a package build. Tested fix: <code>PIP_BUILD_CONSTRAINT</code> with <code>setuptools&lt;81</code>.</p>
+<h2 id="repro">1. The error: pipenv install says &quot;dependencies could not be resolved&quot;</h2>
+<p>Our test package was cx_Oracle 8.3.0. It has no wheel for Python 3.11, so it is built from the sdist, and its <code>setup.py</code> imports <code>pkg_resources</code>. In a fresh project with pipenv 2026.10.2 (pip 26.2.2, fresh caches):</p>
+<pre><code>$ pipenv install cx_Oracle==8.3.0</code></pre>
+<pre><code>[... trimmed ...]
+Upgrading cx_Oracle==8.3.0 in  dependencies.
+Building requirements...
+Resolving dependencies...
+✘ Locking Failed!
+ERROR: Failed to build &#x27;cx-oracle&#x27; when getting requirements to build wheel
+Your dependencies could not be resolved. You likely have a mismatch in your 
+sub-dependencies.
+You can use $ pipenv run pip install &lt;requirement_name&gt; to bypass this 
+mechanism, then run $ pipenv graph to inspect the versions actually installed in
+the virtualenv.
+Hint: try $ pipenv lock --pre if it is a pre-release dependency.
+Hint: try $ pipenv lock --verbose to see the full dependency resolution output.
+</code></pre>
+<p>pipenv reports a resolver &quot;mismatch in your sub-dependencies&quot;, but there is no conflict. The words <code>pkg_resources</code> never appear in its output, not even with <code>pipenv lock --verbose</code>, which only adds <code>Getting requirements to build wheel: finished with status 'error'</code>. pipenv also reverted the Pipfile, so cx_Oracle was not installed.</p>
+<h2 id="cause">2. See the real error: pipenv run pip install</h2>
+<p>Run the same requirement through pip inside the pipenv venv to see the hidden traceback:</p>
+<pre><code>$ pipenv run pip install cx_Oracle==8.3.0
+Collecting cx_Oracle==8.3.0
+  Downloading cx_Oracle-8.3.0.tar.gz (363 kB)
+  Installing build dependencies: started
+  Installing build dependencies: finished with status &#x27;done&#x27;
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status &#x27;error&#x27;
+  error: subprocess-exited-with-error
+  
+  × Getting requirements to build wheel did not run successfully.
+  │ exit code: 1
+  ╰─&gt; [19 lines of output]
+      [... trimmed ...]
+      [end of output]
+  
+  [... trimmed ...]</code></pre>
+<p>pip builds sdists in an isolated build env (<code>/tmp/pip-build-env-...</code>) with the newest setuptools, and setuptools 82.0.0 removed <code>pkg_resources</code>. The venv itself had setuptools 84.2.1, but the build never uses it.</p>
+<h2 id="fix">3. Fix: PIP_BUILD_CONSTRAINT (one-off or in .env)</h2>
+<p>Cap setuptools for build envs only. pipenv runs pip underneath, so pip's <code>PIP_BUILD_CONSTRAINT</code> environment variable reaches the build:</p>
+<pre><code>$ echo &quot;setuptools&lt;81&quot; &gt; constraints.txt
+$ PIP_BUILD_CONSTRAINT=constraints.txt pipenv install cx_Oracle==8.3.0</code></pre>
+<p>With the variable set, the same project locked (<code>✔ Success!</code>), Pipfile.lock got the cx-oracle hashes, and <code>.venv/bin/python -c &quot;import cx_Oracle; print(cx_Oracle.version)&quot;</code> printed <code>8.3.0</code>.</p>
+<p>To make it stick for everyone on the project, put it in the project's <code>.env</code>, which pipenv loads automatically:</p>
+<pre><code>$ cat .env
+PIP_BUILD_CONSTRAINT=constraints.txt
+$ pipenv install cx_Oracle==8.3.0
+Loading .env environment variables...
+[... trimmed ...]</code></pre>
+<p>In a fresh project that also installed and imported 8.3.0. Commit <code>constraints.txt</code> (and <code>.env</code>, if it holds no secrets). Note that <code>PIP_CONSTRAINT</code> does not work here: on pip 26.2.2 it does not reach the isolated build env. For cx_Oracle itself, the long-term fix is <a href="/guides/no-module-named-pkg-resources-cx-oracle/">oracledb</a>.</p>
+<p>Same root cause elsewhere: <a href="/guides/python-modulenotfounderror-no-module-named-pkg-resources/">No module named 'pkg_resources' (general fix)</a> · <a href="/guides/no-module-named-pkg-resources-poetry/">Poetry</a> · <a href="/guides/no-module-named-pkg-resources-uv/">uv</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does pipenv say my dependencies could not be resolved?</summary><p>Here it was not a version conflict. A package&#x27;s sdist build failed because its setup.py imports pkg_resources, and pipenv reports the failure as a resolution error. Run pipenv run pip install &lt;package&gt; to see the real error.</p></details>
+<details><summary>Why doesn&#x27;t installing setuptools in the pipenv venv fix it?</summary><p>pip builds the package in a separate isolated env with the newest setuptools. Use PIP_BUILD_CONSTRAINT with setuptools&lt;81 to cap setuptools in that build env.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux with pipenv 2026.10.2, pip 26.2.2 and CPython 3.11.17, installing cx_Oracle 8.3.0 (sdist) into fresh projects with empty caches. Output pasted unedited except marked trims. PlainTables is our extension; pipenv is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

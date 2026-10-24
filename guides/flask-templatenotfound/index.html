@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flask jinja2.exceptions.TemplateNotFound: Causes and Fixes</title>
+<meta name="description" content="Flask TemplateNotFound tested on Flask 3.1: wrong-case names or templates/ prefix, folder outside the package, blueprints, and how to see where Flask looked.">
+<link rel="canonical" href="https://honestkit.github.io/guides/flask-templatenotfound/">
+<meta property="og:title" content="Flask jinja2.exceptions.TemplateNotFound: Causes and Fixes">
+<meta property="og:description" content="Flask TemplateNotFound tested on Flask 3.1: wrong-case names or templates/ prefix, folder outside the package, blueprints, and how to see where Flask looked.">
+<meta property="og:url" content="https://honestkit.github.io/guides/flask-templatenotfound/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Where does Flask look for templates?", "acceptedAnswer": {"@type": "Answer", "text": "In the templates folder next to the module or package that calls Flask(__name__) (app.root_path), plus each blueprint's template_folder. Not the current working directory."}}, {"@type": "Question", "name": "Why does render_template work on Windows but not in Docker?", "acceptedAnswer": {"@type": "Answer", "text": "Linux filesystems are case-sensitive: 'Index.html' does not match index.html. Use the exact file name."}}, {"@type": "Question", "name": "How do I see where Flask searched for a template?", "acceptedAnswer": {"@type": "Answer", "text": "Set app.config['EXPLAIN_TEMPLATE_LOADING'] = True and app.logger.setLevel(logging.INFO), or print app.jinja_env.list_templates()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Flask jinja2.exceptions.TemplateNotFound (tested)</h1>
+<p class="lead"><code>jinja2.exceptions.TemplateNotFound: index.html</code> means none of Flask's template loaders found that exact name. In our tests the working directory did not matter; what did: the name's case, a <code>templates/</code> prefix, a templates folder outside the package, and blueprints without <code>template_folder</code>.</p>
+<p>Setup for block 1: <code>/w/app/b1.py</code> next to <code>/w/app/templates/index.html</code>, run from <code>/</code> (a different working directory) on purpose.</p>
+<h2 id="name">1. The name you pass is wrong (case, prefix)</h2>
+<pre><code>from flask import Flask, render_template
+app = Flask(__name__)
+print(&quot;root_path:&quot;, app.root_path, &quot;| template_folder:&quot;, app.template_folder)
+with app.test_request_context():
+    print(render_template(&quot;index.html&quot;, name=&quot;Ada&quot;))
+    for name in (&quot;Index.html&quot;, &quot;templates/index.html&quot;, &quot;missing.html&quot;):
+        try:
+            render_template(name)
+        except Exception as e:
+            print(f&quot;{name!r}: {type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>root_path: /w/app | template_folder: templates
+&lt;h1&gt;hi Ada&lt;/h1&gt;
+&#x27;Index.html&#x27;: TemplateNotFound: Index.html
+&#x27;templates/index.html&#x27;: TemplateNotFound: templates/index.html
+&#x27;missing.html&#x27;: TemplateNotFound: missing.html</code></pre>
+<p>Flask looks in <code>templates/</code> next to the module that creates the app (<code>app.root_path</code>), not in the current working directory, so running from another directory was fine here. What broke it: a different case (<code>Index.html</code>; Linux filesystems are case-sensitive, so code that works on Windows or macOS can fail in a Linux container) and a <code>templates/</code> prefix. Pass the path <em>relative to</em> the templates folder.</p>
+<h2 id="folder">2. templates/ is in the wrong place (package layout)</h2>
+<p>Layout: <code>proj/myapp/__init__.py</code> creates the app, but the templates live in <code>proj/templates/</code>.</p>
+<pre><code>import os
+from flask import render_template
+from myapp import app
+print(&quot;root_path:&quot;, app.root_path)
+print(&quot;looking in:&quot;, os.path.join(app.root_path, app.template_folder))
+with app.test_request_context():
+    try:
+        render_template(&quot;dash.html&quot;)
+    except Exception as e:
+        print(f&quot;{type(e).__name__}: {e}&quot;)
+
+# fix: point template_folder at the real directory
+from flask import Flask
+here = os.path.dirname(os.path.abspath(__file__))
+app2 = Flask(&quot;myapp&quot;, template_folder=os.path.join(here, &quot;templates&quot;))
+with app2.test_request_context():
+    print(render_template(&quot;dash.html&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>root_path: /w/proj/myapp
+looking in: /w/proj/myapp/templates
+TemplateNotFound: dash.html
+&lt;p&gt;dash&lt;/p&gt;</code></pre>
+<p>With a package, <code>root_path</code> is the package directory, so Flask looks in <code>myapp/templates/</code>. Either move the folder inside the package, or pass <code>template_folder</code> as an absolute path built from <code>__file__</code>. A relative <code>template_folder</code> is relative to <code>root_path</code>, not to the working directory.</p>
+<h2 id="blueprint">3. Blueprints need template_folder (and a subfolder)</h2>
+<p>Layout: <code>bp/templates/index.html</code> (app) plus <code>bp/shop/templates/index.html</code> and <code>bp/shop/templates/shop/list.html</code> (blueprint).</p>
+<pre><code>from flask import Flask, Blueprint, render_template
+app = Flask(__name__)
+shop = Blueprint(&quot;shop&quot;, &quot;shop&quot;, template_folder=&quot;templates&quot;)
+app.register_blueprint(shop)
+with app.test_request_context():
+    print(render_template(&quot;shop/list.html&quot;))
+    print(render_template(&quot;index.html&quot;), &quot;&lt;- app&#x27;s templates/ wins over the blueprint&#x27;s&quot;)
+app2 = Flask(__name__)
+app2.register_blueprint(Blueprint(&quot;shop&quot;, &quot;shop&quot;))  # no template_folder
+with app2.test_request_context():
+    try:
+        render_template(&quot;shop/list.html&quot;)
+    except Exception as e:
+        print(f&quot;without template_folder: {type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>&lt;p&gt;shop list&lt;/p&gt;
+&lt;p&gt;APP index&lt;/p&gt; &lt;- app&#x27;s templates/ wins over the blueprint&#x27;s
+without template_folder: TemplateNotFound: shop/list.html</code></pre>
+<p>A blueprint's templates are only searched if you pass <code>template_folder</code>. Its folder is searched <em>after</em> the app's, so a blueprint <code>index.html</code> is shadowed by the app's <code>index.html</code>. Put blueprint templates in a subfolder named after the blueprint (<code>shop/templates/shop/list.html</code>) and render <code>"shop/list.html"</code>.</p>
+<h2 id="debug">4. Ask Flask where it looked</h2>
+<pre><code>import logging
+from flask import Flask, render_template
+app = Flask(__name__)
+app.config[&quot;EXPLAIN_TEMPLATE_LOADING&quot;] = True
+app.logger.setLevel(logging.INFO)  # the explanation is logged at INFO
+print(&quot;templates Flask can see:&quot;, app.jinja_env.list_templates())
+with app.test_request_context():
+    try:
+        render_template(&quot;Index.html&quot;)
+    except Exception as e:
+        print(f&quot;{type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>templates Flask can see: [&#x27;index.html&#x27;]
+[2026-10-23 04:47:04,181] INFO in debughelpers: Locating template &#x27;Index.html&#x27;:
+    1: trying loader of application &#x27;__main__&#x27;
+       class: jinja2.loaders.FileSystemLoader
+       encoding: &#x27;utf-8&#x27;
+       followlinks: False
+       searchpath:
+         - /w/app/templates
+       -&gt; no match
+Error: the template could not be found.
+TemplateNotFound: Index.html</code></pre>
+<p><code>app.jinja_env.list_templates()</code> lists every name Flask can load; compare it with the name you pass. <code>EXPLAIN_TEMPLATE_LOADING = True</code> logs each loader and its <code>searchpath</code>, but at INFO level: outside debug mode you also need <code>app.logger.setLevel(logging.INFO)</code>, or nothing is printed.</p>
+<h2 id="checklist">Checklist</h2>
+<ul><li>The folder is named <code>templates</code> (plural, lowercase) and sits next to the module or inside the package that calls <code>Flask(__name__)</code>.</li><li>The name matches the file exactly, including case, with no <code>templates/</code> prefix.</li><li>Blueprints: <code>template_folder="templates"</code> passed, templates in a subfolder named after the blueprint.</li><li>In Docker or a package install: the templates were actually copied (check <code>list_templates()</code> inside the container).</li></ul>
+
+<aside class="cta"><strong>Once the page renders, check the status and headers your Flask app actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Where does Flask look for templates?</summary><p>In the templates folder next to the module or package that calls Flask(__name__) (app.root_path), plus each blueprint&#x27;s template_folder. Not the current working directory.</p></details>
+<details><summary>Why does render_template work on Windows but not in Docker?</summary><p>Linux filesystems are case-sensitive: &#x27;Index.html&#x27; does not match index.html. Use the exact file name.</p></details>
+<details><summary>How do I see where Flask searched for a template?</summary><p>Set app.config[&#x27;EXPLAIN_TEMPLATE_LOADING&#x27;] = True and app.logger.setLevel(logging.INFO), or print app.jinja_env.list_templates().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Flask 3.1.3, Jinja2 3.1.6 and Python 3.14.7 (python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Flask are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

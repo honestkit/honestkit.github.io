@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SSH Host Key Verification Failed: Causes and Fixes (Tested)</title>
+<meta name="description" content="We measured SSH&#x27;s REMOTE HOST IDENTIFICATION HAS CHANGED error, the ssh-keygen -R fix, and why StrictHostKeyChecking=no is unsafe compared to accept-new.">
+<link rel="canonical" href="https://honestkit.github.io/guides/ssh-host-key-verification-failed/">
+<meta property="og:title" content="SSH Host Key Verification Failed: Causes and Fixes (Tested)">
+<meta property="og:description" content="We measured SSH&#x27;s REMOTE HOST IDENTIFICATION HAS CHANGED error, the ssh-keygen -R fix, and why StrictHostKeyChecking=no is unsafe compared to accept-new.">
+<meta property="og:url" content="https://honestkit.github.io/guides/ssh-host-key-verification-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is Host key verification failed always an attack?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured two different causes with different wording. A never-before-seen host just asks you to confirm a fingerprint (not an error). A host whose key changed since your last connection refuses outright with a WARNING banner, exit code 255. Rebuilt servers, reinstalled OSes, and reissued cloud IPs cause this constantly without any attack."}}, {"@type": "Question", "name": "Why didn't typing yes work for the changed-key error?", "acceptedAnswer": {"@type": "Answer", "text": "Because there is no prompt to answer. We tested this directly: with StrictHostKeyChecking at its default, a changed key skips straight to 'Host key verification failed' and exit 255, with no yes/no question at all. That is different from the first-connection case in section 3, which does ask."}}, {"@type": "Question", "name": "What does ssh-keygen -R actually fix?", "acceptedAnswer": {"@type": "Answer", "text": "It deletes the stale cached line for that host from known_hosts (keeping a .old backup) and nothing else. We measured that reconnecting afterward produces a brand-new first-time prompt, not an automatic login. You still need to accept the new key, ideally after confirming it out of band."}}, {"@type": "Question", "name": "Is StrictHostKeyChecking=no safe for automation?", "acceptedAnswer": {"@type": "Answer", "text": "We measured it accepting a host whose key had actually changed, printing the full MITM warning banner but still completing the login with exit code 0. That is the scenario this whole system exists to stop. Use accept-new instead: in our tests it accepted genuinely new hosts the same way but still refused a changed key with the same hard error as the default setting."}}, {"@type": "Question", "name": "What's the difference between accept-new and StrictHostKeyChecking=no?", "acceptedAnswer": {"@type": "Answer", "text": "Both skip the interactive yes/no prompt for a host you've never seen. The difference we measured is what happens when a previously-known host's key changes: accept-new still refuses it (exit 255, same as the default), while =no logs the warning and lets the connection through anyway (exit 0)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SSH Host Key Verification Failed (tested)</h1>
+<p class="lead"><code>Host key verification failed</code> means the key the server just sent does not match what your client expected, or you have strict checking on and no record at all. We built a throwaway sshd, rotated its host key under our own known_hosts file, and measured the exact prompts, the exact error text, the real fix, and the difference between two settings that look similar but are not.</p>
+<h2>1. The two situations behind this message</h2>
+<p>OpenSSH's known-hosts system checks the server's host key against a cache at <code>~/.ssh/known_hosts</code> (or whatever <code>UserKnownHostsFile</code> points to). There are two different situations that both end in trouble:</p>
+<ul>
+<li><strong>Never seen this host before.</strong> ssh asks you to confirm a fingerprint. This is a normal prompt, not an error.</li>
+<li><strong>Seen this host before, but the key changed.</strong> ssh refuses outright and prints a large warning. This is the dangerous one, because it is exactly what a man-in-the-middle attack looks like, and also exactly what a reinstalled server looks like.</li>
+</ul>
+<p>We measured both, plus the actual fix, plus a setting that quietly removes the protection without telling you.</p>
+
+<h2>2. Test setup</h2>
+<p>We ran a throwaway <code>sshd</code> on <code>127.0.0.1:8984</code>, started as a normal user (no root, no system sshd involved), with a fresh ed25519 host key and a dedicated client key in <code>authorized_keys</code>. We pointed every client at our own throwaway <code>known_hosts</code> file so nothing touched any real account.</p>
+<pre><code>$ ssh-keygen -t ed25519 -f hostkey -N ""
+$ /usr/sbin/sshd -D -f sshd_config -p 8984
+$ ssh -p 8984 -o UserKnownHostsFile=/tmp/known_hosts -i clientkey jacque@localhost</code></pre>
+
+<h2>3. First connection: the normal prompt</h2>
+<p>With an empty known_hosts file, the default (<code>StrictHostKeyChecking=ask</code>) prompt looked like this, word for word:</p>
+<pre><code>The authenticity of host '[localhost]:8984 ([127.0.0.1]:8984)' can't be established.
+ED25519 key fingerprint is SHA256:uPaAM/ojNIlnWh3mIk/fNCAVEtRlIZm4PmR/Vx0bvgQ.
+This key is not known by any other names.
+Are you sure you want to continue connecting (yes/no/[fingerprint])? yes
+Warning: Permanently added '[localhost]:8984' (ED25519) to the list of known hosts.</code></pre>
+<p>Typing <code>yes</code> added one line to our known_hosts file. On this box it was hashed, not plaintext, because Debian's system <code>ssh_config</code> sets <code>HashKnownHosts yes</code> by default:</p>
+<pre><code>|1|xyOY8rQJqgRZ/nf9qkKiYp7156E=|Sa/QnPPy5eWaMR2VTSsYuOSbKZo= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIBvFa...</code></pre>
+<p>This is the only step where ssh actually asks you anything. Every situation below starts from this cached line already existing.</p>
+
+<h2>4. The host key changes: REMOTE HOST IDENTIFICATION HAS CHANGED</h2>
+<p>We stopped our sshd, deleted the host key, generated a brand new one, and restarted on the same port with the same known_hosts file still holding the old fingerprint. Reconnecting gave this, exactly:</p>
+<pre><code>@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+Someone could be eavesdropping on you right now (man-in-the-middle attack)!
+It is also possible that a host key has just been changed.
+The fingerprint for the ED25519 key sent by the remote host is
+SHA256:yBHh8qIQfRHQGi/wlrHeeZN8z9SyEo+uf52Sjm4Sulo.
+Please contact your system administrator.
+Add correct host key in /tmp/sshtest2/known_hosts to get rid of this message.
+Offending ED25519 key in /tmp/sshtest2/known_hosts:1
+  remove with:
+  ssh-keygen -f '/tmp/sshtest2/known_hosts' -R '[localhost]:8984'
+Host key for [localhost]:8984 has changed and you have requested strict checking.
+Host key verification failed.</code></pre>
+<p>Exit code was <strong>255</strong>, same as the client's generic "no" exit status for other auth failures. We tried answering anyway: unlike section 3, there is no yes/no prompt here at all. We fed <code>yes</code> into the terminal the instant it appeared and it made no difference, because ssh never reads it; with strict checking on, a changed key is a hard stop, not a question.</p>
+
+<h2>5. The real fix: ssh-keygen -R</h2>
+<p>The error message itself prints the exact fix. We ran it and then reconnected:</p>
+<pre><code>$ ssh-keygen -f '/tmp/sshtest2/known_hosts' -R '[localhost]:8984'
+# Host [localhost]:8984 found: line 1
+/tmp/sshtest2/known_hosts updated.
+Original contents retained as /tmp/sshtest2/known_hosts.old</code></pre>
+<p><code>-R</code> deletes the stale line (keeping a <code>.old</code> backup) and nothing more. It does not add the new key. Reconnecting afterward landed back in section 3's situation exactly: a fresh "authenticity of host can't be established" prompt, because known_hosts is now empty for that host again. Accepting it with <code>yes</code> wrote the new fingerprint and the connection succeeded.</p>
+<p>This is the correct fix only if you have actually confirmed the new key is legitimate out of band (you rebuilt the server, you rotated its host key on purpose). <code>ssh-keygen -R</code> does not verify anything; it just forgets the old answer so ssh will ask again.</p>
+
+<h2>6. StrictHostKeyChecking=no vs accept-new: the part that matters</h2>
+<p>Both settings skip the interactive prompt, but we measured a real difference in what happens to a <strong>changed</strong> key, not just a new one. We put the same stale (pre-rotation) known_hosts in front of the rotated server for each test:</p>
+<table>
+<tr><th>Setting</th><th>Genuinely new host</th><th>Host key CHANGED since last time</th></tr>
+<tr><td><code>StrictHostKeyChecking=ask</code> (default)</td><td>Prompts, asks yes/no</td><td>Refuses outright, exit 255 (section 4)</td></tr>
+<tr><td><code>StrictHostKeyChecking=accept-new</code></td><td>Silently accepts, exit 0, adds the key</td><td>Refuses outright, exit 255, identical wording to section 4</td></tr>
+<tr><td><code>StrictHostKeyChecking=no</code></td><td>Silently accepts, exit 0, adds the key</td><td>Prints the full WARNING banner, then <strong>logs in anyway</strong>, exit 0</td></tr>
+</table>
+<p>The <code>=no</code> case is the one to watch. We measured it directly: the connection succeeded, our command ran, and exit code was <strong>0</strong>, with the same "REMOTE HOST IDENTIFICATION HAS CHANGED" banner from section 4 printed first as a warning rather than enforced as a block. In our run it also did <em>not</em> rewrite the known_hosts entry to the new key; it just let the mismatched connection through every time, silently, from the script's point of view (nothing failed, nothing exited non-zero).</p>
+<p><code>accept-new</code> behaved identically to the secure default for a changed key: flat refusal, exit 255. The only thing it skips is the yes/no prompt for a host it has truly never seen. That is the setting worth using in scripts and CI, not <code>=no</code>: it removes the interactive prompt without removing the protection against a swapped key, which is the actual MITM scenario this whole mechanism exists to catch.</p>
+
+<h2>7. Checklist, in the order we'd check it</h2>
+<ul>
+<li>Read the message. "Can't be established" (section 3) is a new host, normal. "IDENTIFICATION HAS CHANGED" (section 4) is a cached mismatch, stop and think.</li>
+<li>Before running the suggested <code>ssh-keygen -R</code>, confirm out of band that the server's key really did change on purpose (rebuild, reinstall, provider migration) rather than assuming it.</li>
+<li>Run <code>ssh-keygen -R &lt;host&gt;</code> (or <code>[host]:port</code> for a non-default port, exactly as the error prints it) to drop the stale line, then reconnect and accept the new fingerprint.</li>
+<li>In scripts, use <code>StrictHostKeyChecking=accept-new</code>, never <code>=no</code>. We measured <code>=no</code> accepting a changed key and logging in anyway with exit 0; <code>accept-new</code> still blocked it.</li>
+<li>If you manage the server, keep a copy of its host key fingerprint from first boot (<code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code>) somewhere else, so you have something to check a "changed" warning against.</li>
+</ul>
+<aside class="cta"><strong>Debugging the service behind that SSH tunnel? Check its headers:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is Host key verification failed always an attack?</summary><p>No. We measured two different causes with different wording. A never-before-seen host just asks you to confirm a fingerprint (not an error). A host whose key changed since your last connection refuses outright with a WARNING banner, exit code 255. Rebuilt servers, reinstalled OSes, and reissued cloud IPs cause this constantly without any attack.</p></details>
+<details><summary>Why didn&#x27;t typing yes work for the changed-key error?</summary><p>Because there is no prompt to answer. We tested this directly: with StrictHostKeyChecking at its default, a changed key skips straight to &#x27;Host key verification failed&#x27; and exit 255, with no yes/no question at all. That is different from the first-connection case in section 3, which does ask.</p></details>
+<details><summary>What does ssh-keygen -R actually fix?</summary><p>It deletes the stale cached line for that host from known_hosts (keeping a .old backup) and nothing else. We measured that reconnecting afterward produces a brand-new first-time prompt, not an automatic login. You still need to accept the new key, ideally after confirming it out of band.</p></details>
+<details><summary>Is StrictHostKeyChecking=no safe for automation?</summary><p>We measured it accepting a host whose key had actually changed, printing the full MITM warning banner but still completing the login with exit code 0. That is the scenario this whole system exists to stop. Use accept-new instead: in our tests it accepted genuinely new hosts the same way but still refused a changed key with the same hard error as the default setting.</p></details>
+<details><summary>What&#x27;s the difference between accept-new and StrictHostKeyChecking=no?</summary><p>Both skip the interactive yes/no prompt for a host you&#x27;ve never seen. The difference we measured is what happens when a previously-known host&#x27;s key changes: accept-new still refuses it (exit 255, same as the default), while =no logs the warning and lets the connection through anyway (exit 0).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with OpenSSH_10.0p2 (Debian 13), client and server, against a throwaway sshd on 127.0.0.1:8984 with ed25519 host keys we generated and rotated by hand (no real accounts involved). Known-hosts hashing (HashKnownHosts yes) comes from Debian&#x27;s system /etc/ssh/ssh_config, confirmed with `ssh -G`, not changed by us. PlainHeaders is our extension; OpenSSH (ssh, sshd, ssh-keygen) is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

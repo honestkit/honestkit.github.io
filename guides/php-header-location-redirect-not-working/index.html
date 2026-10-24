@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PHP header Location Redirect Not Working? &#x27;Headers Already Sent&#x27; and Other Causes (Tested)</title>
+<meta name="description" content="Why PHP header(&#x27;Location: ...&#x27;) doesn&#x27;t redirect: output before header() (spaces, a UTF-8 BOM, echo), output_buffering hiding the bug, missing exit, 301 vs 302, and passing variables safely, each tested on PHP 8.5.">
+<link rel="canonical" href="https://honestkit.github.io/guides/php-header-location-redirect-not-working/">
+<meta property="og:title" content="PHP header Location Redirect Not Working? &#x27;Headers Already Sent&#x27; and Other Causes (Tested)">
+<meta property="og:description" content="Why PHP header(&#x27;Location: ...&#x27;) doesn&#x27;t redirect: output before header() (spaces, a UTF-8 BOM, echo), output_buffering hiding the bug, missing exit, 301 vs 302, and passing variables safely, each tested on PHP 8.5.">
+<meta property="og:url" content="https://honestkit.github.io/guides/php-header-location-redirect-not-working/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does PHP header Location not redirect?", "acceptedAnswer": {"@type": "Answer", "text": "Something was output before header(). In our test a blank line, a UTF-8 BOM or an echo before header() gave 200 OK and 'Cannot modify header information - headers already sent'."}}, {"@type": "Question", "name": "Why does my redirect work locally but not on the server?", "acceptedAnswer": {"@type": "Answer", "text": "output_buffering. With 4096 the stray output was buffered and the redirect worked; with 0 the same file failed. More than 4,096 bytes of output failed even with buffering."}}, {"@type": "Question", "name": "Do I need exit after header Location?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Without it our test page still sent its full body inside the 302 response and ran the code after header()."}}, {"@type": "Question", "name": "How do I make a 301 redirect in PHP?", "acceptedAnswer": {"@type": "Answer", "text": "header('Location: /new', true, 301); followed by exit. Our test returned 301 Moved Permanently."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>PHP header(&#x27;Location&#x27;) redirect not working: causes, tested</h1>
+<p class="lead">header('Location: …') only works if nothing has been sent to the browser yet. We tested each common way that breaks, and why the same code can work on one server and fail on another.</p>
+<h2>1. The working version</h2>
+<pre><code>&lt;?php
+header('Location: /dashboard.php');   // 302 Found by default
+exit;                                 // stop the script here</code></pre>
+<h2>2. What broke it (output_buffering=0)</h2>
+<table><thead><tr><th>File</th><th>Result</th></tr></thead><tbody>
+<tr><td>A blank line before <code>&lt;?php</code></td><td>200 OK, no redirect</td></tr>
+<tr><td>File saved as "UTF-8 with BOM" (invisible 3 bytes before <code>&lt;?php</code>)</td><td>200 OK, no redirect</td></tr>
+<tr><td><code>echo</code> (or HTML) before <code>header()</code></td><td>200 OK, no redirect</td></tr>
+</tbody></table>
+<p>All three logged: <code>Warning: Cannot modify header information - headers already sent by (output started at /var/www/html/bom.php:1)</code>. The "output started at" file and line is where to look: a leading space or newline, a closing <code>?&gt;</code> followed by a newline in an included file, or a BOM (re-save the file as UTF-8 <em>without</em> BOM).</p>
+<h2>3. Why it works locally but not on the server (or the reverse)</h2>
+<p>With <code>output_buffering=4096</code> (the value in PHP's php.ini-production), the same three files <strong>redirected fine</strong>: PHP held the stray output in a buffer, so headers could still be sent. But 5,000 bytes of output before <code>header()</code> overflowed the 4,096-byte buffer and the redirect failed again with the same warning. So the bug depends on the server's php.ini and on how much was printed. Fix the output, don't rely on the buffer. If you can't, call <code>ob_start();</code> as the very first line.</p>
+<h2>4. Always exit after the redirect</h2>
+<p>Without <code>exit</code>, the response was a 302 with a Location header <em>and</em> the rest of the page in the body (<code>secret page body</code>), and the code after <code>header()</code> ran (it wrote a file). Browsers follow the redirect, but curl, bots or anyone reading the raw response see the page. On a login check that's a data leak.</p>
+<h2>5. 301 vs 302 and variables in the URL</h2>
+<pre><code>header('Location: /new-page.php', true, 301);   // permanent: sent "301 Moved Permanently"
+
+$id = $_GET['id'] ?? '';
+header('Location: /item.php?id=' . urlencode($id) . '&amp;tab=1');
+exit;</code></pre>
+<p><code>urlencode</code> turned the input <code>a&amp;b c</code> into <code>a%26b+c</code>, so it can't inject extra parameters. A lowercase <code>location:</code> header also worked (header names are case-insensitive). Never put raw user input into Location: only redirect to your own paths or an allow-list, or the page becomes an open redirect.</p>
+<p>To check where many URLs end up after a site move, the tool below follows each redirect chain and reports the final status.</p>
+<aside class="cta"><strong>Check where a whole list of URLs redirects:</strong> <a href="/apify/sitemap-url-status-checker/">Sitemap Extractor &amp; Bulk URL Status Checker</a> (hosted, pay per result)</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does PHP header Location not redirect?</summary><p>Something was output before header(). In our test a blank line, a UTF-8 BOM or an echo before header() gave 200 OK and &#x27;Cannot modify header information - headers already sent&#x27;.</p></details>
+<details><summary>Why does my redirect work locally but not on the server?</summary><p>output_buffering. With 4096 the stray output was buffered and the redirect worked; with 0 the same file failed. More than 4,096 bytes of output failed even with buffering.</p></details>
+<details><summary>Do I need exit after header Location?</summary><p>Yes. Without it our test page still sent its full body inside the 302 response and ran the code after header().</p></details>
+<details><summary>How do I make a 301 redirect in PHP?</summary><p>header(&#x27;Location: /new&#x27;, true, 301); followed by exit. Our test returned 301 Moved Permanently.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 with curl 8.14.1 against PHP 8.5.11 (official php:8-apache image, throwaway container) with output_buffering=0 and again with output_buffering=4096, display_errors on. The remarks about included files, ob_start() and browsers are from the PHP manual and HTTP spec, not this test. The Apify tool is ours; the APIs are free to call directly.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

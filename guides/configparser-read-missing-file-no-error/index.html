@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>configparser.read() Silently Ignores a Missing Config File</title>
+<meta name="description" content="We measured ConfigParser.read() returning an empty list on a missing file, no exception, leaving the parser silently empty instead of raising FileNotFoundError.">
+<link rel="canonical" href="https://honestkit.github.io/guides/configparser-read-missing-file-no-error/">
+<meta property="og:title" content="configparser.read() Silently Ignores a Missing Config File">
+<meta property="og:description" content="We measured ConfigParser.read() returning an empty list on a missing file, no exception, leaving the parser silently empty instead of raising FileNotFoundError.">
+<meta property="og:url" content="https://honestkit.github.io/guides/configparser-read-missing-file-no-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does configparser.read() raise an error if the file doesn't exist?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured it returning an empty list with no exception at all. The ConfigParser object is simply left empty, and the missing file produces no direct signal."}}, {"@type": "Question", "name": "How do I know if configparser actually read my config file?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed read() returns a list of the paths it successfully read. Checking that this list is non-empty (or contains your expected path) is the only reliable way to detect a missing file."}}, {"@type": "Question", "name": "Why does configparser.read() accept a list of filenames?", "acceptedAnswer": {"@type": "Answer", "text": "Per the docs and what we measured, it's designed to probe multiple candidate config locations and silently use whichever exist \u2014 useful for optional layered configs like /etc/app.ini plus a user override, but indistinguishable from a typo'd single path."}}, {"@type": "Question", "name": "Is there a configparser method that does raise on a missing file?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we measured read_file() raising FileNotFoundError when given an already-open file object, since the file-opening step (which is where the error naturally occurs) happens outside configparser, via your own open() call."}}, {"@type": "Question", "name": "What happens if I call get() on a config that silently failed to load?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed it raises NoSectionError or NoOptionError (unless you passed fallback=) \u2014 a generic missing-key error that gives no indication the real problem was a missing file, not a missing key."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>configparser read() Missing File No Error (tested)</h1>
+<p class="lead">A typo'd config path is one of the most common deploy-time bugs &mdash; and with <code>configparser</code>, it doesn't look like a bug at all. We measured exactly what <code>ConfigParser.read()</code> does when the file isn't there.</p>
+<h2 id="repro1">1. read() on a missing file returns an empty list, not an exception</h2>
+<pre><code>import configparser
+
+c = configparser.ConfigParser()
+result = c.read("/tmp/definitely_does_not_exist_12345.ini")
+print(result)
+print(c.sections())</code></pre>
+<pre><code>[]
+[]</code></pre>
+<p><strong>Measured:</strong> no <code>FileNotFoundError</code>, no warning &mdash; <code>read()</code> just returns an empty list of successfully-read filenames, and the <code>ConfigParser</code> object stays empty. Every subsequent <code>get()</code> call without a <code>fallback=</code> then raises a generic <code>NoSectionError</code> or <code>NoOptionError</code> far away from the real cause, which is a typo'd path, not a missing key.</p>
+
+<h2 id="repro2">2. This is by design — read() accepts a list and silently skips whichever don't exist</h2>
+<pre><code>c2 = configparser.ConfigParser()
+result = c2.read(["/tmp/nonexistent_a.ini", "/tmp/real_config.ini", "/tmp/nonexistent_b.ini"])
+print(result)
+print(c2.sections())</code></pre>
+<pre><code>['/tmp/real_config.ini']
+['s']
+</code></pre>
+<p><strong>Measured:</strong> <code>read()</code> is built to let you probe several candidate locations (e.g. <code>/etc/app.ini</code>, <code>~/.app.ini</code>, <code>./app.ini</code>) and use whichever exist &mdash; its return value is the list of paths that were <em>actually</em> read. The silent-skip behavior is intentional for that use case; the footgun is that a single missing path behaves identically to that same by-design fallback, so a typo gives you no signal to distinguish "intentionally optional" from "broken."</p>
+
+<h2 id="fix">3. Fix: check the return value, or use read_file() / open() for a required file</h2>
+<pre><code># Option 1: check what was actually read
+c3 = configparser.ConfigParser()
+found = c3.read("/tmp/definitely_does_not_exist_12345.ini")
+if not found:
+    raise FileNotFoundError("config file not found")
+
+# Option 2: open the file yourself — this DOES raise
+with open("/tmp/definitely_does_not_exist_12345.ini") as f:
+    c4 = configparser.ConfigParser()
+    c4.read_file(f)</code></pre>
+<pre><code>FileNotFoundError: [Errno 2] No such file or directory: '/tmp/definitely_does_not_exist_12345.ini'</code></pre>
+<p><strong>Measured:</strong> if the config file is required (not an optional override layer), either check that <code>read()</code>'s return list is non-empty, or swap it for <code>read_file(open(path))</code> &mdash; opening the file yourself raises the normal, immediate <code>FileNotFoundError</code> that <code>read()</code> was built to swallow.</p>
+
+<aside class="cta"><strong>Debugging a config-driven API client? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does configparser.read() raise an error if the file doesn&#x27;t exist?</summary><p>No — we measured it returning an empty list with no exception at all. The ConfigParser object is simply left empty, and the missing file produces no direct signal.</p></details>
+<details><summary>How do I know if configparser actually read my config file?</summary><p>We confirmed read() returns a list of the paths it successfully read. Checking that this list is non-empty (or contains your expected path) is the only reliable way to detect a missing file.</p></details>
+<details><summary>Why does configparser.read() accept a list of filenames?</summary><p>Per the docs and what we measured, it&#x27;s designed to probe multiple candidate config locations and silently use whichever exist — useful for optional layered configs like /etc/app.ini plus a user override, but indistinguishable from a typo&#x27;d single path.</p></details>
+<details><summary>Is there a configparser method that does raise on a missing file?</summary><p>Yes — we measured read_file() raising FileNotFoundError when given an already-open file object, since the file-opening step (which is where the error naturally occurs) happens outside configparser, via your own open() call.</p></details>
+<details><summary>What happens if I call get() on a config that silently failed to load?</summary><p>We confirmed it raises NoSectionError or NoOptionError (unless you passed fallback=) — a generic missing-key error that gives no indication the real problem was a missing file, not a missing key.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in configparser module: called ConfigParser.read() on a nonexistent path and on a list mixing missing and real paths, and compared against open() and read_file() on the same missing path. PlainHeaders is our extension; Python&#x27;s configparser module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

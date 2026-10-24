@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OSError: [Errno 18] Invalid cross-device link (Python Fix)</title>
+<meta name="description" content="Python OSError [Errno 18] Invalid cross-device link: os.rename cannot move files between filesystems. Tested fixes: shutil.move and same-dir temp files.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-oserror-errno-18-invalid-cross-device-link/">
+<meta property="og:title" content="OSError: [Errno 18] Invalid cross-device link (Python Fix)">
+<meta property="og:description" content="Python OSError [Errno 18] Invalid cross-device link: os.rename cannot move files between filesystems. Tested fixes: shutil.move and same-dir temp files.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-oserror-errno-18-invalid-cross-device-link/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Errno 18 Invalid cross-device link mean?", "acceptedAnswer": {"@type": "Answer", "text": "The source and destination are on different filesystems (or mount points), and rename only works within one. The errno name is EXDEV."}}, {"@type": "Question", "name": "Does os.replace fix Invalid cross-device link?", "acceptedAnswer": {"@type": "Answer", "text": "No. os.replace, Path.rename, Path.replace and os.link all raise the same Errno 18. Use shutil.move, which copies and then deletes."}}, {"@type": "Question", "name": "How do I do an atomic write without Errno 18?", "acceptedAnswer": {"@type": "Answer", "text": "Create the temp file in the destination directory with tempfile.mkstemp(dir=target_dir), write and fsync it, then os.replace it over the target."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>OSError: [Errno 18] Invalid cross-device link in Python (tested fix)</h1>
+<p class="lead"><code>OSError: [Errno 18] Invalid cross-device link</code> means <code>os.rename</code> (or <code>os.replace</code>, <code>Path.rename</code>) tried to move a file to a different filesystem, such as from <code>/tmp</code> to your disk or into a Docker volume. We reproduced it and tested the fixes.</p>
+<h2 id="cause">1. Cause: rename() cannot cross filesystems</h2>
+<pre><code>import os, errno
+src = &quot;/tmp/e18w/report.txt&quot;            # /tmp is a tmpfs here
+dst = &quot;report.txt&quot;                       # current dir, on the disk
+open(src, &quot;w&quot;).write(&quot;hello\n&quot;)
+try:
+    os.rename(src, dst)
+except OSError as e:
+    print(f&quot;{type(e).__name__}: {e}&quot;)
+    print(&quot;errno:&quot;, e.errno, errno.errorcode[e.errno])</code></pre>
+<p>Output:</p>
+<pre><code>OSError: [Errno 18] Invalid cross-device link: &#x27;/tmp/e18w/report.txt&#x27; -&gt; &#x27;report.txt&#x27;
+errno: 18 EXDEV</code></pre>
+<p><code>os.rename</code> is the <code>rename(2)</code> system call, which only relabels a file inside one filesystem. It never copies data, so when the source and destination are on different filesystems the kernel refuses with <code>EXDEV</code>. On this machine <code>/tmp</code> is a tmpfs (in RAM) and the current directory is on the disk, which is the most common way to hit it. Others: Docker volumes and bind mounts, a separate <code>/home</code> partition, USB drives, network shares. The Linux man page notes that rename does not work across different mount points <i>even if the same filesystem is mounted on both</i>, so two bind mounts of one disk still fail.</p>
+<h2 id="all">2. os.replace, pathlib and os.link fail the same way</h2>
+<pre><code>import os
+from pathlib import Path
+src = Path(&quot;/tmp/e18w/report.txt&quot;)
+dst = Path(&quot;report.txt&quot;)                 # current dir, on the disk
+src.write_text(&quot;hello\n&quot;)
+for name, fn in [(&quot;os.replace&quot;, os.replace), (&quot;Path.rename&quot;, Path.rename),
+                 (&quot;Path.replace&quot;, Path.replace), (&quot;os.link&quot;, os.link)]:
+    try:
+        fn(src, dst)
+    except OSError as e:
+        print(f&quot;{name:12} -&gt; {type(e).__name__}: [Errno {e.errno}] {e.strerror}&quot;)
+print(&quot;same device?&quot;, os.stat(src).st_dev == os.stat(dst.resolve().parent).st_dev)</code></pre>
+<p>Output:</p>
+<pre><code>os.replace   -&gt; OSError: [Errno 18] Invalid cross-device link
+Path.rename  -&gt; OSError: [Errno 18] Invalid cross-device link
+Path.replace -&gt; OSError: [Errno 18] Invalid cross-device link
+os.link      -&gt; OSError: [Errno 18] Invalid cross-device link
+same device? False</code></pre>
+<p>All four are thin wrappers over a same-filesystem call, so switching from <code>os.rename</code> to <code>os.replace</code> or <code>Path.rename</code> does not help. Comparing <code>os.stat(...).st_dev</code> tells you in advance whether two paths are on the same device.</p>
+<h2 id="fix">3. Fix: shutil.move copies when rename fails</h2>
+<pre><code>import os, shutil
+from pathlib import Path
+src = Path(&quot;/tmp/e18w/report.txt&quot;)
+dst = Path(&quot;report.txt&quot;)                 # current dir, on the disk
+src.write_text(&quot;hello\n&quot;)
+print(shutil.move(src, dst))
+print(&quot;src exists:&quot;, src.exists(), &quot;| dst:&quot;, dst.read_text().strip())
+dst.unlink()</code></pre>
+<p>Output:</p>
+<pre><code>report.txt
+src exists: False | dst: hello</code></pre>
+<p><code>shutil.move</code> tries <code>os.rename</code> first and, when that fails, copies the file (with <code>copy2</code>, keeping metadata) and deletes the source. That works across filesystems, but it is no longer atomic: if the process dies mid-copy you can be left with a partial destination file.</p>
+<h2 id="atomic">4. Fix for atomic writes: create the temp file next to the target</h2>
+<pre><code>import os, tempfile
+from pathlib import Path
+def atomic_write(path, data):
+    path = Path(path)
+    # temp file in the SAME directory, so os.replace never crosses a filesystem
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + &quot;.&quot;)
+    try:
+        with os.fdopen(fd, &quot;w&quot;) as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+target = Path(&quot;config.json&quot;)
+atomic_write(target, &#x27;{&quot;ok&quot;: true}\n&#x27;)
+print(target.read_text().strip())
+target.unlink()</code></pre>
+<p>Output:</p>
+<pre><code>{&quot;ok&quot;: true}</code></pre>
+<p>The usual way to trigger Errno 18 is the "write to a temp file, then rename over the real file" pattern, with the temp file created by <code>tempfile</code> in its default directory (<code>/tmp</code>). Pass <code>dir=</code> the target's own directory so both files are on the same filesystem; then <code>os.replace</code> is atomic and cannot raise EXDEV.</p>
+<p>Related: <a href="/guides/python-oserror-errno-codes-list/">Python errno codes list</a> · <a href="/guides/python-shutil-copy-move-permissionerror-errno-13/">shutil copy/move PermissionError</a> · <a href="/guides/python-fileexistserror-errno-17-file-exists/">Errno 17 file exists</a>.</p>
+
+<aside class="cta"><strong>Debugging a script that also calls web APIs? Check what headers a URL actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Errno 18 Invalid cross-device link mean?</summary><p>The source and destination are on different filesystems (or mount points), and rename only works within one. The errno name is EXDEV.</p></details>
+<details><summary>Does os.replace fix Invalid cross-device link?</summary><p>No. os.replace, Path.rename, Path.replace and os.link all raise the same Errno 18. Use shutil.move, which copies and then deletes.</p></details>
+<details><summary>How do I do an atomic write without Errno 18?</summary><p>Create the temp file in the destination directory with tempfile.mkstemp(dir=target_dir), write and fsync it, then os.replace it over the target.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-22 with Python 3.13.5 on Debian, moving files from /tmp (tmpfs) to a directory on the disk with os.rename, os.replace, Path.rename, Path.replace, os.link and shutil.move, plus an atomic-write helper. Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TypeError: unhashable type: &#x27;slice&#x27; in Python (Tested Fix)</title>
+<meta name="description" content="unhashable type: &#x27;slice&#x27; means you sliced a dict. On Python 3.12+ the same code raises KeyError: slice(0, 2, None). Tested fix with islice.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-typeerror-unhashable-type-slice/">
+<meta property="og:title" content="TypeError: unhashable type: &#x27;slice&#x27; in Python (Tested Fix)">
+<meta property="og:description" content="unhashable type: &#x27;slice&#x27; means you sliced a dict. On Python 3.12+ the same code raises KeyError: slice(0, 2, None). Tested fix with islice.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-typeerror-unhashable-type-slice/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes unhashable type: 'slice'?", "acceptedAnswer": {"@type": "Answer", "text": "Slicing a dict (or a class that forwards the key to a dict), as in d[0:2]. On Python 3.11 and earlier, slices could not be hashed."}}, {"@type": "Question", "name": "Why do I get KeyError: slice(0, 2, None)?", "acceptedAnswer": {"@type": "Answer", "text": "Same bug on Python 3.12+: slices became hashable, so the dict looks the slice up as a key and does not find it."}}, {"@type": "Question", "name": "How do I get the first n items of a dict?", "acceptedAnswer": {"@type": "Answer", "text": "dict(itertools.islice(d.items(), n)), or dict(list(d.items())[:n])."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TypeError: unhashable type: &#x27;slice&#x27; (tested fix)</h1>
+<p class="lead"><code>TypeError: unhashable type: 'slice'</code> means code like <code>d[0:2]</code> tried to slice a dict. Since Python 3.12 slices are hashable, so the same bug now shows up as <code>KeyError: slice(0, 2, None)</code>. We reproduced both on 3.11 and 3.13 and tested the fixes.</p>
+<h2 id="cause">1. Cause: slicing a dict</h2>
+<pre><code>import sys
+print(sys.version.split()[0])
+d = {&quot;a&quot;: 1, &quot;b&quot;: 2, &quot;c&quot;: 3}
+try:
+    d[0:2]                     # slicing a dict
+except (TypeError, KeyError) as e:
+    print(f&quot;{type(e).__name__}: {e}&quot;)
+try:
+    hash(slice(0, 2))
+    print(&quot;slice is hashable&quot;)
+except TypeError as e:
+    print(f&quot;{type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output on Python 3.11:</p>
+<pre><code>3.11.17
+TypeError: unhashable type: &#x27;slice&#x27;
+TypeError: unhashable type: &#x27;slice&#x27;</code></pre>
+<p>Output on Python 3.13:</p>
+<pre><code>3.13.5
+KeyError: slice(0, 2, None)
+slice is hashable</code></pre>
+<p><code>d[0:2]</code> passes a <code>slice(0, 2, None)</code> object to the dict as a key. Dicts have no order-based slicing, so Python hashes the slice to look it up. Up to Python 3.11 slices were unhashable, giving <code>TypeError: unhashable type: 'slice'</code>. Python 3.12 made slice objects hashable, so the same line now raises <code>KeyError: slice(0, 2, None)</code>. Same bug, different message after an upgrade.</p>
+<h2 id="fix">2. Fix: slice the items, then rebuild the dict</h2>
+<pre><code># Fix: slice the keys/items, not the dict
+from itertools import islice
+d = {&quot;a&quot;: 1, &quot;b&quot;: 2, &quot;c&quot;: 3}
+print(dict(list(d.items())[0:2]))
+print(dict(islice(d.items(), 2)))     # no full list copy</code></pre>
+<p>Output (Python 3.13):</p>
+<pre><code>{&#x27;a&#x27;: 1, &#x27;b&#x27;: 2}
+{&#x27;a&#x27;: 1, &#x27;b&#x27;: 2}</code></pre>
+<p>Dicts keep insertion order, so "the first two entries" is well defined. <code>itertools.islice</code> avoids copying every item into a list first, which matters for large dicts.</p>
+<h2 id="class">3. A custom __getitem__ that forwards to a dict</h2>
+<pre><code># A custom class whose __getitem__ uses the key in a dict
+class Cache:
+    def __init__(self): self.data = {0: &quot;x&quot;, 1: &quot;y&quot;, 2: &quot;z&quot;}
+    def __getitem__(self, key): return self.data[key]
+c = Cache()
+try:
+    c[0:2]
+except (TypeError, KeyError) as e:
+    print(f&quot;{type(e).__name__}: {e}&quot;)
+class Fixed(Cache):
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return [self.data[i] for i in range(*key.indices(len(self.data)))]
+        return self.data[key]
+print(Fixed()[0:2])</code></pre>
+<p>Output on Python 3.11:</p>
+<pre><code>TypeError: unhashable type: &#x27;slice&#x27;
+[&#x27;x&#x27;, &#x27;y&#x27;]</code></pre>
+<p>Output on Python 3.13:</p>
+<pre><code>KeyError: slice(0, 2, None)
+[&#x27;x&#x27;, &#x27;y&#x27;]</code></pre>
+<p>Classes that wrap a dict (caches, datasets, config objects) receive the slice in <code>__getitem__</code> and pass it straight to the dict. Check <code>isinstance(key, slice)</code> and expand it with <code>key.indices(len(...))</code>, which also handles negative and missing bounds.</p>
+<p>Related: <a href="/guides/python-typeerror-unhashable-type-list/">unhashable type: 'list'</a> · <a href="/guides/python-typeerror-unhashable-type-dict/">unhashable type: 'dict'</a> · <a href="/guides/python-typeerror-slice-indices-must-be-integers-or-none/">slice indices must be integers or None</a>.</p>
+
+<aside class="cta"><strong>Slicing dicts of API data? Check the headers that API sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes unhashable type: &#x27;slice&#x27;?</summary><p>Slicing a dict (or a class that forwards the key to a dict), as in d[0:2]. On Python 3.11 and earlier, slices could not be hashed.</p></details>
+<details><summary>Why do I get KeyError: slice(0, 2, None)?</summary><p>Same bug on Python 3.12+: slices became hashable, so the dict looks the slice up as a key and does not find it.</p></details>
+<details><summary>How do I get the first n items of a dict?</summary><p>dict(itertools.islice(d.items(), n)), or dict(list(d.items())[:n]).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Python 3.13.5 on Debian and 3.11.17 / 3.8.20 in python:alpine containers: d[0:2] on a dict, hash(slice), two fixes, and a dict-backed __getitem__. Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

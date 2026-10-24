@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Path.resolve() Silently Ignores a Symlink Loop (Tested)</title>
+<meta name="description" content="We measured Path.resolve() default strict=False returning a symlink-loop path unchanged instead of raising -- the failure surfaces later when it&#x27;s opened.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pathlib-resolve-does-not-detect-a-symlink-loop-by-default/">
+<meta property="og:title" content="Path.resolve() Silently Ignores a Symlink Loop (Tested)">
+<meta property="og:description" content="We measured Path.resolve() default strict=False returning a symlink-loop path unchanged instead of raising -- the failure surfaces later when it&#x27;s opened.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pathlib-resolve-does-not-detect-a-symlink-loop-by-default/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Path.resolve() detect a symlink loop?", "acceptedAnswer": {"@type": "Answer", "text": "Not by default -- we measured resolve() with strict=False (the default) returning the loop path unchanged, with no exception. Only resolve(strict=True) raises OSError for it."}}, {"@type": "Question", "name": "Why does resolve() return the same path instead of raising?", "acceptedAnswer": {"@type": "Answer", "text": "The default strict=False mode resolves components lexically and only partially touches the filesystem, so it doesn't fully follow the symlink chain far enough to detect it never terminates."}}, {"@type": "Question", "name": "What error does a symlink loop actually raise?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed OSError: [Errno 40] Too many levels of symbolic links (ELOOP) -- raised by stat(), read_text(), or resolve(strict=True), but not by resolve(strict=False) or exists()."}}, {"@type": "Question", "name": "Does exists() distinguish a symlink loop from a missing file?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured both cases returning False from exists(), with the underlying OSError caught and discarded internally either way."}}, {"@type": "Question", "name": "How do I safely resolve a path that might be a symlink loop?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed wrapping Path.resolve(strict=True) in a try/except OSError catches the loop immediately, instead of getting a path back that fails confusingly wherever it's used next."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pathlib Path.resolve() Does Not Detect a Symlink Loop by Default (tested)</h1>
+<p class="lead">A symlink that points at itself, or at a chain that loops back on itself, is a real and not-uncommon mistake. We measured what <code>pathlib.Path.resolve()</code> does with one, and the default behaviour doesn't raise or warn &mdash; it just hands back the loop.</p>
+<h2 id="repro1">1. resolve() on a self-referential symlink</h2>
+<pre><code>from pathlib import Path
+import os
+
+os.symlink("/tmp/loopdir/self", "/tmp/loopdir/self")
+p = Path("/tmp/loopdir/self")
+
+print("resolve() default:", p.resolve())
+print("resolve() == original:", p.resolve() == p)</code></pre>
+<pre><code>resolve() default: /tmp/loopdir/self
+resolve() == original: True</code></pre>
+<p><strong>Measured:</strong> <code>resolve()</code> is documented to make a path absolute and follow symlinks. Here it returns the exact same path it was given, with no exception, no change, and no indication that following the link forever is impossible. A caller checking "did this resolve to something different / outside my base dir" would see nothing wrong.</p>
+
+<h2 id="repro2">2. The failure only shows up when you use the result</h2>
+<pre><code>resolved = p.resolve()
+try:
+    resolved.read_text()
+except OSError as e:
+    print("reading the resolved path raises:", e)
+
+try:
+    p.resolve(strict=True)
+except OSError as e:
+    print("resolve(strict=True) raises:", e)</code></pre>
+<pre><code>reading the resolved path raises: [Errno 40] Too many levels of symbolic links: '/tmp/loopdir/self'
+resolve(strict=True) raises: [Errno 40] Too many levels of symbolic links: '/tmp/loopdir/self'</code></pre>
+<p><strong>Measured:</strong> the loop is real and the OS does reject it (<code>ELOOP</code>) &mdash; but only once something actually opens or stats the path. <code>resolve()</code>'s default <code>strict=False</code> mode never touches the filesystem that deeply, so it returns a path that looks fully resolved and then blows up two steps later, far from where the actual problem is.</p>
+
+<h2 id="repro3">3. exists() on the same loop also stays quiet</h2>
+<pre><code>print("is_symlink:", p.is_symlink())
+print("exists():", p.exists())</code></pre>
+<pre><code>is_symlink: True
+exists(): False</code></pre>
+<p><strong>Measured:</strong> <code>exists()</code> catches the <code>OSError</code> internally and reports <code>False</code> &mdash; the same answer it gives for a path that was never created at all (see our dangling-symlink guide for that case specifically; a loop and a missing target both end up as plain <code>False</code>, with no way to tell them apart from <code>exists()</code> alone). Only <code>stat()</code> or <code>resolve(strict=True)</code> surfaces the real <code>ELOOP</code> error.</p>
+
+<h2 id="fix">4. Fix: use strict=True when you need to trust the result</h2>
+<pre><code>try:
+    real = p.resolve(strict=True)
+except OSError as e:
+    print("not a usable path:", e)</code></pre>
+<pre><code>not a usable path: [Errno 40] Too many levels of symbolic links: '/tmp/loopdir/self'</code></pre>
+<p><strong>Measured:</strong> passing <code>strict=True</code> makes <code>resolve()</code> actually stat each component, which both raises <code>FileNotFoundError</code> for missing paths (not just symlink loops) and raises <code>OSError</code> for loops, instead of silently returning something that fails later.</p>
+<aside class="cta"><strong>Tracking down a path that silently fails later in a script? Check the real request/response behind it:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Path.resolve() detect a symlink loop?</summary><p>Not by default -- we measured resolve() with strict=False (the default) returning the loop path unchanged, with no exception. Only resolve(strict=True) raises OSError for it.</p></details>
+<details><summary>Why does resolve() return the same path instead of raising?</summary><p>The default strict=False mode resolves components lexically and only partially touches the filesystem, so it doesn&#x27;t fully follow the symlink chain far enough to detect it never terminates.</p></details>
+<details><summary>What error does a symlink loop actually raise?</summary><p>We confirmed OSError: [Errno 40] Too many levels of symbolic links (ELOOP) -- raised by stat(), read_text(), or resolve(strict=True), but not by resolve(strict=False) or exists().</p></details>
+<details><summary>Does exists() distinguish a symlink loop from a missing file?</summary><p>No -- we measured both cases returning False from exists(), with the underlying OSError caught and discarded internally either way.</p></details>
+<details><summary>How do I safely resolve a path that might be a symlink loop?</summary><p>We confirmed wrapping Path.resolve(strict=True) in a try/except OSError catches the loop immediately, instead of getting a path back that fails confusingly wherever it&#x27;s used next.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in pathlib: created a symlink pointing at itself (a self-referential loop), then compared Path.resolve() with its default strict=False against strict=True, plus Path.exists() and Path.stat() on the same path. PlainHeaders is our extension; Python&#x27;s pathlib module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>
