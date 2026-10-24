@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ipaddress: is_private and is_global Are Not Always Opposites</title>
+<meta name="description" content="We measured Python 3.13.5: 100.64.0.5 (CGNAT shared space) has is_private=False and is_global=False -- neither flag is True.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-ipaddress-is-private-is-global-not-always-opposites/">
+<meta property="og:title" content="ipaddress: is_private and is_global Are Not Always Opposites">
+<meta property="og:description" content="We measured Python 3.13.5: 100.64.0.5 (CGNAT shared space) has is_private=False and is_global=False -- neither flag is True.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-ipaddress-is-private-is-global-not-always-opposites/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Are is_private and is_global always opposite values in Python's ipaddress module?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured ipaddress.ip_address('100.64.0.5').is_private and .is_global both returning False for an address in the CGNAT shared address space (100.64.0.0/10, RFC 6598), which is neither private nor globally routable."}}, {"@type": "Question", "name": "Is it safe to use 'not ip.is_private' to check if an IP address is public?", "acceptedAnswer": {"@type": "Answer", "text": "Not always -- we measured this inference giving the wrong answer for CGNAT shared-space addresses: not is_private is True (suggesting public), but is_global is correctly False. Check is_global directly instead of negating is_private."}}, {"@type": "Question", "name": "What is the 100.64.0.0/10 address range in Python's ipaddress module?", "acceptedAnswer": {"@type": "Answer", "text": "It's the carrier-grade NAT (CGNAT) shared address space defined by RFC 6598, used by ISPs between customer equipment and their own NAT layer -- we measured ipaddress correctly classifying it as neither is_private nor is_global."}}, {"@type": "Question", "name": "For normal public and private IP addresses, do is_private and is_global agree?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured both properties behaving as exact opposites for ordinary addresses like 8.8.8.8 (public) and 192.168.1.1 / 10.0.0.5 (private, RFC 1918); the mismatch only appears for special ranges like CGNAT space."}}, {"@type": "Question", "name": "How should I check if an IP address is reachable from the public internet in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Use the is_global property directly rather than inferring it from is_private -- we confirmed is_global correctly returns False for CGNAT addresses while a not is_private check would incorrectly suggest they're public."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ipaddress: is_private and is_global Are Not Always Opposites (tested)</h1>
+<p class="lead">It's tempting to treat <code>is_private</code> and <code>is_global</code> as a simple either/or -- if an address isn't private, it must be globally routable, and vice versa. We measured both properties across a normal public address, a normal private address, and the carrier-grade NAT shared address space, to see whether that assumption holds.</p>
+<h2 id="repro1">1. For ordinary addresses, the two properties are opposites</h2>
+<pre><code>import ipaddress
+
+for s in ("8.8.8.8", "192.168.1.1", "10.0.0.5"):
+    a = ipaddress.ip_address(s)
+    print(s, a.is_private, a.is_global)</code></pre>
+<pre><code>8.8.8.8 False True
+192.168.1.1 True False
+10.0.0.5 True False</code></pre>
+<p><strong>Measured:</strong> for a normal public address and two normal private (RFC 1918) addresses, <code>is_private</code> and <code>is_global</code> are always exact opposites -- exactly True in one and False in the other. This is the pattern that makes <code>not ip.is_private</code> feel like a safe stand-in for "is this address globally routable."</p>
+
+<h2 id="repro2">2. CGNAT shared address space is neither private nor global</h2>
+<pre><code>import ipaddress
+
+a = ipaddress.ip_address("100.64.0.5")
+print(a.is_private, a.is_global)</code></pre>
+<pre><code>False False</code></pre>
+<p><strong>Measured:</strong> <code>100.64.0.5</code> falls in <code>100.64.0.0/10</code>, the carrier-grade NAT shared address space defined by RFC 6598 for ISPs to use between customer routers and their own NAT, without consuming public IPv4 space. <code>ipaddress</code> correctly does not count it as <code>is_private</code> (it's not meant for a single private network like 192.168.0.0/16), but it also correctly does not count it as <code>is_global</code> (it's not meant to be routed on the public internet either). The two properties aren't opposites for this range -- both are simply <code>False</code>.</p>
+
+<h2 id="repro3">3. The fix: never derive one flag from the other -- check is_global directly</h2>
+<pre><code>import ipaddress
+
+candidates = ["8.8.8.8", "192.168.1.1", "100.64.0.5"]
+for s in candidates:
+    a = ipaddress.ip_address(s)
+    treat_as_public_WRONG = not a.is_private
+    treat_as_public_RIGHT = a.is_global
+    print(s, "wrong:", treat_as_public_WRONG, "right:", treat_as_public_RIGHT)</code></pre>
+<pre><code>8.8.8.8 wrong: True right: True
+192.168.1.1 wrong: False right: False
+100.64.0.5 wrong: True right: False</code></pre>
+<p><strong>Measured:</strong> code that checks <code>not ip.is_private</code> to decide whether an address is safe to treat as public/routable gets the CGNAT address wrong -- it's reported as "not private" and therefore treated as public, when <code>is_global</code> correctly says it isn't globally routable at all. If the goal is "is this address reachable from the public internet," check <code>is_global</code> directly rather than inferring it from the negation of <code>is_private</code>.</p>
+<aside class="cta"><strong>Deciding whether an incoming IP is &#x27;public&#x27; by checking `not is_private`? Check CGNAT addresses first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Are is_private and is_global always opposite values in Python&#x27;s ipaddress module?</summary><p>No -- we measured ipaddress.ip_address(&#x27;100.64.0.5&#x27;).is_private and .is_global both returning False for an address in the CGNAT shared address space (100.64.0.0/10, RFC 6598), which is neither private nor globally routable.</p></details>
+<details><summary>Is it safe to use &#x27;not ip.is_private&#x27; to check if an IP address is public?</summary><p>Not always -- we measured this inference giving the wrong answer for CGNAT shared-space addresses: not is_private is True (suggesting public), but is_global is correctly False. Check is_global directly instead of negating is_private.</p></details>
+<details><summary>What is the 100.64.0.0/10 address range in Python&#x27;s ipaddress module?</summary><p>It&#x27;s the carrier-grade NAT (CGNAT) shared address space defined by RFC 6598, used by ISPs between customer equipment and their own NAT layer -- we measured ipaddress correctly classifying it as neither is_private nor is_global.</p></details>
+<details><summary>For normal public and private IP addresses, do is_private and is_global agree?</summary><p>Yes -- we measured both properties behaving as exact opposites for ordinary addresses like 8.8.8.8 (public) and 192.168.1.1 / 10.0.0.5 (private, RFC 1918); the mismatch only appears for special ranges like CGNAT space.</p></details>
+<details><summary>How should I check if an IP address is reachable from the public internet in Python?</summary><p>Use the is_global property directly rather than inferring it from is_private -- we confirmed is_global correctly returns False for CGNAT addresses while a not is_private check would incorrectly suggest they&#x27;re public.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in ipaddress module: checked is_private and is_global on a normal public address, a normal private address, and a CGNAT shared-address-space address (100.64.0.0/10, RFC 6598), to see whether the two properties are always exact opposites of each other. PlainHeaders is our extension; Python&#x27;s ipaddress module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

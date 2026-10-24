@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uv pip install vs uv add: why uv sync removes packages</title>
+<meta name="description" content="uv add records the package in pyproject.toml and uv.lock; uv pip install only installs, so the next uv sync uninstalls it. Tested with uv 0.13.5.">
+<link rel="canonical" href="https://honestkit.github.io/guides/uv-pip-install-vs-uv-add/">
+<meta property="og:title" content="uv pip install vs uv add: why uv sync removes packages">
+<meta property="og:description" content="uv add records the package in pyproject.toml and uv.lock; uv pip install only installs, so the next uv sync uninstalls it. Tested with uv 0.13.5.">
+<meta property="og:url" content="https://honestkit.github.io/guides/uv-pip-install-vs-uv-add/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between uv add and uv pip install?", "acceptedAnswer": {"@type": "Answer", "text": "uv add records the package in pyproject.toml and uv.lock and installs it; uv pip install only installs it into the current venv."}}, {"@type": "Question", "name": "Why did uv sync uninstall my package?", "acceptedAnswer": {"@type": "Answer", "text": "It was installed with uv pip install and is not in uv.lock. uv sync makes the venv match the lockfile exactly. Add it with uv add."}}, {"@type": "Question", "name": "How do I create requirements.txt with uv?", "acceptedAnswer": {"@type": "Answer", "text": "uv export --format requirements-txt (from the lockfile) or uv pip freeze (what is installed now)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>uv pip install vs uv add: what each does (tested)</h1>
+<p class="lead"><code>uv add</code> writes the dependency to <code>pyproject.toml</code> and <code>uv.lock</code> and installs it. <code>uv pip install</code> only installs into the venv, so the next <code>uv sync</code> or <code>uv run</code> uninstalls it. In a project, use <code>uv add</code>.</p>
+<p>uv has two ways to install a package: the project interface (<code>uv add</code>, <code>uv sync</code>, <code>uv.lock</code>) and the pip-compatible interface (<code>uv pip install</code>). They behave very differently in a project. Measured with uv 0.13.5 on Python 3.13.5 (Linux). Every command below was run in a fresh directory and its output pasted unedited.</p>
+<h2 id="add">1. uv add: records the dependency, locks, installs</h2>
+<p>Transcript:</p>
+<pre><code>$ uv init demo -q
+$ cd demo &amp;&amp; uv add requests
+Using CPython 3.13.5 interpreter at: /usr/bin/python3.13
+Creating virtual environment at: .venv
+Resolved 6 packages in 3ms
+   Building demo @ file:///tmp/uvw397/demo
+      Built demo @ file:///tmp/uvw397/demo
+Prepared 1 package in 4ms
+Installed 6 packages in 1ms
+ + certifi==2026.10.23
+ + charset-normalizer==3.5.2
+ + demo==0.1.0 (from file:///tmp/uvw397/demo)
+ + idna==3.20
+ + requests==2.34.2
+ + urllib3==2.8.0
+$ cd demo &amp;&amp; sed -n &#x27;/dependencies/,/]/p&#x27; pyproject.toml
+dependencies = [
+    &quot;requests&gt;=2.34.2&quot;,
+]
+$ cd demo &amp;&amp; ls -a | grep -E &#x27;uv.lock|.venv&#x27;
+.venv
+uv.lock</code></pre>
+<p><code>uv add requests</code> wrote <code>"requests&gt;=2.34.2"</code> into <code>pyproject.toml</code>, created <code>uv.lock</code> and the <code>.venv</code>, and installed everything. Anyone running <code>uv sync</code> on the repo gets the same versions.</p>
+<h2 id="pip">2. uv pip install: installs only, and uv sync removes it</h2>
+<p>Transcript:</p>
+<pre><code>$ cd demo &amp;&amp; uv pip install six
+Resolved 1 package in 1ms
+Installed 1 package in 2ms
+ + six==1.17.0
+$ cd demo &amp;&amp; grep -c six pyproject.toml uv.lock
+pyproject.toml:0
+uv.lock:0
+[exit 1]
+$ cd demo &amp;&amp; uv pip list | grep -i six
+six                1.17.0
+$ cd demo &amp;&amp; uv sync
+Resolved 6 packages in 0.76ms
+Uninstalled 1 package in 0.23ms
+ - six==1.17.0
+$ cd demo &amp;&amp; uv pip list | grep -i six || echo &#x27;six: not installed&#x27;
+six: not installed</code></pre>
+<p><code>uv pip install six</code> put the package in <code>.venv</code> but did not touch <code>pyproject.toml</code> or <code>uv.lock</code>. The next <code>uv sync</code> (which <code>uv run</code> also does) made the environment match the lockfile exactly and <strong>uninstalled</strong> it. If a package "disappears" in a uv project, it was installed with <code>uv pip install</code>: use <code>uv add</code> instead (or <code>uv sync --inexact</code> to keep extras).</p>
+<h2 id="venv">3. uv pip install outside a venv: No virtual environment found</h2>
+<p>Transcript:</p>
+<pre><code>$ mkdir -p plain &amp;&amp; cd plain &amp;&amp; uv pip install six
+error: No virtual environment found; run `uv venv` to create an environment, or pass `--system` to install into a non-virtual environment
+[exit 2]
+$ cd plain &amp;&amp; uv venv -q &amp;&amp; uv pip install six
+Resolved 1 package in 1ms
+Installed 1 package in 2ms
+ + six==1.17.0</code></pre>
+<p>Unlike pip, <code>uv pip install</code> refuses to install into the system Python. Create an environment with <code>uv venv</code> (it is picked up from <code>.venv</code> in the current or a parent directory), or pass <code>--system</code> deliberately, e.g. in a Docker image. On Debian/Ubuntu the system Python will still be <a href="/guides/pip-error-externally-managed-environment/">externally managed</a>.</p>
+<h2 id="requirements">4. requirements.txt: uv pip freeze, uv export, uv add -r</h2>
+<p>Transcript:</p>
+<pre><code>$ cd demo &amp;&amp; uv pip freeze
+certifi==2026.10.23
+charset-normalizer==3.5.2
+-e file:///tmp/uvw397/demo
+idna==3.20
+requests==2.34.2
+urllib3==2.8.0
+$ cd demo &amp;&amp; uv export --format requirements-txt --no-hashes -q
+# This file was autogenerated by uv via the following command:
+#    uv export --format requirements-txt --no-hashes
+-e .
+certifi==2026.10.23
+    # via requests
+charset-normalizer==3.5.2
+    # via requests
+idna==3.20
+    # via requests
+requests==2.34.2
+    # via demo
+urllib3==2.8.0
+    # via requests
+$ printf &#x27;six==1.17.0\n&#x27; &gt; req.txt &amp;&amp; cd demo &amp;&amp; uv add -r ../req.txt -q
+$ cd demo &amp;&amp; sed -n &#x27;/dependencies/,/]/p&#x27; pyproject.toml
+dependencies = [
+    &quot;requests&gt;=2.34.2&quot;,
+    &quot;six==1.17.0&quot;,
+]</code></pre>
+<p><code>uv pip freeze</code> lists what is installed right now, including anything added with <code>uv pip install</code>. <code>uv export --format requirements-txt</code> writes the lockfile instead, with comments showing why each package is there, which is what you want for a deploy target that only understands pip. To move an existing <code>requirements.txt</code> into a uv project, <code>uv add -r requirements.txt</code> copies its lines into <code>pyproject.toml</code>.</p>
+<p><strong>Rule of thumb:</strong> in a project with <code>pyproject.toml</code>, use <code>uv add</code> / <code>uv remove</code> / <code>uv sync</code>. Use <code>uv pip install</code> for throwaway venvs, scripts and tools that expect pip.</p>
+<p>Related: <a href="/guides/uv-pip-compile-requirements-txt-upgrade/">uv pip compile</a>, <a href="/guides/uv-ignore-ssl-errors-invalid-peer-certificate-unknownissuer/">uv ignore SSL errors (UnknownIssuer)</a>, <a href="/guides/pip-error-externally-managed-environment/">pip error: externally-managed-environment</a>, <a href="/guides/pytest-using-wrong-python-version/">pytest using the wrong Python version</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between uv add and uv pip install?</summary><p>uv add records the package in pyproject.toml and uv.lock and installs it; uv pip install only installs it into the current venv.</p></details>
+<details><summary>Why did uv sync uninstall my package?</summary><p>It was installed with uv pip install and is not in uv.lock. uv sync makes the venv match the lockfile exactly. Add it with uv add.</p></details>
+<details><summary>How do I create requirements.txt with uv?</summary><p>uv export --format requirements-txt (from the lockfile) or uv pip freeze (what is installed now).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with uv 0.13.5 and CPython 3.13.5 on Linux. Each transcript was produced by running the commands verbatim in a fresh directory. PlainHeaders is our extension; uv is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

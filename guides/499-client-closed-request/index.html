@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>499 Client Closed Request in nginx: Causes and Fixes (Tested)</title>
+<meta name="description" content="nginx logs 499 when the client hangs up before the answer. We made curl, fetch, Chromium and Python give up after 1 s on a 5 s Node handler and timed what the server sees.">
+<link rel="canonical" href="https://honestkit.github.io/guides/499-client-closed-request/">
+<meta property="og:title" content="499 Client Closed Request in nginx: Causes and Fixes (Tested)">
+<meta property="og:description" content="nginx logs 499 when the client hangs up before the answer. We made curl, fetch, Chromium and Python give up after 1 s on a 5 s Node handler and timed what the server sees.">
+<meta property="og:url" content="https://honestkit.github.io/guides/499-client-closed-request/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can a client ever receive a 499 status?", "acceptedAnswer": {"@type": "Answer", "text": "No. nginx only writes 499 to its access log. The client has already closed the connection, so nothing is sent. In our tests curl reported status 000 with 0 bytes received."}}, {"@type": "Question", "name": "Is 499 an error in my server?", "acceptedAnswer": {"@type": "Answer", "text": "Not by itself. It means the client gave up first. A few are normal (users leaving, cancelled fetches). Many 499s on one endpoint usually mean that endpoint is slower than some client or load balancer timeout."}}, {"@type": "Question", "name": "Does my backend keep working after a 499?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, unless you check. In our Node test the handler ran the full 5 s after every client left at 1 s. Listen for res 'close' with writableFinished false and abort the work."}}, {"@type": "Question", "name": "What does proxy_ignore_client_abort do?", "acceptedAnswer": {"@type": "Answer", "text": "It tells nginx not to close the upstream connection when the client leaves, so the backend can finish. Per the nginx docs it is off by default. Use it only for work that must complete."}}, {"@type": "Question", "name": "What is the difference between 499 and 504?", "acceptedAnswer": {"@type": "Answer", "text": "499: the client gave up waiting for nginx. 504: nginx gave up waiting for the upstream. If the client timeout is shorter than proxy_read_timeout you get 499; if it is longer you get 504."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>499 Client Closed Request (tested)</h1>
+<p class="lead"><code>499 Client Closed Request</code> is an nginx log code. It means the client closed the connection before nginx sent a response. It is never sent to the client. We reproduced the same situation against a Node server to show what the backend sees and how to stop wasted work.</p>
+<h2>1. What 499 means</h2>
+<p>499 is not a real HTTP status. Only nginx uses it, and only in its access log. nginx writes it when the client disconnects while nginx is still waiting for the upstream or still working. No client ever receives a 499, because by then nobody is listening.</p>
+<p>So a 499 is a timeout on the <em>client</em> side. The client got tired first. Compare <a href="/guides/504-gateway-timeout/">504 Gateway Timeout</a>, where nginx gives up on the upstream, and <a href="/guides/408-request-timeout/">408 Request Timeout</a>, where the server gives up on a slow client.</p>
+
+<h2>2. Our test setup</h2>
+<p>We have no nginx on the test box, so we measured the backend's view instead. A Node.js server ran a handler that does 5 s of work (50 ticks of 100 ms) and then sends 200. Four clients each gave up after 1 s. The server logged <code>req</code> and <code>res</code> <code>'close'</code> events and <code>res.writableFinished</code>.</p>
+<pre><code>res.on('close', () =&gt; {
+  if (!res.writableFinished) console.log('client aborted');
+});</code></pre>
+
+<h2>3. Results: every client abort looks the same to the server</h2>
+<table>
+<tr><th>Client</th><th>Client saw</th><th>Server 'close' after</th><th>writableFinished</th><th>Handler kept running?</th></tr>
+<tr><td>curl --max-time 1</td><td>exit 28, "Operation timed out after 1000 milliseconds with 0 bytes received", <code>%{http_code}</code> = 000</td><td>1002 ms</td><td>false</td><td>Yes, finished at 5011 ms</td></tr>
+<tr><td>Node fetch + AbortSignal.timeout(1000)</td><td>TimeoutError after 1012 ms</td><td>969 ms</td><td>false</td><td>Yes, finished at 5013 ms</td></tr>
+<tr><td>Python urllib timeout=1</td><td>TimeoutError "timed out" after 1015 ms</td><td>1002 ms</td><td>false</td><td>Yes, finished at 5021 ms</td></tr>
+<tr><td>Chromium page navigated away after 1 s</td><td>net::ERR_ABORTED</td><td>1000 ms</td><td>false</td><td>Yes, finished at 5010 ms</td></tr>
+<tr><td>Chromium fetch + AbortController.abort() at 1 s</td><td>AbortError after 1003 ms</td><td>1009 ms</td><td>false</td><td>No (handler checked the signal)</td></tr>
+</table>
+<p>In every case the server got <code>res 'close'</code> and <code>req 'close'</code> within about 10 ms of the client giving up. <code>res.writableFinished</code> was <code>false</code> every time. That is the Node equivalent of the 499 moment.</p>
+<p>Without a check, the handler did all 5 s of work anyway. When it finally called <code>res.end()</code>, the socket was already destroyed (<code>res.destroyed</code> was <code>true</code>). The 200 it "would have sent" went nowhere. curl shows that clearly: the status is <code>000</code> and 0 bytes were received.</p>
+<pre><code>$ curl -sS -m 1 -w '%{http_code}\n' http://127.0.0.1:8983/slow
+curl: (28) Operation timed out after 1000 milliseconds with 0 bytes received
+000</code></pre>
+
+<h2>4. Stop the wasted work</h2>
+<p>Turn the close event into an <code>AbortSignal</code> and check it in your work loop, or pass it to <code>fetch</code> and database calls that accept a signal.</p>
+<pre><code>http.createServer((req, res) =&gt; {
+  const ac = new AbortController();
+  res.on('close', () =&gt; {
+    if (!res.writableFinished) ac.abort();   // client went away
+  });
+  doSlowWork({ signal: ac.signal })
+    .then(body =&gt; res.end(body))
+    .catch(err =&gt; { if (!ac.signal.aborted) throw err; });
+});</code></pre>
+<p>With this guard, our curl test logged "work stopped after 9 ticks" 3 ms after the close. The Chromium fetch abort stopped at 9 ticks as well. That is about 0.9 s of work instead of 5 s.</p>
+<p>Use <code>res.on('close')</code> with the <code>writableFinished</code> check. A plain <code>req.on('close')</code> also fires after a normal, finished response, so it alone does not prove an abort.</p>
+
+<h2>5. nginx specifics (from the docs, not measured)</h2>
+<p>When the client closes, nginx logs 499 and by default closes its connection to the upstream too. Your backend then sees the same close event we measured above.</p>
+<p><code>proxy_ignore_client_abort on;</code> tells nginx to keep the upstream request open after the client leaves. Use it for requests that must finish (for example a payment write). It does not help the client; the client is gone either way.</p>
+<pre><code>location /api/ {
+    proxy_pass http://backend;
+    proxy_read_timeout 60s;
+    # proxy_ignore_client_abort on;  # only if the work must complete
+}</code></pre>
+
+<h2>6. Common causes</h2>
+<ul>
+<li><strong>Client or load balancer timeout shorter than the backend.</strong> A front load balancer, CDN or HTTP client gives up before nginx gets an answer. AWS ALB's default idle timeout is 60 s, so a request that takes longer is cut there.</li>
+<li><strong>Users leave.</strong> They close the tab, click a link or hit stop. The browser aborts the request, as our Chromium test shows.</li>
+<li><strong>Health checkers with short timeouts.</strong> A 2 s health check against a slow endpoint shows up as a steady stream of 499s.</li>
+<li><strong>Frontend code that cancels requests.</strong> Type-ahead search and route changes often abort the previous fetch on purpose. Those 499s are harmless.</li>
+</ul>
+
+<h2>7. How to fix it</h2>
+<ul>
+<li>Find who closed first. Compare <code>$request_time</code> in the nginx log with the client's timeout.</li>
+<li>Align timeouts so each layer waits a little longer than the one behind it: client &gt; load balancer &gt; nginx <code>proxy_read_timeout</code> &gt; backend.</li>
+<li>Make slow endpoints fast or asynchronous. Return 202 with a job ID and let the client poll.</li>
+<li>Stop work on abort in the backend (section 4), so 499s do not pile up load.</li>
+<li>Point health checks at a cheap endpoint.</li>
+</ul>
+<p>If you see resets rather than clean closes, read <a href="/guides/err-connection-reset-econnreset/">ERR_CONNECTION_RESET / ECONNRESET</a>. If the upstream itself fails, see <a href="/guides/502-bad-gateway/">502 Bad Gateway</a>.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can a client ever receive a 499 status?</summary><p>No. nginx only writes 499 to its access log. The client has already closed the connection, so nothing is sent. In our tests curl reported status 000 with 0 bytes received.</p></details>
+<details><summary>Is 499 an error in my server?</summary><p>Not by itself. It means the client gave up first. A few are normal (users leaving, cancelled fetches). Many 499s on one endpoint usually mean that endpoint is slower than some client or load balancer timeout.</p></details>
+<details><summary>Does my backend keep working after a 499?</summary><p>Yes, unless you check. In our Node test the handler ran the full 5 s after every client left at 1 s. Listen for res &#x27;close&#x27; with writableFinished false and abort the work.</p></details>
+<details><summary>What does proxy_ignore_client_abort do?</summary><p>It tells nginx not to close the upstream connection when the client leaves, so the backend can finish. Per the nginx docs it is off by default. Use it only for work that must complete.</p></details>
+<details><summary>What is the difference between 499 and 504?</summary><p>499: the client gave up waiting for nginx. 504: nginx gave up waiting for the upstream. If the client timeout is shorter than proxy_read_timeout you get 499; if it is longer you get 504.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0, curl 8.14.1, Python 3 urllib and headless Chromium 153 against a Node server whose handler takes 5 s. Each client gave up after 1 s. The nginx parts are from the nginx docs, not measured. PlainHeaders is our extension; curl, Python, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

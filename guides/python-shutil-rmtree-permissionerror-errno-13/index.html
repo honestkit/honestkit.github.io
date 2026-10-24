@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shutil.rmtree PermissionError [Errno 13] Permission Denied</title>
+<meta name="description" content="We measured why shutil.rmtree raises PermissionError on Linux (directory write permission, not the file), why ignore_errors hides it, and an onexc fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-shutil-rmtree-permissionerror-errno-13/">
+<meta property="og:title" content="shutil.rmtree PermissionError [Errno 13] Permission Denied">
+<meta property="og:description" content="We measured why shutil.rmtree raises PermissionError on Linux (directory write permission, not the file), why ignore_errors hides it, and an onexc fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-shutil-rmtree-permissionerror-errno-13/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does shutil.rmtree give PermissionError: [Errno 13]?", "acceptedAnswer": {"@type": "Answer", "text": "On Linux and macOS, deleting an entry needs write permission on the directory containing it. We measured rmtree failing on a 0o555 directory, with the error naming that directory."}}, {"@type": "Question", "name": "How do I force shutil.rmtree to delete read-only files?", "acceptedAnswer": {"@type": "Answer", "text": "Pass an onexc handler (Python 3.12+) that fixes permissions and calls func(path) again. We measured chmod-ing the parent directory and retrying removing the tree."}}, {"@type": "Question", "name": "Does shutil.rmtree ignore_errors=True delete everything?", "acceptedAnswer": {"@type": "Answer", "text": "No. It skips what it can't delete without telling you. We measured the whole tree still existing afterwards."}}, {"@type": "Question", "name": "Can rmtree delete a read-only file on Linux?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, if the directory is writable. We measured a 0o444 file removed with no error. Read-only files block deletion on Windows, which we did not test."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>shutil.rmtree PermissionError: [Errno 13] (tested)</h1>
+<p class="lead"><code>shutil.rmtree</code> raising <code>PermissionError: [Errno 13] Permission denied</code> on Linux or macOS is usually about a <em>directory</em> you can't write to, not a read-only file. We measured it on Python 3.13.5 along with an <code>onexc</code> handler that fixes it.</p>
+<h2 id="cause">1. On Linux and macOS, deleting a file needs write permission on its directory</h2>
+<pre><code>import os, shutil
+
+os.makedirs(&quot;t/locked&quot;)
+open(&quot;t/locked/f.txt&quot;, &quot;w&quot;).close()
+os.chmod(&quot;t/locked&quot;, 0o555)          # read+execute, no write: can&#x27;t delete entries
+
+try:
+    shutil.rmtree(&quot;t&quot;)
+except PermissionError as e:
+    print(&quot;rmtree:&quot;, e)
+print(&quot;f.txt still there:&quot;, os.path.exists(&quot;t/locked/f.txt&quot;))
+
+shutil.rmtree(&quot;t&quot;, ignore_errors=True)
+print(&quot;after ignore_errors=True, t exists:&quot;, os.path.exists(&quot;t&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>rmtree: [Errno 13] Permission denied: &#x27;t/locked&#x27;
+f.txt still there: True
+after ignore_errors=True, t exists: True</code></pre>
+<p><strong>Measured on Python 3.13.5 (Linux):</strong> <code>rmtree</code> fails with <code>[Errno 13] Permission denied</code>, and the message names the <em>directory</em> <code>t/locked</code>, not the file. That's the clue: removing an entry is a write to its parent directory. <code>ignore_errors=True</code> doesn't fix anything; it silently leaves the whole tree in place.</p>
+
+<h2 id="fix">2. Fix: an onexc handler that adds write permission and retries</h2>
+<p>Run right after the block above, on the same tree:</p>
+<pre><code>import os, shutil, stat
+
+def make_writable_and_retry(func, path, exc):
+    if not isinstance(exc, PermissionError):
+        raise exc
+    os.chmod(os.path.dirname(path), stat.S_IRWXU)   # the parent dir needs write permission
+    func(path)
+
+shutil.rmtree(&quot;t&quot;, onexc=make_writable_and_retry)
+print(&quot;t exists:&quot;, os.path.exists(&quot;t&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>t exists: False</code></pre>
+<p><code>onexc</code> is new in Python 3.12 and receives the exception itself; older code uses <code>onerror</code>, which gets <code>sys.exc_info()</code> instead and is deprecated since 3.12. Re-raising anything that isn't a <code>PermissionError</code> keeps real problems visible. Only use this on trees you own: it changes permissions to delete things someone protected.</p>
+
+<h2 id="file">3. A read-only file is not the problem on Linux</h2>
+<pre><code>import os, shutil
+
+os.makedirs(&quot;t3&quot;)
+open(&quot;t3/ro.txt&quot;, &quot;w&quot;).close()
+os.chmod(&quot;t3/ro.txt&quot;, 0o444)          # read-only file, writable directory
+shutil.rmtree(&quot;t3&quot;)
+print(&quot;t3 exists:&quot;, os.path.exists(&quot;t3&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>t3 exists: False</code></pre>
+<p><strong>Measured:</strong> a <code>0o444</code> file in a writable directory is deleted without any error on Linux. On Windows a read-only file attribute does block deletion and gives a <code>PermissionError</code> (WinError 5 or WinError 32 if another process has the file open); we did not test Windows here. The usual Windows handler clears the attribute with <code>os.chmod(path, stat.S_IWRITE)</code> then retries <code>func(path)</code>; WinError 32 means close the other program first.</p>
+
+<h2 id="checklist">4. Checklist</h2>
+<ul>
+<li>Read the path in the error: it's the directory you can't write to.</li>
+<li>Files created by Docker or <code>sudo</code> are often owned by root; <code>chmod</code> won't help without ownership. Check with <code>ls -ld</code>.</li>
+<li>Don't use <code>ignore_errors=True</code> as a fix; check <code>os.path.exists()</code> afterwards if you do.</li>
+</ul>
+
+<aside class="cta"><strong>Cleaning up after downloads? Check the real status and headers a server returns first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does shutil.rmtree give PermissionError: [Errno 13]?</summary><p>On Linux and macOS, deleting an entry needs write permission on the directory containing it. We measured rmtree failing on a 0o555 directory, with the error naming that directory.</p></details>
+<details><summary>How do I force shutil.rmtree to delete read-only files?</summary><p>Pass an onexc handler (Python 3.12+) that fixes permissions and calls func(path) again. We measured chmod-ing the parent directory and retrying removing the tree.</p></details>
+<details><summary>Does shutil.rmtree ignore_errors=True delete everything?</summary><p>No. It skips what it can&#x27;t delete without telling you. We measured the whole tree still existing afterwards.</p></details>
+<details><summary>Can rmtree delete a read-only file on Linux?</summary><p>Yes, if the directory is writable. We measured a 0o444 file removed with no error. Read-only files block deletion on Windows, which we did not test.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: rmtree on a tree containing a read+execute-only directory, ignore_errors=True, an onexc handler that restores write permission and retries, and a read-only file in a writable directory. Every block was run verbatim and its output pasted from that run. Windows behaviour was not tested. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

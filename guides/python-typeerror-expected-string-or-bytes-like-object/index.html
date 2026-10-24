@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TypeError: expected string or bytes-like object (Tested Fix)</title>
+<meta name="description" content="re.sub/re.search raise expected string or bytes-like object, got &#x27;NoneType&#x27; or &#x27;float&#x27;. Tested on 3.8-3.13: None from JSON, NaN from pandas, file objects.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-typeerror-expected-string-or-bytes-like-object/">
+<meta property="og:title" content="TypeError: expected string or bytes-like object (Tested Fix)">
+<meta property="og:description" content="re.sub/re.search raise expected string or bytes-like object, got &#x27;NoneType&#x27; or &#x27;float&#x27;. Tested on 3.8-3.13: None from JSON, NaN from pandas, file objects.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-typeerror-expected-string-or-bytes-like-object/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does expected string or bytes-like object, got 'NoneType' mean?", "acceptedAnswer": {"@type": "Answer", "text": "A re function such as re.sub or re.search received None, usually from a missing JSON/database value or a function without a return."}}, {"@type": "Question", "name": "Why does it say got 'float'?", "acceptedAnswer": {"@type": "Answer", "text": "The value is almost always NaN, which pandas uses for empty cells. Check for it with value != value, or use the pandas .str methods, which skip NaN."}}, {"@type": "Question", "name": "Should I just wrap the value in str()?", "acceptedAnswer": {"@type": "Answer", "text": "Only after handling None and NaN: str(None) is the text 'None' and str(nan) is 'nan', which then silently pass through your regex."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TypeError: expected string or bytes-like object (tested fix)</h1>
+<p class="lead"><code>TypeError: expected string or bytes-like object, got 'NoneType'</code> comes from the <code>re</code> module: you passed None, a number, NaN or a file object where it needs a string. We reproduced each case on Python 3.8, 3.11 and 3.13 and tested the fix.</p>
+<h2 id="cause">1. Cause: re got something that is not a string</h2>
+<pre><code>import re, sys
+print(sys.version.split()[0])
+for value in [None, 42, float(&quot;nan&quot;), b&quot;bytes ok&quot;, [&quot;a&quot;, &quot;b&quot;]]:
+    try:
+        re.sub(r&quot;\s+&quot;, &quot; &quot;, value)
+    except TypeError as e:
+        print(f&quot;{value!r:12} TypeError: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>3.13.5
+None         TypeError: expected string or bytes-like object, got &#x27;NoneType&#x27;
+42           TypeError: expected string or bytes-like object, got &#x27;int&#x27;
+nan          TypeError: expected string or bytes-like object, got &#x27;float&#x27;
+b&#x27;bytes ok&#x27;  TypeError: cannot use a string pattern on a bytes-like object
+[&#x27;a&#x27;, &#x27;b&#x27;]   TypeError: expected string or bytes-like object, got &#x27;list&#x27;</code></pre>
+<p>Every <code>re</code> function (<code>sub</code>, <code>search</code>, <code>match</code>, <code>findall</code>, <code>split</code>) needs a <code>str</code> (or bytes) to search. Since Python 3.11 the message ends with the type it got, which tells you the cause straight away. On Python 3.8 the same calls say only <code>expected string or bytes-like object</code>:</p>
+<pre><code>3.8.20
+None         TypeError: expected string or bytes-like object
+42           TypeError: expected string or bytes-like object
+nan          TypeError: expected string or bytes-like object
+b&#x27;bytes ok&#x27;  TypeError: cannot use a string pattern on a bytes-like object
+[&#x27;a&#x27;, &#x27;b&#x27;]   TypeError: expected string or bytes-like object</code></pre>
+<p>A <code>float</code> is almost always <code>NaN</code>: pandas reads an empty CSV cell as NaN in a text column, so <code>df["col"].apply(lambda s: re.sub(...))</code> fails on the first blank row. (The pandas <code>.str</code> methods, such as <code>df["col"].str.replace(pattern, "", regex=True)</code>, skip NaN for you.)</p>
+<h2 id="none">2. The usual source: a missing value (None)</h2>
+<pre><code># Typical source: a missing field, or an empty cell (NaN) in CSV/pandas data
+import re, json
+rows = json.loads(&#x27;[{&quot;phone&quot;: &quot;555-0101&quot;}, {&quot;phone&quot;: null}]&#x27;)
+for row in rows:
+    try:
+        print(re.sub(r&quot;\D&quot;, &quot;&quot;, row[&quot;phone&quot;]))
+    except TypeError as e:
+        print(&quot;TypeError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>5550101
+TypeError: expected string or bytes-like object, got &#x27;NoneType&#x27;</code></pre>
+<p>JSON <code>null</code>, a database <code>NULL</code>, <code>dict.get()</code> on a missing key, and a function that forgot to <code>return</code> all give <code>None</code>. The first row works and the second one crashes.</p>
+<h2 id="fix">3. Fix: handle None/NaN explicitly, then convert with str()</h2>
+<pre><code>import re
+def digits(value):
+    if value is None or value != value:     # None or NaN (NaN != NaN)
+        return &quot;&quot;
+    return re.sub(r&quot;\D&quot;, &quot;&quot;, str(value))
+for v in [&quot;555-0101&quot;, None, float(&quot;nan&quot;), 5550101]:
+    print(repr(v), &quot;-&gt;&quot;, repr(digits(v)))</code></pre>
+<p>Output:</p>
+<pre><code>&#x27;555-0101&#x27; -&gt; &#x27;5550101&#x27;
+None -&gt; &#x27;&#x27;
+nan -&gt; &#x27;&#x27;
+5550101 -&gt; &#x27;5550101&#x27;</code></pre>
+<p>Decide what an empty value should become (here an empty string) instead of calling <code>str(None)</code>, which gives the text <code>"None"</code> and lets bad data through. <code>value != value</code> is True only for NaN, so it catches NaN without importing math or pandas.</p>
+<h2 id="file">4. A file object or bytes instead of the text</h2>
+<pre><code># re.findall on a whole file object, or on bytes with a str pattern
+import re, io
+f = io.StringIO(&quot;id=1\nid=2\n&quot;)
+try:
+    re.findall(r&quot;id=(\d)&quot;, f)
+except TypeError as e:
+    print(&quot;TypeError:&quot;, e)
+print(re.findall(r&quot;id=(\d)&quot;, f.getvalue()))
+try:
+    re.findall(r&quot;id=(\d)&quot;, b&quot;id=1&quot;)
+except TypeError as e:
+    print(&quot;TypeError:&quot;, e)
+print(re.findall(rb&quot;id=(\d)&quot;, b&quot;id=1&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>TypeError: expected string or bytes-like object, got &#x27;_io.StringIO&#x27;
+[&#x27;1&#x27;, &#x27;2&#x27;]
+TypeError: cannot use a string pattern on a bytes-like object
+[b&#x27;1&#x27;]</code></pre>
+<p>Pass <code>f.read()</code> (or loop over lines), not the file object itself. Bytes are accepted but need a bytes pattern (<code>rb"..."</code>); a str pattern on bytes gives a different error, <code>cannot use a string pattern on a bytes-like object</code>. Either decode the bytes first or make the pattern bytes too.</p>
+<p>Related: <a href="/guides/python-typeerror-a-bytes-like-object-is-required-not-str/">a bytes-like object is required, not 'str'</a> · <a href="/guides/python-typeerror-object-is-not-iterable/">object is not iterable</a>.</p>
+
+<aside class="cta"><strong>Parsing text from an HTTP response? Check the headers and charset it comes with:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does expected string or bytes-like object, got &#x27;NoneType&#x27; mean?</summary><p>A re function such as re.sub or re.search received None, usually from a missing JSON/database value or a function without a return.</p></details>
+<details><summary>Why does it say got &#x27;float&#x27;?</summary><p>The value is almost always NaN, which pandas uses for empty cells. Check for it with value != value, or use the pandas .str methods, which skip NaN.</p></details>
+<details><summary>Should I just wrap the value in str()?</summary><p>Only after handling None and NaN: str(None) is the text &#x27;None&#x27; and str(nan) is &#x27;nan&#x27;, which then silently pass through your regex.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Python 3.13.5 on Debian, plus 3.11.17 and 3.8.20 in python:alpine containers: re.sub with None, int, NaN, bytes and a list; a JSON null field; a None/NaN-safe fix; and a file object passed to re.findall. Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

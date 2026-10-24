@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python http.server CORS: Add Access-Control-Allow-Origin</title>
+<meta name="description" content="python -m http.server has no CORS flag. Tested drop-in script that adds Access-Control-Allow-Origin and answers the OPTIONS preflight header-only fixes miss.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-http-server-cors/">
+<meta property="og:title" content="Python http.server CORS: Add Access-Control-Allow-Origin">
+<meta property="og:description" content="python -m http.server has no CORS flag. Tested drop-in script that adds Access-Control-Allow-Origin and answers the OPTIONS preflight header-only fixes miss.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-http-server-cors/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is there a --cors flag for python -m http.server?", "acceptedAnswer": {"@type": "Answer", "text": "Not in Python 3.13.5: python3 -m http.server --help lists no CORS option. Use a small subclass like the script above."}}, {"@type": "Question", "name": "Why does my fetch still fail after adding Access-Control-Allow-Origin?", "acceptedAnswer": {"@type": "Answer", "text": "If the request has an Authorization header, a custom header, or Content-Type: application/json, the browser sends an OPTIONS preflight first. SimpleHTTPRequestHandler has no do_OPTIONS and replies 501 Unsupported method ('OPTIONS'), which Chromium reports as 'It does not have HTTP ok status'. Add do_OPTIONS as shown."}}, {"@type": "Question", "name": "Does a different port count as a different origin?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Origin is scheme + host + port, so http://localhost:3000 and http://localhost:8000 are different origins. We measured the block between two 127.0.0.1 ports."}}, {"@type": "Question", "name": "Can I use * with cookies or credentials?", "acceptedAnswer": {"@type": "Answer", "text": "No. Browsers reject Access-Control-Allow-Origin: * for credentialed requests; you must echo the specific Origin and send Access-Control-Allow-Credentials: true."}}, {"@type": "Question", "name": "Why do I get 501 on POST after fixing CORS?", "acceptedAnswer": {"@type": "Answer", "text": "SimpleHTTPRequestHandler only implements GET and HEAD (plus the do_OPTIONS you added). A 501 on POST is the server saying it has no POST handler; write a do_POST method in your subclass."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>python -m http.server with CORS (tested)</h1>
+<p class="lead"><code>python -m http.server</code> sends no CORS headers, so a page on another port can't <code>fetch()</code> from it. The common fix -- override <code>end_headers()</code> to add <code>Access-Control-Allow-Origin: *</code> -- works for a plain GET. We measured in Chromium 153 that it still fails for any request with an <code>Authorization</code> header or a JSON <code>Content-Type</code>, because those trigger an <code>OPTIONS</code> preflight that <code>SimpleHTTPRequestHandler</code> answers with <code>501</code>. Below is a drop-in script that handles both.</p>
+<h2 id="no-flag">1. python -m http.server has no CORS option</h2>
+<p><code>python3 -m http.server --help</code> in Python 3.13.5 lists no CORS flag, and <code>SimpleHTTPRequestHandler</code> sends no <code>Access-Control-Allow-Origin</code> header. A page on another origin -- and a different <strong>port</strong> counts, so <code>localhost:3000</code> fetching from <code>localhost:8000</code> is cross-origin -- gets this in Chromium 153's console:</p>
+<pre><code>Access to fetch at 'http://127.0.0.1:8964/data.json' from origin 'http://127.0.0.1:8966' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource.</code></pre>
+
+<h2 id="script">2. A drop-in replacement with CORS (and preflight)</h2>
+<p>Save as <code>cors_server.py</code> and run <code>python3 cors_server.py preflight 8000</code> from the directory you want to serve:</p>
+<pre><code>import sys
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+class CORSRequestHandler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        super().end_headers()
+
+class CORSPreflightHandler(CORSRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.end_headers()
+
+handler = {"plain": SimpleHTTPRequestHandler, "cors": CORSRequestHandler,
+           "preflight": CORSPreflightHandler}[sys.argv[1]]
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[2])), handler).serve_forever()</code></pre>
+<p>Overriding <code>end_headers()</code> adds the header to every response the handler sends, including 404s and directory listings. <code>do_OPTIONS</code> answers the browser's preflight.</p>
+
+<h2 id="measured">3. What the browser allowed, per handler</h2>
+<p>We served the same <code>data.json</code> with each handler on its own port and called <code>fetch()</code> from a page on <code>http://127.0.0.1:8966</code> in headless Chromium 153:</p>
+<pre><code>plain      GET                          BLOCKED: Failed to fetch
+plain      GET + Authorization header   BLOCKED: Failed to fetch
+plain      POST application/json        BLOCKED: Failed to fetch
+cors       GET                          200 {"ok": true}
+cors       GET + Authorization header   BLOCKED: Failed to fetch
+cors       POST application/json        BLOCKED: Failed to fetch
+preflight  GET                          200 {"ok": true}
+preflight  GET + Authorization header   200 {"ok": true}
+preflight  POST application/json        501 &lt;!DOCTYPE HTML&gt;...</code></pre>
+<p><strong>Measured:</strong></p>
+<ul>
+<li><strong>Header only (<code>cors</code>)</strong> fixes a plain <code>GET</code> but nothing that needs a preflight. Adding an <code>Authorization</code> header, a custom header, or <code>Content-Type: application/json</code> makes the browser send <code>OPTIONS</code> first, and <code>SimpleHTTPRequestHandler</code> has no <code>do_OPTIONS</code>, so it answers <code>501 Unsupported method ('OPTIONS')</code>. Chromium reports: <code>Response to preflight request doesn't pass access control check: It does not have HTTP ok status.</code> Most copy-paste snippets stop at the header and hit this.</li>
+<li><strong>With <code>do_OPTIONS</code> (<code>preflight</code>)</strong> the preflight passes. The POST then reaches the server and gets a readable <code>501</code>, because <code>SimpleHTTPRequestHandler</code> is a static file server with no <code>do_POST</code>. That's no longer a CORS problem: add your own <code>do_POST</code> if you need one.</li>
+</ul>
+
+<h2 id="curl">4. Check it with curl</h2>
+<pre><code>$ curl -s -i -X OPTIONS http://127.0.0.1:8965/data.json   # header-only handler
+HTTP/1.0 501 Unsupported method ('OPTIONS')
+
+$ curl -s -i -X OPTIONS http://127.0.0.1:8967/data.json -H 'Origin: http://127.0.0.1:8966'
+HTTP/1.0 204 No Content
+Server: SimpleHTTP/0.6 Python/3.13.5
+Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
+Access-Control-Allow-Headers: Content-Type, Authorization
+Access-Control-Max-Age: 600
+Access-Control-Allow-Origin: *</code></pre>
+<p>(Date header omitted.) <code>Access-Control-Allow-Origin: *</code> is fine for local development of public, non-credentialed files. It does not work with <code>fetch(..., {credentials: 'include'})</code> -- that needs the exact origin echoed back plus <code>Access-Control-Allow-Credentials: true</code> -- and don't use it on a server that serves anything private: <code>http.server</code> is not meant for production.</p>
+<p>Related: <a href="/guides/cors-preflight-request-options/">CORS preflight (OPTIONS) explained</a> and <a href="/guides/cors-error-messages-explained/">CORS error messages explained</a>.</p>
+<aside class="cta"><strong>See which Access-Control-* headers a server actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is there a --cors flag for python -m http.server?</summary><p>Not in Python 3.13.5: python3 -m http.server --help lists no CORS option. Use a small subclass like the script above.</p></details>
+<details><summary>Why does my fetch still fail after adding Access-Control-Allow-Origin?</summary><p>If the request has an Authorization header, a custom header, or Content-Type: application/json, the browser sends an OPTIONS preflight first. SimpleHTTPRequestHandler has no do_OPTIONS and replies 501 Unsupported method (&#x27;OPTIONS&#x27;), which Chromium reports as &#x27;It does not have HTTP ok status&#x27;. Add do_OPTIONS as shown.</p></details>
+<details><summary>Does a different port count as a different origin?</summary><p>Yes. Origin is scheme + host + port, so http://localhost:3000 and http://localhost:8000 are different origins. We measured the block between two 127.0.0.1 ports.</p></details>
+<details><summary>Can I use * with cookies or credentials?</summary><p>No. Browsers reject Access-Control-Allow-Origin: * for credentialed requests; you must echo the specific Origin and send Access-Control-Allow-Credentials: true.</p></details>
+<details><summary>Why do I get 501 on POST after fixing CORS?</summary><p>SimpleHTTPRequestHandler only implements GET and HEAD (plus the do_OPTIONS you added). A 501 on POST is the server saying it has no POST handler; write a do_POST method in your subclass.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s http.server (SimpleHTTPRequestHandler, ThreadingHTTPServer), headless Chromium 153.0.8010.12 via Playwright, and curl, serving one JSON file on separate localhost ports to a page on another port. PlainHeaders is our extension; Python, Chromium and curl are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vite Error During Dependency Optimization: Why the Server Dies</title>
+<meta name="description" content="We crashed Vite 8.3.2&#x27;s dev server with one broken dependency and measured the exact fix (optimizeDeps.exclude) that keeps it running.">
+<link rel="canonical" href="https://honestkit.github.io/guides/vite-dependency-optimization-crash/">
+<meta property="og:title" content="Vite Error During Dependency Optimization: Why the Server Dies">
+<meta property="og:description" content="We crashed Vite 8.3.2&#x27;s dev server with one broken dependency and measured the exact fix (optimizeDeps.exclude) that keeps it running.">
+<meta property="og:url" content="https://honestkit.github.io/guides/vite-dependency-optimization-crash/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why did my whole Vite dev server crash instead of just one page breaking?", "acceptedAnswer": {"@type": "Answer", "text": "Dependency pre-bundling happens once at server startup, scanning all of node_modules up front. We measured that a syntax error in any scanned package throws an uncaught exception at that point, and Node's default behaviour for an uncaught exception is to exit the whole process - there's no server left, not just a broken page."}}, {"@type": "Question", "name": "Does excluding the broken package from optimizeDeps actually fix the code, or just the crash?", "acceptedAnswer": {"@type": "Answer", "text": "Just the crash. We measured that with optimizeDeps.exclude, the server stays alive and every other page works, but requesting the excluded package's own broken module still fails with a Pre-transform error - the underlying syntax error in that dependency still needs fixing or replacing."}}, {"@type": "Question", "name": "What does '504 (Outdated Optimize Dep)' mean and is it related to this crash?", "acceptedAnswer": {"@type": "Answer", "text": "It's a different, much more common and non-fatal issue: Vite discovers a new dependency after the dev server already started, has to re-run the optimizer, and a request made against the old pre-bundle version briefly 404s/504s. A page reload resolves it. It does not crash the process, unlike the syntax-error case in this guide."}}, {"@type": "Question", "name": "Why does this happen with a local/linked package but not a normal npm install?", "acceptedAnswer": {"@type": "Answer", "text": "Normal npm-published packages are built/transpiled before publishing, so they're far less likely to contain syntax your toolchain can't parse. A package you're actively editing via npm link or a file: dependency can easily be saved mid-edit with a syntax error, which is the realistic way most developers hit this crash."}}, {"@type": "Question", "name": "Is this specific to Vite's new Rolldown/Oxc-based optimizer, or did esbuild do the same thing?", "acceptedAnswer": {"@type": "Answer", "text": "We only measured this on Vite 8.3.2's Rolldown/Oxc toolchain (the default as of this version). esbuild, the optimizer in older Vite versions, also throws on invalid syntax during pre-bundling - the underlying crash mechanism (an uncaught exception killing the Node process) is a Node.js behaviour, not specific to either bundler."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Vite dependency-optimization crash (tested)</h1>
+<p class="lead">Vite's dev server pre-bundles your <code>node_modules</code> dependencies on startup ("dependency optimization") so the browser gets fast, cacheable ESM chunks. If any dependency it scans has invalid JavaScript syntax, this isn't a per-page error &mdash; we measured it crashing the entire Node process, taking the dev server down completely. We reproduced the crash, confirmed the server stays dead until restarted, and measured the config fix that turns it into a recoverable, per-module error instead.</p>
+<h2>1. The crash: one broken dependency kills the whole server</h2>
+<p>We created a minimal package under <code>node_modules/broken-dep</code> with a syntax error, imported it from <code>main.js</code>, and started <code>vite</code>:</p>
+<pre><code>// node_modules/broken-dep/index.js
+export function x() {
+  return (((broken
+}</code></pre>
+<pre><code>$ vite --port 8963
+  VITE v8.3.2  ready in 149 ms
+  &#8227;  Local:   http://127.0.0.1:8963/
+file:///.../node_modules/vite/dist/node/chunks/node.js:7581
+    const wrapper = new Error(summary);
+                    ^
+Error: Transform failed with 1 error:
+[PARSE_ERROR] Expected `,` or `)` but found `}`
+   &#9474; node_modules/broken-dep/index.js:3:1
+    at transformWithOxc (...)
+    at extractExportsData (...)
+    at async prepareRolldownOptimizerRun (...)
+
+Node.js v24.21.0</code></pre>
+<p>We then checked the homepage with curl: connection refused. <code>ps aux</code> confirmed the <code>node</code> process was gone entirely &mdash; this is an uncaught exception during the dependency scan, and Node's default behaviour for an uncaught exception is to terminate the process. There is no dev server left to serve any page, not just the one that imports the broken package.</p>
+
+<h2>2. Why this is different from "Failed to resolve import"</h2>
+<p>A <em>missing</em> dependency (a typo'd package name, or one that isn't installed) does <strong>not</strong> crash the server &mdash; Vite returns a normal per-request 500 with <code>Failed to resolve import "X" from "Y". Does the file exist?</code> and keeps running (see <a href="/guides/vite-failed-to-resolve-import/">Vite: Failed to resolve import</a> for that case). The crash in this guide is specifically about a dependency that <strong>exists and gets scanned</strong>, but fails to parse during the pre-bundling step &mdash; a corrupted install, a package built for a newer JS syntax than your toolchain expects, or (realistically) a local <code>file:</code>/<code>link:</code> dependency you're actively editing and briefly left in a broken state.</p>
+
+<h2>3. The fix: optimizeDeps.exclude</h2>
+<p>Excluding the offending package from pre-bundling in <code>vite.config.js</code> stops Vite from parsing it during the startup scan:</p>
+<pre><code>export default {
+  optimizeDeps: { exclude: ["broken-dep"] }
+}</code></pre>
+<p>We restarted with this config: <code>VITE ready</code>, and the homepage request succeeded (HTTP 200) &mdash; the server stayed alive this time. Requesting the broken module directly now gets a scoped, non-fatal error logged to the terminal instead of a crash:</p>
+<pre><code>14:19:00 [vite] (client) Pre-transform error: Failed to parse source for import analysis
+because the content contains invalid JS syntax.
+  Plugin: vite:import-analysis
+  File: /tmp/.../node_modules/broken-dep/index.js?v=642cbf24:1:0</code></pre>
+<p><code>ps</code> confirmed the Node process was still running after this request. The page using that specific import still won't work &mdash; the dependency is genuinely broken &mdash; but every other page on the site keeps working, and you don't have to restart the whole dev server to keep iterating.</p>
+
+<h2>4. General dependency-optimization troubleshooting checklist</h2>
+<table>
+<tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr>
+<tr><td>Dev server exits immediately on startup, stack trace mentions the optimizer/transform step</td><td>A scanned dependency has invalid syntax</td><td>Find the package named in the stack trace; add it to <code>optimizeDeps.exclude</code>, reinstall it, or pin a working version</td></tr>
+<tr><td>Browser console: "Outdated Optimize Dep" / 504</td><td>A new dependency was discovered mid-session after the page already loaded, and Vite had to re-run the scan</td><td>Reload the page once; Vite's own client auto-retries this in practice</td></tr>
+<tr><td>Stale or wrong pre-bundled output after editing a local/linked package</td><td>The optimizer cache in <code>node_modules/.vite</code> didn't notice the change</td><td>Delete <code>node_modules/.vite</code> and restart, or run <code>vite --force</code></td></tr>
+<tr><td>One specific package always triggers slow re-optimization</td><td>Vite didn't detect it as a dependency upfront (common for deep/dynamic imports)</td><td>Add it to <code>optimizeDeps.include</code> so it's scanned eagerly on startup</td></tr>
+</table>
+<p>Related: for an import Vite can't find on disk at all, see <a href="/guides/vite-failed-to-resolve-import/">Vite: Failed to resolve import</a>.</p>
+<aside class="cta"><strong>Check the status and headers your dev server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why did my whole Vite dev server crash instead of just one page breaking?</summary><p>Dependency pre-bundling happens once at server startup, scanning all of node_modules up front. We measured that a syntax error in any scanned package throws an uncaught exception at that point, and Node&#x27;s default behaviour for an uncaught exception is to exit the whole process - there&#x27;s no server left, not just a broken page.</p></details>
+<details><summary>Does excluding the broken package from optimizeDeps actually fix the code, or just the crash?</summary><p>Just the crash. We measured that with optimizeDeps.exclude, the server stays alive and every other page works, but requesting the excluded package&#x27;s own broken module still fails with a Pre-transform error - the underlying syntax error in that dependency still needs fixing or replacing.</p></details>
+<details><summary>What does &#x27;504 (Outdated Optimize Dep)&#x27; mean and is it related to this crash?</summary><p>It&#x27;s a different, much more common and non-fatal issue: Vite discovers a new dependency after the dev server already started, has to re-run the optimizer, and a request made against the old pre-bundle version briefly 404s/504s. A page reload resolves it. It does not crash the process, unlike the syntax-error case in this guide.</p></details>
+<details><summary>Why does this happen with a local/linked package but not a normal npm install?</summary><p>Normal npm-published packages are built/transpiled before publishing, so they&#x27;re far less likely to contain syntax your toolchain can&#x27;t parse. A package you&#x27;re actively editing via npm link or a file: dependency can easily be saved mid-edit with a syntax error, which is the realistic way most developers hit this crash.</p></details>
+<details><summary>Is this specific to Vite&#x27;s new Rolldown/Oxc-based optimizer, or did esbuild do the same thing?</summary><p>We only measured this on Vite 8.3.2&#x27;s Rolldown/Oxc toolchain (the default as of this version). esbuild, the optimizer in older Vite versions, also throws on invalid syntax during pre-bundling - the underlying crash mechanism (an uncaught exception killing the Node process) is a Node.js behaviour, not specific to either bundler.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Vite 8.3.2 (Rolldown + Oxc, the native-toolchain optimizer that replaced esbuild) and Node.js v24.21.0 on Linux, using a minimal vanilla-JS project with a hand-crafted broken package under node_modules/. Server logs below are copy-pasted verbatim; process liveness was confirmed with ps between requests. PlainHeaders is our extension; Node.js and Vite are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

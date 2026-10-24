@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ERR_CACHE_MISS: Confirm Form Resubmission Fix (Tested)</title>
+<meta name="description" content="We POSTed a form in Chromium 153, then went back and reloaded. no-store gives ERR_CACHE_MISS; reload re-POSTs. A 303 redirect (PRG) fixes both. Counts inside.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-cache-miss-confirm-form-resubmission/">
+<meta property="og:title" content="ERR_CACHE_MISS: Confirm Form Resubmission Fix (Tested)">
+<meta property="og:description" content="We POSTed a form in Chromium 153, then went back and reloaded. no-store gives ERR_CACHE_MISS; reload re-POSTs. A 303 redirect (PRG) fixes both. Counts inside.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-cache-miss-confirm-form-resubmission/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes net::ERR_CACHE_MISS?", "acceptedAnswer": {"@type": "Answer", "text": "Going back or forward to a page that came from a POST when the browser has no stored copy. In our Chromium 153 test it happened when the POST response had Cache-Control: no-store. Without no-store the page came from cache."}}, {"@type": "Question", "name": "Does pressing reload send the form again?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. In our test every reload of a POST result page sent the POST again. Reloading the ERR_CACHE_MISS page itself sent a POST with an empty body (Content-Length: 0)."}}, {"@type": "Question", "name": "How do I stop Confirm Form Resubmission on my site?", "acceptedAnswer": {"@type": "Answer", "text": "Use Post/Redirect/Get. Answer the POST with 303 See Other to a GET URL. In our test that cut the server POST count from 3 to 1 across two reloads and three back/forward moves."}}, {"@type": "Question", "name": "Can I use 307 or 308 for Post/Redirect/Get?", "acceptedAnswer": {"@type": "Answer", "text": "No. 307 and 308 keep the method. Chromium sent POST to the redirect target and re-POSTed on reload. Use 303. 302 also turned into GET in our test, but 303 is the one meant for this."}}, {"@type": "Question", "name": "Does history.replaceState fix it?", "acceptedAnswer": {"@type": "Answer", "text": "It worked in our test if you replace the URL with one that answers GET. Replacing with the same POST URL made reload send GET /submit, which returned 405. A server-side 303 is more reliable."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ERR_CACHE_MISS / Confirm Form Resubmission (tested)</h1>
+<p class="lead"><code>net::ERR_CACHE_MISS</code> with the heading <strong>Confirm Form Resubmission</strong> appears when you go back or forward to a page that was the answer to a POST, and the browser has no stored copy. We reproduced it in Chromium 153, counted how often the server got the POST again, and tested the fixes.</p>
+<h2>1. What the error means</h2>
+<p>A page you get from submitting a form is the result of a POST. To show it again, the browser can either use a stored copy or send the POST again. Sending it again could repeat an order or a payment, so Chrome will not do that on back or forward. If it has no stored copy, it shows an error page instead.</p>
+<p>This is the exact text Chromium 153 showed on back navigation in our test:</p>
+<pre><code>Confirm Form Resubmission
+
+This web page requires data that you entered earlier in order to be
+properly displayed. You can send this data again, but by doing so you
+will repeat any action this page previously performed.
+
+Press the reload button to resubmit the data needed to load the page.
+ERR_CACHE_MISS</code></pre>
+<p>It is not a server error. Your server never sees a request when this page appears.</p>
+
+<h2>2. Our test setup</h2>
+<p>A Node server served a form at <code>/form</code> that POSTs to <code>/submit</code>. The server counted every POST. Playwright then did: submit, reload, go to another page, back, reload, forward, back. We changed only the POST response between runs.</p>
+<p>In Playwright, the failed back navigation throws <code>page.goBack: net::ERR_CACHE_MISS</code> and the page URL becomes <code>chrome-error://chromewebdata/</code>. Note: the default Playwright headless shell renders an empty error page (39 bytes, no text). The full Chromium build in headless mode (<code>channel: 'chromium'</code>) rendered the full text above.</p>
+
+<h2>3. Results: what back and reload do after a POST</h2>
+<table>
+<tr><th>POST response</th><th>Back / forward to result</th><th>Reload of result</th><th>Total POSTs for 1 submit</th></tr>
+<tr><td>200, no Cache-Control</td><td>Shown from cache, 0 new POSTs</td><td>Re-POSTs (same body), no prompt in headless</td><td>3</td></tr>
+<tr><td>200, <code>Cache-Control: no-cache</code></td><td>Shown from cache, 0 new POSTs</td><td>Re-POSTs</td><td>3</td></tr>
+<tr><td>200, <code>Cache-Control: no-store</code></td><td><strong>net::ERR_CACHE_MISS</strong>, Confirm Form Resubmission</td><td>Re-POSTs</td><td>3</td></tr>
+<tr><td>303 to <code>/done</code> (PRG)</td><td>GET page, 0 POSTs</td><td>GET <code>/done</code>, 0 POSTs</td><td><strong>1</strong></td></tr>
+<tr><td>302 to <code>/done</code></td><td>GET page, 0 POSTs</td><td>GET <code>/done</code>, 0 POSTs</td><td>1</td></tr>
+<tr><td>307 to <code>/done</code></td><td>From cache, 0 POSTs</td><td>Re-POSTs to <code>/done</code></td><td>4</td></tr>
+<tr><td>200 + <code>history.replaceState</code> to <code>/done</code></td><td>GET page, 0 POSTs</td><td>GET <code>/done</code>, 0 POSTs</td><td>1</td></tr>
+</table>
+<p>"Total POSTs" is over the whole run of submit, two reloads and three back/forward moves. Three findings stand out:</p>
+<ul>
+<li><strong>no-store is what triggers ERR_CACHE_MISS.</strong> Without it (or with <code>no-cache</code>), Chromium showed the stored copy on back. <code>performance</code> reported <code>back_forward</code> and <code>pageshow</code> had <code>persisted=false</code>, so this was the HTTP cache, not the back/forward cache. See <a href="/guides/cache-control-no-cache-vs-no-store/">no-cache vs no-store</a>.</li>
+<li><strong>Reload always re-POSTs the result page.</strong> Every reload sent the POST again with <code>Cache-Control: max-age=0</code>. Playwright's <code>page.reload()</code> got no dialog event. A headed Chrome shows a "Confirm Form Resubmission" prompt first (per Chrome's behaviour, not measured here).</li>
+<li><strong>Reloading the no-store error page sent an empty POST.</strong> The request had <code>Content-Length: 0</code> and no <code>Content-Type</code>. The form data was gone. Your handler should reject that, not process it.</li>
+</ul>
+
+<h2>4. The fix: Post/Redirect/Get with 303</h2>
+<p>Answer a successful POST with a redirect to a normal GET page. The history entry then holds the GET URL, not the POST.</p>
+<pre><code>// Node / Express
+app.post('/order', async (req, res) =&gt; {
+  const id = await saveOrder(req.body);
+  res.redirect(303, `/order/${id}`);   // See Other: browser follows with GET
+});</code></pre>
+<pre><code>&lt;?php // PHP
+save_order($_POST);
+header('Location: /order/' . $id, true, 303);
+exit;</code></pre>
+<p>With 303, our run sent exactly 1 POST. Two reloads and three back/forward moves all became <code>GET /done</code>. No ERR_CACHE_MISS. 302 behaved the same in Chromium. <strong>307 does not work</strong>: it keeps the method, so Chromium sent <code>POST /done</code> and every reload re-POSTed. Per RFC 9110, 308 also keeps the method (not measured here). See <a href="/guides/301-vs-302-vs-307-vs-308-redirect/">301 vs 302 vs 307 vs 308</a>.</p>
+<p>Use 303 for PRG. Per RFC 9110 it is the status meant for "go GET this other URL". If the redirect does not fire at all in PHP, see <a href="/guides/php-header-location-redirect-not-working/">PHP header Location not working</a>.</p>
+
+<h2>5. Does history.replaceState after the POST help?</h2>
+<p>Partly. We added this script to the 200 result page:</p>
+<pre><code>&lt;script&gt;history.replaceState(null, '', '/done');&lt;/script&gt;</code></pre>
+<p>Chromium then treated the entry as a GET to <code>/done</code>. Reload and back sent GETs, and the run had 1 POST total. But two catches:</p>
+<ul>
+<li>The new URL must work as a GET. When we replaced with the same URL (<code>location.href</code>, i.e. <code>/submit</code>), reload and back sent <code>GET /submit</code> and our server answered <a href="/guides/405-method-not-allowed/">405</a>.</li>
+<li>It needs JavaScript and runs after the page loads. A 303 works for every client. Use replaceState only when you cannot change the server.</li>
+</ul>
+
+<h2>6. Other fixes and when to use them</h2>
+<ul>
+<li><strong>Remove <code>no-store</code> from POST results</strong> if the page holds nothing sensitive. Back then works from cache. Reload still re-POSTs.</li>
+<li><strong>Use GET for searches and filters.</strong> They do not change anything, so put the fields in the query string. Back and reload are then always safe.</li>
+<li><strong>Make POST handlers idempotent.</strong> Use a one-time token in a hidden field and ignore a second submit with the same token. This protects you even when a user forces a resubmit.</li>
+<li><strong>Submit with fetch().</strong> A form sent via <code>fetch</code> does not create a POST history entry (per the HTML spec, not measured). Update the page or navigate to a GET URL afterwards.</li>
+</ul>
+<p>As a user who just sees the error: press reload only if you are fine sending the form again. Otherwise go back to the form page and start over.</p>
+<aside class="cta"><strong>Check which Cache-Control and redirect status your form handler really sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes net::ERR_CACHE_MISS?</summary><p>Going back or forward to a page that came from a POST when the browser has no stored copy. In our Chromium 153 test it happened when the POST response had Cache-Control: no-store. Without no-store the page came from cache.</p></details>
+<details><summary>Does pressing reload send the form again?</summary><p>Yes. In our test every reload of a POST result page sent the POST again. Reloading the ERR_CACHE_MISS page itself sent a POST with an empty body (Content-Length: 0).</p></details>
+<details><summary>How do I stop Confirm Form Resubmission on my site?</summary><p>Use Post/Redirect/Get. Answer the POST with 303 See Other to a GET URL. In our test that cut the server POST count from 3 to 1 across two reloads and three back/forward moves.</p></details>
+<details><summary>Can I use 307 or 308 for Post/Redirect/Get?</summary><p>No. 307 and 308 keep the method. Chromium sent POST to the redirect target and re-POSTed on reload. Use 303. 302 also turned into GET in our test, but 303 is the one meant for this.</p></details>
+<details><summary>Does history.replaceState fix it?</summary><p>It worked in our test if you replace the URL with one that answers GET. Replacing with the same POST URL made reload send GET /submit, which returned 405. A server-side 303 is more reliable.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Chromium 153.0.8010.12 driven by Playwright (both the default headless shell and the full &#x27;chromium&#x27; channel in headless mode) against a Node.js 24.21.0 test server that counted every POST. The headed Chrome reload dialog was not measured. PlainHeaders is our extension; Chromium, Playwright and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

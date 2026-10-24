@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>struct.error: unpack requires a buffer of N bytes (Tested)</title>
+<meta name="description" content="We measured the four causes of Python&#x27;s struct unpack buffer error: native alignment padding, a short last read, too many bytes, and text-mode writes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-struct-error-unpack-requires-a-buffer-of-n-bytes/">
+<meta property="og:title" content="struct.error: unpack requires a buffer of N bytes (Tested)">
+<meta property="og:description" content="We measured the four causes of Python&#x27;s struct unpack buffer error: native alignment padding, a short last read, too many bytes, and text-mode writes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-struct-error-unpack-requires-a-buffer-of-n-bytes/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does struct.error: unpack requires a buffer of N bytes mean?", "acceptedAnswer": {"@type": "Answer", "text": "The buffer length doesn't equal struct.calcsize(fmt). We measured the same message for both too few and too many bytes."}}, {"@type": "Question", "name": "Why is struct.calcsize larger than my fields add up to?", "acceptedAnswer": {"@type": "Answer", "text": "Without a byte-order prefix, struct uses native alignment. We measured 'HI' as 8 bytes and '<HI' as 6. Use <, >, = or ! for file and network formats."}}, {"@type": "Question", "name": "How do I unpack only the start of a larger buffer?", "acceptedAnswer": {"@type": "Answer", "text": "struct.unpack_from(fmt, buf, offset). We measured unpack failing on 13 bytes and unpack_from returning the first field."}}, {"@type": "Question", "name": "Why did my binary file come back with extra bytes?", "acceptedAnswer": {"@type": "Answer", "text": "It was written in text mode, so characters above 0x7F were UTF-8 encoded. We measured 4 intended bytes reading back as 5."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>struct.error: unpack requires a buffer of N bytes (tested)</h1>
+<p class="lead"><code>struct.error: unpack requires a buffer of 8 bytes</code> (or 4, or 16) means your buffer's length isn't exactly what the format needs. We measured the four ways that happens on Python 3.13.5, including one where your fields add up to 6 and struct wants 8.</p>
+<h2 id="rule">The rule</h2>
+<p><code>struct.unpack(fmt, buf)</code> needs <code>len(buf) == struct.calcsize(fmt)</code> exactly. Not at least: exactly. The message is the same whether you passed too few bytes or too many, so print <code>len(buf)</code> and <code>struct.calcsize(fmt)</code> first.</p>
+
+<h2 id="padding">1. Native alignment adds padding bytes</h2>
+<pre><code>import struct
+
+data = b&quot;\x01\x00\x02\x00\x00\x00&quot;          # a uint16 and a uint32, 6 bytes
+for fmt in [&quot;HI&quot;, &quot;&lt;HI&quot;, &quot;=HI&quot;]:
+    print(fmt, &quot;calcsize =&quot;, struct.calcsize(fmt), end=&quot; -&gt; &quot;)
+    try:
+        print(struct.unpack(fmt, data))
+    except struct.error as e:
+        print(&quot;struct.error:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>HI calcsize = 8 -&gt; struct.error: unpack requires a buffer of 8 bytes
+&lt;HI calcsize = 6 -&gt; (1, 2)
+=HI calcsize = 6 -&gt; (1, 2)</code></pre>
+<p><strong>Measured on Python 3.13.5 (x86-64 Linux):</strong> without a prefix, <code>"HI"</code> is 8 bytes, not 6: native mode aligns the 4-byte <code>I</code> to a 4-byte boundary, inserting 2 pad bytes. <code>&lt;</code>, <code>&gt;</code>, <code>=</code> or <code>!</code> turn alignment off. For file formats and network data, always use one of those (and pick the byte order the format specifies). More in <a href="/guides/python-struct-native-format-padding-breaks-unpack/">native format padding breaks unpack</a>.</p>
+
+<h2 id="short">2. The last read is short</h2>
+<pre><code>import struct, io
+
+f = io.BytesIO(b&quot;\x01\x00\x00\x00&quot; * 2 + b&quot;\x01\x00&quot;)   # 2.5 records of 4 bytes
+while chunk := f.read(4):
+    try:
+        print(struct.unpack(&quot;&lt;I&quot;, chunk))
+    except struct.error as e:
+        print(&quot;struct.error:&quot;, e, &quot;| got&quot;, len(chunk), &quot;bytes&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>(1,)
+(1,)
+struct.error: unpack requires a buffer of 4 bytes | got 2 bytes</code></pre>
+<p><strong>Measured:</strong> a file that isn't a whole number of records fails on the last chunk. <code>f.read(4)</code> returns up to 4 bytes, so check <code>len(chunk)</code> and decide whether a partial record means a truncated file (error) or a trailing remainder (skip). Sockets are worse: <code>recv(4)</code> can return fewer bytes even mid-stream, so loop until you have them.</p>
+
+<h2 id="long">3. Too many bytes gives the same error</h2>
+<pre><code>import struct
+
+data = b&quot;\x01\x00\x00\x00\x02\x00\x00\x00extra&quot;
+try:
+    struct.unpack(&quot;&lt;I&quot;, data)
+except struct.error as e:
+    print(&quot;unpack:&quot;, e)
+print(&quot;unpack_from:&quot;, struct.unpack_from(&quot;&lt;I&quot;, data))
+print(&quot;iter_unpack:&quot;, list(struct.iter_unpack(&quot;&lt;I&quot;, data[:8])))</code></pre>
+<p>Output:</p>
+<pre><code>unpack: unpack requires a buffer of 4 bytes
+unpack_from: (1,)
+iter_unpack: [(1,), (2,)]</code></pre>
+<p><strong>Measured:</strong> 13 bytes for a 4-byte format raises <code>unpack requires a buffer of 4 bytes</code>. To read a header from a larger buffer use <code>unpack_from()</code> (it ignores the rest; see <a href="/guides/python-struct-unpack-from-silently-ignores-trailing-bytes/">unpack_from silently ignores trailing bytes</a>). For a run of records, <code>iter_unpack()</code>, which needs a multiple of the size.</p>
+
+<h2 id="text">4. The bytes went through text mode</h2>
+<pre><code>import struct
+
+with open(&quot;/tmp/st/rec.bin&quot;, &quot;w&quot;) as f:       # text mode by mistake
+    f.write(&quot;\x01\x00\x00\x80&quot;)
+with open(&quot;/tmp/st/rec.bin&quot;, &quot;rb&quot;) as f:
+    raw = f.read()
+print(len(raw), raw)
+try:
+    print(struct.unpack(&quot;&lt;I&quot;, raw))
+except struct.error as e:
+    print(&quot;struct.error:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>5 b&#x27;\x01\x00\x00\xc2\x80&#x27;
+struct.error: unpack requires a buffer of 4 bytes</code></pre>
+<p><strong>Measured:</strong> 4 &ldquo;bytes&rdquo; written with text-mode <code>open(..., "w")</code> came back as 5: <code>\x80</code> was UTF-8 encoded as <code>c2 80</code>. Write binary data with <code>"wb"</code> and <code>bytes</code>, never <code>str</code>.</p>
+
+<aside class="cta"><strong>Parsing binary data from HTTP responses? Check the real Content-Length and headers first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does struct.error: unpack requires a buffer of N bytes mean?</summary><p>The buffer length doesn&#x27;t equal struct.calcsize(fmt). We measured the same message for both too few and too many bytes.</p></details>
+<details><summary>Why is struct.calcsize larger than my fields add up to?</summary><p>Without a byte-order prefix, struct uses native alignment. We measured &#x27;HI&#x27; as 8 bytes and &#x27;&lt;HI&#x27; as 6. Use &lt;, &gt;, = or ! for file and network formats.</p></details>
+<details><summary>How do I unpack only the start of a larger buffer?</summary><p>struct.unpack_from(fmt, buf, offset). We measured unpack failing on 13 bytes and unpack_from returning the first field.</p></details>
+<details><summary>Why did my binary file come back with extra bytes?</summary><p>It was written in text mode, so characters above 0x7F were UTF-8 encoded. We measured 4 intended bytes reading back as 5.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on x86-64 Linux: native vs prefixed formats, a file with a partial last record, too-long buffers with unpack, unpack_from and iter_unpack, and binary data written in text mode. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

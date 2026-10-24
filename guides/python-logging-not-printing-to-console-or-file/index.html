@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python Logging Not Printing to Console or File? (Tested Fixes)</title>
+<meta name="description" content="We measured why Python logging shows nothing: default WARNING level, basicConfig silently ignored (force=True), logger vs handler level, missing log file.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-logging-not-printing-to-console-or-file/">
+<meta property="og:title" content="Python Logging Not Printing to Console or File? (Tested Fixes)">
+<meta property="og:description" content="We measured why Python logging shows nothing: default WARNING level, basicConfig silently ignored (force=True), logger vs handler level, missing log file.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-logging-not-printing-to-console-or-file/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is Python logging not printing to the console?", "acceptedAnswer": {"@type": "Answer", "text": "The default level is WARNING, so info() and debug() are dropped. We measured only the warning appearing on Python 3.13.5. Call logging.basicConfig(level=logging.INFO) at startup."}}, {"@type": "Question", "name": "Why does logging.basicConfig not work?", "acceptedAnswer": {"@type": "Answer", "text": "It does nothing if the root logger already has a handler, which an earlier logging.warning() call (often in a library) creates implicitly. We measured the second call being ignored; basicConfig(..., force=True) fixes it."}}, {"@type": "Question", "name": "Why is Python logging not writing to file?", "acceptedAnswer": {"@type": "Answer", "text": "Either basicConfig was ignored (no file was created in our test until force=True) or the relative filename went to a different working directory. Use force=True and an absolute path."}}, {"@type": "Question", "name": "Why does my log message print twice?", "acceptedAnswer": {"@type": "Answer", "text": "A handler on your logger plus one on the root logger, with propagation on. We measured the duplicate and propagate = False removing it."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python logging not printing to console or file (tested)</h1>
+<p class="lead">Python <code>logging</code> that prints nothing, or never creates its log file, almost always comes down to one of five things. We measured each on Python 3.13.5.</p>
+<h2 id="level">1. Nothing configured: only WARNING and above show</h2>
+<pre><code>import logging
+log = logging.getLogger(&quot;app&quot;)
+log.debug(&quot;debug message&quot;)
+log.info(&quot;info message&quot;)
+log.warning(&quot;warning message&quot;)
+print(&quot;effective level:&quot;, logging.getLevelName(log.getEffectiveLevel()))</code></pre>
+<p>Output:</p>
+<pre><code>warning message
+effective level: WARNING</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> with no configuration, the effective level is <code>WARNING</code>, so <code>debug()</code> and <code>info()</code> print nothing. The warning that does appear comes from logging's built-in "last resort" handler (bare message, no level prefix, on stderr). Call <code>logging.basicConfig(level=logging.INFO)</code> once at startup.</p>
+
+<h2 id="basicconfig">2. basicConfig() silently does nothing the second time</h2>
+<pre><code>import logging
+logging.warning(&quot;an import or library logged first&quot;)   # implicitly calls basicConfig()
+logging.basicConfig(level=logging.DEBUG, format=&quot;%(levelname)s %(message)s&quot;)   # silently ignored
+logging.getLogger(&quot;app&quot;).info(&quot;info message&quot;)
+logging.basicConfig(level=logging.DEBUG, format=&quot;%(levelname)s %(message)s&quot;, force=True)  # fix
+logging.getLogger(&quot;app&quot;).info(&quot;info message after force=True&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>WARNING:root:an import or library logged first
+INFO info message after force=True</code></pre>
+<p><strong>Measured:</strong> any call like <code>logging.warning()</code> on the root logger (often inside an imported library) runs <code>basicConfig()</code> implicitly. After that, your own <code>basicConfig(level=DEBUG, ...)</code> is a no-op with no error, so your level and format never apply. <code>force=True</code> (3.8+) removes the existing handlers and applies yours.</p>
+
+<h2 id="handler">3. Setting the handler's level isn't enough</h2>
+<pre><code>import logging, sys
+log = logging.getLogger(&quot;app&quot;)
+h = logging.StreamHandler(sys.stdout)
+h.setLevel(logging.DEBUG)
+log.addHandler(h)
+log.info(&quot;handler is DEBUG, logger is not set&quot;)      # dropped: logger level wins first
+log.setLevel(logging.DEBUG)
+log.info(&quot;now the logger is DEBUG too&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>now the logger is DEBUG too</code></pre>
+<p><strong>Measured:</strong> a record must pass the <em>logger's</em> level before any handler sees it. The handler was <code>DEBUG</code> but the logger was still at the inherited <code>WARNING</code>, so the first <code>info()</code> was dropped. Set both: <code>log.setLevel(logging.DEBUG)</code>.</p>
+
+<h2 id="file">4. Not writing to a file</h2>
+<pre><code>import logging, os
+os.makedirs(&quot;/tmp/lg/run&quot;, exist_ok=True); os.chdir(&quot;/tmp/lg/run&quot;)
+logging.warning(&quot;something logged before setup&quot;)
+logging.basicConfig(filename=&quot;app.log&quot;, level=logging.INFO)    # ignored: root already has a handler
+logging.info(&quot;should go to app.log&quot;)
+print(&quot;app.log exists:&quot;, os.path.exists(&quot;app.log&quot;))
+logging.basicConfig(filename=&quot;app.log&quot;, level=logging.INFO, force=True)
+logging.info(&quot;goes to app.log&quot;)
+logging.shutdown()
+print(&quot;app.log:&quot;, open(&quot;app.log&quot;).read().strip())
+print(&quot;relative to cwd:&quot;, os.path.abspath(&quot;app.log&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>WARNING:root:something logged before setup
+app.log exists: False
+app.log: INFO:root:goes to app.log
+relative to cwd: /tmp/lg/run/app.log</code></pre>
+<p><strong>Measured:</strong> <code>basicConfig(filename="app.log")</code> after an earlier log call creates no file at all, for the same reason as section 2; <code>force=True</code> fixes it. A relative filename is resolved against the <em>current working directory</em>, not the script's folder, so under cron, systemd or an IDE the file may be somewhere you aren't looking. Use an absolute path. Output is written as each record is logged; <code>logging.shutdown()</code> (run automatically at exit) closes the file.</p>
+
+<h2 id="twice">5. The opposite: every message printed twice</h2>
+<pre><code>import logging, sys
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, format=&quot;%(name)s: %(message)s&quot;)
+log = logging.getLogger(&quot;app&quot;)
+log.addHandler(logging.StreamHandler(sys.stdout))   # one more handler
+log.info(&quot;printed twice&quot;)
+log.propagate = False
+log.info(&quot;printed once&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>printed twice
+app: printed twice
+printed once</code></pre>
+<p><strong>Measured:</strong> a handler on <code>app</code> plus a handler on the root logger prints each record twice, because records propagate up to the root. Add handlers in one place only, or set <code>propagate = False</code> on the child logger.</p>
+
+<aside class="cta"><strong>Logging HTTP calls? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is Python logging not printing to the console?</summary><p>The default level is WARNING, so info() and debug() are dropped. We measured only the warning appearing on Python 3.13.5. Call logging.basicConfig(level=logging.INFO) at startup.</p></details>
+<details><summary>Why does logging.basicConfig not work?</summary><p>It does nothing if the root logger already has a handler, which an earlier logging.warning() call (often in a library) creates implicitly. We measured the second call being ignored; basicConfig(..., force=True) fixes it.</p></details>
+<details><summary>Why is Python logging not writing to file?</summary><p>Either basicConfig was ignored (no file was created in our test until force=True) or the relative filename went to a different working directory. Use force=True and an absolute path.</p></details>
+<details><summary>Why does my log message print twice?</summary><p>A handler on your logger plus one on the root logger, with propagation on. We measured the duplicate and propagate = False removing it.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: the default WARNING level and last-resort handler, basicConfig ignored after an implicit call and force=True, logger vs handler levels, a file handler that never creates its file, relative log paths, and duplicate output from propagation. Every block was run verbatim and its output pasted from that run (stdout and stderr together). PlainHeaders is our extension; everything else here is the standard library.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

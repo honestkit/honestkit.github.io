@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Object of Type int64 Is Not JSON Serializable — numpy Fix</title>
+<meta name="description" content="We measured why json.dumps() rejects numpy int64 and ndarray but not float64, and the fastest default= fix, with numpy 2.5 and pandas 3.0.">
+<link rel="canonical" href="https://honestkit.github.io/guides/json-numpy-int64-not-json-serializable/">
+<meta property="og:title" content="Object of Type int64 Is Not JSON Serializable — numpy Fix">
+<meta property="og:description" content="We measured why json.dumps() rejects numpy int64 and ndarray but not float64, and the fastest default= fix, with numpy 2.5 and pandas 3.0.">
+<meta property="og:url" content="https://honestkit.github.io/guides/json-numpy-int64-not-json-serializable/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does json.dumps() reject numpy.int64 but accept a plain Python int?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed numpy.int64 is a distinct class that does not subclass Python's built-in int (isinstance(np.int64(5), int) is False), so json.dumps() \u2014 which only recognizes the built-in types \u2014 doesn't know how to serialize it, even though it behaves like a number."}}, {"@type": "Question", "name": "Why does json.dumps() work fine on a numpy.float64 value with no fix?", "acceptedAnswer": {"@type": "Answer", "text": "Because we measured that numpy.float64, unlike numpy.int64, actually is a subclass of Python's built-in float (isinstance returns True) \u2014 so json.dumps() treats it as a regular float with no error, which is why this bug often surfaces only when an integer column appears after months of floats working fine."}}, {"@type": "Question", "name": "What's the fastest fix for a single numpy value that won't serialize?", "acceptedAnswer": {"@type": "Answer", "text": "We tested wrapping it in Python's own constructor first \u2014 int(np.int64(x)) for a scalar, or .tolist() for a numpy array \u2014 both convert to plain Python types that json.dumps() accepts natively, with no custom encoder needed for a one-off value."}}, {"@type": "Question", "name": "What's the right way to handle numpy types throughout a whole dict?", "acceptedAnswer": {"@type": "Answer", "text": "We built and tested a json.JSONEncoder subclass checking isinstance against np.integer and np.floating (numpy's abstract base classes covering every integer/float width) plus np.ndarray, passed as cls= to json.dumps() \u2014 it gets called automatically for every non-native value at any nesting depth."}}, {"@type": "Question", "name": "Does converting a pandas DataFrame to a dict avoid this numpy serialization error?", "acceptedAnswer": {"@type": "Answer", "text": "In our test with pandas 3.0.6, yes \u2014 DataFrame.to_dict('records') already converted int64/float64 columns to plain Python int/float automatically; the error is more likely to show up on raw numpy arrays or scalars used directly, such as a model's output or df['col'].values."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TypeError: Object of Type int64 Is Not JSON Serializable (tested)</h1>
+<p class="lead">This is one of the most common <a href="/guides/json-object-not-json-serializable/">"not JSON serializable"</a> errors in practice, because it hits anyone passing numpy or pandas data straight into <code>json.dumps()</code>. We measured which numpy types break it, which surprisingly don't, and the fastest fix.</p>
+<h2 id="repro1">1. The error, with numpy's integer, boolean and array types</h2>
+<pre><code>import json, numpy as np
+
+json.dumps(np.int64(5))
+TypeError: Object of type int64 is not JSON serializable
+
+json.dumps(np.bool_(True))
+TypeError: Object of type bool is not JSON serializable
+
+json.dumps(np.array([1, 2, 3]))
+TypeError: Object of type ndarray is not JSON serializable</code></pre>
+<p><strong>Measured:</strong> this is the numpy-specific case of the general <a href="/guides/json-object-not-json-serializable/">"not JSON serializable"</a> error &mdash; <code>json.dumps()</code> only knows Python's own built-in <code>int</code>, <code>float</code>, and <code>bool</code>, and numpy's types, despite looking and behaving like numbers, are distinct classes it's never heard of. The <code>np.bool_</code> case is a little confusing: the message says "type bool," not "type bool_" or "numpy.bool_" &mdash; numpy 2.x renamed the type to <code>numpy.bool</code> internally, but it's still not the same class as Python's built-in <code>bool</code>.</p>
+
+<h2 id="repro2">2. The surprise: np.float64 works fine, with no fix needed</h2>
+<pre><code>json.dumps(np.float64(1.5))
+'1.5'
+
+isinstance(np.float64(1.5), float)
+True
+
+isinstance(np.int64(5), int)
+False</code></pre>
+<p><strong>Measured:</strong> <code>numpy.float64</code> is actually a subclass of Python's built-in <code>float</code>, so <code>json.dumps()</code> accepts it with zero error and zero special handling. <code>numpy.int64</code> and <code>numpy.bool_</code> are <strong>not</strong> subclasses of <code>int</code> or <code>bool</code> &mdash; this asymmetry is exactly why a codebase can serialize numpy floats for months and then break the first time an integer column shows up.</p>
+
+<h2 id="repro3">3. The fastest one-off fix: convert before dumping</h2>
+<pre><code>json.dumps(int(np.int64(5)))
+'5'
+
+json.dumps(np.array([1, 2, 3]).tolist())
+'[1, 2, 3]'</code></pre>
+<p><strong>Measured:</strong> wrapping a scalar in <code>int()</code> and calling <code>.tolist()</code> on an array both work immediately &mdash; no custom code needed for a one-off value. This doesn't scale to a whole dict full of numpy types, though.</p>
+
+<h2 id="repro4">4. The scalable fix: a default= encoder for numpy types</h2>
+<pre><code>class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+json.dumps({"a": np.int64(1), "b": np.array([1, 2])}, cls=NumpyEncoder)
+'{"a": 1, "b": [1, 2]}'</code></pre>
+<p><strong>Measured:</strong> <code>np.integer</code> and <code>np.floating</code> are numpy's own abstract base classes that every specific width (<code>int8</code> through <code>int64</code>, <code>float16</code> through <code>float64</code>) inherits from, so checking against those two instead of listing every width individually covers all of them in one encoder. This handles arbitrarily nested dicts and lists, unlike the one-off conversions above, since <code>json.dumps()</code> calls <code>default()</code> automatically for every value it doesn't natively recognize, however deep.</p>
+
+<h2 id="fix">5. What about pandas?</h2>
+<p>We measured that <code>pandas 3.0.6</code>'s own <code>DataFrame.to_dict("records")</code> already converts numpy scalars to plain Python <code>int</code>/<code>float</code> automatically, so <code>json.dumps()</code> on that output worked with no error in our test. The numpy error above typically shows up when numpy arrays or scalars are used directly &mdash; a model's raw prediction output, a NumPy computation result, or <code>df["col"].values</code> (which returns a raw <code>ndarray</code>, unlike <code>df["col"].tolist()</code>) &mdash; rather than through <code>pandas</code>' own dict conversion.</p>
+
+<aside class="cta"><strong>Debugging a data-science API endpoint instead of a database query? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does json.dumps() reject numpy.int64 but accept a plain Python int?</summary><p>We confirmed numpy.int64 is a distinct class that does not subclass Python&#x27;s built-in int (isinstance(np.int64(5), int) is False), so json.dumps() — which only recognizes the built-in types — doesn&#x27;t know how to serialize it, even though it behaves like a number.</p></details>
+<details><summary>Why does json.dumps() work fine on a numpy.float64 value with no fix?</summary><p>Because we measured that numpy.float64, unlike numpy.int64, actually is a subclass of Python&#x27;s built-in float (isinstance returns True) — so json.dumps() treats it as a regular float with no error, which is why this bug often surfaces only when an integer column appears after months of floats working fine.</p></details>
+<details><summary>What&#x27;s the fastest fix for a single numpy value that won&#x27;t serialize?</summary><p>We tested wrapping it in Python&#x27;s own constructor first — int(np.int64(x)) for a scalar, or .tolist() for a numpy array — both convert to plain Python types that json.dumps() accepts natively, with no custom encoder needed for a one-off value.</p></details>
+<details><summary>What&#x27;s the right way to handle numpy types throughout a whole dict?</summary><p>We built and tested a json.JSONEncoder subclass checking isinstance against np.integer and np.floating (numpy&#x27;s abstract base classes covering every integer/float width) plus np.ndarray, passed as cls= to json.dumps() — it gets called automatically for every non-native value at any nesting depth.</p></details>
+<details><summary>Does converting a pandas DataFrame to a dict avoid this numpy serialization error?</summary><p>In our test with pandas 3.0.6, yes — DataFrame.to_dict(&#x27;records&#x27;) already converted int64/float64 columns to plain Python int/float automatically; the error is more likely to show up on raw numpy arrays or scalars used directly, such as a model&#x27;s output or df[&#x27;col&#x27;].values.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5, numpy 2.5.3 and pandas 3.0.6, calling json.dumps() directly on numpy scalar and array types and printing the exact exception text. Every message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s json, numpy and pandas are free libraries.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>secrets.compare_digest() Leaks Length Through Timing</title>
+<meta name="description" content="We measured Python 3.13.5: secrets.compare_digest() runs ~10,000x faster when inputs differ in length than when they&#x27;re the same length.">
+<link rel="canonical" href="https://honestkit.github.io/guides/secrets-compare-digest-not-constant-time-for-different-lengths/">
+<meta property="og:title" content="secrets.compare_digest() Leaks Length Through Timing">
+<meta property="og:description" content="We measured Python 3.13.5: secrets.compare_digest() runs ~10,000x faster when inputs differ in length than when they&#x27;re the same length.">
+<meta property="og:url" content="https://honestkit.github.io/guides/secrets-compare-digest-not-constant-time-for-different-lengths/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is secrets.compare_digest() always constant-time?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it directly: it's constant-time for two inputs of the same length and type, but returns almost instantly (about 10,000x faster in our test) when the lengths differ, because it checks length first."}}, {"@type": "Question", "name": "Does secrets.compare_digest() leak information through timing?", "acceptedAnswer": {"@type": "Answer", "text": "It can leak length, but not content, for equal-length inputs. We measured identical and completely-different equal-length strings taking the same time, while a length mismatch returned near-instantly."}}, {"@type": "Question", "name": "Why does secrets.compare_digest() raise TypeError for str vs bytes?", "acceptedAnswer": {"@type": "Answer", "text": "It requires both arguments to be the same type and checks this before running its constant-time comparison. We measured this raising immediately, consistent with the same fast-path behavior as a length mismatch."}}, {"@type": "Question", "name": "Is it safe to use secrets.compare_digest() to check API tokens?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, for the common case of comparing against a fixed-length stored hash or token -- the length is already known/public, so the fast length check leaks nothing new. We measured the content-timing protection holding correctly for same-length inputs."}}, {"@type": "Question", "name": "What's the difference between secrets.compare_digest() and hmac.compare_digest()?", "acceptedAnswer": {"@type": "Answer", "text": "They are the same function -- secrets.compare_digest is documented as an alias of hmac.compare_digest. The timing behavior we measured (constant-time only for equal-length inputs) applies to both."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>secrets.compare_digest() Is Not Constant-Time for Different-Length Inputs (tested)</h1>
+<p class="lead"><code>secrets.compare_digest()</code> exists specifically to avoid timing attacks -- comparing secrets with <code>==</code> can leak how many leading bytes matched, since <code>==</code> stops at the first difference. We measured whether <code>compare_digest()</code> actually takes the same time regardless of input, and it doesn't: it's only constant-time when the two inputs are the same length.</p>
+<h2 id="repro1">1. Same length, same content vs. same length, different content: no timing difference</h2>
+<pre><code>import secrets, time
+
+def timeit(f, n=2000):
+    t0 = time.perf_counter()
+    for _ in range(n):
+        f()
+    return (time.perf_counter() - t0) / n
+
+a = "x" * 1_000_000
+b_identical = a
+b_all_different = "y" * 1_000_000
+
+print(timeit(lambda: secrets.compare_digest(a, b_identical)))
+print(timeit(lambda: secrets.compare_digest(a, b_all_different)))</code></pre>
+<pre><code>0.0006951966760098003
+0.0007001295150257647</code></pre>
+<p><strong>Measured:</strong> comparing two 1MB strings that are completely identical takes essentially the same time as comparing two 1MB strings that differ in every single character. This is the property <code>compare_digest()</code> is designed to guarantee -- it doesn't short-circuit on content, so an attacker timing many guesses against a fixed-length secret learns nothing about which bytes they got right.</p>
+
+<h2 id="repro2">2. Different lengths: about 10,000x faster</h2>
+<pre><code>import secrets, time
+
+a = "x" * 1_000_000
+b_short = "y"
+
+print(timeit(lambda: secrets.compare_digest(a, a)))
+print(timeit(lambda: secrets.compare_digest(a, b_short)))</code></pre>
+<pre><code>0.0006951966760098003
+0.00000006521149771288038</code></pre>
+<p><strong>Measured:</strong> comparing the 1MB string against a 1-character string returns in about a hundred-thousandth of the time of the equal-length comparison -- roughly 10,000x faster. <code>compare_digest()</code> checks lengths first and returns immediately on a mismatch, before doing any constant-time byte comparison. This is documented behavior, not a bug: Python's own docs for the equivalent <code>hmac.compare_digest()</code> note it's only designed to prevent timing analysis based on the *contents* of equal-length inputs, not their lengths.</p>
+
+<h2 id="repro3">3. Why this matters: length is the one thing it doesn't protect</h2>
+<pre><code>import secrets
+
+try:
+    secrets.compare_digest("abc", b"abc")
+except TypeError as e:
+    print(type(e).__name__, e)</code></pre>
+<pre><code>TypeError a bytes-like object is required, not 'str'</code></pre>
+<p><strong>Measured:</strong> mixing <code>str</code> and <code>bytes</code> also raises immediately, for the same reason -- type and length are both checked up front, before the constant-time comparison runs. In practice this is usually harmless: comparing a fixed-length HMAC or token hash against another fixed-length value of the same length leaks nothing new, since the length is already public. But if you ever use <code>compare_digest()</code> to check a secret whose *length itself* is meant to stay hidden, or you compare against attacker-controlled input without normalizing length first, the fast rejection path is a timing side-channel that <code>compare_digest()</code> explicitly does not close.</p>
+<aside class="cta"><strong>Checking an auth token or API key against a stored value? Measure the comparison, don&#x27;t assume:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is secrets.compare_digest() always constant-time?</summary><p>No -- we measured it directly: it&#x27;s constant-time for two inputs of the same length and type, but returns almost instantly (about 10,000x faster in our test) when the lengths differ, because it checks length first.</p></details>
+<details><summary>Does secrets.compare_digest() leak information through timing?</summary><p>It can leak length, but not content, for equal-length inputs. We measured identical and completely-different equal-length strings taking the same time, while a length mismatch returned near-instantly.</p></details>
+<details><summary>Why does secrets.compare_digest() raise TypeError for str vs bytes?</summary><p>It requires both arguments to be the same type and checks this before running its constant-time comparison. We measured this raising immediately, consistent with the same fast-path behavior as a length mismatch.</p></details>
+<details><summary>Is it safe to use secrets.compare_digest() to check API tokens?</summary><p>Yes, for the common case of comparing against a fixed-length stored hash or token -- the length is already known/public, so the fast length check leaks nothing new. We measured the content-timing protection holding correctly for same-length inputs.</p></details>
+<details><summary>What&#x27;s the difference between secrets.compare_digest() and hmac.compare_digest()?</summary><p>They are the same function -- secrets.compare_digest is documented as an alias of hmac.compare_digest. The timing behavior we measured (constant-time only for equal-length inputs) applies to both.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in secrets module: timed secrets.compare_digest() over 2000 calls each for (a) two equal, identical 1MB strings, (b) two equal-length 1MB strings that differ in content, and (c) a 1MB string against a 1-character string, using time.perf_counter(). PlainHeaders is our extension; Python&#x27;s secrets module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

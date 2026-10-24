@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MemoryError: Unable to Allocate GiB for an Array (pandas Fix)</title>
+<meta name="description" content="What NumPy&#x27;s Unable to allocate X GiB means, the merge blow-up that usually causes it in pandas, and how to cut memory 12x. Tested on pandas 2.3.3 and 3.1.0.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pandas-numpy-memoryerror-unable-to-allocate-gib/">
+<meta property="og:title" content="MemoryError: Unable to Allocate GiB for an Array (pandas Fix)">
+<meta property="og:description" content="What NumPy&#x27;s Unable to allocate X GiB means, the merge blow-up that usually causes it in pandas, and how to cut memory 12x. Tested on pandas 2.3.3 and 3.1.0.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pandas-numpy-memoryerror-unable-to-allocate-gib/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Unable to allocate X GiB for an array with shape mean?", "acceptedAnswer": {"@type": "Answer", "text": "NumPy computed rows x columns x bytes per item for the array you asked for and the system could not provide that much memory. Check whether the shape in the message is what you expected."}}, {"@type": "Question", "name": "Why does a pandas merge run out of memory?", "acceptedAnswer": {"@type": "Answer", "text": "Duplicate keys on both sides multiply: 2,000 rows by 3,000 rows on one shared key gives 6,000,000 rows. Use validate='many_to_one' or deduplicate the keys first."}}, {"@type": "Question", "name": "How do I reduce pandas memory usage?", "acceptedAnswer": {"@type": "Answer", "text": "Convert repeated strings to category, downcast integers and floats, load only the needed columns with usecols and dtype, or process the file with chunksize."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>MemoryError: Unable to allocate X GiB for an array (NumPy / pandas, tested)</h1>
+<p class="lead"><code>MemoryError: Unable to allocate 298. GiB for an array with shape (200000, 200000) and data type float64</code> is NumPy refusing an allocation it computed up front. If the size is absurd, the shape is wrong, often from a merge on duplicate keys. Otherwise shrink dtypes or read in chunks. Measured on pandas 2.3.3 and 3.1.0.</p>
+<h2 id="what">1. What the number means</h2>
+<pre><code>import numpy as np
+try:
+    a = np.zeros((200_000, 200_000))
+except MemoryError as e:
+    print(type(e).__name__, &quot;is a MemoryError:&quot;, isinstance(e, MemoryError))
+    print(e)
+print(200_000 * 200_000 * 8 / 2**30, &quot;GiB = rows * cols * 8 bytes (float64)&quot;)</code></pre>
+<p>Output (NumPy 2.5.4; identical with pandas 2.3.3 and 3.1.0 installed):</p>
+<pre><code>MemoryError is a MemoryError: True
+Unable to allocate 298. GiB for an array with shape (200000, 200000) and data type float64
+298.0232238769531 GiB = rows * cols * 8 bytes (float64)</code></pre>
+<p>Uncaught, the last traceback line reads <code>numpy._core._exceptions._ArrayMemoryError: Unable to allocate 298. GiB ...</code>. It is a subclass of <code>MemoryError</code>, so <code>except MemoryError</code> catches it. The size is just rows &times; columns &times; bytes per item, computed <em>before</em> any memory is used. When the number is far bigger than your data could possibly be, the shape is wrong, not your RAM: look at the shape in the message and find what made it that big.</p>
+<h2 id="merge">2. The usual hidden cause: a merge on duplicate keys</h2>
+<pre><code>import pandas as pd
+orders = pd.DataFrame({&quot;cust&quot;: [1] * 2000, &quot;order&quot;: range(2000)})
+visits = pd.DataFrame({&quot;cust&quot;: [1] * 3000, &quot;page&quot;: range(3000)})
+# rows the merge will produce, computed before merging
+n = (orders[&quot;cust&quot;].value_counts() * visits[&quot;cust&quot;].value_counts()).sum()
+print(&quot;merge would create&quot;, n, &quot;rows&quot;)
+print(len(orders.merge(visits, on=&quot;cust&quot;)))
+try:
+    orders.merge(visits, on=&quot;cust&quot;, validate=&quot;many_to_one&quot;)
+except pd.errors.MergeError as e:
+    print(&quot;MergeError:&quot;, e)</code></pre>
+<p>Output with pandas 2.3.3:</p>
+<pre><code>merge would create 6000000 rows
+6000000
+MergeError: Merge keys are not unique in right dataset; not a many-to-one merge</code></pre>
+<p>Output with pandas 3.1.0:</p>
+<pre><code>merge would create 6000000 rows
+6000000
+MergeError: Merge keys are not unique in right dataset; not a many-to-one merge
+
+Duplicates in right:
+  cust
+    1
+    1
+    1
+    1
+    1 ...</code></pre>
+<p>2,000 rows merged with 3,000 rows became 6,000,000, because every duplicate key pairs with every other. On real data that turns into "Unable to allocate" inside the merge or in the next step. Multiply the per-key counts before merging to see the row count, and pass <code>validate="one_to_one"</code> or <code>"many_to_one"</code> so pandas raises <code>MergeError</code> instead of quietly building a huge frame. pandas 3.1.0 also prints the duplicate keys. The same kind of blow-up can come from <code>pivot_table</code>, <code>get_dummies</code> or <code>crosstab</code> on a column with millions of unique values.</p>
+<h2 id="dtypes">3. Shrink the dtypes</h2>
+<pre><code>import numpy as np, pandas as pd
+n = 1_000_000
+df = pd.DataFrame({
+    &quot;city&quot;: np.random.default_rng(0).choice([&quot;Paris&quot;, &quot;Lagos&quot;, &quot;Lima&quot;, &quot;Oslo&quot;], n),
+    &quot;qty&quot;: np.arange(n) % 100,
+    &quot;price&quot;: np.arange(n) * 0.5,
+})
+def mib(d): return round(d.memory_usage(deep=True).sum() / 2**20, 1)
+print(df.dtypes.to_dict(), mib(df), &quot;MiB&quot;)
+df[&quot;city&quot;] = df[&quot;city&quot;].astype(&quot;category&quot;)
+df[&quot;qty&quot;] = pd.to_numeric(df[&quot;qty&quot;], downcast=&quot;integer&quot;)
+df[&quot;price&quot;] = df[&quot;price&quot;].astype(&quot;float32&quot;)
+print(df.dtypes.to_dict(), mib(df), &quot;MiB&quot;)</code></pre>
+<p>Output with pandas 2.3.3:</p>
+<pre><code>{&#x27;city&#x27;: dtype(&#x27;O&#x27;), &#x27;qty&#x27;: dtype(&#x27;int64&#x27;), &#x27;price&#x27;: dtype(&#x27;float64&#x27;)} 66.3 MiB
+{&#x27;city&#x27;: CategoricalDtype(categories=[&#x27;Lagos&#x27;, &#x27;Lima&#x27;, &#x27;Oslo&#x27;, &#x27;Paris&#x27;], ordered=False, categories_dtype=object), &#x27;qty&#x27;: dtype(&#x27;int8&#x27;), &#x27;price&#x27;: dtype(&#x27;float32&#x27;)} 5.7 MiB</code></pre>
+<p>Output with pandas 3.1.0:</p>
+<pre><code>{&#x27;city&#x27;: &lt;StringDtype(storage=&#x27;python&#x27;, na_value=nan)&gt;, &#x27;qty&#x27;: dtype(&#x27;int64&#x27;), &#x27;price&#x27;: dtype(&#x27;float64&#x27;)} 66.3 MiB
+{&#x27;city&#x27;: CategoricalDtype(categories=[&#x27;Lagos&#x27;, &#x27;Lima&#x27;, &#x27;Oslo&#x27;, &#x27;Paris&#x27;], ordered=False, categories_dtype=str), &#x27;qty&#x27;: dtype(&#x27;int8&#x27;), &#x27;price&#x27;: dtype(&#x27;float32&#x27;)} 5.7 MiB</code></pre>
+<p>66.3 MiB fell to 5.7 MiB (about 12&times;) on both versions. Repeated strings become <code>category</code>, small integers become <code>int8</code> (<code>downcast="integer"</code> picks the smallest type that fits), and <code>float32</code> is enough when 7 significant digits are. pandas 3 stores text as <code>str</code> by default instead of <code>object</code>, but without pyarrow installed it used the same memory here.</p>
+<h2 id="csv">4. Read less from read_csv, or read it in chunks</h2>
+<pre><code>import numpy as np, pandas as pd
+n = 1_000_000
+pd.DataFrame({
+    &quot;city&quot;: np.random.default_rng(0).choice([&quot;Paris&quot;, &quot;Lagos&quot;, &quot;Lima&quot;, &quot;Oslo&quot;], n),
+    &quot;qty&quot;: np.arange(n) % 100,
+    &quot;note&quot;: [&quot;x&quot; * 40] * n,
+}).to_csv(&quot;big.csv&quot;, index=False)
+# load only the columns you need, with small dtypes
+df = pd.read_csv(&quot;big.csv&quot;, usecols=[&quot;city&quot;, &quot;qty&quot;], dtype={&quot;city&quot;: &quot;category&quot;, &quot;qty&quot;: &quot;int8&quot;})
+print(round(df.memory_usage(deep=True).sum() / 2**20, 1), &quot;MiB&quot;)
+# or never hold the whole file: aggregate chunk by chunk
+total = None
+for chunk in pd.read_csv(&quot;big.csv&quot;, usecols=[&quot;city&quot;, &quot;qty&quot;], chunksize=200_000):
+    part = chunk.groupby(&quot;city&quot;)[&quot;qty&quot;].sum()
+    total = part if total is None else total.add(part, fill_value=0)
+print(total.astype(int).to_dict())</code></pre>
+<p>Output, identical on pandas 2.3.3 and 3.1.0:</p>
+<pre><code>1.9 MiB
+{&#x27;Lagos&#x27;: 12366120, &#x27;Lima&#x27;: 12373822, &#x27;Oslo&#x27;: 12408502, &#x27;Paris&#x27;: 12351556}</code></pre>
+<p><code>usecols</code> skips columns you do not need (the 40-character <code>note</code> column here) and <code>dtype</code> parses straight into small types, so the full-size frame never exists. If even that is too big, <code>chunksize</code> returns an iterator of DataFrames: aggregate each chunk and combine the results, as above. For a plain-Python file version of this problem, see <a href="/guides/python-memoryerror-reading-large-file/">MemoryError when reading a large file</a>.</p>
+<p>Related: <a href="/guides/pandas-merge-keyerror-and-not-matching/">merge KeyError / not matching</a> · <a href="/guides/pandas-pivot-index-contains-duplicate-entries-cannot-reshape/">pivot: Index contains duplicate entries</a> · <a href="/guides/pandas-performancewarning-dataframe-is-highly-fragmented/">DataFrame is highly fragmented</a>.</p>
+
+<aside class="cta"><strong>Pulling a table off a web page into pandas? Copy it as CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Unable to allocate X GiB for an array with shape mean?</summary><p>NumPy computed rows x columns x bytes per item for the array you asked for and the system could not provide that much memory. Check whether the shape in the message is what you expected.</p></details>
+<details><summary>Why does a pandas merge run out of memory?</summary><p>Duplicate keys on both sides multiply: 2,000 rows by 3,000 rows on one shared key gives 6,000,000 rows. Use validate=&#x27;many_to_one&#x27; or deduplicate the keys first.</p></details>
+<details><summary>How do I reduce pandas memory usage?</summary><p>Convert repeated strings to category, downcast integers and floats, load only the needed columns with usecols and dtype, or process the file with chunksize.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 in the python:3-alpine Docker image (Python 3.14.7, NumPy 2.5.4) with pandas 2.3.3 and pandas 3.1.0, 1 GB container memory limit. Outputs pasted unedited. PlainTables is our extension; Python, NumPy and pandas are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MySQL Error 1064: SQL Syntax Error, Causes and Fixes</title>
+<meta name="description" content="We reproduced MySQL&#x27;s error 1064 four ways: a typo&#x27;d keyword, an unquoted reserved word, a trailing comma, and an unterminated string. Each exact message.">
+<link rel="canonical" href="https://honestkit.github.io/guides/mysql-error-1064-syntax-error/">
+<meta property="og:title" content="MySQL Error 1064: SQL Syntax Error, Causes and Fixes">
+<meta property="og:description" content="We reproduced MySQL&#x27;s error 1064 four ways: a typo&#x27;d keyword, an unquoted reserved word, a trailing comma, and an unterminated string. Each exact message.">
+<meta property="og:url" content="https://honestkit.github.io/guides/mysql-error-1064-syntax-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does the \"near\" text always show exactly where the mistake is?", "acceptedAnswer": {"@type": "Answer", "text": "No. It shows where the parser gave up, which is often a few tokens after the actual mistake. In our WEHRE typo test, the near text was 'id = 1' even though the real problem (the misspelled WHERE) came before it."}}, {"@type": "Question", "name": "Why can't I use \"order\" as a column name?", "acceptedAnswer": {"@type": "Answer", "text": "It's a reserved SQL keyword (used in ORDER BY). We reproduced the exact failure with CREATE TABLE t2 (id INT, order INT) and confirmed the fix: wrapping it in backticks, `order` INT, which created the table successfully."}}, {"@type": "Question", "name": "I'm building my SQL string in code and got 1064 \u2014 what's the most likely cause?", "acceptedAnswer": {"@type": "Answer", "text": "An unterminated string literal from unescaped input, most often a value containing a single quote (like O'Brien). We reproduced the same error shape by simply leaving off a closing quote: everything after it, including the real end of the statement, got swallowed into the string."}}, {"@type": "Question", "name": "Is 1064 specific to MySQL?", "acceptedAnswer": {"@type": "Answer", "text": "The error code and exact wording are MySQL/MariaDB-specific. PostgreSQL reports syntax errors as ERROR: syntax error at or near \"x\" (see our PostgreSQL-based ambiguous-column and duplicate-key guides); SQL Server uses its own Msg numbers. The underlying problem \u2014 a statement the parser can't understand \u2014 is universal."}}, {"@type": "Question", "name": "Why does a trailing comma cause an error instead of just being ignored?", "acceptedAnswer": {"@type": "Answer", "text": "SQL's grammar requires exactly one comma between each item and none after the last; a trailing comma makes the parser expect another column name, so the next keyword it actually finds (FROM, in our test) is reported as unexpected."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>MySQL Error 1064: SQL Syntax Error (tested)</h1>
+<p class="lead"><code>ERROR 1064 (42000): You have an error in your SQL syntax</code> is MySQL's generic parse error &mdash; the statement couldn't even be understood, let alone run. Unlike most SQL errors, it doesn't name a table or column; instead it points at roughly where parsing broke down with "near '...'", which is usually your best clue.</p>
+<h2>1. Reading the error</h2>
+<p>The message always ends with <code>near '...' at line N</code>, showing the text MySQL was looking at when it gave up:</p>
+<pre><code>ERROR 1064 (42000) at line 1: You have an error in your SQL syntax; check the manual
+that corresponds to your MySQL server version for the right syntax to use near 'id = 1' at line 1</code></pre>
+<p>Important: the text after "near" is where the parser noticed the problem, not necessarily where the mistake is. In this example the actual typo (<code>WEHRE</code> instead of <code>WHERE</code>) is a few characters <em>before</em> <code>'id = 1'</code> &mdash; the parser only realises something is wrong once it hits the next token it can't make sense of.</p>
+
+<h2>2. Four reproduced causes</h2>
+<table>
+<tr><th>Statement</th><th>Exact error</th></tr>
+<tr><td><code>SELECT * FROM users WEHRE id = 1;</code> (typo'd keyword)</td><td><code>... near 'id = 1' at line 1</code></td></tr>
+<tr><td><code>CREATE TABLE t2 (id INT, order INT);</code> (unquoted reserved word)</td><td><code>... near 'order INT)' at line 1</code></td></tr>
+<tr><td><code>SELECT id, name, FROM users;</code> (trailing comma before FROM)</td><td><code>... near 'FROM users' at line 1</code></td></tr>
+<tr><td><code>SELECT * FROM users WHERE name = 'abc;</code> (missing closing quote)</td><td><code>... near ''abc' at line 1</code></td></tr>
+</table>
+
+<h2>3. Cause 1: a typo'd keyword</h2>
+<p>MySQL has no idea what <code>WEHRE</code> means, so it stops there and reports the next recognisable chunk (<code>id = 1</code>) as the "near" text. Read a few tokens <em>before</em> the quoted text, not just the quoted text itself.</p>
+
+<h2>4. Cause 2: a reserved word used unquoted</h2>
+<p><code>ORDER</code> is a SQL keyword (used in <code>ORDER BY</code>), so MySQL can't use it as a bare column name:</p>
+<pre><code>mysql&gt; CREATE TABLE t2 (id INT, order INT);
+ERROR 1064 (42000) at line 1: ... near 'order INT)' at line 1</code></pre>
+<p>Fix: wrap it in backticks, MySQL's identifier-quoting character:</p>
+<pre><code>mysql&gt; CREATE TABLE t2 (id INT, `order` INT);
+Query OK, 0 rows affected</code></pre>
+<p>This works but is worth avoiding going forward &mdash; rename the column to <code>order_id</code> or similar if you can, since every future query against it will also need backticks.</p>
+
+<h2>5. Cause 3: a trailing comma</h2>
+<pre><code>mysql&gt; SELECT id, name, FROM users;
+ERROR 1064 (42000) at line 1: ... near 'FROM users' at line 1</code></pre>
+<p>The comma after <code>name</code> tells MySQL to expect another column, so <code>FROM</code> is the unexpected token. This is the most common type of 1064 after a quick edit to a SELECT list (adding or removing a column and forgetting a comma).</p>
+
+<h2>6. Cause 4: an unterminated string</h2>
+<pre><code>mysql&gt; SELECT * FROM users WHERE name = 'abc;
+ERROR 1064 (42000) at line 1: ... near ''abc' at line 1</code></pre>
+<p>The missing closing quote means everything after the opening <code>'</code> &mdash; including the rest of your actual statement, and even a trailing <code>;</code> &mdash; is swallowed as part of the string literal. If this happens with a string built from user input or a variable, check for an unescaped single quote inside the value itself (e.g. a name like <code>O'Brien</code>), which has the same effect.</p>
+
+<h2>7. How to track down the error fast</h2>
+<ul>
+<li>Look at the token right after "near", then look a few tokens <em>before</em> it in your actual query &mdash; the real mistake is usually just before where parsing broke.</li>
+<li>Count your commas: every column in a SELECT list or every value in an INSERT needs exactly one comma between items, none after the last.</li>
+<li>If the "near" text starts mid-word or includes a stray quote, suspect an unterminated string literal.</li>
+<li>If the near-text is a single plain word that looks like a valid column name, suspect a reserved word (<code>order</code>, <code>group</code>, <code>key</code>, <code>index</code>, <code>table</code> are common ones) and wrap it in backticks or rename it.</li>
+<li>Run the query in a client that shows the full multi-line statement with the error position, rather than building it as one long string in application code &mdash; it makes "near" text much easier to locate.</li>
+</ul>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does the &quot;near&quot; text always show exactly where the mistake is?</summary><p>No. It shows where the parser gave up, which is often a few tokens after the actual mistake. In our WEHRE typo test, the near text was &#x27;id = 1&#x27; even though the real problem (the misspelled WHERE) came before it.</p></details>
+<details><summary>Why can&#x27;t I use &quot;order&quot; as a column name?</summary><p>It&#x27;s a reserved SQL keyword (used in ORDER BY). We reproduced the exact failure with CREATE TABLE t2 (id INT, order INT) and confirmed the fix: wrapping it in backticks, `order` INT, which created the table successfully.</p></details>
+<details><summary>I&#x27;m building my SQL string in code and got 1064 — what&#x27;s the most likely cause?</summary><p>An unterminated string literal from unescaped input, most often a value containing a single quote (like O&#x27;Brien). We reproduced the same error shape by simply leaving off a closing quote: everything after it, including the real end of the statement, got swallowed into the string.</p></details>
+<details><summary>Is 1064 specific to MySQL?</summary><p>The error code and exact wording are MySQL/MariaDB-specific. PostgreSQL reports syntax errors as ERROR: syntax error at or near &quot;x&quot; (see our PostgreSQL-based ambiguous-column and duplicate-key guides); SQL Server uses its own Msg numbers. The underlying problem — a statement the parser can&#x27;t understand — is universal.</p></details>
+<details><summary>Why does a trailing comma cause an error instead of just being ignored?</summary><p>SQL&#x27;s grammar requires exactly one comma between each item and none after the last; a trailing comma makes the parser expect another column name, so the next keyword it actually finds (FROM, in our test) is reported as unexpected.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with MySQL 8.4.11 (official Docker image), using the mysql CLI. Every error message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; MySQL and Docker are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

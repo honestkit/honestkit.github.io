@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python configparser NoSectionError: No section (Tested Fixes)</title>
+<meta name="description" content="We measured configparser&#x27;s NoSectionError: read() silently skipping a file at a cwd-relative path, case-sensitive sections, DEFAULT, BOM files, fallback=.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-configparser-nosectionerror-no-section/">
+<meta property="og:title" content="Python configparser NoSectionError: No section (Tested Fixes)">
+<meta property="og:description" content="We measured configparser&#x27;s NoSectionError: read() silently skipping a file at a cwd-relative path, case-sensitive sections, DEFAULT, BOM files, fallback=.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-configparser-nosectionerror-no-section/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes configparser.NoSectionError: No section?", "acceptedAnswer": {"@type": "Answer", "text": "Usually the file was never read: read() resolves paths against the current working directory and silently returns [] if the file isn't there. We measured the same script working from app/ and raising NoSectionError from the project root."}}, {"@type": "Question", "name": "Why does configparser read() not raise an error for a missing file?", "acceptedAnswer": {"@type": "Answer", "text": "By design it skips files it can't open and returns the list of files it did read. We measured it returning []; check that list, or use read_file(open(path)) to get FileNotFoundError."}}, {"@type": "Question", "name": "Are configparser section names case-sensitive?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We measured [Database] failing for get('database', ...) with NoSectionError while option names like HOST matched because they are lowercased by default."}}, {"@type": "Question", "name": "Why is DEFAULT not in configparser sections()?", "acceptedAnswer": {"@type": "Answer", "text": "DEFAULT is a special fallback section, not a real one. We measured sections() returning [] and has_section('DEFAULT') False, while get('DEFAULT', ...) still worked."}}, {"@type": "Question", "name": "How do I fix MissingSectionHeaderError with \\ufeff?", "acceptedAnswer": {"@type": "Answer", "text": "The file has a UTF-8 BOM. We measured encoding='utf-8-sig' fixing it."}}, {"@type": "Question", "name": "How do I give configparser a default value?", "acceptedAnswer": {"@type": "Answer", "text": "Pass fallback=, e.g. cfg.get('database', 'host', fallback='localhost'). We measured it working even when no file was loaded."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>configparser.NoSectionError: No section (tested)</h1>
+<p class="lead"><code>configparser.NoSectionError: No section: 'database'</code> usually doesn't mean your file is missing a section. It means the file was never read, and <code>read()</code> didn't say so. We reproduced that and four other causes on Python 3.13.5.</p>
+<h2 id="path">1. The file wasn't read (most common)</h2>
+<pre><code>mkdir -p proj/app &amp;&amp; cd proj
+printf &#x27;[database]\nhost = db.local\n&#x27; &gt; app/settings.ini
+cat &gt; app/main.py &lt;&lt;&#x27;PY&#x27;
+import configparser
+cfg = configparser.ConfigParser()
+print(&quot;read:&quot;, cfg.read(&quot;settings.ini&quot;))
+print(cfg.get(&quot;database&quot;, &quot;host&quot;))
+PY
+cd app &amp;&amp; python3 main.py
+cd .. &amp;&amp; python3 app/main.py 2&gt;&amp;1 | grep -E &quot;^(read:|configparser)&quot;</code></pre>
+<p>Output:</p>
+<pre><code>read: [&#x27;settings.ini&#x27;]
+db.local
+read: []
+configparser.NoSectionError: No section: &#x27;database&#x27;</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> <code>cfg.read("settings.ini")</code> resolves the path against the <em>current working directory</em>, not against the script. Run from <code>app/</code>, it works. Run from the project root, <code>read()</code> silently returns <code>[]</code> (no <code>FileNotFoundError</code>), the parser stays empty, and the first <code>get()</code> raises <code>NoSectionError</code>. That's why this error often shows up only under cron, systemd, an IDE run button, or Docker, which all start from a different directory.</p>
+
+<h2 id="fix-path">Fix: build the path from __file__ and check what read() returned</h2>
+<pre><code>import configparser, pathlib
+cfg = configparser.ConfigParser()
+here = pathlib.Path(__file__).resolve().parent
+path = here / &quot;proj&quot; / &quot;app&quot; / &quot;settings.ini&quot;
+found = cfg.read(path)
+if not found:
+    raise SystemExit(f&quot;config not found: {path}&quot;)
+print(&quot;read:&quot;, [pathlib.Path(p).name for p in found], &quot;-&gt;&quot;, cfg.get(&quot;database&quot;, &quot;host&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>read: [&#x27;settings.ini&#x27;] -&gt; db.local</code></pre>
+<p><strong>Measured:</strong> <code>read()</code> returns the list of files it actually parsed. An empty list means nothing was loaded, so fail loudly there with the full path rather than later with a confusing section error. (If the file must exist, <code>cfg.read_file(open(path))</code> raises <code>FileNotFoundError</code> itself.)</p>
+
+<h2 id="case">2. Section names are case-sensitive (keys aren't)</h2>
+<pre><code>import configparser
+cfg = configparser.ConfigParser()
+cfg.read_string(&quot;[Database]\nhost = db.local\n&quot;)
+print(cfg.sections())
+for call in (lambda: cfg.get(&quot;database&quot;, &quot;host&quot;),
+             lambda: cfg[&quot;database&quot;][&quot;host&quot;],
+             lambda: cfg.get(&quot;Database&quot;, &quot;HOST&quot;)):
+    try:
+        print(&quot;ok:&quot;, call())
+    except Exception as e:
+        print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>[&#x27;Database&#x27;]
+NoSectionError: No section: &#x27;database&#x27;
+KeyError: &#x27;database&#x27;
+ok: db.local</code></pre>
+<p><strong>Measured:</strong> <code>[Database]</code> isn't <code>database</code>: <code>get()</code> raises <code>NoSectionError</code> and <code>cfg["database"]</code> raises a plain <code>KeyError</code>. Option names are lowercased by default, so <code>"HOST"</code> works. Print <code>cfg.sections()</code> to see the exact names that were parsed.</p>
+
+<h2 id="default">3. [DEFAULT] isn't a section</h2>
+<pre><code>import configparser
+cfg = configparser.ConfigParser()
+cfg.read_string(&quot;[DEFAULT]\ntimeout = 5\n&quot;)
+print(&quot;sections():&quot;, cfg.sections(), &quot;has_section:&quot;, cfg.has_section(&quot;DEFAULT&quot;))
+print(&quot;get DEFAULT:&quot;, cfg.get(&quot;DEFAULT&quot;, &quot;timeout&quot;))
+try:
+    cfg.set(&quot;DEFAULT&quot;, &quot;retries&quot;, &quot;3&quot;); print(&quot;set DEFAULT ok&quot;)
+    cfg.add_section(&quot;DEFAULT&quot;)
+except Exception as e:
+    print(type(e).__name__ + &quot;:&quot;, e)
+try:
+    cfg.set(&quot;server&quot;, &quot;port&quot;, &quot;80&quot;)
+except Exception as e:
+    print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>sections(): [] has_section: False
+get DEFAULT: 5
+set DEFAULT ok
+ValueError: Invalid section name: &#x27;DEFAULT&#x27;
+NoSectionError: No section: &#x27;server&#x27;</code></pre>
+<p><strong>Measured:</strong> <code>DEFAULT</code> doesn't show up in <code>sections()</code> and <code>has_section("DEFAULT")</code> is <code>False</code>, but <code>get("DEFAULT", ...)</code> and <code>set("DEFAULT", ...)</code> work. <code>add_section("DEFAULT")</code> raises <code>ValueError</code>. Writing to a section that doesn't exist yet (<code>set("server", ...)</code>) raises <code>NoSectionError</code>: call <code>add_section("server")</code> first, or assign <code>cfg["server"] = {"port": "80"}</code>.</p>
+
+<h2 id="bom">4. A BOM at the start of the file</h2>
+<pre><code>import configparser
+open(&quot;bom.ini&quot;, &quot;w&quot;, encoding=&quot;utf-8-sig&quot;).write(&quot;[database]\nhost = db.local\n&quot;)
+cfg = configparser.ConfigParser()
+try:
+    cfg.read(&quot;bom.ini&quot;, encoding=&quot;utf-8&quot;)
+except Exception as e:
+    print(type(e).__name__ + &quot;:&quot;, str(e).splitlines()[-1])
+cfg.read(&quot;bom.ini&quot;, encoding=&quot;utf-8-sig&quot;)
+print(&quot;utf-8-sig:&quot;, cfg.sections())</code></pre>
+<p>Output:</p>
+<pre><code>MissingSectionHeaderError: &#x27;\ufeff[database]\n&#x27;
+utf-8-sig: [&#x27;database&#x27;]</code></pre>
+<p><strong>Measured:</strong> a file saved as "UTF-8 with BOM" (Notepad and some Windows editors do this) read as <code>utf-8</code> starts with an invisible <code>\ufeff</code>, so the first header isn't recognised and you get <code>MissingSectionHeaderError</code>. Read with <code>encoding="utf-8-sig"</code>, which accepts files with or without the BOM.</p>
+
+<h2 id="fallback">5. Optional settings: fallback= instead of try/except</h2>
+<pre><code>import configparser
+cfg = configparser.ConfigParser()
+cfg.read(&quot;missing.ini&quot;)
+print(cfg.get(&quot;database&quot;, &quot;host&quot;, fallback=&quot;localhost&quot;))
+print(cfg.getint(&quot;database&quot;, &quot;port&quot;, fallback=5432))
+print(cfg.has_option(&quot;database&quot;, &quot;host&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>localhost
+5432
+False</code></pre>
+<p><strong>Measured:</strong> with <code>fallback=</code>, <code>get()</code> and <code>getint()</code> return the default when the section or the option is missing, even when the file didn't load at all, so nothing raises. Use it for optional settings only; for required ones, keep the check from the fix above or a missing file will quietly turn into defaults.</p>
+
+<aside class="cta"><strong>Config loading and now testing your HTTP endpoints? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes configparser.NoSectionError: No section?</summary><p>Usually the file was never read: read() resolves paths against the current working directory and silently returns [] if the file isn&#x27;t there. We measured the same script working from app/ and raising NoSectionError from the project root.</p></details>
+<details><summary>Why does configparser read() not raise an error for a missing file?</summary><p>By design it skips files it can&#x27;t open and returns the list of files it did read. We measured it returning []; check that list, or use read_file(open(path)) to get FileNotFoundError.</p></details>
+<details><summary>Are configparser section names case-sensitive?</summary><p>Yes. We measured [Database] failing for get(&#x27;database&#x27;, ...) with NoSectionError while option names like HOST matched because they are lowercased by default.</p></details>
+<details><summary>Why is DEFAULT not in configparser sections()?</summary><p>DEFAULT is a special fallback section, not a real one. We measured sections() returning [] and has_section(&#x27;DEFAULT&#x27;) False, while get(&#x27;DEFAULT&#x27;, ...) still worked.</p></details>
+<details><summary>How do I fix MissingSectionHeaderError with \ufeff?</summary><p>The file has a UTF-8 BOM. We measured encoding=&#x27;utf-8-sig&#x27; fixing it.</p></details>
+<details><summary>How do I give configparser a default value?</summary><p>Pass fallback=, e.g. cfg.get(&#x27;database&#x27;, &#x27;host&#x27;, fallback=&#x27;localhost&#x27;). We measured it working even when no file was loaded.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5: read() with a relative path from two working directories, a __file__-based path with a check on read()&#x27;s return value, section-name case, the DEFAULT section, a UTF-8 BOM file, and fallback=. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

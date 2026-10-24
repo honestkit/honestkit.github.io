@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sklearn error_score=&#x27;raise&#x27;: Debug FitFailedWarning (Tested)</title>
+<meta name="description" content="What sklearn error_score=&#x27;raise&#x27; does, tested: FitFailedWarning vs Scoring failed, nan scores in GridSearchCV, error_score=0, getting the real traceback.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sklearn-error-score-raise-fitfailedwarning/">
+<meta property="og:title" content="sklearn error_score=&#x27;raise&#x27;: Debug FitFailedWarning (Tested)">
+<meta property="og:description" content="What sklearn error_score=&#x27;raise&#x27; does, tested: FitFailedWarning vs Scoring failed, nan scores in GridSearchCV, error_score=0, getting the real traceback.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sklearn-error-score-raise-fitfailedwarning/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does error_score='raise' do in sklearn?", "acceptedAnswer": {"@type": "Answer", "text": "It makes GridSearchCV, cross_val_score and friends re-raise the first exception from a failing fit or score, instead of recording nan and warning."}}, {"@type": "Question", "name": "Why are my GridSearchCV mean_test_score values nan?", "acceptedAnswer": {"@type": "Answer", "text": "Those parameter combinations failed in fit or scoring. The FitFailedWarning or 'Scoring failed' UserWarning contains the cause; error_score='raise' shows it as a normal traceback."}}, {"@type": "Question", "name": "Should I use error_score=0?", "acceptedAnswer": {"@type": "Answer", "text": "Usually not: it replaces failures with 0, which hides the error. Keep nan or use 'raise' while debugging."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>sklearn error_score=&#x27;raise&#x27; and FitFailedWarning (tested)</h1>
+<p class="lead"><code>FitFailedWarning: ... If these failures are not expected, you can try to debug them by setting error_score='raise'</code> means some cross-validation fits failed and were scored <code>nan</code>. Pass <code>error_score='raise'</code> to <code>GridSearchCV</code> or <code>cross_val_score</code> to stop at the first failure and see the original exception.</p>
+<h2 id="fit">1. The FitFailedWarning that tells you to set error_score='raise'</h2>
+<p><code>b4.py</code>:</p>
+<pre><code>import warnings, numpy as np
+from sklearn.model_selection import GridSearchCV
+from sklearn.linear_model import LogisticRegression
+X = np.random.default_rng(0).normal(size=(60, 3))
+y = (X[:, 0] &gt; 0).astype(int)
+grid = GridSearchCV(LogisticRegression(), {&quot;C&quot;: [1.0, -1.0]}, cv=3)  # C must be &gt; 0
+with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter(&quot;always&quot;)
+    grid.fit(X, y)
+for x in w:
+    print(f&quot;{x.category.__name__}: {x.message}&quot;)</code></pre>
+<p>Output (scikit-learn 1.9.1, Python 3.13.5):</p>
+<pre><code>FitFailedWarning: 
+3 fits failed out of a total of 6.
+The score on these train-test partitions for these parameters will be set to nan.
+If these failures are not expected, you can try to debug them by setting error_score=&#x27;raise&#x27;.
+
+Below are more details about the failures:
+--------------------------------------------------------------------------------
+3 fits failed with the following error:
+Traceback (most recent call last):
+  File &quot;.../site-packages/sklearn/model_selection/_validation.py&quot;, line 855, in _fit_and_score
+    estimator.fit(X_train, y_train, **fit_params)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File &quot;.../site-packages/sklearn/base.py&quot;, line 1393, in wrapper
+    estimator._validate_params()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File &quot;.../site-packages/sklearn/base.py&quot;, line 554, in _validate_params
+    validate_parameter_constraints(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        self._parameter_constraints,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        self.get_params(deep=False),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        caller_name=self.__class__.__name__,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File &quot;.../site-packages/sklearn/utils/_param_validation.py&quot;, line 98, in validate_parameter_constraints
+    raise InvalidParameterError(
+    ...&lt;2 lines&gt;...
+    )
+sklearn.utils._param_validation.InvalidParameterError: The &#x27;C&#x27; parameter of LogisticRegression must be a float in the range (0.0, inf]. Got -1.0 instead.
+
+UserWarning: One or more of the test scores are non-finite: [0.96666667        nan]</code></pre>
+<ul><li>By default (<code>error_score=np.nan</code>) a failing fit does not stop <code>GridSearchCV</code>: it records <code>nan</code> for that fold, emits one <code>FitFailedWarning</code> that groups identical errors (<code>3 fits failed with the following error</code>), and the search finishes.</li>
+<li>The real cause is the last line of the embedded traceback, here <code>InvalidParameterError: The 'C' parameter ... Got -1.0</code>. The final <code>UserWarning: One or more of the test scores are non-finite</code> is just the consequence.</li></ul>
+<h2 id="score">2. Failures at scoring time look different</h2>
+<p><code>b1.py</code>: the fit works but <code>predict</code> fails on the test fold:</p>
+<pre><code>import warnings, sklearn, numpy as np
+from sklearn.model_selection import GridSearchCV
+from sklearn.neighbors import KNeighborsClassifier
+print(&quot;scikit-learn&quot;, sklearn.__version__)
+X = np.random.default_rng(0).normal(size=(60, 3))
+y = (X[:, 0] &gt; 0).astype(int)
+# cv=3 -&gt; each training fold has 40 rows, so n_neighbors=50 cannot work
+grid = GridSearchCV(KNeighborsClassifier(), {&quot;n_neighbors&quot;: [5, 50]}, cv=3)
+with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter(&quot;always&quot;)
+    grid.fit(X, y)
+for x in w:   # print first and last line of each warning
+    lines = [l for l in str(x.message).splitlines() if l.strip()]
+    print(f&quot;{x.category.__name__}: {lines[0]}&quot; + (f&quot;\n    ... {lines[-1]}&quot; if len(lines) &gt; 1 else &quot;&quot;))
+print(&quot;mean_test_score:&quot;, grid.cv_results_[&quot;mean_test_score&quot;])
+print(&quot;best_params_:&quot;, grid.best_params_)</code></pre>
+<pre><code>scikit-learn 1.9.1
+UserWarning: Scoring failed. The score on this train-test partition for these parameters will be set to nan. Details: 
+    ... ValueError: Expected n_neighbors &lt;= n_samples_fit, but n_neighbors = 50, n_samples_fit = 40, n_samples = 20
+UserWarning: Scoring failed. The score on this train-test partition for these parameters will be set to nan. Details: 
+    ... ValueError: Expected n_neighbors &lt;= n_samples_fit, but n_neighbors = 50, n_samples_fit = 40, n_samples = 20
+UserWarning: Scoring failed. The score on this train-test partition for these parameters will be set to nan. Details: 
+    ... ValueError: Expected n_neighbors &lt;= n_samples_fit, but n_neighbors = 50, n_samples_fit = 40, n_samples = 20
+UserWarning: One or more of the test scores are non-finite: [0.91666667        nan]
+mean_test_score: [0.91666667        nan]
+best_params_: {&#x27;n_neighbors&#x27;: 5}</code></pre>
+<ul><li>When the error happens while <em>scoring</em>, you get one <code>UserWarning: Scoring failed</code> per fold (3 here) instead of a grouped <code>FitFailedWarning</code>; both set the score to <code>nan</code>.</li>
+<li><code>best_params_</code> silently ignores the <code>nan</code> candidate and picks <code>n_neighbors=5</code>. If every candidate fails, you get all-<code>nan</code> scores, so check <code>cv_results_["mean_test_score"]</code>.</li></ul>
+<h2 id="raise">3. error_score='raise': stop at the first failure with a real traceback</h2>
+<p><code>b2.py</code>:</p>
+<pre><code>import numpy as np
+from sklearn.model_selection import GridSearchCV
+from sklearn.neighbors import KNeighborsClassifier
+X = np.random.default_rng(0).normal(size=(60, 3))
+y = (X[:, 0] &gt; 0).astype(int)
+grid = GridSearchCV(KNeighborsClassifier(), {&quot;n_neighbors&quot;: [5, 50]}, cv=3,
+                    error_score=&quot;raise&quot;)
+grid.fit(X, y)</code></pre>
+<p>Last 4 lines of the traceback (the full one is 53 lines and ends with the original exception):</p>
+<pre><code>    raise ValueError(
+    ...&lt;3 lines&gt;...
+    )
+ValueError: Expected n_neighbors &lt;= n_samples_fit, but n_neighbors = 50, n_samples_fit = 40, n_samples = 20</code></pre>
+<p>Compare the three settings with <code>cross_val_score</code> (<code>b3.py</code>):</p>
+<pre><code>import warnings, numpy as np
+from sklearn.model_selection import cross_val_score
+from sklearn.neighbors import KNeighborsClassifier
+warnings.simplefilter(&quot;ignore&quot;)
+X = np.random.default_rng(0).normal(size=(60, 3))
+y = (X[:, 0] &gt; 0).astype(int)
+knn = KNeighborsClassifier(n_neighbors=50)
+print(&quot;default (nan):&quot;, cross_val_score(knn, X, y, cv=3))
+print(&quot;error_score=0:&quot;, cross_val_score(knn, X, y, cv=3, error_score=0))
+try:
+    cross_val_score(knn, X, y, cv=3, error_score=&quot;raise&quot;)
+except ValueError as ex:
+    print(&quot;error_score=&#x27;raise&#x27; -&gt; ValueError:&quot;, ex)</code></pre>
+<pre><code>default (nan): [nan nan nan]
+error_score=0: [0 0 0]
+error_score=&#x27;raise&#x27; -&gt; ValueError: Expected n_neighbors &lt;= n_samples_fit, but n_neighbors = 50, n_samples_fit = 40, n_samples = 20</code></pre>
+<ul><li><code>error_score='raise'</code> re-raises the original exception, so you can use a debugger or <code>%debug</code> on it. Use it while developing; switch back to the default for long searches where a few bad combinations are expected.</li>
+<li><code>error_score=0</code> replaces failures with 0 instead of <code>nan</code>. That hides the problem and drags the mean down rather than flagging it; prefer <code>nan</code> or <code>'raise'</code>.</li>
+<li><code>error_score</code> is accepted by <code>GridSearchCV</code>, <code>RandomizedSearchCV</code>, <code>cross_val_score</code>, <code>cross_validate</code> and <code>validation_curve</code>/<code>learning_curve</code>.</li></ul>
+<p>Related: <a href="/guides/sklearn-suppress-warnings/">sklearn: suppress warnings</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does error_score=&#x27;raise&#x27; do in sklearn?</summary><p>It makes GridSearchCV, cross_val_score and friends re-raise the first exception from a failing fit or score, instead of recording nan and warning.</p></details>
+<details><summary>Why are my GridSearchCV mean_test_score values nan?</summary><p>Those parameter combinations failed in fit or scoring. The FitFailedWarning or &#x27;Scoring failed&#x27; UserWarning contains the cause; error_score=&#x27;raise&#x27; shows it as a normal traceback.</p></details>
+<details><summary>Should I use error_score=0?</summary><p>Usually not: it replaces failures with 0, which hides the error. Keep nan or use &#x27;raise&#x27; while debugging.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with scikit-learn 1.9.1, numpy 2.5.4 and Python 3.13.5 on Linux. Scripts ran verbatim and the output was pasted unedited (one long traceback shortened to its last lines, as noted). PlainTables is our extension; scikit-learn is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

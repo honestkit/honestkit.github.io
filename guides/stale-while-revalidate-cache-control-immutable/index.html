@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stale-while-revalidate and Cache-Control: immutable, Meaning and Behaviour Tested in Chrome</title>
+<meta name="description" content="What max-age=1, stale-while-revalidate=60 did in Chrome compared with plain max-age (a 20 ms vs 2,024 ms load when revalidation was slow), and why immutable changed nothing on reload in Chrome.">
+<link rel="canonical" href="https://honestkit.github.io/guides/stale-while-revalidate-cache-control-immutable/">
+<meta property="og:title" content="stale-while-revalidate and Cache-Control: immutable, Meaning and Behaviour Tested in Chrome">
+<meta property="og:description" content="What max-age=1, stale-while-revalidate=60 did in Chrome compared with plain max-age (a 20 ms vs 2,024 ms load when revalidation was slow), and why immutable changed nothing on reload in Chrome.">
+<meta property="og:url" content="https://honestkit.github.io/guides/stale-while-revalidate-cache-control-immutable/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does stale-while-revalidate mean?", "acceptedAnswer": {"@type": "Answer", "text": "After max-age expires, the browser may use the stale copy for that many more seconds while it fetches a fresh one in the background. In our Chrome test the page loaded in 20 ms with the old script instead of waiting 2 s, and the next visit got the new one."}}, {"@type": "Question", "name": "Does Chrome support stale-while-revalidate?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, in the browser HTTP cache: Chromium 153 served the stale script immediately and revalidated in the background."}}, {"@type": "Question", "name": "What does Cache-Control immutable mean?", "acceptedAnswer": {"@type": "Answer", "text": "That the content at this URL never changes, so the browser shouldn't revalidate it even on reload. Use it only on fingerprinted file names."}}, {"@type": "Question", "name": "Does immutable do anything in Chrome?", "acceptedAnswer": {"@type": "Answer", "text": "Not in our test: max-age=600 and max-age=600, immutable both stayed in cache with no request on revisit and on reload."}}, {"@type": "Question", "name": "Is stale-while-revalidate the same as SWR in Next.js?", "acceptedAnswer": {"@type": "Answer", "text": "Same idea (show cached data, refresh in the background); the HTTP directive does it in the browser or CDN cache, the SWR library in your JavaScript."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>stale-while-revalidate and Cache-Control immutable: what Chrome actually does (tested)</h1>
+<p class="lead">Both directives are about avoiding a wait on revalidation. We made revalidation deliberately slow (2 s) and timed what the browser did.</p>
+<h2>1. stale-while-revalidate: measured</h2>
+<table><thead><tr><th>Cache-Control on the script</th><th>Visit 2.5 s later (cache expired)</th><th>Script version that ran</th><th>Next visit</th></tr></thead><tbody>
+<tr><td><code>max-age=1</code></td><td><strong>2,024 ms</strong>: page waited for the revalidation</td><td>new (v2)</td><td>waited again, v3</td></tr>
+<tr><td><code>max-age=1, stale-while-revalidate=60</code></td><td><strong>20 ms</strong>: stale copy used at once</td><td>old (v1)</td><td>v2, fetched in the background</td></tr>
+</tbody></table>
+<p>That is the whole trade: within the <code>stale-while-revalidate</code> window the visitor gets the old file instantly and the browser refreshes it in the background, so the <em>next</em> visit gets the new one. Users can see content one version behind; use it for things where that's fine (avatars, API lists, CSS/JS with stable URLs), not for prices or auth state.</p>
+<pre><code>Cache-Control: max-age=60, stale-while-revalidate=86400
+
+# nginx
+location /api/feed { add_header Cache-Control "max-age=60, stale-while-revalidate=86400" always; proxy_pass http://app; }</code></pre>
+<p>After max-age + stale-while-revalidate seconds the copy is simply expired and the next visit waits again.</p>
+<h2>2. Cache-Control: immutable: no difference in Chrome</h2>
+<table><thead><tr><th>Cache-Control on the script</th><th>Revisit</th><th>Reload</th></tr></thead><tbody>
+<tr><td><code>max-age=600</code></td><td>from cache, no request</td><td>from cache, no request</td></tr>
+<tr><td><code>max-age=600, immutable</code></td><td>from cache, no request</td><td>from cache, no request</td></tr>
+</tbody></table>
+<p><code>immutable</code> means "this URL's content will never change, don't revalidate even on reload". Chrome already doesn't revalidate fresh subresources on a normal reload (only the page itself), so the header changed nothing in our test. It is harmless and helps browsers that do revalidate on reload; send it only on fingerprinted URLs (<code>app.3f9a1c.js</code>), never on <code>/app.js</code>:</p>
+<pre><code># quotes required: an unquoted {8,} is a config error ("unknown directive")
+location ~* "\.[0-9a-f]{8,}\.(js|css|woff2)$" {
+    add_header Cache-Control "public, max-age=31536000, immutable" always;
+}</code></pre>
+<p>Background: <a href="/guides/cache-control-no-cache-vs-no-store/">no-cache vs no-store, measured</a> and <a href="/guides/etag-header-explained/">how ETag revalidation works</a>.</p>
+<aside class="cta"><strong>Check the Cache-Control a URL really sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does stale-while-revalidate mean?</summary><p>After max-age expires, the browser may use the stale copy for that many more seconds while it fetches a fresh one in the background. In our Chrome test the page loaded in 20 ms with the old script instead of waiting 2 s, and the next visit got the new one.</p></details>
+<details><summary>Does Chrome support stale-while-revalidate?</summary><p>Yes, in the browser HTTP cache: Chromium 153 served the stale script immediately and revalidated in the background.</p></details>
+<details><summary>What does Cache-Control immutable mean?</summary><p>That the content at this URL never changes, so the browser shouldn&#x27;t revalidate it even on reload. Use it only on fingerprinted file names.</p></details>
+<details><summary>Does immutable do anything in Chrome?</summary><p>Not in our test: max-age=600 and max-age=600, immutable both stayed in cache with no request on revisit and on reload.</p></details>
+<details><summary>Is stale-while-revalidate the same as SWR in Next.js?</summary><p>Same idea (show cached data, refresh in the background); the HTTP directive does it in the browser or CDN cache, the SWR library in your JavaScript.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 in Chromium 153 (full build), fresh context per row: a page loaded a script whose Cache-Control we varied; the server logged every request and answered conditional (If-None-Match) requests after a 2-second delay with a new version, so we could see whether the page waited and which version ran. Reload behaviour was checked with page.reload(). Both nginx snippets were checked with nginx -t and wget in nginx 1.31.6 (fingerprinted file got the immutable header, /app.js didn&#x27;t). CDN (Cloudflare, CloudFront) and Firefox behaviour are not covered by this test. PlainHeaders is our extension; the other methods are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

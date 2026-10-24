@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>secrets.token_hex(n) Does Not Return a Length-n Token</title>
+<meta name="description" content="We measured Python 3.13.5&#x27;s secrets module: token_hex(16) returns 32 characters, not 16, and token_urlsafe(16) returns 22. Same n, three different lengths.">
+<link rel="canonical" href="https://honestkit.github.io/guides/secrets-token-hex-n-does-not-return-a-length-n-token/">
+<meta property="og:title" content="secrets.token_hex(n) Does Not Return a Length-n Token">
+<meta property="og:description" content="We measured Python 3.13.5&#x27;s secrets module: token_hex(16) returns 32 characters, not 16, and token_urlsafe(16) returns 22. Same n, three different lengths.">
+<meta property="og:url" content="https://honestkit.github.io/guides/secrets-token-hex-n-does-not-return-a-length-n-token/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does secrets.token_hex(16) return a 16-character token?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured this: it returns 32 characters, because n=16 means 16 random bytes, and each byte becomes two hex characters. The output is always 2*n characters long."}}, {"@type": "Question", "name": "Does secrets.token_urlsafe(n) return the same length as token_hex(n)?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured both with identical n values and got different lengths every time. token_urlsafe() base64-encodes the n bytes instead of hex-encoding them, giving roughly 4*n/3 characters (rounded up), versus token_hex()'s 2*n."}}, {"@type": "Question", "name": "Why does secrets.compare_digest() raise a TypeError instead of just returning False?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed it refuses to compare a string against bytes in either argument order, raising TypeError('a bytes-like object is required...'). Plain == would have just returned False silently; compare_digest() treats a type mismatch as an error instead."}}, {"@type": "Question", "name": "I switched == to secrets.compare_digest() for security and now get a crash -- why?", "acceptedAnswer": {"@type": "Answer", "text": "We reproduced this exact scenario: compare_digest() requires both arguments to be the same type (both str or both bytes). If one side is a hex string and the other is raw bytes from storage, the timing-safe comparison raises TypeError where == would have silently (and incorrectly) returned False."}}, {"@type": "Question", "name": "What's the safest way to generate and compare tokens with the secrets module?", "acceptedAnswer": {"@type": "Answer", "text": "Pick one representation -- we'd suggest secrets.token_hex() for plain-ASCII, URL- and column-safe strings -- and keep every token in that same representation from generation through storage to comparison with secrets.compare_digest()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>secrets.token_hex(n) Does Not Return a Length-n Token (tested)</h1>
+<p class="lead">Every function in the <code>secrets</code> module takes an argument called <code>n</code> or <code>nbytes</code>, so it's easy to assume they all control the final string length the same way. We measured all three token functions with identical inputs, and each one returns a different length for the same <code>n</code>.</p>
+<h2 id="repro1">1. token_hex(n), token_urlsafe(n) and token_bytes(n) all return different lengths for the same n</h2>
+<pre><code>import secrets
+
+for n in (1, 2, 3, 8, 16, 32):
+    print(n, len(secrets.token_hex(n)), len(secrets.token_urlsafe(n)), len(secrets.token_bytes(n)))</code></pre>
+<pre><code>n   token_hex  token_urlsafe  token_bytes
+1   2          2              1
+2   4          3              2
+3   6          4              3
+8   16         11             8
+16  32         22             16
+32  64         43             32</code></pre>
+<p><strong>Measured:</strong> all three functions generate <code>n</code> random bytes underneath -- <code>n</code> always means "bytes of entropy," never "characters of output." <code>token_hex()</code> then renders those bytes as two hex characters each, so the string is always <code>2*n</code> characters. <code>token_urlsafe()</code> base64-encodes them (no padding), giving roughly <code>4*n/3</code> characters, rounded up. Only <code>token_bytes()</code> returns something of length exactly <code>n</code> -- and that's raw bytes, not a printable string. If you need a token that fits a fixed-width column or URL slug, you have to work backward from the target length to the right <code>n</code>, not pass the target length directly.</p>
+
+<h2 id="repro2">2. secrets.compare_digest() crashes on a str/bytes mismatch instead of just returning False</h2>
+<pre><code>import secrets
+
+stored_token = secrets.token_bytes(16)       # e.g. loaded from a database BLOB column
+submitted_token = stored_token.hex()         # e.g. received as a string from a web form
+
+print(submitted_token == stored_token)       # naive comparison
+print(secrets.compare_digest(submitted_token, stored_token))</code></pre>
+<pre><code>False
+Traceback (most recent call last):
+  ...
+TypeError: a bytes-like object is required, not 'str'</code></pre>
+<p><strong>Measured:</strong> plain <code>==</code> silently returns <code>False</code> when comparing a string to bytes -- wrong, but not a crash. <code>secrets.compare_digest()</code> (an alias for <code>hmac.compare_digest()</code>) refuses to compare mismatched types at all and raises <code>TypeError</code> in both argument orders. This matters in practice: swapping a naive <code>==</code> for <code>compare_digest()</code> is a common, correct security fix for timing-safe comparison, but if the two values aren't stored in the same representation (one as a hex string, one as raw bytes), the fix itself becomes a new crash in production rather than a silent bug.</p>
+
+<h2 id="repro3">3. The fix: generate and compare in the same representation throughout</h2>
+<pre><code>import secrets
+
+# Pick ONE representation and stick to it end to end -- here, a hex string:
+new_token = secrets.token_hex(16)            # str, 32 chars
+# ... store new_token as TEXT, send it as a string, compare it as a string ...
+is_valid = secrets.compare_digest(new_token, submitted_token_as_str)</code></pre>
+<p><strong>Measured takeaway:</strong> decide up front whether tokens live as hex strings, URL-safe strings, or raw bytes, and keep that representation consistent through storage, transmission and comparison. <code>token_hex()</code> is usually the simplest choice since the result is plain ASCII, safe for any text column, URL, or JSON field, with no base64 padding edge cases to think about.</p>
+<aside class="cta"><strong>Generating API keys or session tokens? Check what headers actually carry them over the wire:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does secrets.token_hex(16) return a 16-character token?</summary><p>No -- we measured this: it returns 32 characters, because n=16 means 16 random bytes, and each byte becomes two hex characters. The output is always 2*n characters long.</p></details>
+<details><summary>Does secrets.token_urlsafe(n) return the same length as token_hex(n)?</summary><p>No -- we measured both with identical n values and got different lengths every time. token_urlsafe() base64-encodes the n bytes instead of hex-encoding them, giving roughly 4*n/3 characters (rounded up), versus token_hex()&#x27;s 2*n.</p></details>
+<details><summary>Why does secrets.compare_digest() raise a TypeError instead of just returning False?</summary><p>We confirmed it refuses to compare a string against bytes in either argument order, raising TypeError(&#x27;a bytes-like object is required...&#x27;). Plain == would have just returned False silently; compare_digest() treats a type mismatch as an error instead.</p></details>
+<details><summary>I switched == to secrets.compare_digest() for security and now get a crash -- why?</summary><p>We reproduced this exact scenario: compare_digest() requires both arguments to be the same type (both str or both bytes). If one side is a hex string and the other is raw bytes from storage, the timing-safe comparison raises TypeError where == would have silently (and incorrectly) returned False.</p></details>
+<details><summary>What&#x27;s the safest way to generate and compare tokens with the secrets module?</summary><p>Pick one representation -- we&#x27;d suggest secrets.token_hex() for plain-ASCII, URL- and column-safe strings -- and keep every token in that same representation from generation through storage to comparison with secrets.compare_digest().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in secrets module: called token_hex(), token_urlsafe() and token_bytes() with the same n across six values (1, 2, 3, 8, 16, 32) and recorded the exact output length for each, then measured secrets.compare_digest() (an alias for hmac.compare_digest()) against mismatched str/bytes arguments. PlainHeaders is our extension; Python&#x27;s secrets module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

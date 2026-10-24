@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>subprocess&#x27;s CalledProcessError.stderr Is None By Default</title>
+<meta name="description" content="We measured catching CalledProcessError without capture_output= and finding e.stderr is None — the real error text went straight to the terminal instead.">
+<link rel="canonical" href="https://honestkit.github.io/guides/subprocess-calledprocesserror-stderr-is-none-by-default/">
+<meta property="og:title" content="subprocess&#x27;s CalledProcessError.stderr Is None By Default">
+<meta property="og:description" content="We measured catching CalledProcessError without capture_output= and finding e.stderr is None — the real error text went straight to the terminal instead.">
+<meta property="og:url" content="https://honestkit.github.io/guides/subprocess-calledprocesserror-stderr-is-none-by-default/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does CalledProcessError automatically contain the command's error message?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured e.stderr and e.stdout both as None by default. The real error text was inherited straight to the terminal, never captured into the exception."}}, {"@type": "Question", "name": "Does check_output() capture stderr into the exception on failure?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured e.output holding captured stdout, but e.stderr still None, since check_output() only redirects stdout by default, not stderr."}}, {"@type": "Question", "name": "How do I actually get the failing command's error output on the exception?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that passing capture_output=True (or stderr=subprocess.PIPE) on the original call is what populates e.stderr \u2014 you can't retroactively capture output after the fact once the exception is raised."}}, {"@type": "Question", "name": "What does str(CalledProcessError) actually tell you?", "acceptedAnswer": {"@type": "Answer", "text": "Based on what we measured, just the command and its non-zero exit status, e.g. \"returned non-zero exit status 2\" \u2014 never the program's own error message unless you separately captured and logged e.stderr."}}, {"@type": "Question", "name": "Is this subprocess stderr-capture behavior documented?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 the Python docs note that run()/check_output() inherit the parent's file descriptors for stdout/stderr unless you pass capture_output or explicit PIPE arguments. We confirmed the exception object reflects exactly that in Python 3.13.5."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>CalledProcessError.stderr Is None By Default (tested)</h1>
+<p class="lead">Catching <code>subprocess.CalledProcessError</code> feels like you now have the command's error output to log or inspect. We measured what <code>e.stderr</code> actually contains by default: <code>None</code> &mdash; the real error message was never captured at all.</p>
+<h2 id="repro1">1. The exception's own stderr/stdout are both None by default</h2>
+<pre><code>import subprocess
+
+try:
+    subprocess.run(["ls", "/no/such/path/xyz"], check=True)
+except subprocess.CalledProcessError as e:
+    e.stderr
+None
+    e.stdout
+None
+    str(e)
+"Command '[...]' returned non-zero exit status 2."</code></pre>
+<p><strong>Measured:</strong> the command's real message (<code>ls: cannot access '/no/such/path/xyz': No such file or directory</code>) printed straight to the terminal &mdash; it was inherited, not captured &mdash; while both <code>e.stderr</code> and <code>e.stdout</code> on the caught exception are <code>None</code>, and <code>str(e)</code> only tells you the exit code, never the reason.</p>
+
+<h2 id="repro2">2. check_output() has the same gap for stderr</h2>
+<pre><code>try:
+    subprocess.check_output(["ls", "/no/such/path/xyz"])
+except subprocess.CalledProcessError as e:
+    e.output
+b''
+    e.stderr
+None</code></pre>
+<p><strong>Measured:</strong> <code>check_output()</code> does capture stdout into <code>e.output</code>, but <code>e.stderr</code> is still <code>None</code> &mdash; so a command that fails and writes its explanation to stderr (the common case) still leaves you with nothing useful on the exception object, even using the "capturing" convenience wrapper.</p>
+
+<h2 id="repro3">3. capture_output=True actually fixes it</h2>
+<pre><code>try:
+    subprocess.run(["ls", "/no/such/path/xyz"], check=True, capture_output=True, text=True)
+except subprocess.CalledProcessError as e:
+    e.stderr
+"ls: cannot access '/no/such/path/xyz': No such file or directory\n"</code></pre>
+<p><strong>Measured:</strong> adding <code>capture_output=True</code> (or manually passing <code>stderr=subprocess.PIPE</code>) redirects the child's stderr into a pipe instead of letting it inherit the parent's terminal, and that captured text is exactly what shows up on <code>e.stderr</code> when the exception is raised. Without it, there's nothing to attach &mdash; the output already went somewhere else by the time Python builds the exception.</p>
+
+<h2 id="fix">4. What to actually do</h2>
+<p>If you plan to log or inspect <code>e.stderr</code>/<code>e.stdout</code> from a <code>CalledProcessError</code>, you must pass <code>capture_output=True</code> (or explicit <code>stdout=subprocess.PIPE</code>/<code>stderr=subprocess.PIPE</code>) on the call that might raise it &mdash; catching the exception after the fact can't retroactively capture output that was never redirected in the first place. If you only need the raw text for display and not programmatic error handling, remember the uncaptured output already printed directly to your terminal/log when the child ran, even though the exception itself stayed empty.</p>
+
+<aside class="cta"><strong>Debugging a failed subprocess call that&#x27;s supposed to hit an API or local server? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does CalledProcessError automatically contain the command&#x27;s error message?</summary><p>No — we measured e.stderr and e.stdout both as None by default. The real error text was inherited straight to the terminal, never captured into the exception.</p></details>
+<details><summary>Does check_output() capture stderr into the exception on failure?</summary><p>No — we measured e.output holding captured stdout, but e.stderr still None, since check_output() only redirects stdout by default, not stderr.</p></details>
+<details><summary>How do I actually get the failing command&#x27;s error output on the exception?</summary><p>We measured that passing capture_output=True (or stderr=subprocess.PIPE) on the original call is what populates e.stderr — you can&#x27;t retroactively capture output after the fact once the exception is raised.</p></details>
+<details><summary>What does str(CalledProcessError) actually tell you?</summary><p>Based on what we measured, just the command and its non-zero exit status, e.g. &quot;returned non-zero exit status 2&quot; — never the program&#x27;s own error message unless you separately captured and logged e.stderr.</p></details>
+<details><summary>Is this subprocess stderr-capture behavior documented?</summary><p>Yes — the Python docs note that run()/check_output() inherit the parent&#x27;s file descriptors for stdout/stderr unless you pass capture_output or explicit PIPE arguments. We confirmed the exception object reflects exactly that in Python 3.13.5.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5 on Linux: ran a command that fails with check=True, caught CalledProcessError, and inspected e.stderr/e.stdout/str(e) both with default arguments and with capture_output=True, to see what information the exception actually carries. PlainHeaders is our extension; Python&#x27;s subprocess module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

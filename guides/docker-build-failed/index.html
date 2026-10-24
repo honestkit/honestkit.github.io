@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker Build Failed: BuildKit Errors Explained (Tested)</title>
+<meta name="description" content="We reproduced real docker build / BuildKit failures on Docker 29.8.1: a missing COPY file, a failing RUN, and a bad FROM image, with exact error text.">
+<link rel="canonical" href="https://honestkit.github.io/guides/docker-build-failed/">
+<meta property="og:title" content="Docker Build Failed: BuildKit Errors Explained (Tested)">
+<meta property="og:description" content="We reproduced real docker build / BuildKit failures on Docker 29.8.1: a missing COPY file, a failing RUN, and a bad FROM image, with exact error text.">
+<meta property="og:url" content="https://honestkit.github.io/guides/docker-build-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does \"failed to calculate checksum of ref\" mean in a docker build?", "acceptedAnswer": {"@type": "Answer", "text": "It means a COPY or ADD instruction in your Dockerfile points at a file or directory that doesn't exist in the build context. We reproduced the exact text on Docker 29.8.1: ERROR: failed to calculate checksum of ref ...: \"/path\": not found. Fix the path, check your .dockerignore, and confirm you passed the right build context directory."}}, {"@type": "Question", "name": "Why do I see \"failed to solve\" for some errors but \"failed to compute cache key\" for others?", "acceptedAnswer": {"@type": "Answer", "text": "failed to solve is BuildKit's generic top-level wrapper for any build failure. failed to compute cache key is a more specific wrapper that only appears for COPY/ADD source problems, because BuildKit fails while hashing the input for its cache, before it ever runs the step. A failing RUN command skips that phrase entirely and goes straight to \"process ... did not complete successfully\", because it did run, it just exited non-zero."}}, {"@type": "Question", "name": "Does the exit code in a docker build error mean anything?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. The number after \"exit code:\" is exactly the exit code your RUN command returned, not a Docker-specific code. We confirmed this directly: RUN exit 1 produced \"exit code: 1\" and RUN exit 42 produced \"exit code: 42\", with no other change in the message. Use that number as a direct clue to what failed inside the step (e.g. a specific tool's documented exit codes)."}}, {"@type": "Question", "name": "What's the difference between a bad image tag and a bad image name in docker build?", "acceptedAnswer": {"@type": "Answer", "text": "A bad tag on a real repository (e.g. alpine:typo-tag) gives \"failed to resolve reference ... not found\", because the registry confirms the repo exists but has no such tag. A bad repository name that doesn't exist at all gives a different error we measured: \"failed to resolve source metadata ... pull access denied, repository does not exist or may require authorization: server message: insufficient_scope\", because the anonymous-pull token request itself gets rejected before any tag lookup happens."}}, {"@type": "Question", "name": "I'm getting an x509 certificate or oauth token error pulling my FROM image \u2014 how do I fix it?", "acceptedAnswer": {"@type": "Answer", "text": "These happen when BuildKit talks to a registry with broken or untrusted TLS, or a failing auth handshake (usually a private registry). Per Docker's own docs: for x509 \"signed by unknown authority\" errors, add the registry's CA certificate under /etc/docker/certs.d/<registry-host>/ca.crt rather than disabling verification. For oauth/anonymous token failures, check that the auth server for that registry is reachable and that credentials in ~/.docker/config.json aren't stale. We did not reproduce these directly since they need a real private registry with broken auth."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>docker build failed (tested)</h1>
+<p class="lead"><code>docker build</code> failing is almost always one of three things: a <code>COPY</code>/<code>ADD</code> instruction pointing at a file that isn't in the build context, a <code>RUN</code> command that exits non-zero, or a <code>FROM</code> base image BuildKit can't fetch. We reproduced all three on a live box running Docker 29.8.1 with BuildKit, and recorded the exact error text each one prints, so you can match yours below. This is about <code>docker build</code> itself (building an image from a Dockerfile); if your failure happens on <code>docker compose up</code> instead, see <a href="/guides/docker-compose-up-error/">Docker Compose Up Errors</a>, which covers a different set of errors (bad service names, port conflicts, bad compose-file image tags).</p>
+<h2>1. Quick lookup: match your error text</h2>
+<table>
+<tr><th>What you see</th><th>Meaning</th><th>Jump to</th></tr>
+<tr><td><code>failed to calculate checksum of ref ... not found</code></td><td>A <code>COPY</code>/<code>ADD</code> source file isn't in the build context</td><td>Section 2</td></tr>
+<tr><td><code>failed to solve: failed to compute cache key</code></td><td>The generic wrapper BuildKit puts around the error above</td><td>Section 2</td></tr>
+<tr><td><code>failed to solve: process "..." did not complete successfully: exit code: N</code></td><td>A <code>RUN</code> command exited non-zero</td><td>Section 3</td></tr>
+<tr><td><code>failed to resolve source metadata</code></td><td>BuildKit couldn't fetch the <code>FROM</code> base image at all</td><td>Section 4</td></tr>
+<tr><td><code>failed to fetch oauth token</code> / <code>failed to fetch anonymous token</code></td><td>Registry auth handshake failed (private registry or rate limit)</td><td>Section 4</td></tr>
+<tr><td><code>failed to verify certificate: x509 ...</code></td><td>TLS cert problem talking to a registry</td><td>Section 4</td></tr>
+</table>
+
+<h2>2. "failed to calculate checksum of ref" / "failed to compute cache key"</h2>
+<p>This is the single most common <code>docker build</code> failure. It means a <code>COPY</code> or <code>ADD</code> instruction names a file or directory that does not exist in the build context (the directory you pass to <code>docker build</code>, not your whole filesystem). We wrote this Dockerfile in an otherwise-empty directory:</p>
+<pre><code>FROM alpine:latest
+COPY nonexistent-file.txt /app/</code></pre>
+<p>Running <code>docker build -t forever-guidetest:copy .</code> against that directory gave:</p>
+<pre><code>#5 [2/2] COPY nonexistent-file.txt /app/
+#5 ERROR: failed to calculate checksum of ref vdvaeexjgxbl2jy563csl2hvu::kddjrvrdpu2p8m21s3wrvvy2l: "/nonexistent-file.txt": not found
+------
+ &gt; [2/2] COPY nonexistent-file.txt /app/:
+------
+Dockerfile:2
+--------------------
+   1 |     FROM alpine:latest
+   2 | &gt;&gt;&gt; COPY nonexistent-file.txt /app/
+   3 |
+--------------------
+ERROR: failed to build: failed to solve: failed to compute cache key: failed to calculate checksum of ref vdvaeexjgxbl2jy563csl2hvu::kddjrvrdpu2p8m21s3wrvvy2l: "/nonexistent-file.txt": not found</code></pre>
+<p><strong>Reading this:</strong> the bottom line, <code>failed to solve: failed to compute cache key: failed to calculate checksum of ref ...: "/path": not found</code>, is BuildKit's generic solve error wrapping the specific cache-key error, which itself wraps the real problem: the named path doesn't exist relative to the build context root. The <code>ref vdvaeexjgxbl2jy563csl2hvu::...</code> part is an internal BuildKit cache reference ID — ignore it, it's not useful for debugging, only the quoted path and "not found" matter.</p>
+<p><strong>Fix:</strong> check three things, in order: (1) the path is spelled correctly and relative to the build context (the last argument to <code>docker build</code>, often <code>.</code>), (2) the file isn't excluded by a <code>.dockerignore</code> file in that context, (3) if you're copying from a subdirectory, that you didn't forget to pass that subdirectory as the context (<code>docker build -f sub/Dockerfile sub/</code>, not just <code>sub/Dockerfile .</code>).</p>
+
+<h2>3. "failed to solve: process ... did not complete successfully: exit code: N"</h2>
+<p>This is a different failure: the Dockerfile and build context are fine, but a <code>RUN</code> command inside the build itself returned a non-zero exit code. We tested this directly:</p>
+<pre><code>FROM alpine:latest
+RUN exit 1</code></pre>
+<pre><code>$ docker build -t forever-guidetest:run1 .
+...
+#5 [2/2] RUN exit 1
+#5 ERROR: process "/bin/sh -c exit 1" did not complete successfully: exit code: 1
+------
+ERROR: failed to build: failed to solve: process "/bin/sh -c exit 1" did not complete successfully: exit code: 1</code></pre>
+<p>Note what's different from Section 2: there's no "failed to compute cache key" in the middle. A failing <code>RUN</code> goes straight from <code>failed to solve</code> to <code>process "..." did not complete successfully</code>, because BuildKit got far enough to actually execute the step — it just failed while running, instead of failing to even start.</p>
+<p><strong>Fix:</strong> the command printed in quotes (<code>/bin/sh -c exit 1</code> here) is the literal shell command BuildKit ran. Run that same command manually (in a container from the same base image, or locally) to see its real output above the Dockerfile's cached build log — BuildKit only shows the exit code by default, not the command's stdout/stderr, unless you add <code>--progress=plain</code> or the step wasn't cached.</p>
+
+<h2>4. Exit codes: the build surfaces your RUN command's own exit code</h2>
+<p>The number after <code>exit code:</code> is not a Docker error code — it's whatever your <code>RUN</code> command itself returned. We confirmed this by changing only the exit code:</p>
+<pre><code>FROM alpine:latest
+RUN exit 42</code></pre>
+<pre><code>#5 [2/2] RUN exit 42
+#5 ERROR: process "/bin/sh -c exit 42" did not complete successfully: exit code: 42
+------
+ERROR: failed to build: failed to solve: process "/bin/sh -c exit 42" did not complete successfully: exit code: 42</code></pre>
+<p>Exit 1 produced "exit code: 1", exit 42 produced "exit code: 42" — nothing else in the message changed. This matters when a <code>RUN</code> calls a script or tool with meaningful exit codes (test runners, linters, package managers): the number in BuildKit's error is your direct clue to what actually failed inside that step, before you go looking at logs.</p>
+
+<h2>5. "failed to resolve source metadata" and registry/auth errors on FROM</h2>
+<p>These errors happen before BuildKit even starts your build — it's failing to fetch the <code>FROM</code> base image. We tested the fast, free case: a <code>FROM</code> referencing an image repository that doesn't exist at all (not just a bad tag):</p>
+<pre><code>FROM nonexistent-image-xyz123:doesnotexist
+RUN echo hi</code></pre>
+<pre><code>#2 [internal] load metadata for docker.io/library/nonexistent-image-xyz123:doesnotexist
+#2 ERROR: pull access denied, repository does not exist or may require authorization: server message: insufficient_scope: authorization failed
+------
+ERROR: failed to build: failed to solve: nonexistent-image-xyz123:doesnotexist: failed to resolve source metadata for docker.io/library/nonexistent-image-xyz123:doesnotexist: pull access denied, repository does not exist or may require authorization: server message: insufficient_scope: authorization failed</code></pre>
+<p>This is a distinct case from a bad <em>tag</em> on an image that does exist (covered in <a href="/guides/docker-compose-up-error/">Docker Compose Up Errors</a>, section 4, where <code>alpine:bad-tag</code> gives <code>failed to resolve reference ... not found</code>). When the <strong>repository name itself</strong> doesn't exist, the Hub's anonymous-pull auth layer rejects the token request first, so you get "pull access denied ... insufficient_scope" wrapped in "failed to resolve source metadata", not a plain "not found".</p>
+<p>Three related messages we did not reproduce, because each needs a private registry with broken auth or an untrusted TLS setup, which this box doesn't have — per Docker/BuildKit's own docs and issue tracker, not measured here:</p>
+<ul>
+<li><strong><code>failed to fetch anonymous token</code> / <code>failed to fetch oauth token</code>:</strong> BuildKit reached the registry's <code>/v2/</code> endpoint but the token request to its auth server failed — typically the auth server is down, blocked by a firewall/proxy, or credentials in <code>~/.docker/config.json</code> are stale for a private registry.</li>
+<li><strong><code>failed to verify certificate: x509: certificate signed by unknown authority</code>:</strong> the registry presents a self-signed or internally-issued TLS certificate that isn't in the daemon's trust store. Per Docker's docs, the fix is to add the registry's CA certificate under <code>/etc/docker/certs.d/&lt;registry-host&gt;/ca.crt</code>, not to disable TLS verification.</li>
+<li><strong><code>x509: certificate has expired</code> or <code>certificate is not valid for any names</code>:</strong> same family, but the cert itself is expired or missing a Subject Alternative Name for the host you're connecting to — a registry operator problem, not a client misconfiguration.</li>
+</ul>
+
+<h2>6. Checklist: narrowing down a build failure fast</h2>
+<ul>
+<li>Read the <em>last</em> line of the error first (<code>ERROR: failed to build: failed to solve: ...</code>) — it names the exact failing step and instruction type.</li>
+<li><code>failed to calculate checksum</code> / <code>failed to compute cache key</code> → a <code>COPY</code>/<code>ADD</code> path problem (Section 2). Check the build context and <code>.dockerignore</code>.</li>
+<li><code>process "..." did not complete successfully: exit code: N</code> → a <code>RUN</code> command failed while executing (Section 3). Re-run that exact command yourself to see its real output.</li>
+<li><code>failed to resolve source metadata</code>, <code>pull access denied</code>, <code>oauth token</code>, or <code>x509</code> → BuildKit can't fetch the <code>FROM</code> image (Section 5). Check the repository/tag spelling, registry login, and (for private registries) TLS certs.</li>
+<li>Add <code>--progress=plain</code> to <code>docker build</code> to see full, unbuffered step output instead of the collapsed TTY view — most useful when a <code>RUN</code> step's own stdout/stderr is what you actually need.</li>
+<li>If the failure is on <code>docker compose up</code> rather than a plain <code>docker build</code>, see <a href="/guides/docker-compose-up-error/">Docker Compose Up Errors</a> instead — compose has its own error set (bad service names, port conflicts, credential helpers).</li>
+</ul>
+<aside class="cta"><strong>Check the exact headers and status your built image&#x27;s server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &quot;failed to calculate checksum of ref&quot; mean in a docker build?</summary><p>It means a COPY or ADD instruction in your Dockerfile points at a file or directory that doesn&#x27;t exist in the build context. We reproduced the exact text on Docker 29.8.1: ERROR: failed to calculate checksum of ref ...: &quot;/path&quot;: not found. Fix the path, check your .dockerignore, and confirm you passed the right build context directory.</p></details>
+<details><summary>Why do I see &quot;failed to solve&quot; for some errors but &quot;failed to compute cache key&quot; for others?</summary><p>failed to solve is BuildKit&#x27;s generic top-level wrapper for any build failure. failed to compute cache key is a more specific wrapper that only appears for COPY/ADD source problems, because BuildKit fails while hashing the input for its cache, before it ever runs the step. A failing RUN command skips that phrase entirely and goes straight to &quot;process ... did not complete successfully&quot;, because it did run, it just exited non-zero.</p></details>
+<details><summary>Does the exit code in a docker build error mean anything?</summary><p>Yes. The number after &quot;exit code:&quot; is exactly the exit code your RUN command returned, not a Docker-specific code. We confirmed this directly: RUN exit 1 produced &quot;exit code: 1&quot; and RUN exit 42 produced &quot;exit code: 42&quot;, with no other change in the message. Use that number as a direct clue to what failed inside the step (e.g. a specific tool&#x27;s documented exit codes).</p></details>
+<details><summary>What&#x27;s the difference between a bad image tag and a bad image name in docker build?</summary><p>A bad tag on a real repository (e.g. alpine:typo-tag) gives &quot;failed to resolve reference ... not found&quot;, because the registry confirms the repo exists but has no such tag. A bad repository name that doesn&#x27;t exist at all gives a different error we measured: &quot;failed to resolve source metadata ... pull access denied, repository does not exist or may require authorization: server message: insufficient_scope&quot;, because the anonymous-pull token request itself gets rejected before any tag lookup happens.</p></details>
+<details><summary>I&#x27;m getting an x509 certificate or oauth token error pulling my FROM image — how do I fix it?</summary><p>These happen when BuildKit talks to a registry with broken or untrusted TLS, or a failing auth handshake (usually a private registry). Per Docker&#x27;s own docs: for x509 &quot;signed by unknown authority&quot; errors, add the registry&#x27;s CA certificate under /etc/docker/certs.d/&lt;registry-host&gt;/ca.crt rather than disabling verification. For oauth/anonymous token failures, check that the auth server for that registry is reachable and that credentials in ~/.docker/config.json aren&#x27;t stale. We did not reproduce these directly since they need a real private registry with broken auth.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Docker 29.8.1 (BuildKit, containerd image store) on Linux, building from Dockerfiles under /tmp with image tags prefixed forever-guidetest. The real x509 certificate / OAuth token failure cases are from Docker&#x27;s and BuildKit&#x27;s own docs and GitHub issues, not measured, because reproducing them needs a private registry with broken auth. PlainHeaders is our extension; Docker and BuildKit are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

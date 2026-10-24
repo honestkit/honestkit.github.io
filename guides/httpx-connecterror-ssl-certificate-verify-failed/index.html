@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx ConnectError SSL CERTIFICATE_VERIFY_FAILED: fix (tested)</title>
+<meta name="description" content="Fix httpx.ConnectError [SSL: CERTIFICATE_VERIFY_FAILED]: pass verify=ssl.create_default_context(cafile=...), or set SSL_CERT_FILE. verify=str is deprecated.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-connecterror-ssl-certificate-verify-failed/">
+<meta property="og:title" content="httpx ConnectError SSL CERTIFICATE_VERIFY_FAILED: fix (tested)">
+<meta property="og:description" content="Fix httpx.ConnectError [SSL: CERTIFICATE_VERIFY_FAILED]: pass verify=ssl.create_default_context(cafile=...), or set SSL_CERT_FILE. verify=str is deprecated.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-connecterror-ssl-certificate-verify-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does httpx raise ConnectError for an SSL problem?", "acceptedAnswer": {"@type": "Answer", "text": "httpx wraps TLS handshake failures in httpx.ConnectError; the message shows [SSL: CERTIFICATE_VERIFY_FAILED] and the reason, such as self-signed certificate."}}, {"@type": "Question", "name": "Does httpx use the system certificate store?", "acceptedAnswer": {"@type": "Answer", "text": "No. By default it uses the certifi bundle, unless SSL_CERT_FILE or SSL_CERT_DIR is set (with trust_env=True, the default)."}}, {"@type": "Question", "name": "Is verify='/path/ca.pem' still supported in httpx?", "acceptedAnswer": {"@type": "Answer", "text": "In httpx 0.28.1 it works but emits a DeprecationWarning; use verify=ssl.create_default_context(cafile=...) instead."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx ConnectError: SSL CERTIFICATE_VERIFY_FAILED fix (tested)</h1>
+<p class="lead">httpx checks certificates against certifi's bundle and raises <code>httpx.ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED]</code> for a private or self-signed CA. Pass <code>verify=ssl.create_default_context(cafile="ca.pem")</code>, or set <code>SSL_CERT_FILE=ca.pem</code>.</p>
+<p>httpx reports a TLS verification failure as <code>httpx.ConnectError</code>, not as an <code>SSLError</code>. Measured with httpx 0.28.1 on Python 3.13.5 against a local HTTPS server using a self-signed certificate (<code>cert.pem</code>, made with <code>openssl req -x509</code>); the same fix applies to a corporate proxy or private CA.</p>
+<h2 id="error">1. The error</h2>
+<pre><code>import httpx
+from srv import start
+base = start()   # HTTPS server with a self-signed certificate (cert.pem)
+
+try:
+    httpx.get(base)
+except httpx.ConnectError as e:
+    print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1029)</code></pre>
+<p>httpx verifies against the <code>certifi</code> CA bundle by default, not the operating system store, so a certificate your browser or OS trusts (for example a company root CA installed system-wide) can still fail in httpx.</p>
+<h2 id="fix">2. Fix: pass an SSLContext that trusts your CA</h2>
+<pre><code>import httpx, ssl
+from srv import start
+base = start()
+
+ctx = ssl.create_default_context(cafile=&quot;cert.pem&quot;)   # your CA / corporate root
+print(httpx.get(base, verify=ctx).status_code)
+
+with httpx.Client(verify=ctx) as client:
+    print(client.get(base).text)</code></pre>
+<p>Output:</p>
+<pre><code>200
+ok</code></pre>
+<p><code>verify=</code> accepts an <code>ssl.SSLContext</code>, per request or on the <code>Client</code> / <code>AsyncClient</code>. Point <code>cafile</code> at the CA certificate (PEM) that signed the server certificate, or at the server certificate itself when it is self-signed.</p>
+<h2 id="str">3. verify="path.pem" still works but is deprecated</h2>
+<pre><code>import httpx, warnings
+from srv import start
+base = start()
+warnings.simplefilter(&quot;always&quot;)
+
+r = httpx.get(base, verify=&quot;cert.pem&quot;)   # string path: still works in 0.28, but deprecated
+print(r.status_code)</code></pre>
+<p>Output:</p>
+<pre><code>/tmp/fx384/ve/lib/python3.13/site-packages/httpx/_config.py:51: DeprecationWarning: `verify=&lt;str&gt;` is deprecated. Use `verify=ssl.create_default_context(cafile=...)` or `verify=ssl.create_default_context(capath=...)` instead.
+  warnings.warn(message, DeprecationWarning)
+200</code></pre>
+<p>In httpx 0.28 a string path is accepted with a <code>DeprecationWarning</code> pointing to <code>ssl.create_default_context(cafile=...)</code>; switch to the SSLContext form before it is removed.</p>
+<h2 id="env">4. Without code changes: SSL_CERT_FILE</h2>
+<pre><code>import os, httpx, subprocess, sys
+from srv import start
+base = start()
+
+code = f&quot;import httpx; print(httpx.get({base!r}).status_code)&quot;
+env = dict(os.environ, SSL_CERT_FILE=&quot;cert.pem&quot;)
+out = subprocess.run([sys.executable, &quot;-c&quot;, code], env=env, capture_output=True, text=True)
+print(&quot;SSL_CERT_FILE=cert.pem -&gt;&quot;, out.stdout.strip() or out.stderr.strip().splitlines()[-1])</code></pre>
+<p>Output:</p>
+<pre><code>SSL_CERT_FILE=cert.pem -&gt; 200</code></pre>
+<p>With the default <code>trust_env=True</code>, httpx uses <code>SSL_CERT_FILE</code> (or <code>SSL_CERT_DIR</code>) instead of certifi when it is set. Useful when the request is made inside a library you don't control. The file replaces the bundle, so it must contain every CA you need.</p>
+<h2 id="false">5. verify=False (testing only)</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+r = httpx.get(base, verify=False)   # no verification at all: testing only
+print(r.status_code)</code></pre>
+<p>Output:</p>
+<pre><code>200</code></pre>
+<p>This disables certificate checking completely, so anyone in the middle can read and change the traffic. Use it only against a local test server.</p>
+<p>Related: <a href="/guides/python-ssl-certificate-verify-failed/">Python SSL CERTIFICATE_VERIFY_FAILED</a>, <a href="/guides/self-signed-certificate-in-certificate-chain/">self-signed certificate in certificate chain</a>, <a href="/guides/httpx-timeout-default-readtimeout/">httpx timeout</a>, <a href="/guides/httpx-follow-redirects/">httpx follow redirects</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does httpx raise ConnectError for an SSL problem?</summary><p>httpx wraps TLS handshake failures in httpx.ConnectError; the message shows [SSL: CERTIFICATE_VERIFY_FAILED] and the reason, such as self-signed certificate.</p></details>
+<details><summary>Does httpx use the system certificate store?</summary><p>No. By default it uses the certifi bundle, unless SSL_CERT_FILE or SSL_CERT_DIR is set (with trust_env=True, the default).</p></details>
+<details><summary>Is verify=&#x27;/path/ca.pem&#x27; still supported in httpx?</summary><p>In httpx 0.28.1 it works but emits a DeprecationWarning; use verify=ssl.create_default_context(cafile=...) instead.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5 against a local HTTPS http.server with a self-signed certificate. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Via HTTP Header: What Proxies and CDNs Add, and Loop Detection (Tested)</title>
+<meta name="description" content="We checked 8 big sites on 2026-10-02: only aws.amazon.com and d1.awsstatic.com (CloudFront) and reddit.com (varnish) returned Via. curl 8.14.1 and Node 24 fetch never send Via. Syntax, loop detection and how to hide it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/via-header/">
+<meta property="og:title" content="Via HTTP Header: What Proxies and CDNs Add, and Loop Detection (Tested)">
+<meta property="og:description" content="We checked 8 big sites on 2026-10-02: only aws.amazon.com and d1.awsstatic.com (CloudFront) and reddit.com (varnish) returned Via. curl 8.14.1 and Node 24 fetch never send Via. Syntax, loop detection and how to hide it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/via-header/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does the Via header mean?", "acceptedAnswer": {"@type": "Answer", "text": "It lists the proxies a request or response passed through. Each entry is the protocol version the proxy received plus a name for the proxy, e.g. <code>1.1 varnish</code> or <code>1.1 abc123.cloudfront.net (CloudFront)</code>."}}, {"@type": "Question", "name": "Does my browser or curl send Via?", "acceptedAnswer": {"@type": "Answer", "text": "No. In our test curl 8.14.1 and Node.js 24 fetch sent no Via header. If your server sees one, a proxy or CDN between you added it."}}, {"@type": "Question", "name": "Which CDNs add Via?", "acceptedAnswer": {"@type": "Answer", "text": "On 2026-10-02 CloudFront (aws.amazon.com, d1.awsstatic.com) and Varnish (reddit.com) returned Via. Cloudflare, Fastly, Google, GitHub and Wikipedia did not, even though most of them run caches. Missing Via does not mean there is no proxy."}}, {"@type": "Question", "name": "How does Via prevent proxy loops?", "acceptedAnswer": {"@type": "Answer", "text": "Each proxy appends its own name. If a proxy receives a request whose Via already contains its name, the request has looped and the proxy can refuse it. Our test proxy did this and returned 508 Loop Detected. Many CDNs now use the CDN-Loop header for this (from the docs, not measured)."}}, {"@type": "Question", "name": "How do I remove the Via header in nginx?", "acceptedAnswer": {"@type": "Answer", "text": "From the nginx docs, not measured: add <code>proxy_hide_header Via;</code> in the proxied location to drop the upstream's Via from responses. nginx does not add Via on its own."}}, {"@type": "Question", "name": "Is Via the same as X-Forwarded-For?", "acceptedAnswer": {"@type": "Answer", "text": "No. Via lists the proxies; X-Forwarded-For and Forwarded carry the original client IP. They are often used together."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Via header (tested)</h1>
+<p class="lead"><code>Via</code> is the header proxies use to say "this message passed through me". Each intermediary appends one entry: the protocol version it received and a name for itself. You mostly see it on responses that came through a CDN or cache. We fetched eight big sites, checked whether clients add it (they do not), and built a tiny proxy to show how entries chain and how loops are caught.</p>
+<h2>1. Which big sites return Via (measured)</h2>
+<p>One <code>curl -sI</code> per site on 2026-10-02, curl 8.14.1, HTTP/2, from a London connection:</p>
+<table><thead><tr><th>Site</th><th>Via in response</th><th>Other clues</th></tr></thead><tbody>
+<tr><td>aws.amazon.com</td><td><code>1.1 c481ec027cb328d503dd63ec0db0d2ca.cloudfront.net (CloudFront)</code></td><td><code>x-cache: Miss from cloudfront</code>, <code>x-amz-cf-pop: LHR3-P3</code></td></tr>
+<tr><td>d1.awsstatic.com</td><td><code>1.1 735ca864d71c76476e2ce475a166303c.cloudfront.net (CloudFront)</code></td><td><code>server: AmazonS3</code>, <code>x-cache: Hit from cloudfront</code></td></tr>
+<tr><td>www.reddit.com</td><td><code>1.1 varnish</code></td><td><code>server: snooserv</code></td></tr>
+<tr><td>www.cloudflare.com</td><td>none</td><td><code>server: cloudflare</code>, <code>cf-ray: ...-LHR</code></td></tr>
+<tr><td>www.fastly.com</td><td>none (also none over HTTP/1.1)</td><td><code>x-served-by: cache-sjc10035-SJC, cache-lhr-...-LHR</code>, <code>x-cache: HIT, HIT</code></td></tr>
+<tr><td>www.wikipedia.org</td><td>none</td><td><code>server: ATS/9.2.15</code>, <code>x-cache: cp3069 miss, cp3069 hit/599418</code></td></tr>
+<tr><td>www.google.com</td><td>none</td><td><code>server: gws</code></td></tr>
+<tr><td>github.com</td><td>none</td><td><code>server: github.com</code></td></tr>
+</tbody></table>
+<p>Three things stood out:</p>
+<ul>
+<li>CloudFront put a different hostname in <code>Via</code> on a second request to aws.amazon.com (<code>8a8ae069...cloudfront.net</code>). The hex part names the edge server, so do not match on it; match on <code>(CloudFront)</code> or <code>cloudfront.net</code>.</li>
+<li>Fastly, Cloudflare and Wikipedia's caches clearly sit in front of those sites, but none sent <code>Via</code>. No <code>Via</code> does <strong>not</strong> mean no proxy. Look at <code>x-cache</code>, <code>x-served-by</code>, <code>cf-ray</code> and <code>server</code> as well.</li>
+<li><code>Via</code> leaks a little about your stack (<code>varnish</code>, <code>CloudFront</code>). That is usually harmless, but it is the same trade-off as the <a href="/guides/remove-server-header-nginx-apache/">Server header</a>.</li>
+</ul>
+<pre><code>curl -sI https://aws.amazon.com/ | grep -i '^via'
+via: 1.1 c481ec027cb328d503dd63ec0db0d2ca.cloudfront.net (CloudFront)</code></pre>
+
+<h2>2. Syntax (from RFC 9110, not measured)</h2>
+<p>RFC 9110 section 7.6.3 defines each entry as <code>received-protocol received-by [comment]</code>, with entries separated by commas:</p>
+<pre><code>Via: 1.0 fred, 1.1 p.example.net (Apache/1.1)
+     ^   ^      ^   ^             ^
+     |   |      |   |             optional comment
+     |   |      |   received-by: host[:port] or a pseudonym
+     |   |      received-protocol (name "HTTP/" is omitted)
+     |   first proxy
+     version that proxy received</code></pre>
+<ul>
+<li><strong>received-protocol</strong> is the version the proxy <em>received</em>, with <code>HTTP/</code> dropped: <code>1.1</code>, <code>2</code>, <code>3</code>. Other protocols keep their name, e.g. <code>HTTP/2</code> is written <code>2</code> but a non-HTTP one would be <code>FOO/1.0</code>.</li>
+<li><strong>received-by</strong> may be a real host and port or a pseudonym like <code>varnish</code>. The RFC lets a proxy hide real hostnames.</li>
+<li>Each proxy <strong>appends</strong>, so the leftmost entry is the first hop. A proxy must add Via on both requests it forwards and responses it returns.</li>
+</ul>
+
+<h2>3. Do clients add Via? (measured: no)</h2>
+<p>A Node.js 24.21.0 echo server on <code>127.0.0.1:8985</code> returned the headers it received:</p>
+<table><thead><tr><th>Client</th><th>Via sent</th><th>Headers seen by server</th></tr></thead><tbody>
+<tr><td>curl 8.14.1</td><td>no</td><td>host, user-agent, accept</td></tr>
+<tr><td>Node.js 24 <code>fetch()</code></td><td>no</td><td>host, connection, accept, accept-language, sec-fetch-mode, user-agent, accept-encoding</td></tr>
+</tbody></table>
+<p>So if your origin logs show a <code>Via</code> request header, something in between (a CDN, a corporate proxy, a load balancer) added it.</p>
+
+<h2>4. How entries chain and how loops are caught (measured on our own proxy)</h2>
+<p>We wrote a 15-line Node proxy on <code>127.0.0.1:8986</code> that appends <code>1.1 test-proxy</code> to <code>Via</code> on the request and the response, and refuses a request that already contains its own name:</p>
+<pre><code>const via = (req.headers.via ? req.headers.via + ', ' : '') + '1.1 test-proxy';
+if ((req.headers.via || '').includes('test-proxy')) {
+  res.statusCode = 508;            // Loop Detected
+  return res.end('loop detected\n');
+}</code></pre>
+<table><thead><tr><th>Request sent to the proxy</th><th>Via the origin received</th><th>Result</th></tr></thead><tbody>
+<tr><td>No Via</td><td><code>1.1 test-proxy</code></td><td>200, response also had <code>via: 1.1 test-proxy</code></td></tr>
+<tr><td><code>Via: 1.1 cdn-edge</code></td><td><code>1.1 cdn-edge, 1.1 test-proxy</code></td><td>200</td></tr>
+<tr><td><code>Via: 1.1 test-proxy</code></td><td>(not forwarded)</td><td><code>HTTP/1.1 508 Loop Detected</code></td></tr>
+</tbody></table>
+<p>That is the whole idea of Via-based loop detection: if a proxy sees its own name already in the list, the request has come back around. The 508 status is our choice for the test, not a standard proxy rule. From the docs, not measured: CDNs increasingly use the separate <code>CDN-Loop</code> header (RFC 8586) for the same purpose, because it survives customers stripping <code>Via</code>; Cloudflare documents adding <code>CDN-Loop: cloudflare</code> to requests it sends to your origin.</p>
+
+<h2>5. Hiding or adding Via (from the docs, not measured)</h2>
+<table><thead><tr><th>Server</th><th>Directive</th><th>Effect</th></tr></thead><tbody>
+<tr><td>nginx (as reverse proxy)</td><td><code>proxy_hide_header Via;</code></td><td>Drops the upstream's Via from responses to clients. nginx does not add Via itself.</td></tr>
+<tr><td>nginx</td><td><code>proxy_set_header Via "";</code></td><td>Stops a client's Via from reaching the upstream (empty value = header not sent).</td></tr>
+<tr><td>Apache mod_proxy</td><td><code>ProxyVia Off | On | Full | Block</code></td><td>Default <code>Off</code> passes Via through untouched; <code>On</code>/<code>Full</code> add an entry; <code>Block</code> removes it.</td></tr>
+<tr><td>Varnish</td><td><code>unset resp.http.Via;</code> in <code>vcl_deliver</code></td><td>Removes the <code>1.1 varnish</code> entry Varnish adds.</td></tr>
+</tbody></table>
+<pre><code>location / {
+    proxy_pass http://backend;
+    proxy_hide_header Via;
+}</code></pre>
+<p>Removing Via from responses is cosmetic. Do not remove it between your own proxies if any of them rely on it for loop detection.</p>
+
+<h2>6. Via vs Forwarded / X-Forwarded-For</h2>
+<p><code>Via</code> records the <strong>proxies</strong> a message went through. It says nothing about the client. To find the original client IP, use <code>Forwarded</code> or <code>X-Forwarded-For</code>; see <a href="/guides/forwarded-header-vs-x-forwarded-for/">Forwarded vs X-Forwarded-For</a>. In our proxy test the echo server saw <code>Via</code> but no <code>X-Forwarded-For</code>, because our proxy, like nginx by default, does not add one unless told to.</p>
+
+<aside class="cta"><strong>See whether a proxy or CDN adds Via to your responses:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does the Via header mean?</summary><p>It lists the proxies a request or response passed through. Each entry is the protocol version the proxy received plus a name for the proxy, e.g. &lt;code&gt;1.1 varnish&lt;/code&gt; or &lt;code&gt;1.1 abc123.cloudfront.net (CloudFront)&lt;/code&gt;.</p></details>
+<details><summary>Does my browser or curl send Via?</summary><p>No. In our test curl 8.14.1 and Node.js 24 fetch sent no Via header. If your server sees one, a proxy or CDN between you added it.</p></details>
+<details><summary>Which CDNs add Via?</summary><p>On 2026-10-02 CloudFront (aws.amazon.com, d1.awsstatic.com) and Varnish (reddit.com) returned Via. Cloudflare, Fastly, Google, GitHub and Wikipedia did not, even though most of them run caches. Missing Via does not mean there is no proxy.</p></details>
+<details><summary>How does Via prevent proxy loops?</summary><p>Each proxy appends its own name. If a proxy receives a request whose Via already contains its name, the request has looped and the proxy can refuse it. Our test proxy did this and returned 508 Loop Detected. Many CDNs now use the CDN-Loop header for this (from the docs, not measured).</p></details>
+<details><summary>How do I remove the Via header in nginx?</summary><p>From the nginx docs, not measured: add &lt;code&gt;proxy_hide_header Via;&lt;/code&gt; in the proxied location to drop the upstream&#x27;s Via from responses. nginx does not add Via on its own.</p></details>
+<details><summary>Is Via the same as X-Forwarded-For?</summary><p>No. Via lists the proxies; X-Forwarded-For and Forwarded carry the original client IP. They are often used together.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with curl 8.14.1 (one request each to www.cloudflare.com, www.fastly.com, aws.amazon.com, d1.awsstatic.com, www.google.com, github.com, www.wikipedia.org and www.reddit.com, over HTTP/2 from London) and Node.js 24.21.0 (an echo server on localhost:8985 and a 15-line test proxy on localhost:8986, plus built-in fetch). Via syntax is quoted from RFC 9110; nginx, Apache and CDN behaviour we did not reproduce is labelled as from the docs, not measured. PlainHeaders is our extension; curl and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

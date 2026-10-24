@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RuntimeError: operator torchvision::nms does not exist: fix</title>
+<meta name="description" content="import torchvision raises operator torchvision::nms does not exist (or segfaults) when torch and torchvision don&#x27;t match. Tested check and fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/runtimeerror-operator-torchvision-nms-does-not-exist/">
+<meta property="og:title" content="RuntimeError: operator torchvision::nms does not exist: fix">
+<meta property="og:description" content="import torchvision raises operator torchvision::nms does not exist (or segfaults) when torch and torchvision don&#x27;t match. Tested check and fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/runtimeerror-operator-torchvision-nms-does-not-exist/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes operator torchvision::nms does not exist?", "acceptedAnswer": {"@type": "Answer", "text": "torchvision was built for a different torch than the one installed (torchvision 0.24 needs torch 2.9.0, 0.23 needs 2.8.0), or a CUDA torchvision is paired with a CPU torch. Its C++ ops fail to load, so nms is never registered."}}, {"@type": "Question", "name": "Why does import torchvision segfault?", "acceptedAnswer": {"@type": "Answer", "text": "In our test an older torchvision (0.23.0) on a newer torch (2.9.0) crashed with exit 139/134 while loading its extension. Install the torchvision version that matches torch."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>RuntimeError: operator torchvision::nms does not exist (fix)</h1>
+<p class="lead"><code>import torchvision</code> fails with <code>RuntimeError: operator torchvision::nms does not exist</code>, or the process just crashes. We reproduced both with mismatched torch/torchvision pairs and a CPU/CUDA mix, then fixed them.</p>
+<h2 id="errors">1. Reproducing it</h2>
+<p>A test that prints what pip thinks is installed, then imports torchvision:</p>
+<pre><code>import importlib.metadata as m
+print(&quot;torch&quot;, m.version(&quot;torch&quot;), &quot;| torchvision&quot;, m.version(&quot;torchvision&quot;))
+import torchvision
+print(&quot;imported torchvision&quot;, torchvision.__version__)</code></pre>
+<p><b>torch 2.8.0 with torchvision 0.24.0</b> (0.24 is built for torch 2.9; traceback without source lines):</p>
+<pre><code>torch 2.8.0+cpu | torchvision 0.24.0+cpu
+Traceback (most recent call last):
+  File &quot;b1.py&quot;, line 3, in &lt;module&gt;
+  File &quot;.../site-packages/torchvision/__init__.py&quot;, line 10, in &lt;module&gt;
+  File &quot;.../site-packages/torchvision/_meta_registrations.py&quot;, line 163, in &lt;module&gt;
+  File &quot;.../site-packages/torch/library.py&quot;, line 1069, in register
+  File &quot;.../site-packages/torch/library.py&quot;, line 219, in _register_fake
+  File &quot;.../site-packages/torch/_library/fake_impl.py&quot;, line 50, in register
+RuntimeError: operator torchvision::nms does not exist</code></pre>
+<p><b>Same version, different build</b>: torch 2.8.0+cpu with the PyPI torchvision 0.23.0 wheel (a CUDA cu128 build) gave the identical error:</p>
+<pre><code>torch 2.8.0+cpu | torchvision 0.23.0
+Traceback (most recent call last):
+  File &quot;b1.py&quot;, line 3, in &lt;module&gt;
+  File &quot;.../site-packages/torchvision/__init__.py&quot;, line 10, in &lt;module&gt;
+  File &quot;.../site-packages/torchvision/_meta_registrations.py&quot;, line 163, in &lt;module&gt;
+  File &quot;.../site-packages/torch/library.py&quot;, line 1069, in register
+  File &quot;.../site-packages/torch/library.py&quot;, line 219, in _register_fake
+  File &quot;.../site-packages/torch/_library/fake_impl.py&quot;, line 50, in register
+RuntimeError: operator torchvision::nms does not exist</code></pre>
+<p><b>torch 2.9.0 with torchvision 0.23.0</b> (older torchvision on newer torch) raised nothing. The process died while loading torchvision&#x27;s C++ extension: three runs gave exit 139 (segmentation fault), 134 (aborted) and 139. With <code>python -X faulthandler</code> (trimmed):</p>
+<pre><code>torch 2.9.0+cpu | torchvision 0.23.0+cpu
+Fatal Python error: Segmentation fault
+
+Current thread 0x00007f19c1ef8740 (most recent call first):
+  File &quot;.../ctypes/__init__.py&quot;, line 376 in __init__
+  File &quot;.../site-packages/torch/_ops.py&quot;, line 1488 in load_library
+  File &quot;.../site-packages/torchvision/extension.py&quot;, line 34 in &lt;module&gt;
+  ...
+  File &quot;b1.py&quot;, line 3 in &lt;module&gt;
+
+Extension modules: numpy..., torch._C, ... (total: 13)
+exit 139</code></pre>
+<p>The cause in every case: torchvision&#x27;s compiled ops library must match the exact torch build. When it can&#x27;t be loaded, <code>torchvision::nms</code> is never registered, and <code>torchvision/_meta_registrations.py</code>, which registers a fake implementation for it with <code>@torch.library.register_fake("torchvision::nms")</code>, raises <code>operator torchvision::nms does not exist</code>.</p>
+<h2 id="diagnose">2. Check the pair without importing torchvision</h2>
+<p>Importing is what fails (or crashes), so read the metadata and torchvision&#x27;s version file, which keeps the <code>+cpu</code>/<code>+cu128</code> tag:</p>
+<pre><code># Diagnose without importing torchvision: versions AND build tags must match
+import importlib.metadata as m, importlib.util, pathlib, torch
+need = [r for r in (m.requires(&quot;torchvision&quot;) or []) if r.startswith(&quot;torch&quot;)]
+print(&quot;torchvision requires:&quot;, need)
+ta_dir = pathlib.Path(importlib.util.find_spec(&quot;torchvision&quot;).origin).parent
+print(&quot;torchvision build:&quot;, (ta_dir / &quot;version.py&quot;).read_text().splitlines()[0])
+print(&quot;torch build:      &quot;, torch.__version__, &quot;| CUDA:&quot;, torch.version.cuda)</code></pre>
+<p>CPU torch with the CUDA torchvision wheel:</p>
+<pre><code>torchvision requires: [&#x27;torch (==2.8.0)&#x27;]
+torchvision build: __version__ = &#x27;0.23.0+cu128&#x27;
+torch build:       2.8.0+cpu | CUDA: None</code></pre>
+<p>torch 2.9.0 with torchvision 0.23.0:</p>
+<pre><code>torchvision requires: [&#x27;torch (==2.8.0)&#x27;]
+torchvision build: __version__ = &#x27;0.23.0+cpu&#x27;
+torch build:       2.9.0+cpu | CUDA: None</code></pre>
+<p>The version must be the one torchvision requires (0.23 needs torch 2.8.0, 0.24 needs 2.9.0) and the tags must agree; <code>CUDA: None</code> means you need a <code>+cpu</code> torchvision. <code>pip check</code> only catches the version case:</p>
+<pre><code>torchvision 0.23.0+cpu has requirement torch==2.8.0, but you have torch 2.9.0+cpu.</code></pre>
+<p>For the CPU/CUDA mix it printed <code>No broken requirements found.</code></p>
+<h2 id="fix">3. Fix: force-reinstall the matching torchvision</h2>
+<p>Install the torchvision that pairs with your torch, from the index that matches its build tag. For torch 2.9.0+cpu:</p>
+<pre><code>pip install --force-reinstall --no-deps torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu</code></pre>
+<p>After that, <code>b1.py</code> and <code>b2.py</code>:</p>
+<pre><code>torch 2.9.0+cpu | torchvision 0.24.0+cpu
+imported torchvision 0.24.0+cpu
+torchvision requires: [&#x27;torch (==2.9.0)&#x27;]
+torchvision build: __version__ = &#x27;0.24.0+cpu&#x27;
+torch build:       2.9.0+cpu | CUDA: None</code></pre>
+<p>and the op that was &quot;missing&quot; works:</p>
+<pre><code>import torch, torchvision
+boxes = torch.tensor([[0., 0, 10, 10], [1, 1, 11, 11], [50, 50, 60, 60]])
+scores = torch.tensor([0.9, 0.8, 0.7])
+print(torchvision.ops.nms(boxes, scores, iou_threshold=0.5))</code></pre>
+<pre><code>tensor([0, 2])</code></pre>
+<p>The CPU/CUDA mix was fixed the same way with <code>torchvision==0.23.0</code> from <code>/whl/cpu</code> (<code>imported torchvision 0.23.0+cpu</code>). Use <code>--force-reinstall</code>: a CUDA build already counts as <code>==0.23.0</code>, so a plain install can leave it in place (that is what happened in our <a href="/guides/torchaudio-libtorchaudio-so-undefined-symbol/">torchaudio test</a>). On a CUDA torch, put its tag in the URL instead (e.g. <code>/whl/cu128</code>). If you&#x27;d rather move torch, reinstall torch and torchvision together in one command from one index.</p>
+<p>Related: <a href="/guides/torchaudio-libtorchaudio-so-undefined-symbol/">torchaudio libtorchaudio.so undefined symbol</a> (the same mismatch for torchaudio) · <a href="/guides/torchcodec-could-not-load-libtorchcodec/">Could not load libtorchcodec</a> · <a href="/guides/torch-load-weights-only-load-failed/">torch.load Weights only load failed</a></p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes operator torchvision::nms does not exist?</summary><p>torchvision was built for a different torch than the one installed (torchvision 0.24 needs torch 2.9.0, 0.23 needs 2.8.0), or a CUDA torchvision is paired with a CPU torch. Its C++ ops fail to load, so nms is never registered.</p></details>
+<details><summary>Why does import torchvision segfault?</summary><p>In our test an older torchvision (0.23.0) on a newer torch (2.9.0) crashed with exit 139/134 while loading its extension. Install the torchvision version that matches torch.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux with CPython 3.11.17, torch 2.8.0/2.9.0 CPU wheels, torchvision 0.23.0/0.24.0 CPU wheels and the PyPI torchvision 0.23.0 (cu128) wheel. Output pasted unedited except shortened paths and trimmed tracebacks. PlainTables is our extension; torch and torchvision are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

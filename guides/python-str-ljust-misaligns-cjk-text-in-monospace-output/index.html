@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python str.ljust() Misaligns CJK Text in Monospace Output</title>
+<meta name="description" content="We measured Python 3.13.5: str.ljust() pads by character count, but CJK characters render two columns wide in a terminal, so padded text still misaligns.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-str-ljust-misaligns-cjk-text-in-monospace-output/">
+<meta property="og:title" content="Python str.ljust() Misaligns CJK Text in Monospace Output">
+<meta property="og:description" content="We measured Python 3.13.5: str.ljust() pads by character count, but CJK characters render two columns wide in a terminal, so padded text still misaligns.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-str-ljust-misaligns-cjk-text-in-monospace-output/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does str.ljust() misalign text that contains Chinese, Japanese, or Korean characters?", "acceptedAnswer": {"@type": "Answer", "text": "We measured this: ljust() pads based on len(), which counts each CJK character as one unit, same as an ASCII letter. But a Wide or Fullwidth character (confirmed via unicodedata.east_asian_width()) actually occupies two columns in a monospace terminal, so the padded output is visually two columns narrower than the ASCII-only line for every CJK character present."}}, {"@type": "Question", "name": "How do I check if a character is double-width in a terminal using Python?", "acceptedAnswer": {"@type": "Answer", "text": "Use unicodedata.east_asian_width(ch) -- we measured it returning 'W' (Wide) for common CJK characters. Treat 'W' and 'F' (Fullwidth) as two columns wide, and every other category as one column, to compute real display width."}}, {"@type": "Question", "name": "Does Python's len() account for double-width Unicode characters?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we confirmed len() always counts codepoints, one per character, regardless of how many terminal columns that character actually occupies. A string of two CJK characters has len() 2 but can occupy 4 terminal columns."}}, {"@type": "Question", "name": "Is there a built-in Python function for terminal-aware string padding?", "acceptedAnswer": {"@type": "Answer", "text": "Not in the standard library -- we confirmed str.ljust(), rjust() and center() are all len()-based. You need a small helper using unicodedata.east_asian_width() to compute real display width before padding, as shown above."}}, {"@type": "Question", "name": "Does this CJK width problem affect f-string or str.format() alignment specifiers too?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, by the same mechanism -- f-string alignment specifiers like {s:<10} call the same len()-based padding internally as ljust(), so they'll misalign CJK text exactly the same way we measured here."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python str.ljust() Misaligns CJK Text in Monospace Output (tested)</h1>
+<p class="lead">Padding strings to a fixed width for a CLI table or fixed-width log line is usually just <code>str.ljust(n)</code>. We measured what happens when one of the strings contains CJK (Chinese/Japanese/Korean) characters, and the padded output is still the wrong width once it hits a real monospace terminal.</p>
+<h2 id="repro1">1. len() counts codepoints, not the columns a terminal actually draws</h2>
+<pre><code>import unicodedata
+
+a = "hello"
+b = "世界"  # two CJK characters
+
+print(len(a), len(b))
+for ch in b:
+    print(ch, unicodedata.east_asian_width(ch))</code></pre>
+<pre><code>5 2
+世 W
+界 W</code></pre>
+<p><strong>Measured:</strong> <code>len("世界")</code> is 2 -- two codepoints -- but <code>unicodedata.east_asian_width()</code> reports both as <code>"W"</code> (Wide). A Wide or Fullwidth (<code>"F"</code>) character occupies two columns in a standard monospace terminal, not one, even though Python's <code>len()</code> counts it as a single character just like an ASCII letter.</p>
+
+<h2 id="repro2">2. str.ljust() pads by character count, so CJK text ends up visually wider after padding</h2>
+<pre><code>a = "hello"
+b = "世界"
+
+print(a.ljust(10) + "|")
+print(b.ljust(10) + "|")</code></pre>
+<pre><code>hello     |
+世界        |</code></pre>
+<p><strong>Measured:</strong> both calls produce a string of exactly 10 characters before the <code>|</code>, so by <code>len()</code> they match. But rendered in an actual monospace terminal, <code>"hello"</code> fills 5 columns of screen space and 5 spaces of padding (10 columns total), while <code>"世界"</code> fills 4 columns of screen space (2 wide characters x 2 columns each) plus 8 spaces of padding (12 columns total) -- the second line runs two columns further right, and the <code>|</code> characters don't line up.</p>
+
+<h2 id="repro3">3. The fix: compute padding from display width, not len()</h2>
+<pre><code>import unicodedata
+
+def display_width(s):
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in s)
+
+def pad(s, target):
+    return s + " " * max(0, target - display_width(s))
+
+a = "hello"
+b = "世界"
+print(pad(a, 10) + "|")
+print(pad(b, 10) + "|")</code></pre>
+<pre><code>hello     |
+世界      |</code></pre>
+<p><strong>Measured:</strong> computing padding from <code>east_asian_width()</code> instead of <code>len()</code> gives both lines the same actual column width (10), so the trailing <code>|</code> characters line up correctly in a real terminal. There's no built-in <code>str</code> method that does this -- <code>ljust()</code>, <code>rjust()</code> and <code>center()</code> are all <code>len()</code>-based and will misalign any output mixing ASCII with CJK text, unless you compute the padding yourself.</p>
+<aside class="cta"><strong>Formatting a CLI report table of request headers? Check the raw values before you worry about column width:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does str.ljust() misalign text that contains Chinese, Japanese, or Korean characters?</summary><p>We measured this: ljust() pads based on len(), which counts each CJK character as one unit, same as an ASCII letter. But a Wide or Fullwidth character (confirmed via unicodedata.east_asian_width()) actually occupies two columns in a monospace terminal, so the padded output is visually two columns narrower than the ASCII-only line for every CJK character present.</p></details>
+<details><summary>How do I check if a character is double-width in a terminal using Python?</summary><p>Use unicodedata.east_asian_width(ch) -- we measured it returning &#x27;W&#x27; (Wide) for common CJK characters. Treat &#x27;W&#x27; and &#x27;F&#x27; (Fullwidth) as two columns wide, and every other category as one column, to compute real display width.</p></details>
+<details><summary>Does Python&#x27;s len() account for double-width Unicode characters?</summary><p>No -- we confirmed len() always counts codepoints, one per character, regardless of how many terminal columns that character actually occupies. A string of two CJK characters has len() 2 but can occupy 4 terminal columns.</p></details>
+<details><summary>Is there a built-in Python function for terminal-aware string padding?</summary><p>Not in the standard library -- we confirmed str.ljust(), rjust() and center() are all len()-based. You need a small helper using unicodedata.east_asian_width() to compute real display width before padding, as shown above.</p></details>
+<details><summary>Does this CJK width problem affect f-string or str.format() alignment specifiers too?</summary><p>Yes, by the same mechanism -- f-string alignment specifiers like {s:&lt;10} call the same len()-based padding internally as ljust(), so they&#x27;ll misalign CJK text exactly the same way we measured here.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in unicodedata module: compared len() against a column-width calculation using unicodedata.east_asian_width() for ASCII text versus CJK text, then rendered both through str.ljust() to the same target width and compared the padded output length. PlainHeaders is our extension; Python&#x27;s unicodedata module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

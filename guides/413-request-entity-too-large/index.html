@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>413 Request Entity Too Large: Express 100kb Limit and Fixes (Tested)</title>
+<meta name="description" content="Express 5.2.1 express.json() accepted 102,400 bytes and returned 413 at 102,401: PayloadTooLargeError, type entity.too.large. Plain Node.js took 200 MB with no limit. Gzip and chunked bodies counted too, and in Chromium a 413 without CORS headers became &#x27;Failed to fetch&#x27;.">
+<link rel="canonical" href="https://honestkit.github.io/guides/413-request-entity-too-large/">
+<meta property="og:title" content="413 Request Entity Too Large: Express 100kb Limit and Fixes (Tested)">
+<meta property="og:description" content="Express 5.2.1 express.json() accepted 102,400 bytes and returned 413 at 102,401: PayloadTooLargeError, type entity.too.large. Plain Node.js took 200 MB with no limit. Gzip and chunked bodies counted too, and in Chromium a 413 without CORS headers became &#x27;Failed to fetch&#x27;.">
+<meta property="og:url" content="https://honestkit.github.io/guides/413-request-entity-too-large/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is Express's default body size limit?", "acceptedAnswer": {"@type": "Answer", "text": "100kb, which is 102,400 bytes. In Express 5.2.1 express.json() accepted exactly 102,400 bytes and returned 413 at 102,401. express.urlencoded(), express.raw() and express.text() have the same default."}}, {"@type": "Question", "name": "How do I fix PayloadTooLargeError: request entity too large?", "acceptedAnswer": {"@type": "Answer", "text": "Pass a larger limit to the parser that rejected the body, for example express.json({ limit: '10mb' }), and if a proxy like nginx sits in front, raise its client_max_body_size too. With limit '10mb', 10,485,760 bytes passed and 10,485,761 got 413."}}, {"@type": "Question", "name": "Does Node.js have a request body size limit?", "acceptedAnswer": {"@type": "Answer", "text": "No. A plain http.createServer handler on Node.js 24.21.0 accepted a 200 MB body. A 413 from a Node app comes from a framework, middleware or proxy."}}, {"@type": "Question", "name": "Does gzip compression get around the 413 limit?", "acceptedAnswer": {"@type": "Answer", "text": "No. A 103,424-byte JSON body gzipped to 155 bytes still got 413 from express.json(), because the limit is applied to the decompressed size."}}, {"@type": "Question", "name": "Why does fetch say 'Failed to fetch' instead of 413?", "acceptedAnswer": {"@type": "Answer", "text": "The 413 response had no Access-Control-Allow-Origin header, because the body parser rejected the request before the handler that sets it ran. Chromium 153 reported a CORS error. Moving CORS middleware before express.json() made the 413 readable."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>413 Request Entity Too Large (tested)</h1>
+<p class="lead"><code>413</code> means the server refused the request because the body was bigger than it allows. The status was called <em>Request Entity Too Large</em>, then <em>Payload Too Large</em> (Node.js still sends that text), and is <em>Content Too Large</em> in RFC 9110. The limit is never in the client. It is set by whatever reads the body first: a body parser, a proxy, or the language runtime. We measured where Node.js and Express draw the line and what the client sees.</p>
+<h2>1. Plain Node.js has no body limit</h2>
+<p>An <code>http.createServer</code> handler that just counted bytes accepted a 200 MB POST (209,715,200 bytes) with <code>200</code> in 0.18 s on localhost. Node.js limits header size, not body size. If a Node app returns 413, a framework or middleware sent it. For the header-size equivalent see <a href="/guides/request-header-or-cookie-too-large/">Request Header Or Cookie Too Large</a>.</p>
+<h2>2. Express: the 100kb default</h2>
+<p><code>express.json()</code>, <code>express.urlencoded()</code>, <code>express.raw()</code> and <code>express.text()</code> all default to <code>limit: '100kb'</code>, and <code>kb</code> means 1,024 bytes. Results with curl and <code>--data-binary</code>:</p>
+<table><thead><tr><th>Parser</th><th>Body size</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>express.json()</code></td><td>101,376 bytes (99 KB)</td><td>200</td></tr>
+<tr><td><code>express.json()</code></td><td>102,400 bytes (exactly 100 KB)</td><td>200</td></tr>
+<tr><td><code>express.json()</code></td><td>102,401 bytes</td><td><strong>413</strong></td></tr>
+<tr><td><code>express.json()</code></td><td>103,424 bytes (101 KB)</td><td><strong>413</strong></td></tr>
+<tr><td><code>express.urlencoded()</code></td><td>103,424 bytes</td><td><strong>413</strong></td></tr>
+<tr><td><code>express.raw()</code></td><td>102,400 / 103,424 bytes</td><td>200 / <strong>413</strong></td></tr>
+<tr><td><code>express.text()</code></td><td>103,424 bytes</td><td><strong>413</strong></td></tr>
+<tr><td>no parser on the route</td><td>103,424 bytes</td><td>200</td></tr>
+<tr><td><code>express.json({ limit: '10mb' })</code></td><td>103,424 bytes</td><td>200</td></tr>
+<tr><td><code>express.json({ limit: '10mb' })</code></td><td>10,485,760 / 10,485,761 bytes</td><td>200 / <strong>413</strong></td></tr>
+</tbody></table>
+<p>Two cases that surprised us:</p>
+<ul>
+<li><strong>Compressed bodies count after decompression.</strong> The 103,424-byte JSON gzipped to 155 bytes. Sent with <code>Content-Encoding: gzip</code>, it still got <code>413</code>. Compressing the upload does not get you under the limit.</li>
+<li><strong>Chunked bodies are counted too.</strong> With <code>Transfer-Encoding: chunked</code> and no <code>Content-Length</code>, the same body got <code>413</code>. The error just has no <code>length</code> field, because no length was declared.</li>
+</ul>
+<p>A body with the wrong <code>Content-Type</code> (for example <code>text/plain</code> sent to <code>express.json()</code>) is not checked for size at all. The parser skips it and <code>req.body</code> is <code>undefined</code> in Express 5, which in our route caused a <code>500</code>. If a large upload "works" but the data is missing, check the header: <a href="/guides/content-type-application-json-header/">Content-Type: application/json</a>.</p>
+<h2>3. What the 413 response looks like</h2>
+<pre><code>HTTP/1.1 413 Payload Too Large
+X-Powered-By: Express
+Content-Security-Policy: default-src 'none'
+X-Content-Type-Options: nosniff
+Content-Type: text/html; charset=utf-8
+Content-Length: 994</code></pre>
+<p>The default error handler returns HTML. With <code>NODE_ENV=production</code> the body is just <code>&lt;pre&gt;Payload Too Large&lt;/pre&gt;</code>. Otherwise it includes the stack trace, starting with <code>PayloadTooLargeError: request entity too large at readStream (.../raw-body/index.js)</code>. The error object passed to your error middleware had these fields:</p>
+<pre><code>{ "name": "PayloadTooLargeError", "type": "entity.too.large",
+  "status": 413, "limit": 102400, "length": 103424, "expected": 103424,
+  "message": "request entity too large" }</code></pre>
+<p>Check <code>err.type === 'entity.too.large'</code> to return a JSON error your client can show:</p>
+<pre><code>app.use(express.json({ limit: '10mb' }));
+
+app.use((err, req, res, next) =&gt; {
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Body too large', limit: err.limit });
+  }
+  next(err);
+});</code></pre>
+<p>Raise the limit only on the routes that need it, for example <code>app.post('/upload', express.json({ limit: '10mb' }), handler)</code>. For real file uploads, use streaming multipart handling instead of a large JSON limit.</p>
+<h2>4. In the browser: 413 can show up as a CORS error</h2>
+<p>We sent a 103,424-byte JSON body with <code>fetch</code> from a page on <code>localhost:8983</code> to an Express API on <code>localhost:8984</code>, in Chromium 153:</p>
+<table><thead><tr><th>Where the API sets <code>Access-Control-Allow-Origin</code></th><th>Small body</th><th>103,424-byte body</th></tr></thead><tbody>
+<tr><td>Only in the route handler (after <code>express.json()</code>)</td><td>200</td><td><code>TypeError: Failed to fetch</code>; the console says "blocked by CORS policy: No 'Access-Control-Allow-Origin' header"</td></tr>
+<tr><td>In middleware that runs before <code>express.json()</code></td><td>200</td><td><code>res.status</code> 413, <code>statusText</code> "Payload Too Large", JSON body readable</td></tr>
+</tbody></table>
+<p>The parser rejects the request before your handler runs, so headers that your handler would have set are never sent. Put the CORS middleware (for example <code>app.use(cors())</code>) before the body parsers. Then the frontend gets a real <code>413</code> it can handle, instead of a network error.</p>
+<h2>5. Other servers (from their docs, not measured here)</h2>
+<ul>
+<li><strong>nginx</strong>: <code>client_max_body_size</code> defaults to <code>1m</code>. Larger requests get <code>413</code> from nginx before your app sees them. Set it in <code>http</code>, <code>server</code> or <code>location</code>, for example <code>client_max_body_size 10m;</code>. <code>0</code> disables the check. If nginx sits in front of Express, raise both limits.</li>
+<li><strong>PHP</strong>: <code>upload_max_filesize</code> (default 2M) and <code>post_max_size</code> (default 8M) in php.ini. <code>post_max_size</code> must be at least as large as the upload. The web server in front of PHP has its own limit too.</li>
+</ul>
+<h2>6. Checklist</h2>
+<ol>
+<li>Find who sent the 413. An Express HTML body with <code>Content-Security-Policy: default-src 'none'</code> comes from Express. A different error page (for example one naming nginx) means a proxy in front rejected it.</li>
+<li>Measure the real body size in bytes, after decompression.</li>
+<li>Raise the limit on the layer that rejected it: <code>express.json({ limit: '10mb' })</code>, nginx <code>client_max_body_size</code>, etc.</li>
+<li>Return a JSON 413 with CORS headers so the browser can read it.</li>
+</ol>
+<aside class="cta"><strong>See the status and headers your server actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is Express&#x27;s default body size limit?</summary><p>100kb, which is 102,400 bytes. In Express 5.2.1 express.json() accepted exactly 102,400 bytes and returned 413 at 102,401. express.urlencoded(), express.raw() and express.text() have the same default.</p></details>
+<details><summary>How do I fix PayloadTooLargeError: request entity too large?</summary><p>Pass a larger limit to the parser that rejected the body, for example express.json({ limit: &#x27;10mb&#x27; }), and if a proxy like nginx sits in front, raise its client_max_body_size too. With limit &#x27;10mb&#x27;, 10,485,760 bytes passed and 10,485,761 got 413.</p></details>
+<details><summary>Does Node.js have a request body size limit?</summary><p>No. A plain http.createServer handler on Node.js 24.21.0 accepted a 200 MB body. A 413 from a Node app comes from a framework, middleware or proxy.</p></details>
+<details><summary>Does gzip compression get around the 413 limit?</summary><p>No. A 103,424-byte JSON body gzipped to 155 bytes still got 413 from express.json(), because the limit is applied to the decompressed size.</p></details>
+<details><summary>Why does fetch say &#x27;Failed to fetch&#x27; instead of 413?</summary><p>The 413 response had no Access-Control-Allow-Origin header, because the body parser rejected the request before the handler that sets it ran. Chromium 153 reported a CORS error. Moving CORS middleware before express.json() made the 413 readable.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 (plain http.createServer on localhost:8983), Express 5.2.1 with body-parser 2.3.0 (localhost:8984, NODE_ENV development and production), curl 8.14.1 as the client, and headless Chromium 153.0.8010.12 (Playwright) for the browser fetch test. Request bodies were exact byte counts generated with Python 3.13.5. Flask could not be installed here (no pip) and nginx and PHP are not installed, so their settings are quoted from their documentation, not run. PlainHeaders is our extension; Node.js, Express, curl and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

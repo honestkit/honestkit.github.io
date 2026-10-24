@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>406 Not Acceptable: What Accept Header Triggers It and How to Fix It (Tested)</title>
+<meta name="description" content="We logged the default Accept header of curl, Node fetch, Python requests and Chromium, then made Express 5.2.1 res.format return 406. application/xml, text/plain or json;q=0 got 406; */* and no Accept got 200. Fixes: a default handler or Accept: application/json.">
+<link rel="canonical" href="https://honestkit.github.io/guides/406-not-acceptable/">
+<meta property="og:title" content="406 Not Acceptable: What Accept Header Triggers It and How to Fix It (Tested)">
+<meta property="og:description" content="We logged the default Accept header of curl, Node fetch, Python requests and Chromium, then made Express 5.2.1 res.format return 406. application/xml, text/plain or json;q=0 got 406; */* and no Accept got 200. Fixes: a default handler or Accept: application/json.">
+<meta property="og:url" content="https://honestkit.github.io/guides/406-not-acceptable/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does 406 Not Acceptable mean?", "acceptedAnswer": {"@type": "Answer", "text": "The server read the request's Accept header and had no format it was willing to send that matched it. In Express 5.2.1, res.format() with JSON and HTML handlers and no default returned 406 for Accept: application/xml, text/plain and application/json;q=0."}}, {"@type": "Question", "name": "Do curl, fetch or Python requests cause 406 by default?", "acceptedAnswer": {"@type": "Answer", "text": "No. curl 8.14.1, Node.js 24 fetch, Python requests 2.32.3 and Chromium 153 fetch/XHR all sent Accept: */*, and Python urllib sent no Accept header; Express answered 200 to both. A 406 usually means code set Accept explicitly."}}, {"@type": "Question", "name": "How do I fix 406 in Express?", "acceptedAnswer": {"@type": "Answer", "text": "Add a default key to res.format(), for example default: () => res.json(data). With it, every Accept value we tried returned 200. Or have the client send Accept: application/json."}}, {"@type": "Question", "name": "How do q-values affect content negotiation?", "acceptedAnswer": {"@type": "Answer", "text": "Higher q wins: with Accept: text/html;q=0.5, application/json, Express chose JSON; with text/html, application/json;q=0.5 it chose HTML. q=0 excludes a type. With */* the server's own order decides."}}, {"@type": "Question", "name": "Why is my 406 response HTML when I expected JSON?", "acceptedAnswer": {"@type": "Answer", "text": "Express's default error handler renders HTML: 932 bytes including a stack trace in development, 141 bytes in production. Add an error middleware that returns JSON using err.status and err.types."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>406 Not Acceptable (tested)</h1>
+<p class="lead"><code>406 Not Acceptable</code> means the server has several formats it could send, read your <code>Accept</code> request header, and found none it was willing to return. It is a content-negotiation failure, not an auth or routing error. We measured what each common client sends by default and exactly which <code>Accept</code> values make an Express 5.2.1 route answer 406.</p>
+<h2>1. The Accept header each client sends by default</h2>
+<p>Recorded by a Node.js echo server that returned <code>req.headers.accept</code>:</p>
+<table><thead><tr><th>Client</th><th>Default <code>Accept</code></th></tr></thead><tbody>
+<tr><td>curl 8.14.1</td><td><code>*/*</code></td></tr>
+<tr><td>Node.js 24.21.0 <code>fetch()</code></td><td><code>*/*</code></td></tr>
+<tr><td>Python requests 2.32.3</td><td><code>*/*</code></td></tr>
+<tr><td>Python <code>urllib.request.urlopen</code> (3.13)</td><td>(no Accept header at all)</td></tr>
+<tr><td>Chromium 153 <code>fetch()</code> and <code>XMLHttpRequest</code></td><td><code>*/*</code></td></tr>
+<tr><td>Chromium 153 page navigation</td><td><code>text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7</code></td></tr>
+</tbody></table>
+<p>Every default above accepts anything, so a 406 almost always means <strong>some code set Accept explicitly</strong>: an HTTP client configured for XML, a library that sends <code>Accept: text/plain</code>, an API SDK, or a header copied from somewhere else. Check the request in the browser's Network tab or with <code>curl -v</code> before touching the server.</p>
+<h2>2. Reproducing 406 in Express 5.2.1</h2>
+<p>A route that offers JSON and HTML with <code>res.format()</code> and no <code>default</code>:</p>
+<pre><code>app.get('/nodef', (req, res) =&gt; res.format({
+  'application/json': () =&gt; res.json({ ok: 1 }),
+  'text/html':        () =&gt; res.send('&lt;p&gt;ok&lt;/p&gt;'),
+}));</code></pre>
+<p>Measured with <code>curl -H "Accept: ..."</code>:</p>
+<table><thead><tr><th><code>Accept</code> sent</th><th>Without <code>default</code></th><th>With <code>default</code></th></tr></thead><tbody>
+<tr><td>(header removed with <code>-H 'Accept:'</code>)</td><td>200, JSON</td><td>200, JSON</td></tr>
+<tr><td><code>*/*</code></td><td>200, JSON (first key wins)</td><td>200, JSON</td></tr>
+<tr><td><code>application/*</code></td><td>200, JSON</td><td>200, JSON</td></tr>
+<tr><td><code>application/json</code></td><td>200, JSON</td><td>200, JSON</td></tr>
+<tr><td><code>text/html</code></td><td>200, HTML</td><td>200, HTML</td></tr>
+<tr><td><code>application/xml</code></td><td><strong>406</strong></td><td>200, default</td></tr>
+<tr><td><code>text/plain</code></td><td><strong>406</strong></td><td>200, default</td></tr>
+<tr><td><code>application/json;q=0</code></td><td><strong>406</strong> (q=0 means "not acceptable")</td><td>200, default</td></tr>
+<tr><td><code>text/html;q=0.5, application/json</code></td><td>200, JSON</td><td>200, JSON</td></tr>
+<tr><td><code>text/html, application/json;q=0.5</code></td><td>200, HTML</td><td>200, HTML</td></tr>
+</tbody></table>
+<p>The 406 response itself:</p>
+<pre><code>$ curl -si -H 'Accept: application/xml' http://localhost:8988/nodef
+HTTP/1.1 406 Not Acceptable
+X-Powered-By: Express
+Vary: Accept
+Content-Security-Policy: default-src 'none'
+X-Content-Type-Options: nosniff
+Content-Type: text/html; charset=utf-8
+Content-Length: 932</code></pre>
+<p>Express raises a <code>NotAcceptableError</code>. Without an error handler the body is an HTML page: in development it contains the full stack trace (932 bytes here) and the trace is also printed to the server console; with <code>NODE_ENV=production</code> it was a 141-byte page saying only <code>Not Acceptable</code>. An API client expecting JSON gets HTML either way. <code>res.format()</code> also added <code>Vary: Accept</code> to both the 200 and 406 responses, which keeps caches from serving the JSON variant to an HTML request; see <a href="/guides/vary-header-accept-encoding-user-agent/">the Vary header guide</a>.</p>
+<p>The error carries the offered types. This handler:</p>
+<pre><code>app.use((err, req, res, next) =&gt;
+  res.status(err.status).json({ error: err.message, status: err.status, types: err.types }));</code></pre>
+<p>returned <code>406 {"error":"Not Acceptable","status":406,"types":["application/json","text/html"]}</code>, which tells the caller what it can ask for.</p>
+<h2>3. How req.accepts() ranks types</h2>
+<table><thead><tr><th>Request <code>Accept</code></th><th><code>accepts(['html','json'])</code></th><th><code>accepts(['json','html'])</code></th><th><code>accepts('xml')</code></th></tr></thead><tbody>
+<tr><td><code>text/html;q=0.5, application/json</code></td><td><code>json</code></td><td><code>json</code></td><td><code>false</code></td></tr>
+<tr><td><code>text/html, application/json;q=0.5</code></td><td><code>html</code></td><td><code>html</code></td><td><code>false</code></td></tr>
+<tr><td><code>*/*</code></td><td><code>html</code></td><td><code>json</code></td><td><code>xml</code></td></tr>
+<tr><td><code>application/xml</code></td><td><code>false</code></td><td><code>false</code></td><td><code>xml</code></td></tr>
+<tr><td>Chromium navigation string (above)</td><td><code>html</code></td><td><code>html</code></td><td><code>xml</code></td></tr>
+</tbody></table>
+<p>The client's q-values decide first; only on a tie (such as <code>*/*</code>) does the order of <em>your</em> list decide. A route with only a JSON handler, <code>res.format({ json: ... })</code>, returned 200 to Chromium's navigation string (through <code>*/*;q=0.8</code>) but 406 to a bare <code>Accept: text/html</code>. If you check by hand, <code>if (!req.accepts('json')) return res.sendStatus(406)</code> sends <code>406</code> with the body <code>Not Acceptable</code>.</p>
+<h2>4. Fixes</h2>
+<p><strong>Client side</strong> (when you call someone else's API): send a type the server offers, usually <code>Accept: application/json</code>, or <code>*/*</code>. In <code>fetch</code>: <code>fetch(url, { headers: { Accept: 'application/json' } })</code>; Chromium sent exactly that value. In curl: <code>-H 'Accept: application/json'</code>. Look for code that sets <code>Accept</code> globally, such as client defaults or interceptors.</p>
+<p><strong>Server side</strong> (Express): add a <code>default</code> so unknown types get your main format instead of an error:</p>
+<pre><code>res.format({
+  'application/json': () =&gt; res.json(data),
+  'text/html':        () =&gt; res.send(html),
+  default:            () =&gt; res.json(data),
+});</code></pre>
+<p>With that change every row in the table above returned 200. Keep the strict 406 only if the endpoint really cannot produce anything else, and then return a JSON error that lists <code>err.types</code>.</p>
+<p>If the server is not yours and even <code>Accept: */*</code> gets 406, the cause is probably not content negotiation. Web application firewalls such as Apache mod_security are reported to answer 406 when a request matches a rule (for example an unusual User-Agent or request body). We did not reproduce that here. Related: <a href="/guides/accept-language-header/">Accept-Language</a> negotiates language the same way, and <a href="/guides/accept-encoding-gzip-deflate-br-zstd/">Accept-Encoding</a> negotiates compression. For the response side of JSON, see <a href="/guides/content-type-application-json-header/">Content-Type: application/json</a>.</p>
+<aside class="cta"><strong>See the Accept header your requests send and the Vary your server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does 406 Not Acceptable mean?</summary><p>The server read the request&#x27;s Accept header and had no format it was willing to send that matched it. In Express 5.2.1, res.format() with JSON and HTML handlers and no default returned 406 for Accept: application/xml, text/plain and application/json;q=0.</p></details>
+<details><summary>Do curl, fetch or Python requests cause 406 by default?</summary><p>No. curl 8.14.1, Node.js 24 fetch, Python requests 2.32.3 and Chromium 153 fetch/XHR all sent Accept: */*, and Python urllib sent no Accept header; Express answered 200 to both. A 406 usually means code set Accept explicitly.</p></details>
+<details><summary>How do I fix 406 in Express?</summary><p>Add a default key to res.format(), for example default: () =&gt; res.json(data). With it, every Accept value we tried returned 200. Or have the client send Accept: application/json.</p></details>
+<details><summary>How do q-values affect content negotiation?</summary><p>Higher q wins: with Accept: text/html;q=0.5, application/json, Express chose JSON; with text/html, application/json;q=0.5 it chose HTML. q=0 excludes a type. With */* the server&#x27;s own order decides.</p></details>
+<details><summary>Why is my 406 response HTML when I expected JSON?</summary><p>Express&#x27;s default error handler renders HTML: 932 bytes including a stack trace in development, 141 bytes in production. Add an error middleware that returns JSON using err.status and err.types.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 (http.createServer echo server on localhost:8987, built-in fetch as a client), Express 5.2.1 on localhost:8988, curl 8.14.1, Python requests 2.32.3 and urllib (Python 3.13), and headless Chromium 153.0.8010.12 (Playwright). Flask, Django and FastAPI were not tested (no pip on the test box). WAF and mod_security causes are reported elsewhere, not reproduced here. PlainHeaders is our extension; Node.js, Express, curl, requests and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forgetting csv.DictWriter.writeheader() Silently Eats Your Header</title>
+<meta name="description" content="We measured csv.DictWriter skipping the header row silently when writeheader() isn&#x27;t called — DictReader then treats your first real row as the header.">
+<link rel="canonical" href="https://honestkit.github.io/guides/csv-dictwriter-forgetting-writeheader-corrupts-data-silently/">
+<meta property="og:title" content="Forgetting csv.DictWriter.writeheader() Silently Eats Your Header">
+<meta property="og:description" content="We measured csv.DictWriter skipping the header row silently when writeheader() isn&#x27;t called — DictReader then treats your first real row as the header.">
+<meta property="og:url" content="https://honestkit.github.io/guides/csv-dictwriter-forgetting-writeheader-corrupts-data-silently/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does csv.DictWriter write a header row automatically?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured it writing zero header bytes unless .writeheader() is called explicitly. fieldnames= is only used to order each row's values, not written to the file by itself."}}, {"@type": "Question", "name": "What happens if I forget csv.DictWriter.writeheader() and read the file back?", "acceptedAnswer": {"@type": "Answer", "text": "We measured csv.DictReader silently treating the first data row's values as the header (becoming the dict keys), losing that row's data entirely \u2014 with no exception or warning anywhere in the process."}}, {"@type": "Question", "name": "Does csv.DictWriter raise an error if I never call writeheader()?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed writerow() and writerows() both succeed normally with no header written. There's no validation that a header exists; the file is simply missing one."}}, {"@type": "Question", "name": "How do I fix a CSV file that's missing its header because writeheader() was forgotten?", "acceptedAnswer": {"@type": "Answer", "text": "Based on the csv docs, you'd need to know the original fieldnames and prepend them as the first line yourself \u2014 csv.DictWriter has no way to add a header after rows have already been written."}}, {"@type": "Question", "name": "When should I call DictWriter.writeheader()?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed calling it once, right after creating the DictWriter and before any writerow() calls, is what produces a correctly-ordered header matching fieldnames=."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>csv DictWriter Forgetting writeheader() (tested)</h1>
+<p class="lead"><code>csv.DictWriter</code> needs <code>fieldnames=</code> to know the column order, but it does not write a header row for you &mdash; you have to call <code>.writeheader()</code> yourself. We measured what happens if you forget: no exception, no warning, just a file missing its header, and a very misleading result if you read it back.</p>
+<h2 id="repro1">1. Forgetting writeheader() produces a file with no header row</h2>
+<pre><code>import csv, io
+
+buf = io.StringIO()
+w = csv.DictWriter(buf, fieldnames=["name", "age"])
+w.writerow({"name": "Alice", "age": 30})
+w.writerow({"name": "Bob", "age": 25})
+
+buf.getvalue()
+'Alice,30\r\nBob,25\r\n'</code></pre>
+<p><strong>Measured:</strong> both <code>writerow()</code> calls succeed with no error, no warning, and no indication anything is missing. <code>fieldnames</code> is only used internally to pick out dict values in the right order &mdash; it is never written to the output unless <code>.writeheader()</code> is called separately.</p>
+
+<h2 id="repro2">2. Reading it back silently corrupts your first real row into a header</h2>
+<pre><code>buf.seek(0)
+r = csv.DictReader(buf)
+for row in r:
+    print(row)</code></pre>
+<pre><code>{'Alice': 'Bob', '30': '25'}</code></pre>
+<p><strong>Measured:</strong> <code>csv.DictReader</code> always treats the first line of the file as the header, with no way to know one wasn't written. "Alice" and "30" silently become the dict keys, and the only data row left is Bob's &mdash; Alice's entire record is gone, replaced by malformed keys that look like real column names if you don't notice the output values are wrong. No exception is raised anywhere in this whole round trip.</p>
+
+<h2 id="repro3">3. Why this is easy to miss</h2>
+<p>Per the <a href="https://docs.python.org/3/library/csv.html#csv.DictWriter.writeheader">csv docs</a>, <code>writeheader()</code> is explicitly a separate method you must call &mdash; <code>DictWriter.__init__</code> never calls it automatically, unlike some other languages' CSV libraries that write a header by default. Because <code>writerow()</code> and <code>writerows()</code> both succeed normally without it, small scripts that only check "did an exception get raised" or "does the file have the right number of rows" pass every check while silently producing headerless output.</p>
+
+<h2 id="fix">4. Fix: always call writeheader() before the first writerow()</h2>
+<pre><code>buf2 = io.StringIO()
+w2 = csv.DictWriter(buf2, fieldnames=["name", "age"])
+w2.writeheader()
+w2.writerow({"name": "Alice", "age": 30})
+w2.writerow({"name": "Bob", "age": 25})
+
+buf2.getvalue()
+'name,age\r\nAlice,30\r\nBob,25\r\n'</code></pre>
+<p><strong>Measured:</strong> calling <code>.writeheader()</code> once, immediately after constructing the <code>DictWriter</code> and before any <code>writerow()</code> calls, writes <code>fieldnames</code> as the first line &mdash; confirmed the file round-trips correctly through <code>DictReader</code> afterward with every value under its real column name. There's no flag or constructor argument to make this automatic; it's a required manual step every time.</p>
+
+<aside class="cta"><strong>Debugging a CSV export an API is supposed to accept? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does csv.DictWriter write a header row automatically?</summary><p>No — we measured it writing zero header bytes unless .writeheader() is called explicitly. fieldnames= is only used to order each row&#x27;s values, not written to the file by itself.</p></details>
+<details><summary>What happens if I forget csv.DictWriter.writeheader() and read the file back?</summary><p>We measured csv.DictReader silently treating the first data row&#x27;s values as the header (becoming the dict keys), losing that row&#x27;s data entirely — with no exception or warning anywhere in the process.</p></details>
+<details><summary>Does csv.DictWriter raise an error if I never call writeheader()?</summary><p>No — we confirmed writerow() and writerows() both succeed normally with no header written. There&#x27;s no validation that a header exists; the file is simply missing one.</p></details>
+<details><summary>How do I fix a CSV file that&#x27;s missing its header because writeheader() was forgotten?</summary><p>Based on the csv docs, you&#x27;d need to know the original fieldnames and prepend them as the first line yourself — csv.DictWriter has no way to add a header after rows have already been written.</p></details>
+<details><summary>When should I call DictWriter.writeheader()?</summary><p>We confirmed calling it once, right after creating the DictWriter and before any writerow() calls, is what produces a correctly-ordered header matching fieldnames=.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in csv module: wrote two rows via csv.DictWriter without calling writeheader() first, then read the resulting file back with csv.DictReader. PlainHeaders is our extension; Python&#x27;s csv module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

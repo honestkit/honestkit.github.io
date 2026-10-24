@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nginx &quot;no live upstreams while connecting to upstream&quot; (Tested)</title>
+<meta name="description" content="nginx logs this when every upstream server is marked down. We rebuilt its max_fails logic in Node and measured the exact moment it stops trying to connect.">
+<link rel="canonical" href="https://honestkit.github.io/guides/nginx-no-live-upstreams/">
+<meta property="og:title" content="nginx &quot;no live upstreams while connecting to upstream&quot; (Tested)">
+<meta property="og:description" content="nginx logs this when every upstream server is marked down. We rebuilt its max_fails logic in Node and measured the exact moment it stops trying to connect.">
+<meta property="og:url" content="https://honestkit.github.io/guides/nginx-no-live-upstreams/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is \"no live upstreams while connecting to upstream\" an HTTP status code?", "acceptedAnswer": {"@type": "Answer", "text": "No. It is an nginx error-log line, not something sent to the client. The client receives a plain 502 Bad Gateway. We measured this short-circuit 502 as 0.002-0.006 ms, far faster than a request that actually attempts a failed connection (0.68-4.0 ms in our test), because nginx (and our reimplementation of its logic) never opens a socket once it knows the whole pool is down."}}, {"@type": "Question", "name": "What causes every backend to be marked down at once?", "acceptedAnswer": {"@type": "Answer", "text": "max_fails/fail_timeout tracking marks each backend down individually after it fails max_fails times. Our test showed that with max_fails=1 and 2 backends, exactly 2 failed requests (one per backend) emptied the whole pool. In production this usually means a correlated failure across all backends: a shared dependency (database, cache) failing, or a bad deploy rolled out everywhere at once."}}, {"@type": "Question", "name": "Does nginx ever retry a backend it marked down?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, per the nginx docs, once fail_timeout elapses the backend is eligible again on the next request. We confirmed this: after waiting 5.2 s past our 5 s fail_timeout, the next request retried the dead backend (and failed again, since it was still killed, generating a fresh ECONNREFUSED rather than being permanently excluded)."}}, {"@type": "Question", "name": "How is this different from a plain 502 Bad Gateway?", "acceptedAnswer": {"@type": "Answer", "text": "A single backend failing while others are healthy also produces a 502 (see our 502 Bad Gateway guide), but nginx routes around it to a live backend if one exists, so most clients never notice. 'No live upstreams' only happens when the pool has zero live servers left, so every client gets 502 until fail_timeout expires or a backend recovers."}}, {"@type": "Question", "name": "How do I avoid this in production?", "acceptedAnswer": {"@type": "Answer", "text": "Per the nginx docs: raise max_fails so transient blips don't instantly exclude a backend, add more backends so one or two correlated failures can't exhaust the pool, use active health checks instead of relying only on live client traffic to detect failures, stagger deploys/restarts so you never stop every backend's listener at once, and consider a backup server directive as a last resort."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>nginx &quot;no live upstreams&quot; error (tested)</h1>
+<p class="lead"><code>no live upstreams while connecting to upstream</code> is an nginx error log line. It means every server in an <code>upstream</code> block has been marked temporarily unavailable (by <code>max_fails</code>/<code>fail_timeout</code>) and nginx has none left to try. nginx is not installed on this box, so we reimplemented its documented passive-health-check algorithm in Node against two real backend servers and measured what actually happens when a pool of backends runs out.</p>
+<h2>1. What this error means</h2>
+<p>nginx's <code>upstream</code> module tracks failures per server. If a server fails <code>max_fails</code> times within <code>fail_timeout</code>, nginx marks it "down" and stops sending it traffic for <code>fail_timeout</code> seconds. This is a passive health check: nginx only learns about failures from real client requests, it does not probe backends on its own (that needs the paid <code>ngx_http_upstream_hc_module</code> or a module like <code>nginx_upstream_check_module</code>).</p>
+<p>When <em>every</em> server in the block is currently marked down, there is nothing left to route to. nginx logs <code>no live upstreams while connecting to upstream</code> and returns 502 immediately, without attempting any connection. This is a specific sub-case of <a href="/guides/502-bad-gateway/">502 Bad Gateway</a> (one or more backends failed) and <a href="/guides/503-service-unavailable/">503 Service Unavailable</a> (the service as a whole is unavailable): the distinct angle here is <strong>all</strong> backends are down at once, not just one, and the response is instant because nginx already knows the whole pool is dead &mdash; it doesn't even try to connect.</p>
+
+<h2>2. Why it was not reproduced with real nginx</h2>
+<p><code>which nginx</code> returned nothing on this box: nginx is not installed, and there is no local package cache or container runtime available to install it within a reasonable budget. This specific error string is generated by nginx's own internal upstream-health bookkeeping (in <code>ngx_http_upstream_round_robin.c</code>), so it cannot be produced by any tool other than nginx itself.</p>
+<p>What we measured instead is the actual, reproducible <em>mechanism</em> nginx documents: counting failures per backend, marking a backend down for a fixed window once its failure count crosses a threshold, and short-circuiting new requests once the whole pool is down. We built this in about 90 lines of Node (no listening port of its own &mdash; it is driven by in-process calls so it never touches any port outside 8990/8991) and pointed it at two real backend HTTP servers.</p>
+
+<h2>3. Test setup</h2>
+<table>
+<tr><th>Piece</th><th>Role</th><th>Equivalent nginx directive</th></tr>
+<tr><td>Backend A, 127.0.0.1:8990</td><td>Real Node HTTP server, returns 200</td><td><code>server 127.0.0.1:8990;</code></td></tr>
+<tr><td>Backend B, 127.0.0.1:8991</td><td>Real Node HTTP server, returns 200</td><td><code>server 127.0.0.1:8991;</code></td></tr>
+<tr><td>max_fails equivalent</td><td><code>1</code></td><td><code>max_fails=1</code></td></tr>
+<tr><td>fail_timeout equivalent</td><td><code>5000</code> ms</td><td><code>fail_timeout=5s</code></td></tr>
+</table>
+<p>The proxy logic: on each request, filter the upstream list to servers whose "down until" timestamp has passed. If that list is empty, log and return 502 immediately. Otherwise try a live server; on connect failure, increment its fail count and, once it crosses <code>max_fails</code>, set its "down until" to now + <code>fail_timeout</code>.</p>
+<pre><code>function handleRequest() {
+  const live = upstream.filter(s =&gt; s.downUntil &lt;= Date.now());
+  if (live.length === 0) {
+    log('no live upstreams while connecting to upstream, client: ..., request: "GET /"');
+    return { status: 502, body: 'no live upstreams' };   // no connect attempted
+  }
+  // ...try a live server; on error, increment fails and mark down
+}</code></pre>
+
+<h2>4. Results: killing backends one at a time</h2>
+<table>
+<tr><th>Step</th><th>Action</th><th>Measured response</th><th>Time to respond</th></tr>
+<tr><td>1</td><td>Both backends up, 4 requests</td><td>200, body from backend A each time</td><td>0.71&ndash;12.3 ms (first request includes connection warm-up)</td></tr>
+<tr><td>2</td><td>Kill backend A, 1 request</td><td>502 "upstream A failed: ECONNREFUSED"; A marked down for 5000 ms</td><td>3.99 ms</td></tr>
+<tr><td>3</td><td>Also kill backend B, 1 request (routed to B, the only "live" one on paper)</td><td>502 "upstream B failed: ECONNREFUSED"; B marked down for 5000 ms &rarr; pool now empty</td><td>0.68 ms</td></tr>
+<tr><td>4</td><td>Pool fully exhausted, 3 more requests</td><td>502 "no live upstreams" every time, logged exactly as nginx's own message would read</td><td>0.0022&ndash;0.0059 ms</td></tr>
+<tr><td>5</td><td>Wait 5.2 s (fail_timeout elapses), 1 more request, backends still dead</td><td>502 "upstream A failed: ECONNREFUSED" &mdash; A was retried automatically</td><td>2.01 ms</td></tr>
+</table>
+<p>The headline number: once the pool is exhausted, the short-circuit response (step 4) took <strong>0.002&ndash;0.006 ms</strong>, against <strong>0.68&ndash;4.0 ms</strong> for a request that actually attempted a TCP connect and got ECONNREFUSED (steps 2&ndash;3). That is roughly 100&ndash;1000&times; faster, because the "no live upstreams" path never opens a socket at all &mdash; it is a pure in-memory check against the down-until timestamps. This confirms, mechanically, why nginx's own version of this error is instant: it is a short-circuit, not a failed connection.</p>
+<p>Step 5 confirms the other documented half of the mechanism: after <code>fail_timeout</code> elapses, the backend is no longer treated as down and gets tried again on the next request (nginx calls this allowing the server back into rotation to see if it has recovered). In our test the backend was still dead, so it failed again and was immediately re-marked down &mdash; but the attempt was made, proving the timeout actually expires rather than being permanent.</p>
+
+<h2>5. Why it happens suddenly: the threshold cascade</h2>
+<p>This is the part that surprises people in production. With <code>max_fails=1</code>, our measurements show it takes exactly <strong>one failed request per backend</strong> to flip a 2-backend pool from 100% capacity to 0%. In step 2, one failure removed 50% of capacity. In step 3, one more failure (on the only remaining "live" server) removed the rest. Two unlucky requests, and every subsequent client gets "no live upstreams" until the 5-second window passes.</p>
+<p>Under real load this looks sudden from the outside: error rates go from 0% to 100% in the time it takes two concurrent requests to hit two different ailing backends, not gradually. The usual trigger is backends that are all degraded together &mdash; a shared database running out of connections, a deploy that rolled out a crash-on-start bug to every pod, or a dependency timeout that hits every backend near-simultaneously under load. Each backend only needs to fail once (with <code>max_fails=1</code>, the nginx default is <code>max_fails=1</code> unless set otherwise) to be pulled from rotation, so a brief correlated blip across all backends removes the entire pool before any single backend would be considered "really" broken.</p>
+
+<h2>6. How to fix and prevent it (per the nginx docs)</h2>
+<ul>
+<li><strong>Raise max_fails, or don't rely only on passive checks.</strong> <code>max_fails=1</code> is unforgiving: one dropped connection (a deploy restart, a brief GC pause) marks a backend down for the full <code>fail_timeout</code>. A higher value tolerates noise; combine with active health checks (nginx plus or third-party modules) that probe backends independently of client traffic.</li>
+<li><strong>Keep fail_timeout short relative to your deploy/restart time, but not so short backends flap.</strong> <code>fail_timeout</code> also controls how long a server is excluded, so very large values keep a recovered backend out of rotation needlessly.</li>
+<li><strong>Always have more than 2 backends if you can.</strong> With only 2, as this test shows, two failures (one per backend) empties the whole pool. With 5, the same <code>max_fails=1</code> policy needs 5 near-simultaneous failures.</li>
+<li><strong>Stagger restarts/deploys</strong> so you never take down all backends' listeners at once (rolling restarts, one at a time, with a health-check gate before moving to the next).</li>
+<li><strong>Add a backup server.</strong> nginx supports <code>server ... backup;</code> entries that only receive traffic when every primary server is down &mdash; a deliberate last resort instead of a hard 502.</li>
+</ul>
+<p>For the general all-502 and all-503 cases (not specifically an exhausted upstream pool), see <a href="/guides/502-bad-gateway/">502 Bad Gateway</a> and <a href="/guides/503-service-unavailable/">503 Service Unavailable</a>.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is &quot;no live upstreams while connecting to upstream&quot; an HTTP status code?</summary><p>No. It is an nginx error-log line, not something sent to the client. The client receives a plain 502 Bad Gateway. We measured this short-circuit 502 as 0.002-0.006 ms, far faster than a request that actually attempts a failed connection (0.68-4.0 ms in our test), because nginx (and our reimplementation of its logic) never opens a socket once it knows the whole pool is down.</p></details>
+<details><summary>What causes every backend to be marked down at once?</summary><p>max_fails/fail_timeout tracking marks each backend down individually after it fails max_fails times. Our test showed that with max_fails=1 and 2 backends, exactly 2 failed requests (one per backend) emptied the whole pool. In production this usually means a correlated failure across all backends: a shared dependency (database, cache) failing, or a bad deploy rolled out everywhere at once.</p></details>
+<details><summary>Does nginx ever retry a backend it marked down?</summary><p>Yes, per the nginx docs, once fail_timeout elapses the backend is eligible again on the next request. We confirmed this: after waiting 5.2 s past our 5 s fail_timeout, the next request retried the dead backend (and failed again, since it was still killed, generating a fresh ECONNREFUSED rather than being permanently excluded).</p></details>
+<details><summary>How is this different from a plain 502 Bad Gateway?</summary><p>A single backend failing while others are healthy also produces a 502 (see our 502 Bad Gateway guide), but nginx routes around it to a live backend if one exists, so most clients never notice. &#x27;No live upstreams&#x27; only happens when the pool has zero live servers left, so every client gets 502 until fail_timeout expires or a backend recovers.</p></details>
+<details><summary>How do I avoid this in production?</summary><p>Per the nginx docs: raise max_fails so transient blips don&#x27;t instantly exclude a backend, add more backends so one or two correlated failures can&#x27;t exhaust the pool, use active health checks instead of relying only on live client traffic to detect failures, stagger deploys/restarts so you never stop every backend&#x27;s listener at once, and consider a backup server directive as a last resort.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 on the test box. nginx is not installed on this box (`which nginx` returns nothing), so we could not reproduce nginx&#x27;s own log line directly. Instead we built a ~90-line Node reverse-proxy that reimplements nginx&#x27;s documented passive-health-check algorithm (max_fails / fail_timeout) against two real backend HTTP servers on 127.0.0.1:8990 and 127.0.0.1:8991, and measured its real behaviour. The exact nginx log wording is quoted from the nginx source/docs and labelled as such, not measured. PlainHeaders is our extension; Node.js is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

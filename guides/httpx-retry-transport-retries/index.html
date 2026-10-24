@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx retry: what HTTPTransport(retries=) covers (tested)</title>
+<meta name="description" content="httpx HTTPTransport(retries=N) retries only failed connections, not ReadTimeout or 429/503. Measured, plus a short retry loop with Retry-After and backoff.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-retry-transport-retries/">
+<meta property="og:title" content="httpx retry: what HTTPTransport(retries=) covers (tested)">
+<meta property="og:description" content="httpx HTTPTransport(retries=N) retries only failed connections, not ReadTimeout or 429/503. Measured, plus a short retry loop with Retry-After and backoff.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-retry-transport-retries/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does httpx retry requests automatically?", "acceptedAnswer": {"@type": "Answer", "text": "No, not by default. HTTPTransport(retries=N) retries failed connections only."}}, {"@type": "Question", "name": "How do I retry on 429 or 503 in httpx?", "acceptedAnswer": {"@type": "Answer", "text": "Check r.status_code in a loop, sleep for Retry-After (or exponential backoff), and retry; the transport's retries= option returns the 503 unchanged."}}, {"@type": "Question", "name": "Does httpx retries= retry ReadTimeout?", "acceptedAnswer": {"@type": "Answer", "text": "No. In the test a ReadTimeout was raised after 1.0 s with retries=3 set."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx retry: what HTTPTransport(retries=) does and doesn&#x27;t retry (tested)</h1>
+<p class="lead"><code>httpx.HTTPTransport(retries=3)</code> retries only <strong>connection</strong> failures (<code>ConnectError</code>/<code>ConnectTimeout</code>). A <code>ReadTimeout</code> or a 429/503 response is not retried; handle those with a small loop that honours <code>Retry-After</code>.</p>
+<p>httpx has one built-in retry setting, <code>httpx.HTTPTransport(retries=N)</code>, and it covers less than people expect. Measured with httpx 0.28.1 on Python 3.13.5 against local <code>http.server</code> instances (<code>srv.start()</code>: the path is the seconds to wait before answering).</p>
+<h2 id="connect">1. retries= retries failed connections</h2>
+<pre><code>import httpx, socket, threading, time
+
+# a port that refuses twice, then starts listening
+port = 8966
+def late_server():
+    time.sleep(1.2)
+    from srv import start
+    start(port)
+threading.Thread(target=late_server, daemon=True).start()
+
+for retries in (0, 3):
+    t = time.monotonic()
+    transport = httpx.HTTPTransport(retries=retries)
+    try:
+        r = httpx.Client(transport=transport).get(f&quot;http://127.0.0.1:{port}/0&quot;)
+        print(f&quot;retries={retries}: {r.status_code} after {time.monotonic() - t:.1f}s&quot;)
+    except httpx.ConnectError as e:
+        print(f&quot;retries={retries}: ConnectError after {time.monotonic() - t:.1f}s&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>retries=0: ConnectError after 0.0s
+retries=3: 200 after 1.5s</code></pre>
+<p>The server starts listening 1.2 s in. Without retries the request fails at once with <code>ConnectError</code>; with <code>retries=3</code> httpx reconnected with a short backoff and got the 200 after 1.5 s. Use <code>httpx.AsyncHTTPTransport(retries=...)</code> for <code>AsyncClient</code>.</p>
+<h2 id="timeout">2. It does not retry a read timeout</h2>
+<pre><code>import httpx, time
+from srv import start
+base = start()   # /3 answers after 3 s
+
+client = httpx.Client(transport=httpx.HTTPTransport(retries=3), timeout=1.0)
+t = time.monotonic()
+try:
+    client.get(base + &quot;/3&quot;)
+except httpx.ReadTimeout:
+    print(f&quot;ReadTimeout after {time.monotonic() - t:.1f}s (not retried)&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>ReadTimeout after 1.0s (not retried)</code></pre>
+<p>Once connected, a slow response raises <code>ReadTimeout</code> after the 1 s timeout with no retry, even with <code>retries=3</code>.</p>
+<h2 id="status">3. It does not retry 429/503 either: add a small loop</h2>
+<pre><code>import httpx, threading, http.server, time
+
+hits = 0
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        global hits; hits += 1
+        code = 503 if hits &lt; 3 else 200
+        self.send_response(code); self.send_header(&quot;Retry-After&quot;, &quot;1&quot;); self.send_header(&quot;Content-Length&quot;, &quot;0&quot;); self.end_headers()
+s = http.server.ThreadingHTTPServer((&quot;127.0.0.1&quot;, 8967), H)
+threading.Thread(target=s.serve_forever, daemon=True).start()
+
+client = httpx.Client(transport=httpx.HTTPTransport(retries=3))
+print(&quot;transport retries only:&quot;, client.get(&quot;http://127.0.0.1:8967/&quot;).status_code)
+
+def get_with_retry(client, url, attempts=4, statuses=(429, 502, 503, 504)):
+    for attempt in range(attempts):
+        r = client.get(url)
+        if r.status_code not in statuses or attempt == attempts - 1:
+            return r
+        wait = float(r.headers.get(&quot;Retry-After&quot;, 2 ** attempt))
+        print(f&quot;  attempt {attempt + 1}: {r.status_code}, sleeping {wait}s&quot;)
+        time.sleep(wait)
+
+r = get_with_retry(client, &quot;http://127.0.0.1:8967/&quot;)
+print(&quot;with status retry:&quot;, r.status_code, &quot;total hits:&quot;, hits)</code></pre>
+<p>Output:</p>
+<pre><code>transport retries only: 503
+  attempt 1: 503, sleeping 1.0s
+with status retry: 200 total hits: 3</code></pre>
+<p>A 503 comes back as a normal response, so the transport returns it. The loop retries listed status codes, honours a numeric <code>Retry-After</code> header (otherwise exponential backoff), and returns the last response when attempts run out. Only retry idempotent requests (GET, PUT, DELETE) this way, or a POST may run twice. To also retry timeouts, wrap the <code>client.get</code> in <code>try/except httpx.TimeoutException</code> inside the same loop; libraries such as tenacity do the same with decorators.</p>
+<p>Related: <a href="/guides/httpx-timeout-default-readtimeout/">httpx timeout default</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests</a>, <a href="/guides/python-requests-connectionerror-max-retries/">requests ConnectionError max retries</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does httpx retry requests automatically?</summary><p>No, not by default. HTTPTransport(retries=N) retries failed connections only.</p></details>
+<details><summary>How do I retry on 429 or 503 in httpx?</summary><p>Check r.status_code in a loop, sleep for Retry-After (or exponential backoff), and retry; the transport&#x27;s retries= option returns the 503 unchanged.</p></details>
+<details><summary>Does httpx retries= retry ReadTimeout?</summary><p>No. In the test a ReadTimeout was raised after 1.0 s with retries=3 set.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5 against local http.server instances. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

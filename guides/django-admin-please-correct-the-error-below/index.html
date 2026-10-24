@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Django Admin &#x27;Please correct the error below&#x27; (Tested Fixes)</title>
+<meta name="description" content="Django admin shows &#x27;Please correct the error below&#x27; but no error? Tested on 6.1.2: required form fields missing from fieldsets, and how to print form.errors.">
+<link rel="canonical" href="https://honestkit.github.io/guides/django-admin-please-correct-the-error-below/">
+<meta property="og:title" content="Django Admin &#x27;Please correct the error below&#x27; (Tested Fixes)">
+<meta property="og:description" content="Django admin shows &#x27;Please correct the error below&#x27; but no error? Tested on 6.1.2: required form fields missing from fieldsets, and how to print form.errors.">
+<meta property="og:url" content="https://honestkit.github.io/guides/django-admin-please-correct-the-error-below/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Django admin say 'Please correct the error below' with no error shown?", "acceptedAnswer": {"@type": "Answer", "text": "A form field that fails validation is not rendered, usually a required field declared on a custom form but missing from fieldsets or fields. Print form.errors to see it."}}, {"@type": "Question", "name": "Does the admin validate model fields that are not in fields?", "acceptedAnswer": {"@type": "Answer", "text": "No. Fields left out of the form are not validated; a required CharField is saved as an empty string unless you set it in save_model()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Django admin &#x27;Please correct the error below&#x27; (tested)</h1>
+<p class="lead">Django admin shows <code>Please correct the error below.</code> when the change form fails validation. If no field is marked red, the error belongs to a form field that is not rendered, usually one missing from <code>fieldsets</code>.</p>
+<h2 id="setup">Setup used in every block</h2>
+<p><code>common.py</code> configures a minimal project (admin, auth, sessions, messages, an in-memory SQLite database and one app, <code>shop</code>), logs in a superuser with the Django test client, and defines <code>show()</code>, which prints the status code, the red banner (<code>p.errornote</code>) and each <code>ul.errorlist</code> on the returned admin page. The model:</p>
+<pre><code>from django.db import models
+class Product(models.Model):
+    name = models.CharField(max_length=50)
+    sku = models.CharField(max_length=20, unique=True)
+    slug = models.SlugField()          # required, but hidden from the admin form below
+    class Meta:
+        app_label = &#x27;shop&#x27;</code></pre>
+<h2 id="visible">1. The normal case: the error is shown next to a field</h2>
+<pre><code>from common import *
+from shop.models import Product
+from django import forms
+class ProductForm(forms.ModelForm):
+    class Meta:
+        model = Product
+        fields = [&#x27;name&#x27;, &#x27;sku&#x27;]
+    def clean(self):
+        d = super().clean()
+        if d.get(&#x27;name&#x27;) == d.get(&#x27;sku&#x27;):
+            # attach to a field the form does not have
+            self.add_error(None, &#x27;Name and SKU must differ.&#x27;)
+        return d
+@admin.register(Product)
+class ProductAdmin(admin.ModelAdmin):
+    form = ProductForm
+    fields = [&#x27;name&#x27;, &#x27;sku&#x27;]
+    def save_model(self, request, obj, form, change):
+        obj.slug = obj.sku.lower(); super().save_model(request, obj, form, change)
+Product.objects.create(name=&#x27;Cup&#x27;, sku=&#x27;C1&#x27;, slug=&#x27;c1&#x27;)
+print(&#x27;--- duplicate sku&#x27;)
+show(client.post(&#x27;/admin/shop/product/add/&#x27;, {&#x27;name&#x27;: &#x27;Cup 2&#x27;, &#x27;sku&#x27;: &#x27;C1&#x27;}))
+print(&#x27;--- two errors&#x27;)
+show(client.post(&#x27;/admin/shop/product/add/&#x27;, {&#x27;name&#x27;: &#x27;&#x27;, &#x27;sku&#x27;: &#x27;C1&#x27;}))
+print(&#x27;--- non-field error&#x27;)
+show(client.post(&#x27;/admin/shop/product/add/&#x27;, {&#x27;name&#x27;: &#x27;X&#x27;, &#x27;sku&#x27;: &#x27;X&#x27;}))
+print(&#x27;--- valid&#x27;)
+r = client.post(&#x27;/admin/shop/product/add/&#x27;, {&#x27;name&#x27;: &#x27;Bowl&#x27;, &#x27;sku&#x27;: &#x27;B1&#x27;})
+print(&#x27;status&#x27;, r.status_code, r.headers.get(&#x27;Location&#x27;), Product.objects.count())</code></pre>
+<p>Output:</p>
+<pre><code>--- duplicate sku
+status 200
+banner: Please correct the error below.
+errorlist: Product with this Sku already exists.
+--- two errors
+status 200
+banner: Please correct the errors below.
+errorlist: This field is required.
+errorlist: Product with this Sku already exists.
+--- non-field error
+status 200
+banner: Please correct the error below.
+errorlist: Name and SKU must differ.
+--- valid
+status 302 /admin/shop/product/ 2</code></pre>
+<p>The banner is only a summary. The admin says <code>Please correct the error below.</code> for one error and <code>Please correct the errors below.</code> for more than one, and each message is listed above the field it belongs to. Errors from <code>clean()</code> with <code>add_error(None, ...)</code> are non-field errors and appear at the top of the form. A successful save returns <code>302</code> to the changelist.</p>
+<h2 id="hidden">2. Banner but no visible error: the field is not on the page</h2>
+<pre><code>from common import *
+from shop.models import Product
+from django import forms
+class ProductForm(forms.ModelForm):
+    reason = forms.CharField()        # declared, required
+    class Meta:
+        model = Product
+        fields = [&#x27;name&#x27;, &#x27;sku&#x27;, &#x27;slug&#x27;]
+@admin.register(Product)
+class ProductAdmin(admin.ModelAdmin):
+    form = ProductForm
+    fieldsets = [(None, {&#x27;fields&#x27;: [&#x27;name&#x27;, &#x27;sku&#x27;, &#x27;slug&#x27;]})]   # &#x27;reason&#x27; not listed
+from django.test.utils import setup_test_environment
+setup_test_environment()   # lets us read r.context
+r = client.post(&#x27;/admin/shop/product/add/&#x27;, {&#x27;name&#x27;: &#x27;Mug&#x27;, &#x27;sku&#x27;: &#x27;M1&#x27;, &#x27;slug&#x27;: &#x27;mug&#x27;})
+show(r)
+print(&#x27;hidden error:&#x27;, r.context[&#x27;adminform&#x27;].form.errors.get_json_data())</code></pre>
+<p>Output:</p>
+<pre><code>status 200
+banner: Please correct the error below.
+hidden error: {&#x27;reason&#x27;: [{&#x27;message&#x27;: &#x27;This field is required.&#x27;, &#x27;code&#x27;: &#x27;required&#x27;}]}</code></pre>
+<p>This is the confusing case. The custom form declares a required field, <code>reason</code>, but the admin's <code>fieldsets</code> (or <code>fields</code>) do not list it. Declared form fields stay on the form class, so validation fails with <code>This field is required.</code>, yet the admin only renders the fields in <code>fieldsets</code>, so the page shows the banner and no error list. The same happens with errors in an inline formset you didn't render or scrolled past.</p>
+<p>To find the hidden error, print <code>form.errors</code> (as above; <code>save_model()</code> is never called for an invalid form), or temporarily remove <code>fieldsets</code> so every form field is rendered. Then fix it: add the field to <code>fieldsets</code>, give it <code>required=False</code>, or remove it from the form.</p>
+<h2 id="excluded">3. Model fields left out of the form are not validated</h2>
+<pre><code>from common import *
+from shop.models import Product
+@admin.register(Product)
+class ProductAdmin(admin.ModelAdmin):
+    fields = [&#x27;name&#x27;, &#x27;sku&#x27;]          # slug left out of the form
+show(client.post(&#x27;/admin/shop/product/add/&#x27;, {&#x27;name&#x27;: &#x27;Mug&#x27;, &#x27;sku&#x27;: &#x27;M1&#x27;}))
+print(&#x27;saved slug:&#x27;, repr(Product.objects.get().slug))</code></pre>
+<p>Output:</p>
+<pre><code>status 302
+saved slug: &#x27;&#x27;</code></pre>
+<p>The opposite case: <code>slug</code> is required on the model (no <code>blank=True</code>), but because it is not in <code>fields</code> the admin form skips it, there is no error, and the row is saved with an empty string. If the admin should fill it, set it in <code>save_model()</code> (as in section 1) or <code>prepopulated_fields</code>.</p>
+<p>Related: <a href="/guides/django-csrf-verification-failed-cookie-not-set/">Django CSRF verification failed</a>, <a href="/guides/django-templatedoesnotexist/">Django TemplateDoesNotExist</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers your Django admin returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Django admin say &#x27;Please correct the error below&#x27; with no error shown?</summary><p>A form field that fails validation is not rendered, usually a required field declared on a custom form but missing from fieldsets or fields. Print form.errors to see it.</p></details>
+<details><summary>Does the admin validate model fields that are not in fields?</summary><p>No. Fields left out of the form are not validated; a required CharField is saved as an empty string unless you set it in save_model().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Django 6.1.2 and Python 3.14.7 (python:3-alpine in Docker, Django test client). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Django are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

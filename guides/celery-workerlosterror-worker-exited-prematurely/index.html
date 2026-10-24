@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Celery WorkerLostError: Worker exited prematurely (signal 9)</title>
+<meta name="description" content="Celery WorkerLostError &#x27;Worker exited prematurely: signal 9 (SIGKILL)&#x27; or &#x27;exitcode 1&#x27;: what killed the pool process, and how it differs from TimeLimitExceeded.">
+<link rel="canonical" href="https://honestkit.github.io/guides/celery-workerlosterror-worker-exited-prematurely/">
+<meta property="og:title" content="Celery WorkerLostError: Worker exited prematurely (signal 9)">
+<meta property="og:description" content="Celery WorkerLostError &#x27;Worker exited prematurely: signal 9 (SIGKILL)&#x27; or &#x27;exitcode 1&#x27;: what killed the pool process, and how it differs from TimeLimitExceeded.">
+<meta property="og:url" content="https://honestkit.github.io/guides/celery-workerlosterror-worker-exited-prematurely/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes Celery WorkerLostError signal 9?", "acceptedAnswer": {"@type": "Answer", "text": "The prefork child was SIGKILLed from outside Celery, most often by the Linux OOM killer or a container memory limit."}}, {"@type": "Question", "name": "Can I catch WorkerLostError inside a Celery task?", "acceptedAnswer": {"@type": "Answer", "text": "No. The process running the task is gone; the error is recorded by the parent worker process."}}, {"@type": "Question", "name": "Is a Celery hard time limit reported as WorkerLostError?", "acceptedAnswer": {"@type": "Answer", "text": "No. Celery logs the SIGKILL but the result is TimeLimitExceeded."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Celery WorkerLostError: Worker exited prematurely (tested)</h1>
+<p class="lead"><code>WorkerLostError: Worker exited prematurely: signal 9 (SIGKILL)</code> means the pool process running the task was killed from outside, usually by the out-of-memory killer. <code>exitcode N</code> means code in the task process called exit. Neither can be caught inside the task.</p>
+<p><code>WorkerLostError: Worker exited prematurely</code> means the prefork child process running your task died before it could report a result. Python code did not raise it: the process itself went away, so <code>try/except</code> inside the task cannot catch it. The text after "exited prematurely" tells you how it died.</p>
+<h2 id="repro">1. exitcode vs signal 9 (SIGKILL)</h2>
+<pre><code>$ cat tasks.py
+import os, signal
+from celery import Celery
+app = Celery(&quot;tasks&quot;, broker=&quot;redis://127.0.0.1:8964/0&quot;, backend=&quot;redis://127.0.0.1:8964/1&quot;)
+
+@app.task
+def crash():
+    os._exit(1)                            # like a C extension calling exit()
+
+@app.task
+def killed():
+    os.kill(os.getpid(), signal.SIGKILL)   # what the Linux OOM killer does
+$ celery -A tasks worker -c 1 --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ cat run.py
+from tasks import crash, killed
+for t in (crash, killed):
+    try:
+        print(t.name, &quot;-&gt;&quot;, t.delay().get(timeout=20))
+    except Exception as e:
+        print(t.name, &quot;-&gt;&quot;, type(e).__name__, e)
+$ timeout 60 python run.py
+tasks.crash -&gt; WorkerLostError Worker exited prematurely: exitcode 1 Job: 0.
+tasks.killed -&gt; WorkerLostError Worker exited prematurely: signal 9 (SIGKILL) Job: 1.</code></pre>
+<p>The worker log names the dead process:</p>
+<pre><code>$ grep -E &quot;ERROR|WARNING|succeeded&quot; worker.log | cut -c1-200
+[2026-10-23 10:59:52,141: ERROR/MainProcess] Process &#x27;ForkPoolWorker-1&#x27; pid:3012915 exited with &#x27;exitcode 1&#x27;
+[2026-10-23 10:59:52,159: ERROR/MainProcess] Task handler raised error: WorkerLostError(&#x27;Worker exited prematurely: exitcode 1 Job: 0.&#x27;)
+[2026-10-23 10:59:52,185: ERROR/MainProcess] Process &#x27;ForkPoolWorker-2&#x27; pid:3012960 exited with &#x27;signal 9 (SIGKILL)&#x27;
+[2026-10-23 10:59:52,197: ERROR/MainProcess] Task handler raised error: WorkerLostError(&#x27;Worker exited prematurely: signal 9 (SIGKILL) Job: 1.&#x27;)</code></pre>
+<ul><li><strong>exitcode N</strong>: something in the child called <code>exit()</code> / <code>os._exit()</code>, often a C extension or a library that exits on a fatal error.</li><li><strong>signal 9 (SIGKILL)</strong>: the process was killed from outside. On Linux the usual culprit is the OOM killer (check <code>dmesg</code> or the container's memory limit), or Celery's own hard <code>time_limit</code>.</li></ul>
+<h2 id="time-limit">2. SIGKILL from a hard time limit is reported as TimeLimitExceeded</h2>
+<pre><code>$ grep -E &quot;ERROR|WARNING|succeeded&quot; worker.log | cut -c1-200
+[2026-10-23 11:00:02,602: ERROR/MainProcess] Task handler raised error: TimeLimitExceeded(2)
+[2026-10-23 11:00:02,602: ERROR/MainProcess] Hard time limit (2s) exceeded for tasks.slow[9516fbc7-4263-400d-82aa-873f4c047dee]
+[2026-10-23 11:00:02,709: ERROR/MainProcess] Process &#x27;ForkPoolWorker-1&#x27; pid:3012968 exited with &#x27;signal 9 (SIGKILL)&#x27;
+[2026-10-23 11:00:03,783: WARNING/MainProcess] Soft time limit (1s) exceeded for tasks.slow_soft[e188cdea-0f12-4ba6-a058-dae7eb169b79]
+[2026-10-23 11:00:03,792: INFO/ForkPoolWorker-2] Task tasks.slow_soft[e188cdea-0f12-4ba6-a058-dae7eb169b79] succeeded in 1.0103442892432213s: &#x27;cleaned up&#x27;</code></pre>
+<p>When Celery itself kills the child for exceeding <code>time_limit</code>, the log also shows <code>exited with 'signal 9 (SIGKILL)'</code>, but the task result is <code>TimeLimitExceeded</code>, not <code>WorkerLostError</code>. A <code>WorkerLostError</code> with SIGKILL and no "Hard time limit" line above it points to something outside Celery, usually memory. See <a href="/guides/celery-task-timeout-error-time-limit/">Celery task timeout / time limits</a>.</p>
+<h2 id="fix">What to do</h2>
+<ul><li>Memory: lower <code>--concurrency</code>, give the container more memory, or recycle children with <code>--max-memory-per-child</code> (KiB) / <code>--max-tasks-per-child</code>.</li><li>Retries: the task's own <code>autoretry_for</code> cannot catch it. Celery documents <code>acks_late=True</code> with <code>task_reject_on_worker_lost=True</code> to requeue the message instead; only do that for idempotent tasks, because a task that always crashes will be redelivered in a loop.</li></ul>
+<p>Related: <a href="/guides/celery-chord-error-handling/">Celery chord error handling</a>, <a href="/guides/celery-maxretriesexceedederror/">Celery MaxRetriesExceededError</a>, <a href="/guides/celery-link-error-errback-example/">Celery link_error errback</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes Celery WorkerLostError signal 9?</summary><p>The prefork child was SIGKILLed from outside Celery, most often by the Linux OOM killer or a container memory limit.</p></details>
+<details><summary>Can I catch WorkerLostError inside a Celery task?</summary><p>No. The process running the task is gone; the error is recorded by the parent worker process.</p></details>
+<details><summary>Is a Celery hard time limit reported as WorkerLostError?</summary><p>No. Celery logs the SIGKILL but the result is TimeLimitExceeded.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Celery 5.6.3 (kombu 5.6.2, redis-py 8.1.0) on Python 3.13.5, Redis 7 (Docker) as broker and backend. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Celery and Redis are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL Foreign Key Constraint Fails: Causes and Fixes, Tested</title>
+<meta name="description" content="We reproduced PostgreSQL&#x27;s foreign key violation from both directions (bad insert, blocked delete) and tested ON DELETE CASCADE and SET NULL as real fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sql-foreign-key-constraint-fails/">
+<meta property="og:title" content="SQL Foreign Key Constraint Fails: Causes and Fixes, Tested">
+<meta property="og:description" content="We reproduced PostgreSQL&#x27;s foreign key violation from both directions (bad insert, blocked delete) and tested ON DELETE CASCADE and SET NULL as real fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sql-foreign-key-constraint-fails/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I tell which direction caused the error, just from the message?", "acceptedAnswer": {"@type": "Answer", "text": "Check the DETAIL line. \"Key (x)=(y) is not present in table z\" means you inserted or updated a row pointing at a parent that doesn't exist. \"Key (x)=(y) is still referenced from table z\" means you tried to delete or update a parent row that a child still depends on."}}, {"@type": "Question", "name": "What's the default behaviour if I don't specify ON DELETE?", "acceptedAnswer": {"@type": "Answer", "text": "ON DELETE NO ACTION, which is what produced the error in section 3 of this guide: Postgres refuses the delete rather than leaving an orphaned reference. You have to opt in to CASCADE or SET NULL explicitly."}}, {"@type": "Question", "name": "What's the difference between CASCADE and SET NULL?", "acceptedAnswer": {"@type": "Answer", "text": "CASCADE deletes the dependent rows along with the parent (we confirmed the child row for user 3 disappeared with DELETE 1 and no error). SET NULL keeps the dependent row but blanks its foreign key column (we confirmed the row survived with user_id now empty). SET NULL only works if the column allows NULL."}}, {"@type": "Question", "name": "Can I check for dependents without triggering the error?", "acceptedAnswer": {"@type": "Answer", "text": "Yes: SELECT EXISTS(SELECT 1 FROM orders WHERE user_id = 2) returns t or f without erroring, so you can branch in application code before deciding whether to delete, cascade manually, or block the action."}}, {"@type": "Question", "name": "Does SQLite enforce foreign keys the same way by default?", "acceptedAnswer": {"@type": "Answer", "text": "No, per the SQLite docs (not measured here): foreign key enforcement is off by default and must be turned on per connection with PRAGMA foreign_keys = ON;. PostgreSQL and MySQL (InnoDB) enforce foreign keys unconditionally once declared."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQL Foreign Key Constraint Fails (tested)</h1>
+<p class="lead">A foreign key constraint links a column in one table to a primary key in another, so every value in the "child" column must already exist in the "parent" table. The error fires in two opposite situations: inserting a child row that points at a parent which doesn't exist, or deleting a parent row that a child still points at. Both are the database refusing to create an orphaned reference.</p>
+<h2>1. Reading the error: two directions, two messages</h2>
+<p>PostgreSQL's wording differs depending on which side of the relationship you violated:</p>
+<pre><code>-- inserting a child that points at a missing parent
+ERROR:  insert or update on table "orders" violates foreign key constraint "orders_user_id_fkey"
+DETAIL:  Key (user_id)=(999) is not present in table "users".
+
+-- deleting a parent that a child still references
+ERROR:  update or delete on table "users" violates foreign key constraint "orders_user_id_fkey" on table "orders"
+DETAIL:  Key (id)=(1) is still referenced from table "orders".</code></pre>
+<p>Both name the same constraint (<code>orders_user_id_fkey</code>), but the first DETAIL says a key is <em>not present</em> (you're pointing at something that doesn't exist), and the second says a key is <em>still referenced</em> (something is still pointing at what you're trying to remove). Reading which of the two you have tells you immediately which table to fix: the child row in the first case, or the dependents in the second.</p>
+
+<h2>2. Reproduced: inserting into the child table</h2>
+<pre><code>psql&gt; INSERT INTO orders (user_id, amount) VALUES (999, 10);
+ERROR:  insert or update on table "orders" violates foreign key constraint "orders_user_id_fkey"
+DETAIL:  Key (user_id)=(999) is not present in table "users".</code></pre>
+<p>Fix: insert the parent row first, or correct the foreign key value to one that already exists. If this is happening inside application code, check for a race &mdash; something may be inserting the child before the parent's transaction has committed.</p>
+
+<h2>3. Reproduced: deleting from the parent table</h2>
+<pre><code>psql&gt; DELETE FROM users WHERE id = 1;
+ERROR:  update or delete on table "users" violates foreign key constraint "orders_user_id_fkey" on table "orders"
+DETAIL:  Key (id)=(1) is still referenced from table "orders".</code></pre>
+<p>Postgres refuses by default (<code>ON DELETE NO ACTION</code>, the default if you don't specify otherwise) rather than silently leaving <code>orders</code> rows pointing at a user that no longer exists.</p>
+
+<h2>4. Fix: decide what should happen to the children, then declare it</h2>
+<p>The constraint's <code>ON DELETE</code> clause controls this. We tested the two most common choices, each on its own table with a fresh row:</p>
+<p><strong>CASCADE</strong> &mdash; delete the children along with the parent:</p>
+<pre><code>CREATE TABLE orders2 (id SERIAL PRIMARY KEY, user_id INT REFERENCES users(id) ON DELETE CASCADE, amount NUMERIC);
+-- insert a row for user 3, then:
+psql&gt; DELETE FROM users WHERE id = 3;
+DELETE 1
+-- the orders2 row for user 3 is gone too, no error</code></pre>
+<p><strong>SET NULL</strong> &mdash; keep the child row, but blank out the reference:</p>
+<pre><code>CREATE TABLE orders3 (id SERIAL PRIMARY KEY, user_id INT REFERENCES users(id) ON DELETE SET NULL, amount NUMERIC);
+-- insert a row for user 4, then:
+psql&gt; DELETE FROM users WHERE id = 4;
+DELETE 1
+psql&gt; SELECT * FROM orders3;
+ id | user_id | amount
+----+---------+--------
+  1 |       2 |     40
+  2 |         |     40
+(2 rows)</code></pre>
+<p>Row 2's <code>user_id</code> is now blank (NULL) instead of the deleted user's id, and the row still exists. Use CASCADE when the child data is meaningless without the parent (e.g. a user's saved addresses). Use SET NULL when the child should survive independently (e.g. an order history row shouldn't vanish just because the account was deleted) &mdash; but only if the column allows NULL.</p>
+<p>Without either, the default behaviour (which produced the error in section 3) is usually right for data you cannot afford to silently delete or orphan &mdash; add CASCADE or SET NULL deliberately, not as a reflex to make the error go away.</p>
+
+<h2>5. Alternative: check before you delete</h2>
+<p>If you want to decide per-case rather than declare a blanket rule, check for dependents first and handle it in application logic:</p>
+<pre><code>psql&gt; SELECT EXISTS(SELECT 1 FROM orders WHERE user_id = 2);
+ exists
+--------
+ t
+(1 row)</code></pre>
+<p><code>t</code> means at least one order still references user 2 &mdash; deleting that user will fail (or cascade/null out orders, depending on the constraint) unless you handle those rows first.</p>
+
+<h2>6. Other databases (per their docs, not measured on this box)</h2>
+<p>MySQL (InnoDB) raises <code>ERROR 1452 (23000): Cannot add or update a child row: a foreign key constraint fails</code> for the insert case, and <code>ERROR 1451 (23000): Cannot delete or update a parent row: a foreign key constraint fails</code> for the delete case. SQLite raises a plain <code>FOREIGN KEY constraint failed</code> for both (foreign keys must also be turned on explicitly with <code>PRAGMA foreign_keys = ON;</code>, unlike Postgres and MySQL where they're always enforced). <code>ON DELETE CASCADE</code>/<code>SET NULL</code> syntax is the same across all three.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I tell which direction caused the error, just from the message?</summary><p>Check the DETAIL line. &quot;Key (x)=(y) is not present in table z&quot; means you inserted or updated a row pointing at a parent that doesn&#x27;t exist. &quot;Key (x)=(y) is still referenced from table z&quot; means you tried to delete or update a parent row that a child still depends on.</p></details>
+<details><summary>What&#x27;s the default behaviour if I don&#x27;t specify ON DELETE?</summary><p>ON DELETE NO ACTION, which is what produced the error in section 3 of this guide: Postgres refuses the delete rather than leaving an orphaned reference. You have to opt in to CASCADE or SET NULL explicitly.</p></details>
+<details><summary>What&#x27;s the difference between CASCADE and SET NULL?</summary><p>CASCADE deletes the dependent rows along with the parent (we confirmed the child row for user 3 disappeared with DELETE 1 and no error). SET NULL keeps the dependent row but blanks its foreign key column (we confirmed the row survived with user_id now empty). SET NULL only works if the column allows NULL.</p></details>
+<details><summary>Can I check for dependents without triggering the error?</summary><p>Yes: SELECT EXISTS(SELECT 1 FROM orders WHERE user_id = 2) returns t or f without erroring, so you can branch in application code before deciding whether to delete, cascade manually, or block the action.</p></details>
+<details><summary>Does SQLite enforce foreign keys the same way by default?</summary><p>No, per the SQLite docs (not measured here): foreign key enforcement is off by default and must be turned on per connection with PRAGMA foreign_keys = ON;. PostgreSQL and MySQL (InnoDB) enforce foreign keys unconditionally once declared.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with PostgreSQL 16.15 (official Docker image), using psql. Every error message below is copy-pasted output, not paraphrased. MySQL and SQLite enforce the same rule but phrase the error differently (per their docs, not measured here). PlainHeaders is our extension; PostgreSQL and Docker are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

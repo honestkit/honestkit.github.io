@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OSError: [Errno 113] No route to host in Python (Tested)</title>
+<meta name="description" content="Python [Errno 113] No route to host reproduced: unused IP (3s ARP timeout), firewall REJECT with the server up (instant), musl wording, and how to catch it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-oserror-errno-113-no-route-to-host/">
+<meta property="og:title" content="OSError: [Errno 113] No route to host in Python (Tested)">
+<meta property="og:description" content="Python [Errno 113] No route to host reproduced: unused IP (3s ARP timeout), firewall REJECT with the server up (instant), musl wording, and how to catch it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-oserror-errno-113-no-route-to-host/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does [Errno 113] No route to host mean?", "acceptedAnswer": {"@type": "Answer", "text": "EHOSTUNREACH: the host did not answer at the network level (wrong IP, host down) or a firewall rejected the connection with an ICMP host-prohibited reply."}}, {"@type": "Question", "name": "Why do I get No route to host when the server is running?", "acceptedAnswer": {"@type": "Answer", "text": "A firewall REJECT rule (firewalld rejects with icmp-host-prohibited by default) returns errno 113 instantly. Open the port in the server's firewall."}}, {"@type": "Question", "name": "How do I catch Errno 113 in Python?", "acceptedAnswer": {"@type": "Answer", "text": "except OSError as e: if e.errno == errno.EHOSTUNREACH. It is not a ConnectionError subclass, so except ConnectionError misses it."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>OSError: [Errno 113] No route to host in Python (tested)</h1>
+<p class="lead"><code>OSError: [Errno 113] No route to host</code> (<code>EHOSTUNREACH</code>) means the kernel could not reach the host at all. We reproduced both common causes: an address nobody answers (fails after about 3 seconds) and a firewall REJECT rule on a server that is up (fails instantly). It is a plain <code>OSError</code>, not a <code>ConnectionError</code>.</p>
+<h2 id="test">1. Reproduce it: connect to an address nobody answers</h2>
+<pre><code>import socket, time
+
+ip = socket.gethostbyname(socket.gethostname())          # this container&#x27;s address
+target = ip.rsplit(&quot;.&quot;, 1)[0] + &quot;.250&quot;                   # an unused address on the same subnet
+t = time.monotonic()
+try:
+    socket.create_connection((target, 80), timeout=10)
+except OSError as e:
+    print(f&quot;{type(e).__name__}: {e}  (errno {e.errno}, after {time.monotonic() - t:.1f}s)&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>OSError: [Errno 113] No route to host  (errno 113, after 3.1s)</code></pre>
+<p>The container asked its subnet for <code>.250</code> (an unused address). Nobody answered the ARP request, so after about 3 seconds the kernel gave up with <code>EHOSTUNREACH</code>. The same code on Alpine (musl libc) prints different text for the same errno:</p>
+<pre><code>OSError: [Errno 113] Host is unreachable  (errno 113, after 3.1s)</code></pre>
+<p>So <code>[Errno 113] No route to host</code> and <code>[Errno 113] Host is unreachable</code> are the same error.</p>
+<h2 id="firewall">2. The surprising cause: a firewall REJECT rule</h2>
+<pre><code>import socket, subprocess, time
+
+# firewall on the server side: REJECT with icmp-host-prohibited (firewalld&#x27;s default reject)
+subprocess.run([&quot;iptables&quot;, &quot;-A&quot;, &quot;INPUT&quot;, &quot;-p&quot;, &quot;tcp&quot;, &quot;--dport&quot;, &quot;8080&quot;,
+                &quot;-j&quot;, &quot;REJECT&quot;, &quot;--reject-with&quot;, &quot;icmp-host-prohibited&quot;], check=True)
+srv = socket.create_server((&quot;0.0.0.0&quot;, 8080))           # the service IS listening
+ip = socket.gethostbyname(socket.gethostname())
+t = time.monotonic()
+try:
+    socket.create_connection((ip, 8080), timeout=10)
+except OSError as e:
+    print(f&quot;{type(e).__name__}: {e}  (after {time.monotonic() - t:.2f}s, server is up and listening)&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>OSError: [Errno 113] No route to host  (after 0.00s, server is up and listening)</code></pre>
+<p>The server was up and listening, yet the client got <code>No route to host</code> instantly. A firewall rule that rejects with <code>icmp-host-prohibited</code> (firewalld's default reject) produces exactly this errno. If the host answers ping but a port gives errno 113, check the server's firewall (<code>firewall-cmd --list-all</code>, <code>iptables -L -n</code>) and open the port, rather than debugging routing.</p>
+<h2 id="type">3. It is a plain OSError, not ConnectionError</h2>
+<pre><code>import errno, socket
+
+target = socket.gethostbyname(socket.gethostname()).rsplit(&quot;.&quot;, 1)[0] + &quot;.250&quot;
+try:
+    socket.create_connection((target, 80), timeout=10)
+except OSError as e:
+    print(&quot;errno name:&quot;, errno.errorcode[e.errno], &quot;| EHOSTUNREACH =&quot;, errno.EHOSTUNREACH)
+    print(&quot;ConnectionError?&quot;, isinstance(e, ConnectionError), &quot;| TimeoutError?&quot;, isinstance(e, TimeoutError))
+    print(&quot;class:&quot;, type(e).__name__)</code></pre>
+<p>Output:</p>
+<pre><code>errno name: EHOSTUNREACH | EHOSTUNREACH = 113
+ConnectionError? False | TimeoutError? False
+class: OSError</code></pre>
+<p>Python maps errno 111 to <code>ConnectionRefusedError</code>, but errno 113 has no subclass: <code>except ConnectionError</code> and <code>except TimeoutError</code> both miss it. Catch <code>OSError</code> and compare <code>e.errno == errno.EHOSTUNREACH</code>.</p>
+<h2 id="requests">4. The same error through requests</h2>
+<pre><code>import socket, requests
+
+target = socket.gethostbyname(socket.gethostname()).rsplit(&quot;.&quot;, 1)[0] + &quot;.250&quot;
+try:
+    requests.get(f&quot;http://{target}/&quot;, timeout=10)
+except requests.exceptions.ConnectionError as e:
+    print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>ConnectionError: HTTPConnectionPool(host=&#x27;172.17.0.250&#x27;, port=80): Max retries exceeded with url: / (Caused by NewConnectionError(&quot;HTTPConnection(host=&#x27;172.17.0.250&#x27;, port=80): Failed to establish a new connection: [Errno 113] No route to host&quot;))</code></pre>
+<p>requests wraps it in <code>requests.exceptions.ConnectionError</code> with <code>Max retries exceeded</code>; the <code>[Errno 113]</code> at the end is the real cause.</p>
+<h2 id="fix">5. Checklist</h2>
+<ul><li><strong>Right address?</strong> A typo, a stale DNS record, or a DHCP address that changed points at an empty slot, which looks exactly like block 1.</li><li><strong>Host up?</strong> A machine that is off or asleep on the local network gives errno 113 after a few seconds (no ARP reply).</li><li><strong>Firewall?</strong> An instant errno 113 with the host up means a REJECT rule (block 2). Open the port on the server.</li><li><strong>Docker/VM networks?</strong> Container IPs (172.17.x.x) are only reachable from the same host or network; from elsewhere publish a port (<code>-p 8080:8080</code>) and connect to the host's address.</li></ul>
+<p>Related: <a href="/guides/python-oserror-errno-101-network-is-unreachable/">[Errno 101] Network is unreachable</a> · <a href="/guides/python-connectionrefusederror-errno-111-connection-refused/">[Errno 111] Connection refused</a> · <a href="/guides/python-socket-error-handling-exceptions-and-errno-codes/">socket errors and errno codes</a>.</p>
+
+<aside class="cta"><strong>Once it connects, check the headers and status the server actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does [Errno 113] No route to host mean?</summary><p>EHOSTUNREACH: the host did not answer at the network level (wrong IP, host down) or a firewall rejected the connection with an ICMP host-prohibited reply.</p></details>
+<details><summary>Why do I get No route to host when the server is running?</summary><p>A firewall REJECT rule (firewalld rejects with icmp-host-prohibited by default) returns errno 113 instantly. Open the port in the server&#x27;s firewall.</p></details>
+<details><summary>How do I catch Errno 113 in Python?</summary><p>except OSError as e: if e.errno == errno.EHOSTUNREACH. It is not a ConnectionError subclass, so except ConnectionError misses it.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 in Docker: python:3-slim (Python 3.15.1, glibc, requests from pip) and python:3-alpine (musl). The firewall test ran iptables inside its own container. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

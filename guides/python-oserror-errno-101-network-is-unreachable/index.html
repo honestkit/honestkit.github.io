@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OSError: [Errno 101] Network is unreachable (Python Fix)</title>
+<meta name="description" content="Python OSError [Errno 101] Network is unreachable: no route to the address. Tested: why except ConnectionError misses it, DNS vs 101, and a safe retry.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-oserror-errno-101-network-is-unreachable/">
+<meta property="og:title" content="OSError: [Errno 101] Network is unreachable (Python Fix)">
+<meta property="og:description" content="Python OSError [Errno 101] Network is unreachable: no route to the address. Tested: why except ConnectionError misses it, DNS vs 101, and a safe retry.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-oserror-errno-101-network-is-unreachable/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Errno 101 Network is unreachable mean in Python?", "acceptedAnswer": {"@type": "Answer", "text": "The OS has no route to the destination: no interface up, no default gateway, or no IPv6 connectivity for an IPv6 address."}}, {"@type": "Question", "name": "Does except ConnectionError catch Errno 101?", "acceptedAnswer": {"@type": "Answer", "text": "No. Errno 101 (ENETUNREACH) is raised as a plain OSError. Catch OSError and check e.errno == errno.ENETUNREACH."}}, {"@type": "Question", "name": "Why do I get a DNS error instead of Errno 101?", "acceptedAnswer": {"@type": "Answer", "text": "With a hostname, name resolution runs first and fails first when there is no network. Errno 101 appears for IP literals or when DNS still works."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>OSError: [Errno 101] Network is unreachable in Python (tested fix)</h1>
+<p class="lead"><code>OSError: [Errno 101] Network is unreachable</code> means the OS has no route to the address you connected to, so it fails instantly. We reproduced it in a container with no network and tested how to catch it and retry.</p>
+<h2 id="cause">1. What Errno 101 means</h2>
+<pre><code>import socket
+for host in (&quot;1.1.1.1&quot;, &quot;2606:4700::1111&quot;):
+    fam = socket.AF_INET6 if &quot;:&quot; in host else socket.AF_INET
+    s = socket.socket(fam)
+    try:
+        s.connect((host, 80))
+    except OSError as e:
+        print(f&quot;{type(e).__name__}: {e}&quot;)
+    finally:
+        s.close()</code></pre>
+<p>Output:</p>
+<pre><code>OSError: [Errno 101] Network unreachable
+OSError: [Errno 101] Network unreachable</code></pre>
+<p>The kernel has no route for the destination address: no network interface is up, there is no default gateway, or (for IPv6) the host has no IPv6 connectivity at all. The connect fails at once instead of timing out. We reproduced it in a Docker container started with <code>--network none</code> (python:3.11-alpine). Alpine uses musl libc, which words it <code>Network unreachable</code>; on glibc systems (Debian, Ubuntu, most desktops) the same errno reads <code>[Errno 101] Network is unreachable</code>.</p>
+<h2 id="type">2. It is a plain OSError, not ConnectionError</h2>
+<pre><code>import errno, socket
+s = socket.socket()
+try:
+    s.connect((&quot;1.1.1.1&quot;, 443))
+except OSError as e:
+    print(type(e).__mro__[:3])
+    print(&quot;ConnectionError?&quot;, isinstance(e, ConnectionError))
+    print(&quot;errno:&quot;, e.errno, errno.errorcode[e.errno], e.errno == errno.ENETUNREACH)
+finally:
+    s.close()</code></pre>
+<p>Output:</p>
+<pre><code>(&lt;class &#x27;OSError&#x27;&gt;, &lt;class &#x27;Exception&#x27;&gt;, &lt;class &#x27;BaseException&#x27;&gt;)
+ConnectionError? False
+errno: 101 ENETUNREACH True</code></pre>
+<p>Python maps only some errnos to subclasses (<code>ConnectionRefusedError</code> for 111, <code>ConnectionResetError</code> for 104, and so on). ENETUNREACH is not one of them, so <code>except ConnectionError</code> will <b>not</b> catch it. Catch <code>OSError</code> and check <code>e.errno == errno.ENETUNREACH</code>.</p>
+<h2 id="dns">3. With a hostname you usually see a DNS error first</h2>
+<pre><code>import urllib.request
+for url in (&quot;http://example.com&quot;, &quot;http://1.1.1.1&quot;):
+    try:
+        urllib.request.urlopen(url, timeout=5)
+    except Exception as e:
+        print(url, &quot;-&gt;&quot;, type(e).__name__, e)</code></pre>
+<p>Output:</p>
+<pre><code>http://example.com -&gt; URLError &lt;urlopen error [Errno -3] Try again&gt;
+http://1.1.1.1 -&gt; URLError &lt;urlopen error [Errno 101] Network unreachable&gt;</code></pre>
+<p>Before connecting, <code>urllib</code> (and <code>requests</code>) must resolve the hostname. With no network, resolution fails first (<code>[Errno -3] Try again</code> on musl; glibc commonly gives <code>Temporary failure in name resolution</code>). So Errno 101 shows up when you connect to an IP literal, when DNS still works (for example via a local resolver or <code>/etc/hosts</code>) but routing does not, or when a hostname resolves to an IPv6 address on a host without IPv6.</p>
+<h2 id="fix">4. Fixes</h2>
+<ul>
+<li><b>Docker:</b> a container on <code>--network none</code> or on an internal-only network has no route out. Attach it to a normal bridge network.</li>
+<li><b>IPv6 only failing:</b> if IPv4 works but an IPv6 address gives 101, the host has no IPv6 route. <code>socket.create_connection</code> tries every address the name resolves to, so prefer it over a hand-rolled <code>connect()</code> on the first result.</li>
+<li><b>VPN / interface down / boot order:</b> a service that starts before the network is up gets 101. Retry with backoff (below), or order the service after the network is online.</li>
+</ul>
+<h2 id="retry">5. Retry only the network-down errors</h2>
+<pre><code>import errno, socket, time
+
+def connect(host, port, tries=3):
+    for i in range(tries):
+        try:
+            return socket.create_connection((host, port), timeout=5)
+        except OSError as e:
+            if e.errno not in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+                raise
+            print(f&quot;try {i+1}: {e}; network down, retrying in {2**i}s&quot;)
+            time.sleep(2**i)
+    raise SystemExit(&quot;no network route; check the interface / VPN / docker network&quot;)
+
+connect(&quot;1.1.1.1&quot;, 443)</code></pre>
+<p>Output:</p>
+<pre><code>try 1: [Errno 101] Network unreachable; network down, retrying in 1s
+try 2: [Errno 101] Network unreachable; network down, retrying in 2s
+try 3: [Errno 101] Network unreachable; network down, retrying in 4s
+no network route; check the interface / VPN / docker network</code></pre>
+<p>The loop retries ENETUNREACH (101) and EHOSTUNREACH (113, <code>No route to host</code>) and re-raises everything else, so real bugs are not hidden. The output above is from the container with no network, so every try failed.</p>
+<p>Related: <a href="/guides/python-oserror-errno-codes-list/">Python errno codes list</a> · <a href="/guides/python-socket-error-handling-exceptions-and-errno-codes/">socket error handling</a> · <a href="/guides/python-connectionrefusederror-errno-111-connection-refused/">Errno 111 connection refused</a>.</p>
+
+<aside class="cta"><strong>Once the network is back, check what headers a URL actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Errno 101 Network is unreachable mean in Python?</summary><p>The OS has no route to the destination: no interface up, no default gateway, or no IPv6 connectivity for an IPv6 address.</p></details>
+<details><summary>Does except ConnectionError catch Errno 101?</summary><p>No. Errno 101 (ENETUNREACH) is raised as a plain OSError. Catch OSError and check e.errno == errno.ENETUNREACH.</p></details>
+<details><summary>Why do I get a DNS error instead of Errno 101?</summary><p>With a hostname, name resolution runs first and fails first when there is no network. Errno 101 appears for IP literals or when DNS still works.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-22 in the official python:3.11-alpine image run with docker --network none: raw socket connects over IPv4 and IPv6, the exception class and errno, urllib with a hostname vs an IP, and a retry loop. glibc wording checked with os.strerror(101) on Debian (Python 3.13.5). Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

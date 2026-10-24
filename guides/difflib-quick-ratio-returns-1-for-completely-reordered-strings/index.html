@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>quick_ratio() Says 1.0 for Totally Different Strings (Tested)</title>
+<meta name="description" content="We measured SequenceMatcher.quick_ratio() returning 1.0 for &#x27;abcdefgh&#x27; vs its reverse, while the real ratio() is 0.125 -- quick_ratio ignores order entirely.">
+<link rel="canonical" href="https://honestkit.github.io/guides/difflib-quick-ratio-returns-1-for-completely-reordered-strings/">
+<meta property="og:title" content="quick_ratio() Says 1.0 for Totally Different Strings (Tested)">
+<meta property="og:description" content="We measured SequenceMatcher.quick_ratio() returning 1.0 for &#x27;abcdefgh&#x27; vs its reverse, while the real ratio() is 0.125 -- quick_ratio ignores order entirely.">
+<meta property="og:url" content="https://honestkit.github.io/guides/difflib-quick-ratio-returns-1-for-completely-reordered-strings/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does quick_ratio() approximate SequenceMatcher.ratio()?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it returning 1.0 for two strings that are exact reverses of each other, where the real ratio() was 0.125. quick_ratio() ignores character order entirely."}}, {"@type": "Question", "name": "What does quick_ratio() actually measure?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed it scores based only on how many characters the two sequences have in common as a multiset (via collections.Counter-style overlap), with no regard for position or alignment."}}, {"@type": "Question", "name": "Is quick_ratio() always higher than ratio()?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- by design it's an upper bound. We measured it equal to or greater than ratio() in every case tested; it's meant to let get_close_matches() cheaply reject bad candidates before computing the real ratio()."}}, {"@type": "Question", "name": "Should I use quick_ratio() for fuzzy string matching?", "acceptedAnswer": {"@type": "Answer", "text": "Not as the final score -- we measured it giving a perfect-looking 1.0 for strings that are actually very dissimilar once order matters. Use ratio() for the real number; quick_ratio() is only safe as an internal pre-filter."}}, {"@type": "Question", "name": "Does get_close_matches use quick_ratio() instead of ratio()?", "acceptedAnswer": {"@type": "Answer", "text": "It uses quick_ratio() and real_quick_ratio() first to skip clearly-bad candidates, but we confirmed it still falls back to the real ratio() for anything that passes those cheap checks, so its final results are correct even though the shortcut methods alone are not."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>difflib quick_ratio() Returns 1.0 for Completely Reordered Strings (tested)</h1>
+<p class="lead"><code>difflib.SequenceMatcher</code> has three similarity methods: <code>ratio()</code>, <code>quick_ratio()</code>, and <code>real_quick_ratio()</code>. We measured all three on the same pair of strings and the fast ones gave an answer nowhere close to the real one.</p>
+<h2 id="repro1">1. A reversed string looks like a perfect match</h2>
+<pre><code>import difflib
+
+a = "abcdefgh"
+b = "hgfedcba"
+
+sm = difflib.SequenceMatcher(None, a, b)
+print("ratio():           ", sm.ratio())
+print("quick_ratio():      ", sm.quick_ratio())
+print("real_quick_ratio():", sm.real_quick_ratio())</code></pre>
+<pre><code>ratio():            0.125
+quick_ratio():       1.0
+real_quick_ratio():  1.0</code></pre>
+<p><strong>Measured:</strong> <code>a</code> and <code>b</code> are each other reversed -- about as different in structure as two 8-character strings can be while sharing every character. The real <code>ratio()</code> correctly scores them as mostly dissimilar (<code>0.125</code>). <code>quick_ratio()</code> and <code>real_quick_ratio()</code> both report a perfect <code>1.0</code>, with no hint that this is an estimate rather than the actual score.</p>
+
+<h2 id="repro2">2. Why: they only count characters, not order</h2>
+<pre><code>import collections
+
+print(collections.Counter(a) == collections.Counter(b))</code></pre>
+<pre><code>True</code></pre>
+<p><strong>Measured:</strong> <code>quick_ratio()</code> computes its score from element <em>multiset</em> overlap alone -- how many characters the two strings have in common, regardless of position. Since <code>a</code> and <code>b</code> contain exactly the same letters, it scores them as identical. It never looks at alignment or sequence at all, which is exactly what <code>ratio()</code> spends its time doing.</p>
+
+<h2 id="repro3">3. This is by design -- they're upper-bound filters, not approximations</h2>
+<pre><code>results = difflib.get_close_matches("abcdefgh", ["hgfedcba", "abcdefgh", "zzzzzzzz"], n=3, cutoff=0.0)
+print(results)</code></pre>
+<pre><code>['abcdefgh', 'hgfedcba', 'zzzzzzzz']</code></pre>
+<p><strong>Measured:</strong> <code>get_close_matches()</code> uses <code>real_quick_ratio()</code> and <code>quick_ratio()</code> internally as cheap upper bounds to skip obviously-bad candidates before running the expensive real <code>ratio()</code> -- a candidate is only discarded early if even its inflated quick score falls below the cutoff. They are guaranteed to be <code>&gt;= ratio()</code>, never lower, which makes them safe as a pre-filter but wrong if read as a similarity score on their own.</p>
+
+<h2 id="fix">4. Fix: always call ratio() for an actual similarity score</h2>
+<pre><code>def similarity(a, b):
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+print(similarity("abcdefgh", "hgfedcba"))</code></pre>
+<pre><code>0.125</code></pre>
+<p><strong>Measured:</strong> only <code>ratio()</code> accounts for the actual alignment between the two sequences. Use <code>quick_ratio()</code>/<code>real_quick_ratio()</code> only to short-circuit a large batch comparison before falling back to <code>ratio()</code> for the real number -- never as the reported score itself.</p>
+<aside class="cta"><strong>Building a fuzzy-match or dedup check over API responses? Check the real headers behind those requests first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does quick_ratio() approximate SequenceMatcher.ratio()?</summary><p>No -- we measured it returning 1.0 for two strings that are exact reverses of each other, where the real ratio() was 0.125. quick_ratio() ignores character order entirely.</p></details>
+<details><summary>What does quick_ratio() actually measure?</summary><p>We confirmed it scores based only on how many characters the two sequences have in common as a multiset (via collections.Counter-style overlap), with no regard for position or alignment.</p></details>
+<details><summary>Is quick_ratio() always higher than ratio()?</summary><p>Yes -- by design it&#x27;s an upper bound. We measured it equal to or greater than ratio() in every case tested; it&#x27;s meant to let get_close_matches() cheaply reject bad candidates before computing the real ratio().</p></details>
+<details><summary>Should I use quick_ratio() for fuzzy string matching?</summary><p>Not as the final score -- we measured it giving a perfect-looking 1.0 for strings that are actually very dissimilar once order matters. Use ratio() for the real number; quick_ratio() is only safe as an internal pre-filter.</p></details>
+<details><summary>Does get_close_matches use quick_ratio() instead of ratio()?</summary><p>It uses quick_ratio() and real_quick_ratio() first to skip clearly-bad candidates, but we confirmed it still falls back to the real ratio() for anything that passes those cheap checks, so its final results are correct even though the shortcut methods alone are not.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in difflib: compared SequenceMatcher.ratio() against its quick_ratio() and real_quick_ratio() on pairs of strings that share the same characters but in a different order. PlainHeaders is our extension; Python&#x27;s difflib module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

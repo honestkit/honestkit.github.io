@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unhandled Promise Rejection: Node Crash vs Browser (Tested)</title>
+<meta name="description" content="We measured what Node 24 and headless Chromium actually do with a rejected promise and no .catch(). Node crashes; the browser just logs and moves on.">
+<link rel="canonical" href="https://honestkit.github.io/guides/unhandled-promise-rejection/">
+<meta property="og:title" content="Unhandled Promise Rejection: Node Crash vs Browser (Tested)">
+<meta property="og:description" content="We measured what Node 24 and headless Chromium actually do with a rejected promise and no .catch(). Node crashes; the browser just logs and moves on.">
+<meta property="og:url" content="https://honestkit.github.io/guides/unhandled-promise-rejection/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Node.js always crash on an unhandled promise rejection?", "acceptedAnswer": {"@type": "Answer", "text": "On current Node (we tested 24.21.0), yes by default: it prints the error and stack to stderr and exits with code 1. Older Node (8-14) only printed a DeprecationWarning/UnhandledPromiseRejectionWarning and kept running. If you need the old behaviour you can run with --unhandled-rejections=warn, per the Node docs (not measured here)."}}, {"@type": "Question", "name": "Does the browser crash the page on an unhandled rejection?", "acceptedAnswer": {"@type": "Answer", "text": "No. In our headless Chromium 153 test, a rejected promise with no handler fired the unhandledrejection event and logged an 'Uncaught (in promise)' error to the console, but the page kept running normally afterward."}}, {"@type": "Question", "name": "What's the actual fix, not just suppressing the message?", "acceptedAnswer": {"@type": "Answer", "text": "Attach a .catch() to the promise chain, or wrap an awaited call in try/catch. We confirmed both stop the error entirely at the source, which is better than a global handler that only logs it after the fact."}}, {"@type": "Question", "name": "What does process.on('unhandledRejection') receive?", "acceptedAnswer": {"@type": "Answer", "text": "In our test it was called with (reason, promise), where reason was the Error object (reason.message gave the message text). Attaching this handler measurably stopped Node from crashing and exiting."}}, {"@type": "Question", "name": "What is the most common real-world cause?", "acceptedAnswer": {"@type": "Answer", "text": "A floating promise: calling an async function with .then() but no .catch(), or forgetting to await/return a promise inside another async function. We reproduced this exact pattern and got the identical crash and exit code 1 as a bare Promise.reject()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>UnhandledPromiseRejectionWarning / Uncaught (in promise) (tested)</h1>
+<p class="lead">A rejected <code>Promise</code> with no <code>.catch()</code> or surrounding <code>try/catch</code> is an unhandled promise rejection. Old Node.js printed a warning and kept running. We tested current Node and current headless Chromium side by side to see what actually happens now.</p>
+<h2>1. The two different behaviours, measured</h2>
+<p>We ran the same bug &mdash; <code>Promise.reject(new Error(...))</code> with nothing attached to it &mdash; in Node.js 24.21.0 and in headless Chromium 153 (via Playwright). The outcomes are not the same.</p>
+<table>
+<tr><th>Environment</th><th>What we saw</th><th>Process/page survives?</th></tr>
+<tr><td>Node.js 24.21.0</td><td>Prints the error and stack straight to stderr, exits with code 1</td><td>No &mdash; process exits</td></tr>
+<tr><td>Headless Chromium 153</td><td><code>unhandledrejection</code> event fires; console shows "Uncaught (in promise) Error: ..."</td><td>Yes &mdash; page keeps running</td></tr>
+</table>
+
+<h2>2. Node.js: it crashes, and the old warning text is gone</h2>
+<p>We ran this file with nothing else in it:</p>
+<pre><code>Promise.reject(new Error("boom - no handler"));
+console.log("this line still runs synchronously");</code></pre>
+<p>Exact output on Node.js 24.21.0:</p>
+<pre><code>this line still runs synchronously
+file:///tmp/unhandledrej-guide/node_crash.mjs:1
+Promise.reject(new Error("boom - no handler"));
+               ^
+
+Error: boom - no handler
+    at file:///tmp/unhandledrej-guide/node_crash.mjs:1:16
+    at ModuleJob.run (node:internal/modules/esm/module_job:561:25)
+    ...
+
+Node.js v24.21.0</code></pre>
+<p>Exit code was <strong>1</strong>. Note what is <em>not</em> there: there is no line starting with <code>UnhandledPromiseRejectionWarning</code>. That text was the behaviour in old Node (&le; 14, before the default flipped). Current Node prints the error like an uncaught exception and kills the process outright. If you still see "UnhandledPromiseRejectionWarning" in your logs, you are on an old Node version or reading an old stack trace saved somewhere &mdash; it is not what current Node prints.</p>
+
+<h2>3. The common real cause: a floating promise</h2>
+<p>You rarely write <code>Promise.reject()</code> directly. The usual way to hit this is forgetting to <code>return</code> or <code>await</code> a promise, or chaining <code>.then()</code> without a paired <code>.catch()</code>:</p>
+<pre><code>async function fetchThing() {
+  throw new Error("fetch failed inside async fn");
+}
+
+function run() {
+  // BUG: no return, no await, no .catch()
+  fetchThing().then(r =&gt; console.log("got", r));
+}
+
+run();</code></pre>
+<p>We ran this on Node.js 24.21.0. <code>run()</code> returns immediately (synchronous code finishes fine), but when the rejected promise from <code>fetchThing()</code> is checked on the next microtask turn with no <code>.catch()</code> attached, Node prints the same style of error and stack pointing at the <code>throw</code> site, then exits with code <strong>1</strong>. The fix is any one of: <code>await fetchThing()</code> inside an <code>async</code> function wrapped in <code>try/catch</code>, <code>return fetchThing()...</code> so the caller's chain handles it, or adding <code>.catch(err =&gt; ...)</code> to the chain itself.</p>
+
+<h2>4. Fix #1: a .catch() or try/catch</h2>
+<pre><code>// Promise chain
+fetchThing().then(r =&gt; console.log(r)).catch(err =&gt; console.error("failed:", err.message));
+
+// async/await
+async function run() {
+  try {
+    const r = await fetchThing();
+    console.log(r);
+  } catch (err) {
+    console.error("failed:", err.message);
+  }
+}</code></pre>
+<p>This is the real fix: handle the rejection where it happens. The global handlers below are a safety net, not a substitute.</p>
+
+<h2>5. Fix #2 (Node): a global process.on('unhandledRejection') handler</h2>
+<p>We added this one line before the same <code>Promise.reject()</code> call:</p>
+<pre><code>process.on("unhandledRejection", (reason, promise) =&gt; {
+  console.log("CAUGHT by unhandledRejection handler:", reason.message);
+});
+Promise.reject(new Error("boom - no handler"));</code></pre>
+<p>Measured result: Node printed <code>CAUGHT by unhandledRejection handler: boom - no handler</code>, the rest of the script kept running (a later <code>setTimeout</code> still fired), and the process exited with code <strong>0</strong>. The crash is fully suppressed. Treat this as a last-resort logger/reporter (e.g. send to your error tracker), not a way to silently ignore bugs &mdash; per the Node.js docs, relying on it instead of fixing the rejection is explicitly discouraged.</p>
+
+<h2>6. Fix #2 (browser): window.addEventListener('unhandledrejection', ...)</h2>
+<p>In headless Chromium 153 we confirmed the rejection fires a real DOM event with the reason attached:</p>
+<pre><code>window.addEventListener("unhandledrejection", ev =&gt; {
+  console.log("reason:", ev.reason);
+});
+Promise.reject(new Error("boom in browser - no handler"));</code></pre>
+<p>Measured: the <code>unhandledrejection</code> event fired with <code>ev.reason</code> set to the <code>Error</code> object, and Playwright's page also reported a <code>pageerror</code> with message "boom in browser - no handler" (this is what shows as <code>Uncaught (in promise) Error: boom in browser - no handler</code> in a real DevTools console). The page kept running fine afterward &mdash; a follow-up <code>1 + 1</code> evaluation on the same page still returned <code>2</code>. Calling <code>ev.preventDefault()</code> inside the listener measurably suppressed that console error entirely in our test: with <code>preventDefault()</code> called, no <code>pageerror</code> fired at all.</p>
+
+<h2>7. Node vs browser, side by side</h2>
+<table>
+<tr><th></th><th>Node.js 24.21.0</th><th>Chromium 153</th></tr>
+<tr><td>Default behaviour</td><td>Crashes, exit code 1</td><td>Logs to console, keeps running</td></tr>
+<tr><td>Event/hook name</td><td><code>process.on("unhandledRejection", (reason, promise) =&gt; ...)</code></td><td><code>window.addEventListener("unhandledrejection", ev =&gt; ...)</code></td></tr>
+<tr><td>Can you stop the default report?</td><td>Yes &mdash; attaching the handler is enough to stop the crash</td><td>Yes &mdash; call <code>ev.preventDefault()</code> inside the listener</td></tr>
+<tr><td>Should you rely on this as the fix?</td><td>No &mdash; add <code>.catch()</code>/<code>try-catch</code> at the source</td><td>No &mdash; same</td></tr>
+</table>
+
+<h2>8. Checklist</h2>
+<ul>
+<li>Every <code>async function</code> call you don't <code>await</code> or <code>return</code> is a candidate for an unhandled rejection. Grep for <code>.then(</code> calls with no <code>.catch(</code> on the same chain.</li>
+<li>Add a global <code>process.on("unhandledRejection", ...)</code> in Node and a <code>window.addEventListener("unhandledrejection", ...)</code> in the browser as a safety net that logs to your error tracker &mdash; we confirmed both actually fire and both can suppress the default crash/log.</li>
+<li>Don't use the global handler to silence the warning and move on. Fix the actual missing <code>.catch()</code>; we reproduced the exact same crash from a realistic "floating <code>.then()</code>" bug, not just a bare <code>Promise.reject()</code>.</li>
+<li>If your logs mention <code>UnhandledPromiseRejectionWarning</code>, that string is from old Node (&le;14). Current Node (we tested 24.21.0) prints a plain error and stack trace instead and exits immediately &mdash; check your Node version with <code>node --version</code>.</li>
+</ul>
+<p>If your actual crash is a different runtime error, see <a href="/plainheaders/">PlainHeaders</a> for inspecting what your server sends when a request handler throws.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Node.js always crash on an unhandled promise rejection?</summary><p>On current Node (we tested 24.21.0), yes by default: it prints the error and stack to stderr and exits with code 1. Older Node (8-14) only printed a DeprecationWarning/UnhandledPromiseRejectionWarning and kept running. If you need the old behaviour you can run with --unhandled-rejections=warn, per the Node docs (not measured here).</p></details>
+<details><summary>Does the browser crash the page on an unhandled rejection?</summary><p>No. In our headless Chromium 153 test, a rejected promise with no handler fired the unhandledrejection event and logged an &#x27;Uncaught (in promise)&#x27; error to the console, but the page kept running normally afterward.</p></details>
+<details><summary>What&#x27;s the actual fix, not just suppressing the message?</summary><p>Attach a .catch() to the promise chain, or wrap an awaited call in try/catch. We confirmed both stop the error entirely at the source, which is better than a global handler that only logs it after the fact.</p></details>
+<details><summary>What does process.on(&#x27;unhandledRejection&#x27;) receive?</summary><p>In our test it was called with (reason, promise), where reason was the Error object (reason.message gave the message text). Attaching this handler measurably stopped Node from crashing and exiting.</p></details>
+<details><summary>What is the most common real-world cause?</summary><p>A floating promise: calling an async function with .then() but no .catch(), or forgetting to await/return a promise inside another async function. We reproduced this exact pattern and got the identical crash and exit code 1 as a bare Promise.reject().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 and headless Chromium 153 via Playwright 1.63. Ran a rejected promise with no handler, a floating .then() with no .catch(), and both global-handler fixes, and recorded the exact exit codes and printed text. PlainHeaders is our extension; Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

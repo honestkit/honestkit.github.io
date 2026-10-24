@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Content-Length Mismatch: What curl, fetch, Python and Chromium Do When It Is Wrong</title>
+<meta name="description" content="Measured results when Content-Length is smaller or larger than the body, duplicated, conflicting, sent with Transfer-Encoding, negative or non-numeric. Exact error strings from curl 8.14, Node fetch, Python requests and Chromium 153.">
+<link rel="canonical" href="https://honestkit.github.io/guides/content-length-header-mismatch/">
+<meta property="og:title" content="Content-Length Mismatch: What curl, fetch, Python and Chromium Do When It Is Wrong">
+<meta property="og:description" content="Measured results when Content-Length is smaller or larger than the body, duplicated, conflicting, sent with Transfer-Encoding, negative or non-numeric. Exact error strings from curl 8.14, Node fetch, Python requests and Chromium 153.">
+<meta property="og:url" content="https://honestkit.github.io/guides/content-length-header-mismatch/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does curl: (18) mean?", "acceptedAnswer": {"@type": "Answer", "text": "In curl 8.14.1 we got 'curl: (18) end of response with 9 bytes missing' when the server promised Content-Length: 20, sent 11 bytes and closed the connection. The body is shorter than the header says."}}, {"@type": "Question", "name": "What causes net::ERR_CONTENT_LENGTH_MISMATCH in Chrome?", "acceptedAnswer": {"@type": "Answer", "text": "In Chromium 153, a navigation to a response with Content-Length: 20 and only 11 bytes before the server closed the connection failed with net::ERR_CONTENT_LENGTH_MISMATCH. fetch() in the same case rejected with TypeError: Failed to fetch."}}, {"@type": "Question", "name": "What happens if Content-Length is smaller than the body?", "acceptedAnswer": {"@type": "Answer", "text": "Every client we tested (curl, Node fetch, Python requests, Chromium) returned only the first N bytes with no error. The extra bytes were silently dropped."}}, {"@type": "Question", "name": "Why does my request hang when Content-Length is too large?", "acceptedAnswer": {"@type": "Answer", "text": "If the server keeps the connection open, the client waits for the missing bytes. curl, Node fetch, Python requests and Chromium all waited until a timeout in our test."}}, {"@type": "Question", "name": "Is it OK to send Content-Length twice?", "acceptedAnswer": {"@type": "Answer", "text": "Two identical values worked in curl, Python requests and Chromium 153, but Node 24 fetch rejected it with UND_ERR_RES_CONTENT_LENGTH_MISMATCH. Two different values were rejected by Python, Chromium and Node fetch, and curl cut the body to the second value. Send it once."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Content-Length mismatch errors (tested)</h1>
+<p class="lead">A wrong Content-Length header causes truncated responses, hanging requests and errors such as curl (18) or net::ERR_CONTENT_LENGTH_MISMATCH. We sent eight broken responses from a raw Node server to four clients and wrote down exactly what each one did.</p>
+<h2>1. The results</h2>
+<p>The body was always the 11 bytes <code>hello world</code>. "OK" means the client returned without error; the quoted text is the body it gave back.</p>
+<table><thead><tr><th>Response sent</th><th>curl 8.14.1</th><th>Node 24 fetch (undici)</th><th>Python requests 2.32.3</th><th>Chromium 153 fetch() / navigation</th></tr></thead><tbody>
+<tr><td>Content-Length: 5 (smaller than body)</td><td>OK, "hello" (exit 0)</td><td>OK, "hello"</td><td>OK, "hello"</td><td>OK, "hello" / page shows "hello"</td></tr>
+<tr><td>Content-Length: 20, server closes after 11 bytes</td><td><code>curl: (18) end of response with 9 bytes missing</code></td><td><code>TypeError: terminated</code>, cause <code>UND_ERR_SOCKET</code> "other side closed"</td><td><code>ChunkedEncodingError</code>: "Connection broken: IncompleteRead(11 bytes read, 9 more expected)"</td><td><code>TypeError: Failed to fetch</code> / navigation status 200, then <code>net::ERR_CONTENT_LENGTH_MISMATCH</code></td></tr>
+<tr><td>Content-Length: 20, connection left open</td><td>Hangs; with <code>-m 3</code>: <code>curl: (28) Operation timed out after 3002 milliseconds with 11 out of 20 bytes received</code></td><td>Hangs until our 3 s AbortSignal timeout (<code>TimeoutError</code>)</td><td>Hangs until timeout: <code>ConnectionError</code> "Read timed out."</td><td>fetch() hangs until our abort / navigation did not finish within 4 s</td></tr>
+<tr><td>Two identical lines: Content-Length: 11 twice</td><td>OK, full body</td><td><code>TypeError: fetch failed</code>, cause <code>UND_ERR_RES_CONTENT_LENGTH_MISMATCH</code> "Response body length does not match content-length header"</td><td>OK, full body</td><td>OK, full body (both)</td></tr>
+<tr><td>Two different values: 11 and 5</td><td>OK, but body cut to "hello" (verbose: "Excess found writing body")</td><td><code>UND_ERR_RES_CONTENT_LENGTH_MISMATCH</code> (same as above)</td><td><code>InvalidHeader</code>: "Content-Length contained multiple unmatching values (11, 5)"</td><td><code>TypeError: Failed to fetch</code> / <code>net::ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_LENGTH</code></td></tr>
+<tr><td>Content-Length: 5 plus Transfer-Encoding: chunked (valid chunked body)</td><td>OK, full body (chunked used)</td><td><code>UND_ERR_RES_CONTENT_LENGTH_MISMATCH</code></td><td>OK, full body</td><td>OK, full body (both)</td></tr>
+<tr><td>Content-Length: -1</td><td><code>curl: (8) Invalid Content-Length: value</code></td><td><code>TypeError: fetch failed</code>: "Response does not match the HTTP/1.1 protocol (Invalid character in Content-Length)"</td><td>OK, full body (read until close)</td><td>OK, full body (both)</td></tr>
+<tr><td>Content-Length: abc</td><td><code>curl: (8) Invalid Content-Length: value</code></td><td>Same "Invalid character in Content-Length" error</td><td>OK, full body (read until close)</td><td>OK, full body (both)</td></tr>
+</tbody></table>
+<p>The Node fetch result for two identical Content-Length lines surprised us: every other client accepted it, but undici in Node 24.21.0 rejected it with a length mismatch error. If a proxy or framework in front of your Node code duplicates the header, Node fetch clients can fail while browsers and curl work.</p>
+<h2>2. What this means in practice</h2>
+<ul>
+<li><strong>Too small is silent.</strong> No client we tested reported an error when Content-Length was smaller than the body. They all returned the first N bytes and dropped the rest. A truncated JSON response then fails later as a parse error, far from the real cause.</li>
+<li><strong>Too large is loud only if the connection closes.</strong> If the server closes the socket, every client errored. If the server keeps the connection open, every client waited for the missing bytes until a timeout. That looks like a slow or hung endpoint, not a header bug.</li>
+<li><strong>Conflicting values are the riskiest.</strong> Clients disagreed: curl used the second value and cut the body, Python and Chromium refused, Node fetch refused. Disagreement between parsers is what request smuggling attacks rely on (doc-based: RFC 9112 section 6.3 says a recipient must treat differing Content-Length values as an error).</li>
+<li><strong>Content-Length with Transfer-Encoding.</strong> curl, Python and Chromium ignored Content-Length and used chunked, which matches RFC 9112 (doc-based: Transfer-Encoding overrides Content-Length, and a server must not send both). Node fetch rejected the response.</li>
+</ul>
+<p>When to expect Content-Length versus chunked in the first place is covered in <a href="/guides/transfer-encoding-chunked-vs-content-length/">Transfer-Encoding chunked vs Content-Length</a>.</p>
+<h2>3. Node http server with a wrong Content-Length</h2>
+<pre><code>http.createServer((req, res) =&gt; {
+  res.setHeader('Content-Length', '20');   // body below is 11 bytes
+  res.end('hello world');
+});</code></pre>
+<p>In Node 24.21.0 with default options, <code>res.end()</code> did not throw and nothing was logged. Node sent the header as given. With Content-Length 20, curl got 11 bytes and then hung until its timeout (<code>curl: (28) ... with 11 out of 20 bytes received</code>), because Node kept the keep-alive connection open. With Content-Length 5, curl received "hello" and exit code 0.</p>
+<p>Doc-based, not tested here: Node's <code>http.createServer({ strictContentLength: true })</code> option makes Node throw <code>ERR_HTTP_CONTENT_LENGTH_MISMATCH</code> instead of sending a mismatched body. The safest fix is to not set Content-Length by hand at all; <code>res.end(body)</code> sets a correct one for you when headers have not been sent yet. If you do set it, use <code>Buffer.byteLength(body)</code>, not <code>body.length</code>, because non-ASCII characters take more than one byte in UTF-8.</p>
+<h2>4. Common causes</h2>
+<ul>
+<li>Using string length instead of byte length (accents, emoji, CJK text).</li>
+<li>Changing the body after setting the header: compression, minification, injected scripts, or a template filled in later.</li>
+<li>Proxies or middleware that copy an upstream Content-Length after rewriting or decompressing the body.</li>
+<li>Adding a header in two layers (app and proxy), producing duplicate or conflicting lines.</li>
+</ul>
+<h2>5. How to check</h2>
+<pre><code>curl -sv -o body.bin https://example.com/path
+wc -c body.bin    # compare with the Content-Length line in the -v output</code></pre>
+<p>curl's verbose output shows each Content-Length line it received, and the error codes above (18 and 8) point straight at the problem. You can also see the headers of any URL with the free <a href="/tools/http-headers/">HTTP headers checker</a>.</p>
+<aside class="cta"><strong>Check the Content-Length a URL actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does curl: (18) mean?</summary><p>In curl 8.14.1 we got &#x27;curl: (18) end of response with 9 bytes missing&#x27; when the server promised Content-Length: 20, sent 11 bytes and closed the connection. The body is shorter than the header says.</p></details>
+<details><summary>What causes net::ERR_CONTENT_LENGTH_MISMATCH in Chrome?</summary><p>In Chromium 153, a navigation to a response with Content-Length: 20 and only 11 bytes before the server closed the connection failed with net::ERR_CONTENT_LENGTH_MISMATCH. fetch() in the same case rejected with TypeError: Failed to fetch.</p></details>
+<details><summary>What happens if Content-Length is smaller than the body?</summary><p>Every client we tested (curl, Node fetch, Python requests, Chromium) returned only the first N bytes with no error. The extra bytes were silently dropped.</p></details>
+<details><summary>Why does my request hang when Content-Length is too large?</summary><p>If the server keeps the connection open, the client waits for the missing bytes. curl, Node fetch, Python requests and Chromium all waited until a timeout in our test.</p></details>
+<details><summary>Is it OK to send Content-Length twice?</summary><p>Two identical values worked in curl, Python requests and Chromium 153, but Node 24 fetch rejected it with UND_ERR_RES_CONTENT_LENGTH_MISMATCH. Two different values were rejected by Python, Chromium and Node fetch, and curl cut the body to the second value. Send it once.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 against a raw Node.js 24.21.0 net server on 127.0.0.1 sending hand-written HTTP/1.1 responses with an 11-byte body (hello world). Clients: curl 8.14.1, Node 24.21.0 fetch (undici), Python requests 2.32.3, and Chromium 153.0.8010.12 (Playwright, full chromium channel) for both fetch() and page navigation. Also a Node http server with a wrong Content-Length set by hand. PlainHeaders is our extension; the other methods are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

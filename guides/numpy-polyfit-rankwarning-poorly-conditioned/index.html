@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>numpy polyfit RankWarning: Poorly Conditioned - Fixes (Tested)</title>
+<meta name="description" content="numpy polyfit errors tested: RankWarning poorly conditioned (degree too high, large x), NaN gives all-NaN silently, np.RankWarning gone in numpy 2.">
+<link rel="canonical" href="https://honestkit.github.io/guides/numpy-polyfit-rankwarning-poorly-conditioned/">
+<meta property="og:title" content="numpy polyfit RankWarning: Poorly Conditioned - Fixes (Tested)">
+<meta property="og:description" content="numpy polyfit errors tested: RankWarning poorly conditioned (degree too high, large x), NaN gives all-NaN silently, np.RankWarning gone in numpy 2.">
+<meta property="og:url" content="https://honestkit.github.io/guides/numpy-polyfit-rankwarning-poorly-conditioned/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does RankWarning: Polyfit may be poorly conditioned mean?", "acceptedAnswer": {"@type": "Answer", "text": "The least-squares matrix is rank-deficient: the polynomial degree is too high for the data or x values are so large that powers of x swamp the other columns. Coefficients are returned but not reliable."}}, {"@type": "Question", "name": "How do I fix a poorly conditioned polyfit?", "acceptedAnswer": {"@type": "Answer", "text": "Center or scale x (e.g. years - 2000), or use numpy.polynomial.Polynomial.fit which scales the domain to [-1, 1]; lower the degree if the warning remains."}}, {"@type": "Question", "name": "Why does np.polyfit return nan?", "acceptedAnswer": {"@type": "Answer", "text": "A NaN in x or y makes all coefficients NaN without a warning. Remove missing points with a mask such as ~np.isnan(y) before fitting."}}, {"@type": "Question", "name": "Where is np.RankWarning in numpy 2?", "acceptedAnswer": {"@type": "Answer", "text": "It was removed from the main namespace; use np.exceptions.RankWarning."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>numpy polyfit RankWarning: Polyfit may be poorly conditioned (tested)</h1>
+<p class="lead"><code>RankWarning: Polyfit may be poorly conditioned</code> means the fit is rank-deficient: the degree is too high for the number of points, or large x values (like years) make the matrix numerically singular. Center/scale x (or use <code>Polynomial.fit</code>), lower the degree, and drop NaN values first, which otherwise give all-NaN coefficients silently.</p>
+<h2 id="errors">1. The warning and the errors, reproduced</h2>
+<p>Run with <code>python b1.py</code> (numpy 2.5.4, Python 3.13.5):</p>
+<pre><code>import numpy as np
+
+print(&quot;numpy&quot;, np.__version__)
+x = np.arange(10, dtype=float)
+y = x ** 2
+
+# 1. degree higher than the data supports
+c = np.polyfit(x[:3], y[:3], deg=5)
+print(&quot;deg 5 on 3 points:&quot;, np.round(c, 3))
+
+# 2. huge x values (years) with a high degree
+years = np.arange(2000, 2021, dtype=float)
+vals = np.sin(years)
+c = np.polyfit(years, vals, deg=8)
+
+# 3. NaN in the data
+y_nan = y.copy(); y_nan[3] = np.nan
+try:
+    print(&quot;NaN in y -&gt;&quot;, np.polyfit(x, y_nan, 1))
+except np.linalg.LinAlgError as e:
+    print(&quot;NaN -&gt; LinAlgError:&quot;, e)
+
+# 4. too few points / mismatched lengths
+for args in [(x[:0], y[:0]), (x, y[:5])]:
+    try:
+        np.polyfit(*args, 1)
+    except (TypeError, ValueError) as e:
+        print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>numpy 2.5.4
+/tmp/pf403/b1.py:8: RankWarning: Polyfit may be poorly conditioned
+  c = np.polyfit(x[:3], y[:3], deg=5)
+deg 5 on 3 points: [ 0.016  0.036  0.089  0.236  0.623 -0.   ]
+/tmp/pf403/b1.py:14: RankWarning: Polyfit may be poorly conditioned
+  c = np.polyfit(years, vals, deg=8)
+NaN in y -&gt; [nan nan]
+TypeError: expected non-empty vector for x
+TypeError: expected x and y to have same length</code></pre>
+<ul><li><code>RankWarning: Polyfit may be poorly conditioned</code> is a warning, not an exception: <code>polyfit</code> still returned coefficients. It means the least-squares matrix is rank-deficient, so some coefficients are not determined by your data.</li>
+<li>Case 1: degree 5 through 3 points. Any degree &ge; the number of points is underdetermined; the six coefficients printed are one arbitrary solution out of infinitely many.</li>
+<li>Case 2: x values around 2000 raised to the 8th power (~2.6e26) next to the constant column (1) make the matrix numerically singular, even with 21 points.</li>
+<li>Case 3: a single <code>NaN</code> in <code>y</code> gave <strong>all-NaN coefficients with no warning and no error</strong>.</li>
+<li>Case 4: empty input and length mismatch raise <code>TypeError</code> with the messages shown.</li></ul>
+<h2 id="fixes">2. Fixes that worked</h2>
+<pre><code>import warnings
+import numpy as np
+from numpy.polynomial import Polynomial
+
+years = np.arange(2000, 2021, dtype=float)
+vals = np.sin(years)
+
+# full=True returns the rank instead of only warning
+c, res, rank, sv, rcond = np.polyfit(years, vals, 8, full=True)
+print(&quot;full=True: rank&quot;, rank, &quot;of&quot;, 8 + 1)
+
+# shift/scale x first
+c = np.polyfit(years - 2000, vals, 8)
+print(&quot;years - 2000: fitted, no warning&quot;)
+
+# Polynomial.fit maps x to [-1, 1] internally
+p = Polynomial.fit(years, vals, 8)
+print(&quot;Polynomial.fit: no warning, domain&quot;, p.domain)
+
+# catch it as an exception
+try:
+    np.RankWarning
+except AttributeError as e:
+    print(&quot;AttributeError:&quot;, str(e)[:80])
+with warnings.catch_warnings():
+    warnings.simplefilter(&quot;error&quot;, np.exceptions.RankWarning)
+    try:
+        np.polyfit(years, vals, 8)
+    except np.exceptions.RankWarning as e:
+        print(&quot;raised:&quot;, e)
+
+# NaN: drop missing points first
+x = np.arange(10, dtype=float); y = x ** 2; y[3] = np.nan
+ok = ~np.isnan(y)
+print(&quot;after dropping NaN:&quot;, np.round(np.polyfit(x[ok], y[ok], 2), 6))</code></pre>
+<p>Output:</p>
+<pre><code>full=True: rank 6 of 9
+years - 2000: fitted, no warning
+Polynomial.fit: no warning, domain [2000. 2020.]
+AttributeError: module &#x27;numpy&#x27; has no attribute &#x27;RankWarning&#x27;
+raised: Polyfit may be poorly conditioned
+after dropping NaN: [1. 0. 0.]</code></pre>
+<ul><li><code>full=True</code> returns the effective rank (6 of 9 here) instead of only warning, so you can check it in code.</li>
+<li>Centering x (<code>years - 2000</code>) removed the warning for the same degree. <code>numpy.polynomial.Polynomial.fit</code> does this for you: it maps the x <code>domain</code> (here 2000 to 2020) to [-1, 1] before fitting. Call <code>p(x)</code> to evaluate it; its coefficients refer to the scaled variable, not raw x.</li>
+<li>In numpy 2, <code>np.RankWarning</code> no longer exists (<code>AttributeError</code>); the class is <code>np.exceptions.RankWarning</code>. Use it with <code>warnings.simplefilter("error", ...)</code> to make the fit fail loudly.</li>
+<li>Drop NaN points with a mask (<code>~np.isnan(y)</code>) before fitting. The fit then recovers y = x&sup2; exactly.</li></ul>
+<p>If the warning remains after scaling, lower the degree: a high-degree polynomial through noisy data rarely means anything outside the fitted points.</p>
+<p>Related: <a href="/guides/numpy-linalgerror-singular-matrix/">numpy LinAlgError: Singular matrix</a> · <a href="/guides/numpy-errstate-divide-by-zero-ignore-raise/">numpy errstate</a> · <a href="/guides/numpy-2-breaking-changes/">numpy 2 breaking changes</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV to fit it:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does RankWarning: Polyfit may be poorly conditioned mean?</summary><p>The least-squares matrix is rank-deficient: the polynomial degree is too high for the data or x values are so large that powers of x swamp the other columns. Coefficients are returned but not reliable.</p></details>
+<details><summary>How do I fix a poorly conditioned polyfit?</summary><p>Center or scale x (e.g. years - 2000), or use numpy.polynomial.Polynomial.fit which scales the domain to [-1, 1]; lower the degree if the warning remains.</p></details>
+<details><summary>Why does np.polyfit return nan?</summary><p>A NaN in x or y makes all coefficients NaN without a warning. Remove missing points with a mask such as ~np.isnan(y) before fitting.</p></details>
+<details><summary>Where is np.RankWarning in numpy 2?</summary><p>It was removed from the main namespace; use np.exceptions.RankWarning.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with numpy 2.5.4 and Python 3.13.5 on Linux. Each script was run verbatim and the output pasted unedited. PlainTables is our extension; numpy is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>email.message_from_binary_file() Silently Empties (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: message_from_binary_file() silently returns an empty message on a transient None read, even with a complete valid email waiting.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-email-message-from-binary-file-none-silently-empty/">
+<meta property="og:title" content="email.message_from_binary_file() Silently Empties (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: message_from_binary_file() silently returns an empty message on a transient None read, even with a complete valid email waiting.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-email-message-from-binary-file-none-silently-empty/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "The email module's documentation for message_from_binary_file() does not mention non-blocking streams or a None read result at all; it assumes a blocking file object that returns either data or b'' for EOF. We measured that a None-returning source produces a silently empty result with no error of any kind."}}, {"@type": "Question", "name": "Why is there no exception at all here, unlike gzip or ElementTree?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that the email parser's internal line-reading loop checks for a falsy result to decide a message has ended, the same way shutil.copyfileobj() and TextIOWrapper.readline() do -- there's no decode or length operation downstream that a None could break, so the parser just quietly concludes the message is over with zero content."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- same family already confirmed in shutil.copyfileobj, gzip/bz2/lzma, tarfile/zipfile, TextIOWrapper.readline(), and ElementTree.parse(): a correctly-returned non-blocking None gets mishandled one layer above io itself. This is the second confirmed case (after copyfileobj and readline()) where the failure is completely silent rather than a crash or misleading error."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>email.message_from_binary_file() Silently Returns Empty on None (tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> from <code>readinto()</code> -- distinct from the empty read that means real end-of-stream. We measured that <code>email.message_from_binary_file()</code> mishandles this signal the same silent way <code>shutil.copyfileobj()</code> and <code>TextIOWrapper.readline()</code> already do: a single transient <code>None</code>, even with a complete, well-formed email waiting on the very next read call, produces a completely empty <code>Message</code> object -- no <code>Subject</code>, no body, and critically, <strong>no exception at all</strong>.</p>
+<h2 id="repro1">1. A real, valid email behind one transient None</h2>
+<pre><code>import io, email
+
+class FlakyRaw(io.RawIOBase):
+    def __init__(self, payload):
+        self.calls = 0
+        self.sent = False
+        self.payload = payload
+    def readable(self):
+        return True
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None            # transient: no data ready yet
+        if not self.sent:
+            self.sent = True
+            n = len(self.payload)
+            b[:n] = self.payload
+            return n               # the real, complete email
+        return 0                   # real EOF after that
+
+payload = b"Subject: hello\n\nbody text\n"
+raw = FlakyRaw(payload)
+br = io.BufferedReader(raw)
+msg = email.message_from_binary_file(br)
+print("subject:", msg.get("Subject"))
+print("payload:", repr(msg.get_payload()))
+print("raw calls made:", raw.calls)</code></pre>
+<pre><code>subject: None
+payload: ''
+raw calls made: 1</code></pre>
+<p><strong>Measured:</strong> no exception is raised anywhere. <code>message_from_binary_file()</code> made exactly one read call, got <code>None</code>, and silently handed back a valid-looking but completely empty <code>Message</code> object -- indistinguishable, at the call site, from parsing a genuinely empty file. The real <code>Subject: hello</code> header and body are never read at all.</p>
+
+<h2 id="repro2">2. Contrast: plain BufferedReader.read() on the identical signal</h2>
+<pre><code>raw0 = FlakyRaw(b"irrelevant for this check")
+br0 = io.BufferedReader(raw0)
+print("plain read():", repr(br0.read()))</code></pre>
+<pre><code>plain read(): None</code></pre>
+<p><strong>Measured:</strong> the <code>io</code> layer preserves the <code>None</code>/EOF distinction correctly; <code>email.message_from_binary_file()</code>'s own internal line-reading loop is what silently collapses that <code>None</code> into "nothing more to parse" -- the same root mechanism already confirmed in <code>shutil.copyfileobj()</code> and <code>TextIOWrapper.readline()</code>.</p>
+
+<h2 id="repro3">3. The fix: drain into a real buffer first, retrying on None</h2>
+<pre><code>def drain_retrying_on_none(raw_stream, chunk_size=65536):
+    out = io.BytesIO()
+    br = io.BufferedReader(raw_stream)
+    while True:
+        chunk = br.read(chunk_size)
+        if chunk is None:
+            continue              # retry: not ready yet, not EOF
+        if not chunk:
+            break                  # real EOF
+        out.write(chunk)
+    out.seek(0)
+    return out
+
+raw2 = FlakyRaw(payload)
+safe_buf = drain_retrying_on_none(raw2)
+msg2 = email.message_from_binary_file(safe_buf)
+print("safe subject:", msg2.get("Subject"))
+print("safe payload:", repr(msg2.get_payload()))</code></pre>
+<pre><code>safe subject: hello
+safe payload: 'body text\n'</code></pre>
+<p><strong>Measured:</strong> resolving the <code>None</code>/EOF distinction before the bytes reach <code>message_from_binary_file()</code> parses the header and body correctly.</p>
+<aside class="cta"><strong>Parsing an email from a non-blocking stream with email.message_from_binary_file()? A transient None read silently produces an empty message -- no Subject, no body, no error:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>The email module&#x27;s documentation for message_from_binary_file() does not mention non-blocking streams or a None read result at all; it assumes a blocking file object that returns either data or b&#x27;&#x27; for EOF. We measured that a None-returning source produces a silently empty result with no error of any kind.</p></details>
+<details><summary>Why is there no exception at all here, unlike gzip or ElementTree?</summary><p>We measured that the email parser&#x27;s internal line-reading loop checks for a falsy result to decide a message has ended, the same way shutil.copyfileobj() and TextIOWrapper.readline() do -- there&#x27;s no decode or length operation downstream that a None could break, so the parser just quietly concludes the message is over with zero content.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>Yes -- same family already confirmed in shutil.copyfileobj, gzip/bz2/lzma, tarfile/zipfile, TextIOWrapper.readline(), and ElementTree.parse(): a correctly-returned non-blocking None gets mishandled one layer above io itself. This is the second confirmed case (after copyfileobj and readline()) where the failure is completely silent rather than a crash or misleading error.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in email.message_from_binary_file(), reading a genuinely valid, complete email through an io.BufferedReader over a custom non-blocking RawIOBase whose readinto() returns None once before returning the real message bytes. PlainHeaders is our extension; Python&#x27;s email and io modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

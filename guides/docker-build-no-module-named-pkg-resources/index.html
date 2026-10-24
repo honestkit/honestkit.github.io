@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>docker build No module named &#x27;pkg_resources&#x27; (tested fix)</title>
+<meta name="description" content="docker build fails at pip install with No module named &#x27;pkg_resources&#x27;. Tested Dockerfile fix for pip 24 and 26: PIP_CONSTRAINT + PIP_BUILD_CONSTRAINT.">
+<link rel="canonical" href="https://honestkit.github.io/guides/docker-build-no-module-named-pkg-resources/">
+<meta property="og:title" content="docker build No module named &#x27;pkg_resources&#x27; (tested fix)">
+<meta property="og:description" content="docker build fails at pip install with No module named &#x27;pkg_resources&#x27;. Tested Dockerfile fix for pip 24 and 26: PIP_CONSTRAINT + PIP_BUILD_CONSTRAINT.">
+<meta property="og:url" content="https://honestkit.github.io/guides/docker-build-no-module-named-pkg-resources/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why doesn't pip install setuptools<81 in my Dockerfile fix it?", "acceptedAnswer": {"@type": "Answer", "text": "pip builds sdists in a separate isolated build env that gets the newest setuptools, not the image's. Use a constraint file via PIP_CONSTRAINT (older pip, e.g. 24.0) or PIP_BUILD_CONSTRAINT (pip 26.2.2)."}}, {"@type": "Question", "name": "Why does PIP_BUILD_CONSTRAINT not work in my Docker image?", "acceptedAnswer": {"@type": "Answer", "text": "Your image's pip may be too old. python:3.11-alpine shipped pip 24.0, which ignored it. Either set PIP_CONSTRAINT as well or upgrade pip first."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>docker build: No module named &#x27;pkg_resources&#x27; (tested Dockerfile fix)</h1>
+<p class="lead"><code>docker build</code> fails at a <code>RUN pip install</code> step with <code>ModuleNotFoundError: No module named 'pkg_resources'</code> during &quot;Getting requirements to build wheel&quot;. Tested fix: a <code>setuptools&lt;81</code> constraint file passed with both <code>PIP_CONSTRAINT</code> and <code>PIP_BUILD_CONSTRAINT</code>, because which one pip uses depends on its version.</p>
+<h2 id="repro">1. The error in docker build</h2>
+<p>Our test package was cx_Oracle 8.3.0. It has no wheel for Python 3.11, so pip builds it from the sdist, and its <code>setup.py</code> imports <code>pkg_resources</code>. This Dockerfile:</p>
+<pre><code>FROM python:3.11-alpine
+RUN apk add --no-cache build-base
+RUN pip install --no-cache-dir cx_Oracle==8.3.0</code></pre>
+<pre><code>$ docker build --progress=plain --no-cache .
+#6 [3/3] RUN pip install --no-cache-dir cx_Oracle==8.3.0
+#6 2.523 Collecting cx_Oracle==8.3.0
+#6 2.553   Downloading cx_Oracle-8.3.0.tar.gz (363 kB)
+#6 2.579      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 363.9/363.9 kB 15.6 MB/s eta 0:00:00
+#6 2.658   Installing build dependencies: started
+#6 4.652   Installing build dependencies: finished with status &#x27;done&#x27;
+#6 4.653   Getting requirements to build wheel: started
+[... trimmed ...]
+#6 4.859       ModuleNotFoundError: No module named &#x27;pkg_resources&#x27;
+[... trimmed ...]
+#6 ERROR: process &quot;/bin/sh -c pip install --no-cache-dir cx_Oracle==8.3.0&quot; did not complete successfully: exit code: 1</code></pre>
+<p>pip builds the sdist in an isolated build env (<code>/tmp/pip-build-env-...</code>) with the newest setuptools, and setuptools 82.0.0 removed <code>pkg_resources</code>. The image itself has setuptools 79.0.1, and <code>import pkg_resources</code> works in it, but the build env does not use the image's setuptools, so pinning setuptools in the image does not help.</p>
+<h2 id="pipver">2. Check your pip version first</h2>
+<p>The <code>python:3.11-alpine</code> image we pulled ships <strong>pip 24.0</strong>. Which environment variable reaches the build env depends on the pip version:</p>
+<ul>
+<li><code>PIP_BUILD_CONSTRAINT</code> works on pip 26.2.2, but pip 24.0 ignores it. The build still failed:
+<pre><code>#7 4.904       ModuleNotFoundError: No module named &#x27;pkg_resources&#x27;
+[... trimmed ...]
+#7 5.000 [notice] A new release of pip is available: 24.0 -&gt; 26.2.2
+#7 5.000 [notice] To update, run: pip install --upgrade pip
+#7 ERROR: process &quot;/bin/sh -c pip install --no-cache-dir cx_Oracle==8.3.0&quot; did not complete successfully: exit code: 1</code></pre></li>
+<li><code>PIP_CONSTRAINT</code> worked on pip 24.0, but on pip 26.2.2 it does not reach the build env.</li>
+</ul>
+<h2 id="fix">3. Fix: set both variables (tested on pip 24.0 and 26.2.2)</h2>
+<pre><code>FROM python:3.11-alpine
+RUN apk add --no-cache build-base
+RUN echo &quot;setuptools&lt;81&quot; &gt; /tmp/constraints.txt
+ENV PIP_CONSTRAINT=/tmp/constraints.txt PIP_BUILD_CONSTRAINT=/tmp/constraints.txt
+RUN pip --version &amp;&amp; pip install --no-cache-dir cx_Oracle==8.3.0
+RUN python -c &quot;import cx_Oracle; print(cx_Oracle.version)&quot;</code></pre>
+<p>This built and printed <code>8.3.0</code> on the image's pip 24.0. We also tested it with <code>RUN pip install --no-cache-dir --upgrade pip</code> added before the install:</p>
+<pre><code>#8 0.655 pip 26.2.2 from /usr/local/lib/python3.11/site-packages/pip (python 3.11)
+[... trimmed ...]
+#8 23.18 Successfully installed cx_Oracle-8.3.0
+[... trimmed ...]
+#9 0.597 8.3.0</code></pre>
+<p>Remember that <code>PIP_CONSTRAINT</code> also stops anything else in that image from installing setuptools 81 or newer at runtime. If you only want the build-time cap, upgrade pip and set only <code>PIP_BUILD_CONSTRAINT</code> (we tested that too: pip 26.2.2, cx_Oracle installed, import printed <code>8.3.0</code>). On Alpine you also need <code>build-base</code>, or gcc fails after the pkg_resources step is fixed. For cx_Oracle itself, the long-term fix is <a href="/guides/no-module-named-pkg-resources-cx-oracle/">oracledb</a>.</p>
+<p>Same root cause elsewhere: <a href="/guides/python-modulenotfounderror-no-module-named-pkg-resources/">No module named 'pkg_resources' (general fix)</a> · <a href="/guides/no-module-named-pkg-resources-pipenv/">pipenv</a> · <a href="/guides/no-module-named-pkg-resources-poetry/">Poetry</a> · <a href="/guides/no-module-named-pkg-resources-uv/">uv</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why doesn&#x27;t pip install setuptools&lt;81 in my Dockerfile fix it?</summary><p>pip builds sdists in a separate isolated build env that gets the newest setuptools, not the image&#x27;s. Use a constraint file via PIP_CONSTRAINT (older pip, e.g. 24.0) or PIP_BUILD_CONSTRAINT (pip 26.2.2).</p></details>
+<details><summary>Why does PIP_BUILD_CONSTRAINT not work in my Docker image?</summary><p>Your image&#x27;s pip may be too old. python:3.11-alpine shipped pip 24.0, which ignored it. Either set PIP_CONSTRAINT as well or upgrade pip first.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux with Docker BuildKit, python:3.11-alpine (pip 24.0, then upgraded to pip 26.2.2), installing cx_Oracle 8.3.0 (sdist) with --no-cache. Output pasted unedited except marked trims. PlainTables is our extension; Docker and pip are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

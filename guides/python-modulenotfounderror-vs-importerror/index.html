@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ModuleNotFoundError vs ImportError in Python: The Real Difference</title>
+<meta name="description" content="We triggered both errors on Python 3.13.5: a missing module, a bad name import, a circular import, and a shadowed stdlib file. Exact tracebacks included.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-modulenotfounderror-vs-importerror/">
+<meta property="og:title" content="ModuleNotFoundError vs ImportError in Python: The Real Difference">
+<meta property="og:description" content="We triggered both errors on Python 3.13.5: a missing module, a bad name import, a circular import, and a shadowed stdlib file. Exact tracebacks included.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-modulenotfounderror-vs-importerror/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is ModuleNotFoundError the same as ImportError?", "acceptedAnswer": {"@type": "Answer", "text": "No, but it is related: ModuleNotFoundError is a subclass of ImportError, added in Python 3.6. We confirmed issubclass(ModuleNotFoundError, ImportError) returns True on Python 3.13.5. Every ModuleNotFoundError is an ImportError, but not every ImportError is a ModuleNotFoundError."}}, {"@type": "Question", "name": "Why did I get ImportError instead of ModuleNotFoundError?", "acceptedAnswer": {"@type": "Answer", "text": "ModuleNotFoundError only fires when Python cannot find the module file at all. If the module loads successfully but the specific name you imported from it doesn't exist, you get plain ImportError instead. We measured this directly: from os import fake_function_xyz raised ImportError: cannot import name 'fake_function_xyz' from 'os', not ModuleNotFoundError, because os itself was found and loaded fine."}}, {"@type": "Question", "name": "Why does my circular import error mention a module being partially initialized?", "acceptedAnswer": {"@type": "Answer", "text": "Because Python imports modules top to bottom and caches each module in sys.modules the moment it starts, not when it finishes. If module A imports module B, and B tries to import a name from A before A has finished running, A exists in sys.modules but doesn't have that name defined yet. In our test, Python 3.13.5 reported this as an ImportError naming the file, after first re-running both modules' top-level code for diagnostics."}}, {"@type": "Question", "name": "Can a local file break a standard library import without raising ImportError?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We named a local file json.py next to a script that did import json. The import itself succeeded silently, because Python found our local file on sys.path before the real standard library json module. The failure only appeared later as AttributeError: module 'json' has no attribute 'dumps' when we tried to use a real json function. Python 3.13 added a hint identifying the shadowing file; this import-time silence is the main reason this bug is confusing."}}, {"@type": "Question", "name": "Should I catch ModuleNotFoundError or ImportError in my code?", "acceptedAnswer": {"@type": "Answer", "text": "Catch ModuleNotFoundError only when you specifically want to react to a missing optional dependency, and check exception.name to make sure it's the package you expected before swallowing it. Catch the broader ImportError when you want to handle any import failure the same way, including name-mismatch and circular-import errors. We verified except ImportError catches a ModuleNotFoundError, but except ModuleNotFoundError does not catch a plain ImportError raised by a bad from-import."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ModuleNotFoundError vs ImportError (tested)</h1>
+<p class="lead"><code>ModuleNotFoundError</code> and <code>ImportError</code> look similar and get confused constantly. <code>ModuleNotFoundError</code> is a subclass of <code>ImportError</code>, added in Python 3.6, raised specifically when the module itself cannot be located. <code>ImportError</code> is the broader parent class, raised when the module is found but something about the import still fails. We reproduced four real failure cases on this box and captured the exact text.</p><p>Catching <code>ImportError</code> catches both. Catching only <code>ModuleNotFoundError</code> misses the other failure modes below.</p>
+<h2>1. The class relationship</h2>
+<p>We checked it directly:</p>
+<pre><code>$ python3 -c "print(issubclass(ModuleNotFoundError, ImportError))"
+True</code></pre>
+<p><code>ModuleNotFoundError</code> was added in Python 3.6 (<a href="https://docs.python.org/3/library/exceptions.html#ModuleNotFoundError">per the Python docs</a>, not independently measured here). Before 3.6, a missing module also raised plain <code>ImportError</code>. Because of the subclass relationship, <code>except ImportError:</code> still catches a missing-module error today; <code>except ModuleNotFoundError:</code> does not catch the other <code>ImportError</code> cases in this guide.</p>
+
+<h2>2. Case A: the module genuinely does not exist</h2>
+<p>We ran this against Python 3.13.5:</p>
+<pre><code>$ python3 -c "import totally_fake_module_xyz"
+Traceback (most recent call last):
+  File "&lt;string&gt;", line 1, in &lt;module&gt;
+    import totally_fake_module_xyz
+ModuleNotFoundError: No module named 'totally_fake_module_xyz'</code></pre>
+<p>This is the clean case: Python searched <code>sys.path</code>, found nothing named <code>totally_fake_module_xyz</code>, and raised <code>ModuleNotFoundError</code>. The exception carries the missing name in <code>e.name</code>; we checked and <code>e.path</code> is <code>None</code> here because no file was ever located.</p>
+
+<h2>2b. Case B: the module exists, but the name inside it does not</h2>
+<p><code>os</code> is a real, importable module, but it has no <code>fake_function_xyz</code>:</p>
+<pre><code>$ python3 -c "from os import fake_function_xyz"
+Traceback (most recent call last):
+  File "&lt;string&gt;", line 1, in &lt;module&gt;
+    from os import fake_function_xyz
+ImportError: cannot import name 'fake_function_xyz' from 'os' (/usr/lib/python3.13/os.py)</code></pre>
+<p>This is plain <code>ImportError</code>, not <code>ModuleNotFoundError</code>. Python found and loaded <code>os</code> fine (the message even gives the exact file it loaded, <code>/usr/lib/python3.13/os.py</code>); the failure is that the name you asked for isn't an attribute of that module. We confirmed the class split directly:</p>
+<pre><code>$ python3 -c "
+try:
+    from os import fake_function_xyz
+except ModuleNotFoundError as e:
+    print('caught as ModuleNotFoundError')
+except ImportError as e:
+    print('caught as ImportError:', e)
+"
+caught as ImportError: cannot import name 'fake_function_xyz' from 'os' (/usr/lib/python3.13/os.py)</code></pre>
+<p>An <code>except ModuleNotFoundError:</code> clause silently falls through to the next handler here &mdash; it never fires, because this error is <code>ImportError</code> but not the subclass.</p>
+
+<h2>3. Case C: circular imports</h2>
+<p>We created two files that import each other:</p>
+<pre><code># file_a.py
+print("file_a: starting")
+import file_b
+print("file_a: got file_b")
+
+def a_func():
+    return "a_func result"
+
+# file_b.py
+print("file_b: starting")
+from file_a import a_func
+print("file_b: got a_func")
+
+# main_circular.py
+import file_a</code></pre>
+<p>Running <code>python3 main_circular.py</code> gave this exact output on Python 3.13.5:</p>
+<pre><code>file_a: starting
+file_b: starting
+file_a: starting
+file_b: starting
+Traceback (most recent call last):
+  File "/tmp/py-import-guide/main_circular.py", line 1, in &lt;module&gt;
+    import file_a
+  File "/tmp/py-import-guide/file_a.py", line 2, in &lt;module&gt;
+    import file_b
+  File "/tmp/py-import-guide/file_b.py", line 2, in &lt;module&gt;
+    from file_a import a_func
+ImportError: cannot import name 'a_func' from 'file_a' (consider renaming '/tmp/py-import-guide/file_a.py' if it has the same name as a library you intended to import)</code></pre>
+<p>Two things surprised us. First, both files' top-level <code>print</code> lines ran twice before the final error &mdash; Python 3.13's import machinery makes a second diagnostic pass to build a better message after the first failed name lookup, which re-executes the partially-imported modules' module-level code. Second, the message on this version is not the older, more commonly quoted "cannot import name 'a_func' from partially initialized module 'file_a' (most likely due to a circular import)" text; instead it printed the shadowing-style hint shown above, because <code>file_a</code> was still mid-import (not fully in <code>sys.modules</code> with <code>a_func</code> defined) when <code>file_b</code> asked for it. Either phrasing means the same root cause: <code>file_a</code> imports <code>file_b</code>, which tries to import something from <code>file_a</code> before <code>file_a</code> has finished running top to bottom.</p>
+<p>The fix is to break the cycle: move the cross-import inside a function (so it runs after both modules are fully loaded), or import the whole module (<code>import file_a</code> then use <code>file_a.a_func</code>) instead of pulling a name out at import time, or merge shared code into a third module both sides import from.</p>
+
+<h2>4. Case D: a local file shadows a stdlib module name</h2>
+<p>We made a file named <code>json.py</code> in the same directory as the script, alongside a script that does <code>import json</code>:</p>
+<pre><code># json.py
+print("my local json.py loaded")
+
+# use_json.py
+import json
+print("about to call json.dumps")
+print(json.dumps({"a": 1}))</code></pre>
+<p>Running <code>python3 use_json.py</code> from that directory gave:</p>
+<pre><code>my local json.py loaded
+about to call json.dumps
+Traceback (most recent call last):
+  File "/tmp/py-import-guide/shadow_test/use_json.py", line 3, in &lt;module&gt;
+    print(json.dumps({"a": 1}))
+          ^^^^^^^^^^
+AttributeError: module 'json' has no attribute 'dumps' (consider renaming '/tmp/py-import-guide/shadow_test/json.py' since it has the same name as the standard library module named 'json' and prevents importing that standard library module)</code></pre>
+<p>This is the sharpest finding of the four: shadowing does not raise <code>ImportError</code> or <code>ModuleNotFoundError</code> at all. The <code>import json</code> line succeeds &mdash; it happily imports your local, empty-looking <code>json.py</code> instead of the real standard-library module, because the script's own directory is first on <code>sys.path</code>. The failure only shows up later, as <code>AttributeError</code>, the moment you call something the real stdlib module would have had. Python 3.13 adds a helpful parenthetical naming the exact shadowing file, which made this easy to diagnose; older Python versions give a bare <code>AttributeError</code> with no such hint.</p>
+
+<h2>5. Which exception to catch, and when</h2>
+<table>
+<tr><th>Situation</th><th>Exception raised</th><th>Catch with</th></tr>
+<tr><td>Module not found anywhere on sys.path</td><td>ModuleNotFoundError</td><td>ImportError or ModuleNotFoundError</td></tr>
+<tr><td>Module found, but requested name missing from it</td><td>ImportError</td><td>ImportError only</td></tr>
+<tr><td>Circular import mid-initialization</td><td>ImportError</td><td>ImportError only</td></tr>
+<tr><td>Local file shadows a stdlib/package name</td><td>AttributeError (usually, not at import time)</td><td>Neither &mdash; fix the filename</td></tr>
+</table>
+<p>Practical rule: if you only want to handle "this dependency isn't installed" (for example to fall back to a different library), catch <code>ModuleNotFoundError</code> specifically and check <code>e.name</code> against the package you expected:</p>
+<pre><code>try:
+    import orjson as json_impl
+except ModuleNotFoundError as e:
+    if e.name != "orjson":
+        raise
+    import json as json_impl</code></pre>
+<p>That re-raise matters: a bare <code>except ModuleNotFoundError:</code> with no name check will also swallow an unrelated missing import that happens to occur inside <code>orjson</code>'s own code, hiding a real bug.</p>
+
+<h2>6. Quick checklist</h2>
+<ul>
+<li>"No module named X" &rarr; ModuleNotFoundError &rarr; the package isn't installed, isn't on <code>sys.path</code>, or you misspelled it. Check with <code>python3 -c "import X"</code> directly, matching the interpreter and virtualenv you actually run.</li>
+<li>"cannot import name X from Y" where Y loaded fine &rarr; plain ImportError &rarr; the name doesn't exist in that module, or it exists but isn't exported the way you think. Check with <code>python3 -c "import Y; print(dir(Y))"</code>.</li>
+<li>"cannot import name X from Y" with a circular-import or "partially initialized module" hint &rarr; two of your own files import each other at module level. Move the import inside a function or restructure.</li>
+<li>A working third-party import suddenly breaks only in one directory &rarr; check for a local file with the same name as the package (our <a href="/guides/python-requests-connectionerror-max-retries/">Python requests ConnectionError</a> guide hits a similar "it worked yesterday" pattern from a different angle).</li>
+</ul>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is ModuleNotFoundError the same as ImportError?</summary><p>No, but it is related: ModuleNotFoundError is a subclass of ImportError, added in Python 3.6. We confirmed issubclass(ModuleNotFoundError, ImportError) returns True on Python 3.13.5. Every ModuleNotFoundError is an ImportError, but not every ImportError is a ModuleNotFoundError.</p></details>
+<details><summary>Why did I get ImportError instead of ModuleNotFoundError?</summary><p>ModuleNotFoundError only fires when Python cannot find the module file at all. If the module loads successfully but the specific name you imported from it doesn&#x27;t exist, you get plain ImportError instead. We measured this directly: from os import fake_function_xyz raised ImportError: cannot import name &#x27;fake_function_xyz&#x27; from &#x27;os&#x27;, not ModuleNotFoundError, because os itself was found and loaded fine.</p></details>
+<details><summary>Why does my circular import error mention a module being partially initialized?</summary><p>Because Python imports modules top to bottom and caches each module in sys.modules the moment it starts, not when it finishes. If module A imports module B, and B tries to import a name from A before A has finished running, A exists in sys.modules but doesn&#x27;t have that name defined yet. In our test, Python 3.13.5 reported this as an ImportError naming the file, after first re-running both modules&#x27; top-level code for diagnostics.</p></details>
+<details><summary>Can a local file break a standard library import without raising ImportError?</summary><p>Yes. We named a local file json.py next to a script that did import json. The import itself succeeded silently, because Python found our local file on sys.path before the real standard library json module. The failure only appeared later as AttributeError: module &#x27;json&#x27; has no attribute &#x27;dumps&#x27; when we tried to use a real json function. Python 3.13 added a hint identifying the shadowing file; this import-time silence is the main reason this bug is confusing.</p></details>
+<details><summary>Should I catch ModuleNotFoundError or ImportError in my code?</summary><p>Catch ModuleNotFoundError only when you specifically want to react to a missing optional dependency, and check exception.name to make sure it&#x27;s the package you expected before swallowing it. Catch the broader ImportError when you want to handle any import failure the same way, including name-mismatch and circular-import errors. We verified except ImportError catches a ModuleNotFoundError, but except ModuleNotFoundError does not catch a plain ImportError raised by a bad from-import.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Python 3.13.5 (GCC 14.2.0) on Linux, using plain python3 -c one-liners and small scripts under /tmp/py-import-guide/. Every traceback below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

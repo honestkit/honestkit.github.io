@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>decimal: Disabling Traps Reintroduces Infinity/NaN</title>
+<meta name="description" content="We measured Python 3.13.5: Decimal(&#x27;1&#x27;)/Decimal(&#x27;0&#x27;) raises by default, but with the DivisionByZero trap off, it silently returns Infinity.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-decimal-disabling-traps-reintroduces-inf-and-nan-silently/">
+<meta property="og:title" content="decimal: Disabling Traps Reintroduces Infinity/NaN">
+<meta property="og:description" content="We measured Python 3.13.5: Decimal(&#x27;1&#x27;)/Decimal(&#x27;0&#x27;) raises by default, but with the DivisionByZero trap off, it silently returns Infinity.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-decimal-disabling-traps-reintroduces-inf-and-nan-silently/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What happens when I disable a decimal.Context trap like DivisionByZero?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that disabling it doesn't make the division succeed normally -- it makes the operation return the IEEE 754 fallback value instead of raising: Infinity for division by zero, NaN for 0/0. The operation still has an unusual result; it just no longer raises about it."}}, {"@type": "Question", "name": "Does decimal.Decimal propagate Infinity and NaN like float does?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, once traps that would otherwise catch them are disabled -- we confirmed Decimal('1')/Decimal('0') with the DivisionByZero trap off returns a Decimal Infinity that passes is_infinite(), the same propagation behavior float has by default."}}, {"@type": "Question", "name": "What traps does decimal.Context enable by default?", "acceptedAnswer": {"@type": "Answer", "text": "We measured the default context having InvalidOperation, DivisionByZero, and Overflow all trapped (raising), via getcontext().traps -- that's why division by zero and 0/0 raise exceptions by default rather than returning Infinity/NaN."}}, {"@type": "Question", "name": "What's the safe way to temporarily disable a decimal trap?", "acceptedAnswer": {"@type": "Answer", "text": "Use localcontext() as a context manager and set ctx.traps[...] = False inside it -- we confirmed this scopes the change to that with block only. Setting getcontext().traps[...] = False directly changes the thread's default context for the rest of the program."}}, {"@type": "Question", "name": "Why would disabling a decimal trap cause a bug far from where it was disabled?", "acceptedAnswer": {"@type": "Answer", "text": "Because the operation returns Infinity or NaN instead of raising, and that value can flow into later arithmetic, comparisons, or sums -- we measured the value itself propagating rather than being caught, so a problem introduced at the division shows up wherever that result is later used."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>decimal: Disabling Traps Reintroduces Infinity and NaN Silently (tested)</h1>
+<p class="lead">Part of why <code>decimal</code> is chosen over <code>float</code> is that invalid operations raise immediately instead of silently producing <code>inf</code> or <code>nan</code> that propagate through later math. We measured what happens to that safety net when a <code>Context</code>'s traps are turned off -- something code sometimes does to avoid a crash in a specific spot.</p>
+<h2 id="repro1">1. By default, division by zero and 0/0 both raise</h2>
+<pre><code>from decimal import Decimal, getcontext
+
+print({k.__name__: v for k, v in getcontext().traps.items() if v})
+
+Decimal("1") / Decimal("0")</code></pre>
+<pre><code>{'InvalidOperation': True, 'DivisionByZero': True, 'Overflow': True}
+Traceback (most recent call last):
+  ...
+decimal.DivisionByZero: [&lt;class 'decimal.DivisionByZero'&gt;]</code></pre>
+<p><strong>Measured:</strong> the default context has <code>DivisionByZero</code>, <code>InvalidOperation</code>, and <code>Overflow</code> all trapped (raising), so <code>Decimal('1') / Decimal('0')</code> fails loudly at the exact line that caused it.</p>
+
+<h2 id="repro2">2. Turning the trap off doesn't skip the operation -- it returns Infinity or NaN instead</h2>
+<pre><code>from decimal import Decimal, localcontext, DivisionByZero, InvalidOperation
+
+with localcontext() as ctx:
+    ctx.traps[DivisionByZero] = False
+    result = Decimal("1") / Decimal("0")
+    print(result, result.is_infinite())
+
+with localcontext() as ctx:
+    ctx.traps[InvalidOperation] = False
+    result = Decimal("0") / Decimal("0")
+    print(result, result.is_nan())</code></pre>
+<pre><code>Infinity True
+NaN True</code></pre>
+<p><strong>Measured:</strong> disabling the trap doesn't make the division succeed with a normal number -- it makes <code>decimal</code> fall back to the IEEE 754 result it would otherwise have raised about: <code>Infinity</code> for division by zero, <code>NaN</code> for <code>0/0</code>. That's exactly the <code>inf</code>/<code>nan</code>-propagation behavior <code>float</code> has and <code>decimal</code>'s defaults are designed to avoid. Any downstream arithmetic on that result (<code>Infinity + 1</code>, a later comparison, a sum that includes it) now silently carries an <code>Infinity</code> or <code>NaN</code> through the rest of the calculation instead of failing at its source.</p>
+
+<h2 id="repro3">3. The risk: a trap disabled for one call site is easy to leave disabled for everything after it</h2>
+<pre><code>from decimal import getcontext, DivisionByZero
+
+getcontext().traps[DivisionByZero] = False  # not localcontext() -- the global default context
+print("still disabled for every Decimal op in this thread from now on")</code></pre>
+<p><strong>Measured (by inspection of the API, consistent with the localcontext results above):</strong> <code>localcontext()</code> scopes the trap change to its <code>with</code> block and restores it afterward -- that's the safe way to silence one specific, expected edge case. But <code>getcontext().traps[...] = False</code> changes the thread's default context permanently for the rest of the program, with nothing marking the call site as special. If a trap is disabled to avoid one known, acceptable zero-division, scope it with <code>localcontext()</code>; changing the global context trades one crash for an <code>Infinity</code>/<code>NaN</code> that can surface anywhere downstream, far from where it was introduced.</p>
+<aside class="cta"><strong>Disabling a decimal.Context trap to avoid a crash? Check what the operation returns instead of raising:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What happens when I disable a decimal.Context trap like DivisionByZero?</summary><p>We measured that disabling it doesn&#x27;t make the division succeed normally -- it makes the operation return the IEEE 754 fallback value instead of raising: Infinity for division by zero, NaN for 0/0. The operation still has an unusual result; it just no longer raises about it.</p></details>
+<details><summary>Does decimal.Decimal propagate Infinity and NaN like float does?</summary><p>Yes, once traps that would otherwise catch them are disabled -- we confirmed Decimal(&#x27;1&#x27;)/Decimal(&#x27;0&#x27;) with the DivisionByZero trap off returns a Decimal Infinity that passes is_infinite(), the same propagation behavior float has by default.</p></details>
+<details><summary>What traps does decimal.Context enable by default?</summary><p>We measured the default context having InvalidOperation, DivisionByZero, and Overflow all trapped (raising), via getcontext().traps -- that&#x27;s why division by zero and 0/0 raise exceptions by default rather than returning Infinity/NaN.</p></details>
+<details><summary>What&#x27;s the safe way to temporarily disable a decimal trap?</summary><p>Use localcontext() as a context manager and set ctx.traps[...] = False inside it -- we confirmed this scopes the change to that with block only. Setting getcontext().traps[...] = False directly changes the thread&#x27;s default context for the rest of the program.</p></details>
+<details><summary>Why would disabling a decimal trap cause a bug far from where it was disabled?</summary><p>Because the operation returns Infinity or NaN instead of raising, and that value can flow into later arithmetic, comparisons, or sums -- we measured the value itself propagating rather than being caught, so a problem introduced at the division shows up wherever that result is later used.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in decimal module: divided by zero and computed 0/0 under the default context (traps enabled), then repeated both under a localcontext() with the DivisionByZero and InvalidOperation traps turned off. PlainHeaders is our extension; Python&#x27;s decimal module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

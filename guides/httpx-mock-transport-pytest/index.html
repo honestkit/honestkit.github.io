@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx mock: fake responses with MockTransport (tested)</title>
+<meta name="description" content="Mock httpx in tests with the built-in httpx.MockTransport: fake responses, assert requests, simulate timeouts, AsyncClient. No extra library needed.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-mock-transport-pytest/">
+<meta property="og:title" content="httpx mock: fake responses with MockTransport (tested)">
+<meta property="og:description" content="Mock httpx in tests with the built-in httpx.MockTransport: fake responses, assert requests, simulate timeouts, AsyncClient. No extra library needed.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-mock-transport-pytest/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I mock httpx in tests?", "acceptedAnswer": {"@type": "Answer", "text": "Create httpx.Client(transport=httpx.MockTransport(handler)) where handler(request) returns an httpx.Response."}}, {"@type": "Question", "name": "Can MockTransport simulate a timeout?", "acceptedAnswer": {"@type": "Answer", "text": "Yes: raise httpx.ConnectTimeout('msg', request=request) (or another httpx exception) from the handler."}}, {"@type": "Question", "name": "Why does raise_for_status raise RuntimeError on a mock response?", "acceptedAnswer": {"@type": "Answer", "text": "An httpx.Response built by hand has no request attached; return it through a client (MockTransport) so the request is set."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx mock: MockTransport for tests (tested)</h1>
+<p class="lead">Pass <code>transport=httpx.MockTransport(handler)</code> to <code>httpx.Client</code> or <code>AsyncClient</code>; <code>handler(request)</code> returns <code>httpx.Response(200, json=...)</code> or raises an httpx exception. No network, no extra library.</p>
+<p>httpx has a built-in way to fake HTTP in tests: <code>httpx.MockTransport(handler)</code>. The handler receives each <code>httpx.Request</code> and returns an <code>httpx.Response</code>; no network or extra library is needed. Measured with httpx 0.28.1 on Python 3.13.5.</p>
+<h2 id="mock">1. httpx mock transport: fake responses by path</h2>
+<pre><code>import httpx
+
+def handler(request: httpx.Request) -&gt; httpx.Response:
+    if request.url.path == &quot;/users/1&quot;:
+        return httpx.Response(200, json={&quot;id&quot;: 1, &quot;name&quot;: &quot;Ada&quot;})
+    return httpx.Response(404, json={&quot;error&quot;: &quot;not found&quot;})
+
+client = httpx.Client(transport=httpx.MockTransport(handler), base_url=&quot;https://api.example.com&quot;)
+print(client.get(&quot;/users/1&quot;).json())
+print(client.get(&quot;/users/2&quot;).status_code)</code></pre>
+<p>Output:</p>
+<pre><code>{&#x27;id&#x27;: 1, &#x27;name&#x27;: &#x27;Ada&#x27;}
+404</code></pre>
+<p>Inject the client (or its transport) into the code under test, so tests can pass a mocked client and production uses a real one.</p>
+<h2 id="assert">2. Assert what your code sent</h2>
+<pre><code>import httpx
+
+seen = []
+def handler(request):
+    seen.append((request.method, str(request.url), request.headers.get(&quot;authorization&quot;), request.content))
+    return httpx.Response(201)
+
+client = httpx.Client(transport=httpx.MockTransport(handler), headers={&quot;Authorization&quot;: &quot;Bearer t&quot;})
+client.post(&quot;https://api.example.com/items&quot;, json={&quot;a&quot;: 1})
+print(seen)</code></pre>
+<p>Output:</p>
+<pre><code>[(&#x27;POST&#x27;, &#x27;https://api.example.com/items&#x27;, &#x27;Bearer t&#x27;, b&#x27;{&quot;a&quot;:1}&#x27;)]</code></pre>
+<p>The handler sees the final request: method, full URL, merged client headers and the encoded body.</p>
+<h2 id="errors">3. Simulate network errors, and a raise_for_status gotcha</h2>
+<pre><code>import httpx
+
+def handler(request):
+    raise httpx.ConnectTimeout(&quot;simulated&quot;, request=request)
+
+client = httpx.Client(transport=httpx.MockTransport(handler))
+try:
+    client.get(&quot;https://api.example.com/&quot;)
+except httpx.ConnectTimeout as e:
+    print(&quot;ConnectTimeout:&quot;, e)
+
+r = httpx.Response(500)
+try:
+    r.raise_for_status()
+except RuntimeError as e:
+    print(&quot;RuntimeError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>ConnectTimeout: simulated
+RuntimeError: Cannot call `raise_for_status` as the request instance has not been set on this response.</code></pre>
+<p>Raise an httpx exception from the handler to test timeout and retry paths. A bare <code>httpx.Response(500)</code> built outside a client has no request attached, so <code>raise_for_status()</code> raises <code>RuntimeError</code> instead of <code>HTTPStatusError</code>; responses returned through a client (as in block 1) have the request set.</p>
+<h2 id="async">4. httpx mock with AsyncClient</h2>
+<pre><code>import asyncio, httpx
+
+async def handler(request):
+    return httpx.Response(200, json={&quot;async&quot;: True})
+
+async def main():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        r = await client.get(&quot;https://api.example.com/&quot;)
+        print(r.json())
+
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>{&#x27;async&#x27;: True}</code></pre>
+<p>For <code>AsyncClient</code> the handler can be an <code>async def</code>. Third-party libraries such as respx and pytest-httpx add route matching on top of the same idea.</p>
+<p>Related: <a href="/guides/pytest-mock-patch-not-working/">pytest mock patch not working</a>, <a href="/guides/httpx-raise-for-status-httpstatuserror/">httpx raise_for_status</a>, <a href="/guides/httpx-retry-transport-retries/">httpx retries</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests differences</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I mock httpx in tests?</summary><p>Create httpx.Client(transport=httpx.MockTransport(handler)) where handler(request) returns an httpx.Response.</p></details>
+<details><summary>Can MockTransport simulate a timeout?</summary><p>Yes: raise httpx.ConnectTimeout(&#x27;msg&#x27;, request=request) (or another httpx exception) from the handler.</p></details>
+<details><summary>Why does raise_for_status raise RuntimeError on a mock response?</summary><p>An httpx.Response built by hand has no request attached; return it through a client (MockTransport) so the request is set.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

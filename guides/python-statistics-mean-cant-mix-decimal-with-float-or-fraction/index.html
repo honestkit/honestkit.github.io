@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>statistics: mean() Rejects Decimal Mixed With Float/Fraction</title>
+<meta name="description" content="We measured Python 3.13.5: statistics.mean([Fraction(1,2), 0.5]) works, but mixing Decimal with float or Fraction raises TypeError: don&#x27;t know how to coerce.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-statistics-mean-cant-mix-decimal-with-float-or-fraction/">
+<meta property="og:title" content="statistics: mean() Rejects Decimal Mixed With Float/Fraction">
+<meta property="og:description" content="We measured Python 3.13.5: statistics.mean([Fraction(1,2), 0.5]) works, but mixing Decimal with float or Fraction raises TypeError: don&#x27;t know how to coerce.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-statistics-mean-cant-mix-decimal-with-float-or-fraction/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can statistics.mean() mix Decimal and float values in the same list?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured statistics.mean([1.5, Decimal('0.5')]) raising TypeError: don't know how to coerce float and Decimal. Convert everything to the same type first, ideally Decimal via str() rather than float() to avoid baking in binary rounding error."}}, {"@type": "Question", "name": "Can statistics.mean() mix Fraction and Decimal values?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured statistics.mean([Fraction(1,2), Decimal('0.5')]) raising TypeError: don't know how to coerce Decimal and Fraction, even though both types individually mix fine with float and int respectively in other combinations."}}, {"@type": "Question", "name": "Why does statistics.mean() raise a different TypeError message than normal arithmetic?", "acceptedAnswer": {"@type": "Answer", "text": "statistics has its own internal _coerce() function for combining mixed numeric types across a dataset, separate from Python's normal operator dispatch. It raises \"don't know how to coerce <type> and <type>\" instead of the standard \"unsupported operand type(s) for +\" message you'd see from direct arithmetic like 1.5 + Decimal('0.5')."}}, {"@type": "Question", "name": "Does statistics.mean() support mixing Fraction and float?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured statistics.mean([Fraction(1, 2), 0.5]) returning 0.5 as a float with no error, unlike the Decimal combinations which raise TypeError. Only Decimal mixed with float or Fraction specifically fails to coerce."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>statistics: mean() Can&#x27;t Mix Decimal With Other Types (tested)</h1>
+<p class="lead"><code>statistics.mean()</code> is documented as working across <code>int</code>, <code>float</code>, <code>Decimal</code>, and <code>Fraction</code> data. We measured what happens when a single call mixes two of those types together in the same list, and found it depends heavily on which two types -- some combinations work transparently, others raise a distinctive error that doesn't look like Python's usual arithmetic <code>TypeError</code>.</p>
+<h2 id="repro1">1. Mixing Fraction and float works fine and returns float</h2>
+<pre><code>import statistics as st
+from fractions import Fraction
+
+result = st.mean([Fraction(1, 2), 0.5])
+print(result, type(result))</code></pre>
+<pre><code>0.5 &lt;class 'float'&gt;</code></pre>
+<p><strong>Measured:</strong> <code>statistics.mean()</code> has its own internal type-coercion logic, separate from Python's normal operator dispatch -- it successfully mixes <code>Fraction</code> and <code>float</code> values in one call, promoting the result to <code>float</code>.</p>
+
+<h2 id="repro2">2. Mixing Decimal with float or Fraction raises TypeError with an unusual message</h2>
+<pre><code>import statistics as st
+from fractions import Fraction
+from decimal import Decimal
+
+try:
+    st.mean([1.5, Decimal("0.5")])
+except TypeError as e:
+    print("TypeError:", e)
+
+try:
+    st.mean([Fraction(1, 2), Decimal("0.5")])
+except TypeError as e:
+    print("TypeError:", e)</code></pre>
+<pre><code>TypeError: don't know how to coerce float and Decimal
+TypeError: don't know how to coerce Decimal and Fraction</code></pre>
+<p><strong>Measured:</strong> both combinations raise <code>TypeError</code>, but with the message <code>"don't know how to coerce &lt;type&gt; and &lt;type&gt;"</code> -- this comes from <code>statistics</code>'s own internal <code>_coerce()</code> helper, not from Python's normal <code>+</code>/<code>/</code> operators, so it reads differently from the <code>TypeError</code> you'd get calling <code>1.5 + Decimal("0.5")</code> directly (<code>"unsupported operand type(s) for +"</code>). Grepping logs for the standard arithmetic error text won't catch this one.</p>
+
+<h2 id="repro3">3. Decimal only coerces cleanly with int, not with float or Fraction</h2>
+<pre><code>import statistics as st
+from decimal import Decimal
+
+print(st.mean([1, 2, Decimal("3")]))
+print(type(st.mean([1, 2, Decimal("3")])))</code></pre>
+<pre><code>2
+&lt;class 'decimal.Decimal'&gt;</code></pre>
+<p><strong>Measured:</strong> <code>Decimal</code> mixed with plain <code>int</code> works fine and the result stays a <code>Decimal</code> -- it's specifically <code>float</code> and <code>Fraction</code> that <code>Decimal</code> can't be coerced with inside <code>statistics</code>, matching the fact that plain Python arithmetic rejects <code>Decimal</code>+<code>float</code> too (though, as shown above, <code>Fraction</code>+<code>float</code> arithmetic works directly while <code>Fraction</code>+<code>Decimal</code> arithmetic doesn't -- yet both raise inside <code>statistics.mean()</code> once <code>Decimal</code> is one of the two types). A data pipeline that stores measurements as plain <code>float</code> in one place and switches to <code>Decimal</code> for a "more precise" column elsewhere will crash the first time both land in the same <code>statistics.mean()</code> call, with an error message that doesn't mention "Decimal" or "float" in the way a normal arithmetic error would make obvious at a glance -- read the full message, or convert everything to one exact type (e.g. <code>Decimal</code> via each value's <code>str()</code>, not <code>float()</code>) before calling <code>statistics</code> functions on mixed-provenance data.</p>
+<aside class="cta"><strong>Calling statistics.mean() on data that mixes Decimal with other numeric types? Check which combinations it actually allows first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can statistics.mean() mix Decimal and float values in the same list?</summary><p>No -- we measured statistics.mean([1.5, Decimal(&#x27;0.5&#x27;)]) raising TypeError: don&#x27;t know how to coerce float and Decimal. Convert everything to the same type first, ideally Decimal via str() rather than float() to avoid baking in binary rounding error.</p></details>
+<details><summary>Can statistics.mean() mix Fraction and Decimal values?</summary><p>No -- we measured statistics.mean([Fraction(1,2), Decimal(&#x27;0.5&#x27;)]) raising TypeError: don&#x27;t know how to coerce Decimal and Fraction, even though both types individually mix fine with float and int respectively in other combinations.</p></details>
+<details><summary>Why does statistics.mean() raise a different TypeError message than normal arithmetic?</summary><p>statistics has its own internal _coerce() function for combining mixed numeric types across a dataset, separate from Python&#x27;s normal operator dispatch. It raises &quot;don&#x27;t know how to coerce &lt;type&gt; and &lt;type&gt;&quot; instead of the standard &quot;unsupported operand type(s) for +&quot; message you&#x27;d see from direct arithmetic like 1.5 + Decimal(&#x27;0.5&#x27;).</p></details>
+<details><summary>Does statistics.mean() support mixing Fraction and float?</summary><p>Yes -- we measured statistics.mean([Fraction(1, 2), 0.5]) returning 0.5 as a float with no error, unlike the Decimal combinations which raise TypeError. Only Decimal mixed with float or Fraction specifically fails to coerce.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in statistics module: called mean() on lists mixing int, float, Fraction, and Decimal values in different combinations, and compared the exact error to Python&#x27;s normal arithmetic TypeError. PlainHeaders is our extension; Python&#x27;s statistics, fractions, and decimal modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

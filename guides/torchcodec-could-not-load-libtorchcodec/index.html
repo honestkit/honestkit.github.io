@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RuntimeError: Could not load libtorchcodec: 2 causes, tested</title>
+<meta name="description" content="torchaudio.load fails with &quot;Could not load libtorchcodec&quot; or an OSError on libtorchcodec_image.so. Tested: missing FFmpeg vs. torchcodec/torch mismatch.">
+<link rel="canonical" href="https://honestkit.github.io/guides/torchcodec-could-not-load-libtorchcodec/">
+<meta property="og:title" content="RuntimeError: Could not load libtorchcodec: 2 causes, tested">
+<meta property="og:description" content="torchaudio.load fails with &quot;Could not load libtorchcodec&quot; or an OSError on libtorchcodec_image.so. Tested: missing FFmpeg vs. torchcodec/torch mismatch.">
+<meta property="og:url" content="https://honestkit.github.io/guides/torchcodec-could-not-load-libtorchcodec/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I tell the two causes apart?", "acceptedAnswer": {"@type": "Answer", "text": "In our tests a torchcodec/torch mismatch failed first with OSError: Could not load this library: ...libtorchcodec_image.so. With matching versions and no FFmpeg we got RuntimeError: Could not load libtorchcodec, listing libtorchcodec_core8 to core4."}}, {"@type": "Question", "name": "Which torchcodec goes with torch 2.9?", "acceptedAnswer": {"@type": "Answer", "text": "torchcodec 0.8 or 0.9, per the TorchCodec README table. 0.17.0 (newest when tested) failed on torch 2.9.0."}}, {"@type": "Question", "name": "Can I avoid torchcodec?", "acceptedAnswer": {"@type": "Answer", "text": "For WAV/FLAC/OGG, soundfile.read plus torch.from_numpy(data.T) gave the same (channels, frames) shape as torchaudio.load in our test."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Could not load libtorchcodec (fix)</h1>
+<p class="lead">Since torchaudio 2.9, <code>torchaudio.load</code> decodes through TorchCodec, and it often fails with <code>RuntimeError: Could not load libtorchcodec</code> (&quot;TorchCodec is not installed correctly&quot;). We reproduced the two common causes: no FFmpeg shared libraries, and a torchcodec built for a different torch. Each has a different error and fix.</p>
+<h2 id="setup">1. The test</h2>
+<p>A one-second WAV made with the standard library:</p>
+<pre><code>import math, struct, wave
+with wave.open(&quot;tone.wav&quot;, &quot;wb&quot;) as w:          # 1 s, 16 kHz, mono 440 Hz
+    w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+    w.writeframes(b&quot;&quot;.join(struct.pack(&quot;&lt;h&quot;, int(8000 * math.sin(2 * math.pi * 440 * i / 16000))) for i in range(16000)))
+print(&quot;wrote tone.wav&quot;)</code></pre>
+<pre><code>wrote tone.wav</code></pre>
+<p>The script that loads it:</p>
+<pre><code>import torch, torchaudio, torchcodec
+print(&quot;torch&quot;, torch.__version__, &quot;| torchaudio&quot;, torchaudio.__version__, &quot;| torchcodec&quot;, torchcodec.__version__)
+waveform, sr = torchaudio.load(&quot;tone.wav&quot;)
+print(waveform.shape, sr)</code></pre>
+<h2 id="ffmpeg">2. Error A: &quot;Could not load libtorchcodec&quot; = FFmpeg missing</h2>
+<p>torch 2.9.0, torchaudio 2.9.0 and the matching torchcodec 0.9.1 (CPU wheels), on a machine with no FFmpeg:</p>
+<pre><code>Traceback (most recent call last):
+  ...
+RuntimeError: Could not load libtorchcodec. Likely causes:
+          1. FFmpeg is not properly installed in your environment. We support
+             versions 4, 5, 6, 7, and 8. On Windows, ensure you&#x27;ve installed
+             the &quot;full-shared&quot; version which ships DLLs.
+          2. The PyTorch version (2.9.0+cpu) is not compatible with
+             this version of TorchCodec. Refer to the version compatibility
+             table:
+             https://github.com/pytorch/torchcodec?tab=readme-ov-file#installing-torchcodec.
+          3. Another runtime dependency; see exceptions below.
+        The following exceptions were raised as we tried to load libtorchcodec:
+        
+[start of libtorchcodec loading traceback]
+FFmpeg version 8: Could not load this library: .../site-packages/torchcodec/libtorchcodec_core8.so
+FFmpeg version 7: Could not load this library: .../site-packages/torchcodec/libtorchcodec_core7.so
+FFmpeg version 6: Could not load this library: .../site-packages/torchcodec/libtorchcodec_core6.so
+FFmpeg version 5: Could not load this library: .../site-packages/torchcodec/libtorchcodec_core5.so
+FFmpeg version 4: Could not load this library: .../site-packages/torchcodec/libtorchcodec_core4.so
+[end of libtorchcodec loading traceback].</code></pre>
+<p>The versions match here, so cause 2 in the message is not it. Each <code>libtorchcodec_coreN.so</code> fails because the FFmpeg shared libraries (<code>libavcodec</code>, <code>libavutil</code>, …) are not found. TorchCodec does not bundle FFmpeg.</p>
+<h2 id="fix-ffmpeg">3. Fix: install FFmpeg 4–8 shared libraries</h2>
+<ul><li>Debian/Ubuntu: <code>sudo apt install ffmpeg</code></li><li>macOS: <code>brew install ffmpeg</code></li><li>conda: <code>conda install -c conda-forge &quot;ffmpeg&lt;8&quot;</code></li><li>Windows: a &quot;full-shared&quot; FFmpeg build (the message says so) on PATH</li></ul>
+<p>We had no root, so we used conda-forge FFmpeg 7 in a micromamba prefix and pointed the loader at it:</p>
+<pre><code>micromamba create -p ./ff -c conda-forge &quot;ffmpeg=7&quot;
+LD_LIBRARY_PATH=./ff/lib python c1.py</code></pre>
+<pre><code>torch 2.9.0+cpu | torchaudio 2.9.0+cpu | torchcodec 0.9.1
+torch.Size([1, 16000]) 16000</code></pre>
+<p>Same venv, same torchcodec, only FFmpeg added: it loads.</p>
+<h2 id="mismatch">4. Error B: OSError on libtorchcodec_image.so = wrong torchcodec for your torch</h2>
+<p>torchcodec declares no torch dependency, so <code>pip install torchcodec</code> pulls the newest release whatever torch you have. torchcodec 0.17.0 on torch 2.9.0:</p>
+<pre><code>Traceback (most recent call last):
+  ...
+OSError: libnvrtc.so.13: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  ...
+OSError: Could not load this library: .../site-packages/torchcodec/libtorchcodec_image.so</code></pre>
+<p>This fails before FFmpeg is even looked for. The inner error varied between our installs (<code>libnvrtc.so.13</code> missing in this one, <code>undefined symbol: torch_list_size</code> in an earlier one); the outer <code>OSError: Could not load this library: …libtorchcodec_image.so</code> was the same.</p>
+<h2 id="fix-match">5. Fix: install the torchcodec that matches your torch</h2>
+<p>From the TorchCodec README compatibility table:</p>
+<table><tr><th>torch</th><th>torchcodec</th></tr><tr><td>2.8</td><td>0.6, 0.7</td></tr><tr><td>2.9</td><td>0.8, 0.9</td></tr><tr><td>2.10</td><td>0.10</td></tr><tr><td>2.11</td><td>0.11</td></tr><tr><td>&gt;=2.11</td><td>0.12 – 0.17</td></tr></table>
+<pre><code>python -c &quot;import torch; print(torch.__version__)&quot;
+pip install &quot;torchcodec==0.9.*&quot;   # for torch 2.9</code></pre>
+<p>After that you get Error A or success, depending on FFmpeg.</p>
+<h2 id="no-torchcodec">6. Workaround: load audio without torchcodec</h2>
+<p>For plain WAV/FLAC/OGG, <code>pip install soundfile</code> (ships libsndfile) and build the same <code>(channels, frames)</code> tensor:</p>
+<pre><code>import soundfile as sf, torch
+data, sr = sf.read(&quot;tone.wav&quot;, dtype=&quot;float32&quot;, always_2d=True)
+waveform = torch.from_numpy(data.T)        # (channels, frames), like torchaudio.load
+print(waveform.shape, sr)</code></pre>
+<pre><code>torch.Size([1, 16000]) 16000</code></pre>
+<p>Related: <a href="/guides/torchaudio-has-no-attribute-info/">torchaudio has no attribute info</a> · <a href="/guides/torchaudio-has-no-attribute-audiometadata/">torchaudio has no attribute AudioMetaData</a> · <a href="/guides/torchaudio-no-module-named-backend/">No module named torchaudio.backend</a> · <a href="/guides/torchaudio-no-module-named-io/">No module named torchaudio.io</a> · <a href="/guides/torchaudio-libtorchaudio-so-undefined-symbol/">libtorchaudio.so undefined symbol</a></p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I tell the two causes apart?</summary><p>In our tests a torchcodec/torch mismatch failed first with OSError: Could not load this library: ...libtorchcodec_image.so. With matching versions and no FFmpeg we got RuntimeError: Could not load libtorchcodec, listing libtorchcodec_core8 to core4.</p></details>
+<details><summary>Which torchcodec goes with torch 2.9?</summary><p>torchcodec 0.8 or 0.9, per the TorchCodec README table. 0.17.0 (newest when tested) failed on torch 2.9.0.</p></details>
+<details><summary>Can I avoid torchcodec?</summary><p>For WAV/FLAC/OGG, soundfile.read plus torch.from_numpy(data.T) gave the same (channels, frames) shape as torchaudio.load in our test.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux with CPython 3.11.17, CPU wheels of torch/torchaudio 2.9.0, torchcodec 0.9.1 and 0.17.0, conda-forge FFmpeg 7. Output pasted unedited except shortened site-packages paths and cut tracebacks. PlainTables is our extension; torchcodec, FFmpeg and soundfile are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

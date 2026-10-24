@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jupyter Kernel Keeps Dying: Crash or Out of Memory? (Tested)</title>
+<meta name="description" content="Jupyter &quot;kernel died&quot; reproduced: a native crash and an OOM-style kill give the same DeadKernelError with no traceback. How to tell them apart and fix it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/jupyter-notebook-kernel-keeps-dying-deadkernelerror/">
+<meta property="og:title" content="Jupyter Kernel Keeps Dying: Crash or Out of Memory? (Tested)">
+<meta property="og:description" content="Jupyter &quot;kernel died&quot; reproduced: a native crash and an OOM-style kill give the same DeadKernelError with no traceback. How to tell them apart and fix it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/jupyter-notebook-kernel-keeps-dying-deadkernelerror/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does my Jupyter kernel keep dying?", "acceptedAnswer": {"@type": "Answer", "text": "Usually the process runs out of memory and is killed by the OS, or a compiled library crashes. Both show \"Kernel died\" with no traceback."}}, {"@type": "Question", "name": "How do I check if the Jupyter kernel died from out of memory?", "acceptedAnswer": {"@type": "Answer", "text": "Watch memory while the cell runs and check dmesg or journalctl -k for an out-of-memory kill right after the death."}}, {"@type": "Question", "name": "What is DeadKernelError in nbconvert?", "acceptedAnswer": {"@type": "Answer", "text": "nbconvert's error when the kernel process exits while executing a cell: \"Kernel died while waiting for execute reply\"."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Jupyter notebook kernel keeps dying: DeadKernelError, crash vs out of memory (tested)</h1>
+<p class="lead">When a Jupyter kernel keeps dying, the Python process was killed or crashed, so there is no traceback: running out of memory (the OS kills it) and a crash in compiled code look exactly the same. Below both are reproduced, plus how a memory limit turns the death into a catchable <code>MemoryError</code>.</p>
+<h2 id="repro">1. Reproduce: a crash, a hard kill, and a memory limit</h2>
+<p><code>run.sh</code> builds three small notebooks and executes them headless with nbconvert, which reports a dead kernel as <code>DeadKernelError</code> (the Notebook/Lab UI shows its own "kernel died / restarting" notice for the same event). <code>os.abort()</code> stands in for a crashing C extension; <code>SIGKILL</code> is what the Linux out-of-memory killer sends.</p>
+<pre><code>cd /tmp/kd408
+export PATH=/tmp/jn408/ve/bin:$PATH
+mk() { python -c &quot;
+import json,sys
+nb={&#x27;cells&#x27;:[{&#x27;cell_type&#x27;:&#x27;code&#x27;,&#x27;execution_count&#x27;:None,&#x27;id&#x27;:&#x27;c%d&#x27;%i,&#x27;metadata&#x27;:{},&#x27;outputs&#x27;:[],&#x27;source&#x27;:[s]} for i,s in enumerate(sys.argv[2:])],
+ &#x27;metadata&#x27;:{&#x27;kernelspec&#x27;:{&#x27;name&#x27;:&#x27;python3&#x27;,&#x27;display_name&#x27;:&#x27;Python 3&#x27;,&#x27;language&#x27;:&#x27;python&#x27;}},&#x27;nbformat&#x27;:4,&#x27;nbformat_minor&#x27;:5}
+json.dump(nb,open(sys.argv[1],&#x27;w&#x27;))&quot; &quot;$@&quot;; }
+mk crash.ipynb &quot;print(&#x27;cell 1 ok&#x27;)&quot; &quot;import os; os.abort()   # stands in for a crashing C extension&quot;
+mk kill.ipynb &quot;print(&#x27;cell 1 ok&#x27;)&quot; &quot;import os, signal; os.kill(os.getpid(), signal.SIGKILL)   # what the Linux OOM killer does&quot;
+mk limit.ipynb &quot;import resource; resource.setrlimit(resource.RLIMIT_AS, (1500 * 1024**2,) * 2)&quot; &quot;x = bytearray(3000 * 1024**2)&quot; &quot;print(&#x27;kernel still alive&#x27;)&quot;
+echo &#x27;$ jupyter nbconvert --to notebook --execute crash.ipynb&#x27;
+jupyter nbconvert --to notebook --execute crash.ipynb 2&gt;&amp;1 | grep -E &quot;DeadKernelError|Kernel died|^\[NbConvertApp\]&quot; | head -3
+echo
+echo &#x27;$ jupyter nbconvert --to notebook --execute kill.ipynb&#x27;
+jupyter nbconvert --to notebook --execute kill.ipynb 2&gt;&amp;1 | grep -E &quot;DeadKernelError|Kernel died&quot; | head -2
+echo
+echo &#x27;$ jupyter nbconvert --to notebook --execute --allow-errors --stdout limit.ipynb | grep -E &quot;ename|kernel still&quot;&#x27;
+jupyter nbconvert --to notebook --execute --allow-errors --stdout limit.ipynb 2&gt;/dev/null | grep -E &#x27;&quot;ename&quot;|kernel still alive\\n&quot;$&#x27;</code></pre>
+<p>Output (nbconvert 7.17.2, ipykernel, Python 3.13 on Linux):</p>
+<pre><code>$ jupyter nbconvert --to notebook --execute crash.ipynb
+[NbConvertApp] Converting notebook crash.ipynb to notebook
+[NbConvertApp] ERROR | Kernel died while waiting for execute reply.
+    raise DeadKernelError(&quot;Kernel died&quot;) from None
+
+$ jupyter nbconvert --to notebook --execute kill.ipynb
+[NbConvertApp] ERROR | Kernel died while waiting for execute reply.
+    raise DeadKernelError(&quot;Kernel died&quot;) from None
+
+$ jupyter nbconvert --to notebook --execute --allow-errors --stdout limit.ipynb | grep -E &quot;ename|kernel still&quot;
+     &quot;ename&quot;: &quot;MemoryError&quot;,
+      &quot;kernel still alive\n&quot;</code></pre>
+<ul><li>A native crash (abort/segfault in compiled code) and a hard kill look <strong>identical</strong> from Jupyter's side: <code>Kernel died while waiting for execute reply</code>. There is no Python traceback, because the process is gone, so the message alone doesn't tell you which it was.</li>
+<li>An out-of-memory kill gives no Python <code>MemoryError</code>. When the process has a memory limit instead (<code>resource.setrlimit(RLIMIT_AS, ...)</code> at 1.5 GB in <code>limit.ipynb</code>), the 3 GB allocation raised <code>MemoryError</code> as a normal exception and the next cell still ran: the kernel survived.</li></ul>
+<h2 id="fix">2. Finding the cause</h2>
+<ol><li><strong>Memory:</strong> watch memory while the cell runs; on Linux check the system log (<code>dmesg</code> or <code>journalctl -k</code>) for an out-of-memory kill right after the death. Fix by loading less (chunks, smaller dtypes, <code>del</code> big objects) or, as above, set a memory limit so you get a catchable <code>MemoryError</code> instead of a dead kernel.</li>
+<li><strong>Native crash:</strong> run the same code as a plain script (<code>jupyter nbconvert --to script</code>, then <code>python -X faulthandler file.py</code>) to see which line and library crashes; mismatched binary packages (e.g. two copies of a library from pip and conda, or a wheel built for another NumPy) are the usual suspects. Reinstall them in one environment.</li>
+<li><strong>Wrong environment:</strong> if the kernel dies right at startup, check <code>jupyter kernelspec list</code> and the Python path in the kernel's <code>kernel.json</code> (see <a href="/guides/jupyter-notebook-kernel-not-found-nosuchkernel/">kernel not found</a>).</li></ol>
+<p>Related: <a href="/guides/jupyter-error-starting-kernel/">Jupyter &quot;Error Starting Kernel&quot;</a>, <a href="/guides/jupyter-nbconvert-not-installed-command-not-found/">jupyter nbconvert is not installed</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does my Jupyter kernel keep dying?</summary><p>Usually the process runs out of memory and is killed by the OS, or a compiled library crashes. Both show &quot;Kernel died&quot; with no traceback.</p></details>
+<details><summary>How do I check if the Jupyter kernel died from out of memory?</summary><p>Watch memory while the cell runs and check dmesg or journalctl -k for an out-of-memory kill right after the death.</p></details>
+<details><summary>What is DeadKernelError in nbconvert?</summary><p>nbconvert&#x27;s error when the kernel process exits while executing a cell: &quot;Kernel died while waiting for execute reply&quot;.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with nbconvert 7.17.2, ipykernel and Python 3.13 on Linux. The script ran verbatim and the output was pasted unedited. PlainTables is our extension; Jupyter is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker Python &quot;exec format error&quot;: Arch or Shebang (Tested)</title>
+<meta name="description" content="&quot;exec /usr/local/bin/python: exec format error&quot; reproduced: an arm64 image on amd64, and an entrypoint script with no #! line. How to check and fix both.">
+<link rel="canonical" href="https://honestkit.github.io/guides/docker-python-exec-format-error/">
+<meta property="og:title" content="Docker Python &quot;exec format error&quot;: Arch or Shebang (Tested)">
+<meta property="og:description" content="&quot;exec /usr/local/bin/python: exec format error&quot; reproduced: an arm64 image on amd64, and an entrypoint script with no #! line. How to check and fix both.">
+<meta property="og:url" content="https://honestkit.github.io/guides/docker-python-exec-format-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes exec format error in a Docker Python container?", "acceptedAnswer": {"@type": "Answer", "text": "Usually an image built for another CPU architecture (arm64 on amd64 or the reverse), or an entrypoint script without a #! shebang line."}}, {"@type": "Question", "name": "How do I fix exec format error from an image built on a Mac M1/M2?", "acceptedAnswer": {"@type": "Answer", "text": "Rebuild for the server's platform with docker build --platform linux/amd64, or publish a multi-arch image with docker buildx build --platform linux/amd64,linux/arm64."}}, {"@type": "Question", "name": "How do I check which architecture a Docker image is for?", "acceptedAnswer": {"@type": "Answer", "text": "docker image inspect --format '{{.Os}}/{{.Architecture}}' IMAGE"}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Docker Python exec format error: wrong architecture or missing shebang (tested)</h1>
+<p class="lead"><code>exec /usr/local/bin/python: exec format error</code> means the container tried to start a file this machine can't execute. Below it is reproduced on an amd64 host with an arm64 image (at run time and in a <code>RUN</code> step) and with an entrypoint script that lacks a <code>#!</code> line, with the fix for each run.</p>
+<h2 id="repro">1. Reproduce: wrong CPU architecture, and a script without <code>#!</code></h2>
+<p>The files: <code>a</code> is a plain Python image, <code>b</code> starts through a shell script (once without a <code>#!</code> line, once with one), <code>c</code> has a <code>RUN</code> step:</p>
+<pre><code># ---- a/Dockerfile
+FROM python:3-alpine
+CMD [&quot;python&quot;, &quot;-c&quot;, &quot;import platform; print(platform.machine())&quot;]
+# ---- b/Dockerfile
+FROM python:3-alpine
+COPY start.sh start-fixed.sh /
+ENTRYPOINT [&quot;/start.sh&quot;]
+# ---- b/start.sh
+echo &quot;starting app&quot;
+exec python -c &quot;print(42)&quot;
+# ---- b/start-fixed.sh
+#!/bin/sh
+echo &quot;starting app&quot;
+exec python -c &quot;print(42)&quot;
+# ---- c/Dockerfile
+FROM python:3-alpine
+RUN pip install -q six</code></pre>
+<p><code>run.sh</code>, on an x86_64 (amd64) Linux host with no QEMU emulation registered:</p>
+<pre><code>#!/bin/sh
+echo &quot;host: $(uname -m)&quot;
+echo &quot;== a: image built for arm64, run on this amd64 host&quot;
+docker build -q --platform linux/arm64 -t forever-ef410:arm a &gt;/dev/null
+docker image inspect --format &#x27;{{.Os}}/{{.Architecture}}&#x27; forever-ef410:arm
+docker run --rm --name forever-ef410run forever-ef410:arm 2&gt;&amp;1
+echo &quot;exit code: $?&quot;
+echo &quot;== a: same Dockerfile built for amd64&quot;
+docker build -q --platform linux/amd64 -t forever-ef410:amd a &gt;/dev/null
+docker run --rm --name forever-ef410run forever-ef410:amd 2&gt;&amp;1
+echo &quot;== b: ENTRYPOINT script without a #! line&quot;
+docker build -q -t forever-ef410:sh b &gt;/dev/null
+docker run --rm --name forever-ef410run forever-ef410:sh 2&gt;&amp;1
+echo &quot;exit code: $?&quot;
+echo &quot;== b: script with #!/bin/sh&quot;
+docker run --rm --name forever-ef410run --entrypoint /start-fixed.sh forever-ef410:sh 2&gt;&amp;1</code></pre>
+<p>Output (Docker 29.8.1, <code>python:3-alpine</code>):</p>
+<pre><code>host: x86_64
+== a: image built for arm64, run on this amd64 host
+linux/arm64
+WARNING: The requested image&#x27;s platform (linux/arm64) does not match the detected host platform (linux/amd64/v3) and no specific platform was requested
+exec /usr/local/bin/python: exec format error
+exit code: 255
+== a: same Dockerfile built for amd64
+x86_64
+== b: ENTRYPOINT script without a #! line
+exec /start.sh: exec format error
+exit code: 255
+== b: script with #!/bin/sh
+starting app
+42</code></pre>
+<p>The same thing during a build, when a <code>RUN</code> step has to execute an arm64 binary:</p>
+<pre><code>#!/bin/sh
+# a RUN step in a cross-platform build without emulation
+docker build --platform linux/arm64 --progress=plain -t forever-ef410:c c &gt; build.log 2&gt;&amp;1
+echo &quot;build exit code: $?&quot;
+grep -E &quot;^#5 .*exec format|^ERROR&quot; build.log</code></pre>
+<pre><code>build exit code: 1
+#5 0.320 exec /bin/sh: exec format error
+ERROR: failed to build: failed to solve: process &quot;/bin/sh -c pip install -q six&quot; did not complete successfully: exit code: 255</code></pre>
+<h2 id="causes">2. What the error means</h2>
+<p><code>exec ...: exec format error</code> is the Linux kernel refusing to start a file it can't run. In Python containers it is almost always one of two things:</p>
+<ul><li><strong>The image is for another CPU.</strong> An image built on an Apple Silicon Mac or a Raspberry Pi is <code>linux/arm64</code>; on an amd64 server the very first binary (<code>/usr/local/bin/python</code> above, or <code>/bin/sh</code> in a <code>RUN</code> step) fails, exit code 255. Docker prints a "requested image's platform ... does not match the detected host platform" warning first. Check with <code>docker image inspect --format '{{.Os}}/{{.Architecture}}' IMAGE</code>.</li>
+<li><strong>The entrypoint script has no <code>#!</code> line.</strong> In the exec form <code>ENTRYPOINT ["/start.sh"]</code> there is no shell, so the kernel needs a shebang to know what runs the file. Adding <code>#!/bin/sh</code> (the <code>start-fixed.sh</code> run printed <code>starting app</code> and <code>42</code>) fixes it, as does <code>ENTRYPOINT ["sh", "/start.sh"]</code>. The shebang must be the very first bytes of the file.</li></ul>
+<h2 id="fix">3. Fixes for the architecture mismatch</h2>
+<ul><li>Build for the machine that will run it: <code>docker build --platform linux/amd64 ...</code> (the <code>a</code> rebuild printed <code>x86_64</code>). In Compose, set <code>platform: linux/amd64</code> on the service.</li>
+<li>Publish a multi-architecture image so each host pulls its own: <code>docker buildx build --platform linux/amd64,linux/arm64 --push -t NAME .</code> (needs QEMU or native builders for the other arch).</li>
+<li>Check for <code>FROM --platform=...</code> pinned in the Dockerfile; it overrides what you pass on the command line for that stage.</li>
+<li>Pure-Python code is portable, but wheels with compiled code are per-architecture, so build the image on (or for) the target platform rather than copying a <code>site-packages</code> folder between machines.</li></ul>
+<p>Related: <a href="/guides/docker-python-modulenotfounderror-no-module-named/">Docker Python ModuleNotFoundError</a>, <a href="/guides/docker-pip-error-externally-managed-environment/">Docker pip externally-managed-environment</a>, <a href="/guides/docker-build-failed/">docker build failed</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes exec format error in a Docker Python container?</summary><p>Usually an image built for another CPU architecture (arm64 on amd64 or the reverse), or an entrypoint script without a #! shebang line.</p></details>
+<details><summary>How do I fix exec format error from an image built on a Mac M1/M2?</summary><p>Rebuild for the server&#x27;s platform with docker build --platform linux/amd64, or publish a multi-arch image with docker buildx build --platform linux/amd64,linux/arm64.</p></details>
+<details><summary>How do I check which architecture a Docker image is for?</summary><p>docker image inspect --format &#x27;{{.Os}}/{{.Architecture}}&#x27; IMAGE</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Docker 29.8.1 and python:3-alpine on an x86_64 Linux host. The scripts ran verbatim and the output was pasted unedited. PlainTables is our extension; Docker and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

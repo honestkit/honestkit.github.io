@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>copy.deepcopy Carries Over a Stale cached_property Value (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: deepcopy copies a cached_property&#x27;s stored value as plain data -- it never recomputes, even after the source attribute changed.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-copy-deepcopy-cached-property-stale-value/">
+<meta property="og:title" content="copy.deepcopy Carries Over a Stale cached_property Value (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: deepcopy copies a cached_property&#x27;s stored value as plain data -- it never recomputes, even after the source attribute changed.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-copy-deepcopy-cached-property-stale-value/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does copy.deepcopy recompute a functools.cached_property for the new object?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured that deepcopy copies whatever is already in instance.__dict__, including any already-computed cached_property result, as plain data. If the underlying attributes the property depends on were mutated before the copy, the copy keeps the old cached answer rather than recomputing it."}}, {"@type": "Question", "name": "Does copy.copy (shallow copy) have the same issue?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, identically -- we measured the same stale cached_property value surviving a copy.copy() in addition to copy.deepcopy(). Both operate on __dict__ the same generic way."}}, {"@type": "Question", "name": "How do I force a copied object to recompute its cached_property?", "acceptedAnswer": {"@type": "Answer", "text": "Delete the cached entry from the copy's __dict__ (e.g. del obj.__dict__['propname']) right after copying -- we measured this forcing a correct recomputation on next access, using the copy's own current attribute values."}}, {"@type": "Question", "name": "Is this specific to cached_property, or does it affect ordinary @property too?", "acceptedAnswer": {"@type": "Answer", "text": "Ordinary @property has no __dict__ entry at all -- it recomputes every access from the live object, including on a copy, so it's unaffected. The issue is specific to cached_property (and any other pattern that memoizes a value directly into instance.__dict__)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>copy.deepcopy Copies a functools.cached_property&#x27;s Stale Cached Value (tested)</h1>
+<p class="lead"><code>functools.cached_property</code> stores its computed result as an ordinary entry in <code>instance.__dict__</code> once accessed -- there's nothing marking it as "derived" or cache-like to <code>copy.copy</code>/<code>copy.deepcopy</code>. Both copy functions operate on <code>__dict__</code> generically, so a cached_property's stored result is copied exactly like any other attribute: as a frozen value, not as something to recompute. If the underlying data the property depends on changes before the copy is made, the copy inherits the old answer, not a fresh one.</p>
+<h2 id="repro1">1. Deep-copying after a mutation keeps the pre-mutation cached result</h2>
+<pre><code>import functools, copy
+
+class Config:
+    def __init__(self, base):
+        self.base = base
+    @functools.cached_property
+    def derived(self):
+        return self.base * 2
+
+c = Config(5)
+print("derived:", c.derived)   # computes and caches 10
+c.base = 100                    # mutate AFTER caching
+
+d = copy.deepcopy(c)
+print("deepcopy's base:", d.base)
+print("deepcopy's derived:", d.derived)
+print(d.__dict__)</code></pre>
+<pre><code>derived: 10
+deepcopy's base: 100
+deepcopy's derived: 10
+{'base': 100, 'derived': 10}</code></pre>
+<p><strong>Measured:</strong> the deep copy's <code>base</code> is correctly <code>100</code> -- <code>deepcopy</code> did its job on that plain attribute. But <code>derived</code> comes out as <code>10</code>, the value cached <em>before</em> the mutation, not <code>200</code> (what <code>self.base * 2</code> would actually produce now). <code>cached_property</code>'s result sat in <code>__dict__</code> as <code>{'derived': 10}</code>, and <code>deepcopy</code> copied that entry exactly like <code>base</code> -- it has no way to know <code>derived</code> was ever a computed, potentially-stale value rather than real data.</p>
+
+<h2 id="repro2">2. copy.copy (shallow) has the identical effect</h2>
+<pre><code>import functools, copy
+
+class Config:
+    def __init__(self, base):
+        self.base = base
+    @functools.cached_property
+    def derived(self):
+        return self.base * 2
+
+c = Config(5)
+c.derived           # cache it: 10
+c.base = 100
+s = copy.copy(c)
+print("shallow copy base:", s.base, "derived:", s.derived)</code></pre>
+<pre><code>shallow copy base: 100 derived: 10</code></pre>
+<p><strong>Measured:</strong> same inconsistency with <code>copy.copy</code> -- it isn't specific to the deep-copy traversal logic, it's simply that both copy functions treat <code>__dict__</code> contents uniformly, with no special case for an entry that happened to originate from a <code>cached_property</code> getter.</p>
+
+<h2 id="repro3">3. The fix: clear the cached entry before or after copying</h2>
+<pre><code>import functools, copy
+
+class Config:
+    def __init__(self, base):
+        self.base = base
+    @functools.cached_property
+    def derived(self):
+        return self.base * 2
+
+c = Config(5)
+c.derived
+c.base = 100
+d = copy.deepcopy(c)
+del d.__dict__["derived"]   # drop the stale cache entry
+print("derived after invalidation:", d.derived)</code></pre>
+<pre><code>derived after invalidation: 200</code></pre>
+<p><strong>Measured:</strong> deleting the cached entry from the copy's <code>__dict__</code> (the same technique used to invalidate a <code>cached_property</code> on the original object) forces the next access to recompute from the copy's own, current <code>base</code> -- giving the correct <code>200</code>. There's no built-in copy hook for this; it has to be done explicitly after every copy, or by implementing <code>__deepcopy__</code>/<code>__copy__</code> to strip cached entries automatically.</p>
+<aside class="cta"><strong>Copying an object that has a functools.cached_property with copy.copy or copy.deepcopy and expecting the copy to recompute derived values from its own state? Check the copy&#x27;s __dict__ first -- it probably carried over a stale cached answer instead:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does copy.deepcopy recompute a functools.cached_property for the new object?</summary><p>No. We measured that deepcopy copies whatever is already in instance.__dict__, including any already-computed cached_property result, as plain data. If the underlying attributes the property depends on were mutated before the copy, the copy keeps the old cached answer rather than recomputing it.</p></details>
+<details><summary>Does copy.copy (shallow copy) have the same issue?</summary><p>Yes, identically -- we measured the same stale cached_property value surviving a copy.copy() in addition to copy.deepcopy(). Both operate on __dict__ the same generic way.</p></details>
+<details><summary>How do I force a copied object to recompute its cached_property?</summary><p>Delete the cached entry from the copy&#x27;s __dict__ (e.g. del obj.__dict__[&#x27;propname&#x27;]) right after copying -- we measured this forcing a correct recomputation on next access, using the copy&#x27;s own current attribute values.</p></details>
+<details><summary>Is this specific to cached_property, or does it affect ordinary @property too?</summary><p>Ordinary @property has no __dict__ entry at all -- it recomputes every access from the live object, including on a copy, so it&#x27;s unaffected. The issue is specific to cached_property (and any other pattern that memoizes a value directly into instance.__dict__).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in copy.deepcopy/copy.copy and functools.cached_property: accessed a cached_property to populate its cache, mutated the instance&#x27;s underlying attribute afterward, then copied the instance and checked whether the copy&#x27;s cached_property reflects the copy&#x27;s own (mutated, deep-copied) attribute value or the original cached result. PlainHeaders is our extension; Python&#x27;s functools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

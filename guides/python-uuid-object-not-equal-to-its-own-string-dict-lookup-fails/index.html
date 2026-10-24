@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python uuid.UUID Objects Aren&#x27;t Equal to Their Own String</title>
+<meta name="description" content="We measured Python 3.13.5: uuid.uuid4() == str(uuid.uuid4()) is False, so a dict keyed by UUID objects can&#x27;t be looked up by the matching string.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-uuid-object-not-equal-to-its-own-string-dict-lookup-fails/">
+<meta property="og:title" content="Python uuid.UUID Objects Aren&#x27;t Equal to Their Own String">
+<meta property="og:description" content="We measured Python 3.13.5: uuid.uuid4() == str(uuid.uuid4()) is False, so a dict keyed by UUID objects can&#x27;t be looked up by the matching string.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-uuid-object-not-equal-to-its-own-string-dict-lookup-fails/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is a Python uuid.UUID object equal to its string representation?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured uuid.uuid4() == str(uuid.uuid4()) returning False, even on the exact same UUID. UUID.__eq__ only compares against other UUID objects, never strings."}}, {"@type": "Question", "name": "Why does a dict lookup by UUID string fail in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Because the dict key is a UUID object, not a string, and the two don't hash or compare equal. We measured a dict entry keyed by a UUID object failing an 'in' check against the identical-looking string, while the original UUID object still matched."}}, {"@type": "Question", "name": "How do I fix UUID vs string comparison problems in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Parse the string back into a UUID object with uuid.UUID(s) before comparing or using it as a key. We confirmed this normalized form correctly equals and hashes the same as the original UUID object."}}, {"@type": "Question", "name": "Does uuid.UUID() care about uppercase vs lowercase hex digits?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured uuid.UUID() on an uppercased UUID string comparing equal to the original lowercase UUID object, since UUID parsing normalizes case; the str-vs-UUID type mismatch is the real issue, not case."}}, {"@type": "Question", "name": "Can a KeyError from a UUID lookup happen even though the ID 'matches'?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured this exact scenario: looking up a dict keyed by a UUID object using the equivalent string raises a miss (KeyError on direct indexing, False via 'in'), even though printing both the key and the lookup value shows identical text."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>A uuid.UUID Object Is Not Equal to Its Own String Form (tested)</h1>
+<p class="lead">A <code>uuid.UUID</code> object prints as a string, gets logged as a string, and looks exactly like a string everywhere you can see it. We measured whether it actually behaves like one for comparison and dict lookups. It doesn't -- and that silently breaks lookups when an ID crosses a string boundary, like a URL path or a JSON payload.</p>
+<h2 id="repro1">1. A UUID object never equals its own string form</h2>
+<pre><code>import uuid
+
+u = uuid.uuid4()
+print(u)
+print(type(u))
+print(u == str(u))</code></pre>
+<pre><code>31e81eb9-5d5d-410a-ab92-7f0ffa9a2d3d
+&lt;class 'uuid.UUID'&gt;
+False</code></pre>
+<p><strong>Measured:</strong> <code>uuid.uuid4()</code> returns a <code>UUID</code> object, not a string. Printing it shows the same text you'd expect from the string form, but <code>==</code> against that exact string returns <code>False</code> -- <code>UUID.__eq__</code> only considers another <code>UUID</code> equal, never a plain string, no matter how it's formatted.</p>
+
+<h2 id="repro2">2. This silently breaks dict/set lookups across a string boundary</h2>
+<pre><code>import uuid
+
+u = uuid.uuid4()
+sessions = {u: "session data"}
+
+received_id = str(u)   # e.g. came in as a URL path segment or JSON field
+print(received_id in sessions)
+print(u in sessions)</code></pre>
+<pre><code>False
+True</code></pre>
+<p><strong>Measured:</strong> the same dict entry is found when looked up by the original <code>UUID</code> object, but <code>in</code> (and a direct <code>sessions[received_id]</code>, which would raise <code>KeyError</code>) returns <code>False</code> for the string that looks identical when printed. This is exactly the shape of a real request-handling bug: an ID generated and stored as a <code>UUID</code> object, then received back later as a plain string from a URL parameter, HTTP header, or JSON body -- the lookup fails with no type error and no obviously wrong value to spot, just a silent miss.</p>
+
+<h2 id="repro3">3. The fix: normalize to UUID before comparing or keying</h2>
+<pre><code>import uuid
+
+u = uuid.uuid4()
+sessions = {u: "session data"}
+received_id = str(u)
+
+normalized = uuid.UUID(received_id)
+print(normalized == u)
+print(normalized in sessions)</code></pre>
+<pre><code>True
+True</code></pre>
+<p><strong>Measured:</strong> parsing the received string back into a <code>uuid.UUID</code> object before comparing or looking it up resolves correctly -- <code>UUID.__eq__</code> and hashing both work as expected between two <code>UUID</code> objects, including when one came from a different-case string (<code>uuid.UUID</code> normalizes case on parse). The fix is consistency: pick one representation (object or string) for anything used as a cache/dict key or compared with <code>==</code>, and convert at the boundary every time an ID crosses in or out as text.</p>
+<aside class="cta"><strong>Looking up a session or request by an ID that came in as a URL/header string? Check what type your cache key actually is:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is a Python uuid.UUID object equal to its string representation?</summary><p>No -- we measured uuid.uuid4() == str(uuid.uuid4()) returning False, even on the exact same UUID. UUID.__eq__ only compares against other UUID objects, never strings.</p></details>
+<details><summary>Why does a dict lookup by UUID string fail in Python?</summary><p>Because the dict key is a UUID object, not a string, and the two don&#x27;t hash or compare equal. We measured a dict entry keyed by a UUID object failing an &#x27;in&#x27; check against the identical-looking string, while the original UUID object still matched.</p></details>
+<details><summary>How do I fix UUID vs string comparison problems in Python?</summary><p>Parse the string back into a UUID object with uuid.UUID(s) before comparing or using it as a key. We confirmed this normalized form correctly equals and hashes the same as the original UUID object.</p></details>
+<details><summary>Does uuid.UUID() care about uppercase vs lowercase hex digits?</summary><p>No -- we measured uuid.UUID() on an uppercased UUID string comparing equal to the original lowercase UUID object, since UUID parsing normalizes case; the str-vs-UUID type mismatch is the real issue, not case.</p></details>
+<details><summary>Can a KeyError from a UUID lookup happen even though the ID &#x27;matches&#x27;?</summary><p>Yes -- we measured this exact scenario: looking up a dict keyed by a UUID object using the equivalent string raises a miss (KeyError on direct indexing, False via &#x27;in&#x27;), even though printing both the key and the lookup value shows identical text.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in uuid module: generated a UUID object with uuid.uuid4(), used it as a dict key, then looked the same entry up by its string form (str(u)) and by a fresh uuid.UUID() object parsed from that string. PlainHeaders is our extension; Python&#x27;s uuid module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

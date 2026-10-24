@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx proxy: unexpected keyword argument &#x27;proxies&#x27; fix (tested)</title>
+<meta name="description" content="httpx 0.28 rejects proxies=: use proxy= on Client/AsyncClient, mounts= for per-scheme proxies, plus HTTP_PROXY/NO_PROXY and SOCKS. Measured.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-proxy-unexpected-keyword-argument-proxies/">
+<meta property="og:title" content="httpx proxy: unexpected keyword argument &#x27;proxies&#x27; fix (tested)">
+<meta property="og:description" content="httpx 0.28 rejects proxies=: use proxy= on Client/AsyncClient, mounts= for per-scheme proxies, plus HTTP_PROXY/NO_PROXY and SOCKS. Measured.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-proxy-unexpected-keyword-argument-proxies/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I fix httpx unexpected keyword argument 'proxies'?", "acceptedAnswer": {"@type": "Answer", "text": "Replace proxies=... with proxy=\"http://host:port\" on httpx.Client, AsyncClient or httpx.get; for a dict of proxies use mounts= with HTTPTransport(proxy=...)."}}, {"@type": "Question", "name": "Does httpx use the HTTP_PROXY environment variable?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, with the default trust_env=True; NO_PROXY excludes hosts. Pass trust_env=False to ignore them."}}, {"@type": "Question", "name": "Does httpx support SOCKS proxies?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, after pip install \"httpx[socks]\"; without it a socks5:// proxy raises ImportError."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx proxy: unexpected keyword argument &#x27;proxies&#x27; fix (tested)</h1>
+<p class="lead"><code>TypeError: Client.__init__() got an unexpected keyword argument 'proxies'</code>: httpx 0.28 takes <code>proxy="http://host:port"</code> (one URL) instead. For per-scheme proxies use <code>mounts={"http://": httpx.HTTPTransport(proxy=...)}</code>.</p>
+<p>Measured with httpx 0.28.1 on Python 3.13.5. The "proxy" is a local <code>http.server</code> that echoes the request line it receives: when a request goes through it, the path is the full target URL (<code>http://example.invalid/...</code>), which proves the proxy was used. <code>example.invalid</code> does not resolve, so a request that skips the proxy fails.</p>
+<h2 id="proxy">1. proxies= is a TypeError: use proxy=</h2>
+<pre><code>import httpx
+from srv import start
+proxy = start()   # local server that echoes the request line it receives
+
+try:
+    httpx.Client(proxies=proxy)
+except TypeError as e:
+    print(&quot;TypeError:&quot;, e)
+
+with httpx.Client(proxy=proxy) as client:
+    print(client.get(&quot;http://example.invalid/hello&quot;).json())</code></pre>
+<p>Output:</p>
+<pre><code>TypeError: Client.__init__() got an unexpected keyword argument &#x27;proxies&#x27;
+{&#x27;method&#x27;: &#x27;GET&#x27;, &#x27;path&#x27;: &#x27;http://example.invalid/hello&#x27;, &#x27;auth&#x27;: None}</code></pre>
+<p>httpx 0.28.1 rejects the old <code>proxies=</code> argument (found in many tutorials and in code written for older httpx). Pass a single URL with <code>proxy=</code>, on <code>httpx.Client</code>, <code>httpx.AsyncClient</code> or a one-off <code>httpx.get(..., proxy=...)</code>. Credentials go in the URL: <code>http://user:pass@proxy:3128</code>.</p>
+<h2 id="mounts">2. Different proxies per scheme or host: mounts=</h2>
+<pre><code>import httpx
+from srv import start
+proxy = start()
+
+mounts = {&quot;http://&quot;: httpx.HTTPTransport(proxy=proxy)}   # proxy only plain-http traffic
+with httpx.Client(mounts=mounts) as client:
+    print(client.get(&quot;http://example.invalid/mounted&quot;).json()[&quot;path&quot;])</code></pre>
+<p>Output:</p>
+<pre><code>http://example.invalid/mounted</code></pre>
+<p>The old <code>proxies={"http://": ..., "https://": ...}</code> dict becomes <code>mounts=</code> with one <code>httpx.HTTPTransport(proxy=...)</code> (or <code>AsyncHTTPTransport</code> for AsyncClient) per URL pattern. Requests that match no mount use a direct connection.</p>
+<h2 id="env">3. HTTP_PROXY / HTTPS_PROXY / NO_PROXY environment variables</h2>
+<pre><code>import os, subprocess, sys
+from srv import start
+proxy = start()
+
+code = &quot;import httpx; print(httpx.get(&#x27;http://example.invalid/env&#x27;).json()[&#x27;path&#x27;])&quot;
+for extra in ({&quot;HTTP_PROXY&quot;: proxy}, {&quot;HTTP_PROXY&quot;: proxy, &quot;NO_PROXY&quot;: &quot;example.invalid&quot;}):
+    env = {k: v for k, v in os.environ.items() if &quot;PROXY&quot; not in k.upper()} | extra
+    out = subprocess.run([sys.executable, &quot;-c&quot;, code], env=env, capture_output=True, text=True)
+    print(sorted(extra), &quot;-&gt;&quot;, out.stdout.strip() or out.stderr.strip().splitlines()[-1])</code></pre>
+<p>Output:</p>
+<pre><code>[&#x27;HTTP_PROXY&#x27;] -&gt; http://example.invalid/env
+[&#x27;HTTP_PROXY&#x27;, &#x27;NO_PROXY&#x27;] -&gt; httpx.ConnectError: [Errno -2] Name or service not known</code></pre>
+<p>With the default <code>trust_env=True</code>, httpx picks up <code>HTTP_PROXY</code>, <code>HTTPS_PROXY</code> and <code>ALL_PROXY</code>, and <code>NO_PROXY</code> excludes hosts (here the request went direct and failed on DNS). If an explicit <code>proxy=</code> seems ignored or a proxy is used unexpectedly, check these variables, or pass <code>trust_env=False</code>.</p>
+<h2 id="socks">4. SOCKS proxies need an extra</h2>
+<pre><code>import httpx
+try:
+    httpx.Client(proxy=&quot;socks5://127.0.0.1:1080&quot;)
+except ImportError as e:
+    print(&quot;ImportError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>ImportError: Using SOCKS proxy, but the &#x27;socksio&#x27; package is not installed. Make sure to install httpx using `pip install httpx[socks]`.</code></pre>
+<p>Install <code>pip install "httpx[socks]"</code> to use <code>socks5://</code> proxy URLs.</p>
+<p>Related: <a href="/guides/httpx-vs-requests-differences/">httpx vs requests</a>, <a href="/guides/httpx-connecterror-ssl-certificate-verify-failed/">httpx CERTIFICATE_VERIFY_FAILED</a> (common behind a TLS-inspecting corporate proxy), <a href="/guides/httpx-timeout-default-readtimeout/">httpx timeout</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I fix httpx unexpected keyword argument &#x27;proxies&#x27;?</summary><p>Replace proxies=... with proxy=&quot;http://host:port&quot; on httpx.Client, AsyncClient or httpx.get; for a dict of proxies use mounts= with HTTPTransport(proxy=...).</p></details>
+<details><summary>Does httpx use the HTTP_PROXY environment variable?</summary><p>Yes, with the default trust_env=True; NO_PROXY excludes hosts. Pass trust_env=False to ignore them.</p></details>
+<details><summary>Does httpx support SOCKS proxies?</summary><p>Yes, after pip install &quot;httpx[socks]&quot;; without it a socks5:// proxy raises ImportError.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5, using a local http.server as an echoing HTTP proxy. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Selenium Element Not Interactable: Causes and Fixes (Tested)</title>
+<meta name="description" content="Selenium ElementNotInteractableException tested in Chrome 156: hidden elements, a hidden duplicate matched first, WebDriverWait, and which inputs count.">
+<link rel="canonical" href="https://honestkit.github.io/guides/selenium-element-not-interactable/">
+<meta property="og:title" content="Selenium Element Not Interactable: Causes and Fixes (Tested)">
+<meta property="og:description" content="Selenium ElementNotInteractableException tested in Chrome 156: hidden elements, a hidden duplicate matched first, WebDriverWait, and which inputs count.">
+<meta property="og:url" content="https://honestkit.github.io/guides/selenium-element-not-interactable/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes element not interactable in Selenium?", "acceptedAnswer": {"@type": "Answer", "text": "The element exists but cannot receive input: it is display:none or visibility:hidden, disabled, not yet shown by JavaScript, or not an input at all (e.g. a div). Often the locator matched a hidden duplicate first."}}, {"@type": "Question", "name": "How do I fix ElementNotInteractableException?", "acceptedAnswer": {"@type": "Answer", "text": "Check how many elements your locator matches and pick the visible one, wait with WebDriverWait and EC.element_to_be_clickable, and send keys to the actual input element."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Selenium ElementNotInteractableException (tested)</h1>
+<p class="lead">Selenium raises <code>ElementNotInteractableException: element not interactable</code> when <code>send_keys()</code> or <code>click()</code> targets an element that is in the DOM but hidden, disabled, or not an input. Most often your locator matched a hidden duplicate first, or the element has not appeared yet: wait with <code>EC.element_to_be_clickable</code>.</p>
+<h2 id="setup">Setup used in every block</h2>
+<p><code>common.py</code> writes a small HTML page to a local file and starts headless Chrome. Exception messages are cut to their first line (Selenium appends the session info and a documentation link).</p>
+<pre><code>import os, pathlib
+from selenium import webdriver
+CHROME = os.path.expanduser(&quot;~/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome&quot;)
+def page(html):
+    p = pathlib.Path(&quot;/tmp/sl383/page.html&quot;); p.write_text(html); return p.as_uri()
+def driver():
+    o = webdriver.ChromeOptions()
+    o.binary_location = CHROME
+    o.add_argument(&quot;--headless=new&quot;); o.add_argument(&quot;--no-sandbox&quot;); o.add_argument(&quot;--window-size=1000,700&quot;)
+    return webdriver.Chrome(options=o)</code></pre>
+<h2 id="hidden">1. Reproduce it: the element is hidden</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+d = driver()
+d.get(page(&#x27;&lt;input id=&quot;q&quot; style=&quot;display:none&quot;&gt;&lt;button id=&quot;go&quot; hidden&gt;Go&lt;/button&gt;&#x27;))
+for action in (&quot;send_keys&quot;, &quot;click&quot;):
+    el = d.find_element(By.ID, &quot;q&quot; if action == &quot;send_keys&quot; else &quot;go&quot;)
+    print(action, &quot;is_displayed:&quot;, el.is_displayed())
+    try:
+        el.send_keys(&quot;hello&quot;) if action == &quot;send_keys&quot; else el.click()
+    except Exception as e:
+        print(&quot; &quot;, type(e).__name__ + &quot;:&quot;, e.msg.splitlines()[0])
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>send_keys is_displayed: False
+  ElementNotInteractableException: element not interactable
+click is_displayed: False
+  ElementNotInteractableException: element not interactable</code></pre>
+<p>Selenium finds elements that are in the DOM whether or not they are visible, so <code>find_element()</code> succeeds. The error comes on <code>send_keys()</code> or <code>click()</code>, because a <code>display:none</code> or <code>hidden</code> element cannot be typed into or clicked. <code>is_displayed()</code> returns <code>False</code> for it.</p>
+<h2 id="wrong">2. Your locator matched a hidden duplicate first</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+d = driver()
+d.get(page(&#x27;&#x27;&#x27;
+&lt;div class=&quot;mobile&quot; style=&quot;display:none&quot;&gt;&lt;input name=&quot;email&quot;&gt;&lt;/div&gt;
+&lt;div class=&quot;desktop&quot;&gt;&lt;input name=&quot;email&quot;&gt;&lt;/div&gt;&#x27;&#x27;&#x27;))
+els = d.find_elements(By.NAME, &quot;email&quot;)
+print(&quot;matches:&quot;, len(els), [e.is_displayed() for e in els])
+try:
+    d.find_element(By.NAME, &quot;email&quot;).send_keys(&quot;a@b.c&quot;)
+except Exception as e:
+    print(type(e).__name__ + &quot;:&quot;, e.msg.splitlines()[0])
+visible = next(e for e in els if e.is_displayed())
+visible.send_keys(&quot;a@b.c&quot;)
+print(&quot;visible one:&quot;, visible.get_attribute(&quot;value&quot;))
+d.find_element(By.CSS_SELECTOR, &quot;.desktop input[name=email]&quot;).clear()
+print(&quot;scoped selector OK&quot;)
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>matches: 2 [False, True]
+ElementNotInteractableException: element not interactable
+visible one: a@b.c
+scoped selector OK</code></pre>
+<p>This is the most common cause on real sites: a responsive page has two copies of a form (mobile and desktop) or a hidden template, and <code>find_element()</code> returns the <em>first</em> match in document order, which is the hidden one. Check <code>len(driver.find_elements(...))</code>. If there is more than one match, pick the visible one or scope the selector to the visible container.</p>
+<h2 id="wait">3. The element is not visible yet: wait for it</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+html = &#x27;&#x27;&#x27;&lt;input id=&quot;q&quot; style=&quot;display:none&quot;&gt;
+&lt;script&gt;setTimeout(() =&gt; document.getElementById(&quot;q&quot;).style.display = &quot;&quot;, 1500)&lt;/script&gt;&#x27;&#x27;&#x27;
+d = driver()
+d.get(page(html))
+try:
+    d.find_element(By.ID, &quot;q&quot;).send_keys(&quot;too early&quot;)
+except Exception as e:
+    print(&quot;immediately:&quot;, type(e).__name__ + &quot;:&quot;, e.msg.splitlines()[0])
+d.get(page(html))
+el = WebDriverWait(d, 5).until(EC.element_to_be_clickable((By.ID, &quot;q&quot;)))
+el.send_keys(&quot;after wait&quot;)
+print(&quot;after WebDriverWait:&quot;, el.get_attribute(&quot;value&quot;))
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>immediately: ElementNotInteractableException: element not interactable
+after WebDriverWait: after wait</code></pre>
+<p>If the page reveals the element with JavaScript (after an animation, an AJAX call, or a click that opens a modal), acting immediately fails. <code>WebDriverWait(driver, 5).until(EC.element_to_be_clickable(locator))</code> polls until the element is displayed and enabled, then returns it. <code>time.sleep()</code> also works but is slower and still flaky.</p>
+<h2 id="which">4. What exactly counts as "not interactable" (measured)</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+d = driver()
+d.get(page(&#x27;&#x27;&#x27;&lt;div id=&quot;plain&quot;&gt;text&lt;/div&gt;
+&lt;input id=&quot;zero&quot; style=&quot;width:0;height:0;border:0;padding:0&quot;&gt;
+&lt;input id=&quot;off&quot; style=&quot;position:absolute;left:-9999px&quot;&gt;
+&lt;input id=&quot;dis&quot; disabled&gt;
+&lt;input id=&quot;ro&quot; readonly&gt;
+&lt;input id=&quot;hid&quot; style=&quot;visibility:hidden&quot;&gt;
+&lt;input id=&quot;op&quot; style=&quot;opacity:0&quot;&gt;&#x27;&#x27;&#x27;))
+for id_ in [&quot;plain&quot;, &quot;zero&quot;, &quot;off&quot;, &quot;dis&quot;, &quot;ro&quot;, &quot;hid&quot;, &quot;op&quot;]:
+    el = d.find_element(By.ID, id_)
+    try:
+        el.send_keys(&quot;x&quot;)
+        r = &quot;OK value=%r&quot; % el.get_attribute(&quot;value&quot;)
+    except Exception as e:
+        r = type(e).__name__ + &quot;: &quot; + e.msg.splitlines()[0]
+    print(f&quot;{id_:5} displayed={el.is_displayed()!s:5} enabled={el.is_enabled()!s:5} -&gt; {r}&quot;)
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>plain displayed=True  enabled=True  -&gt; ElementNotInteractableException: element not interactable
+zero  displayed=False enabled=True  -&gt; OK value=&#x27;x&#x27;
+off   displayed=False enabled=True  -&gt; OK value=&#x27;x&#x27;
+dis   displayed=True  enabled=False -&gt; ElementNotInteractableException: element not interactable
+ro    displayed=True  enabled=True  -&gt; OK value=&#x27;&#x27;
+hid   displayed=False enabled=True  -&gt; ElementNotInteractableException: element not interactable
+op    displayed=False enabled=True  -&gt; OK value=&#x27;x&#x27;</code></pre>
+<p>Chrome raises the error for <code>send_keys()</code> into a plain <code>&lt;div&gt;</code> (it is not an input or <code>contenteditable</code>, so send keys to the input inside it instead), for <code>disabled</code> inputs and for <code>visibility:hidden</code>. It does <em>not</em> raise for a zero-size, off-screen or <code>opacity:0</code> input, even though <code>is_displayed()</code> is <code>False</code> for those: the text is typed. A <code>readonly</code> input raises nothing either, but the value stays empty, so check <code>get_attribute("value")</code> after typing.</p>
+<h2 id="checklist">5. Checklist</h2>
+<ul><li>Print <code>len(driver.find_elements(by, value))</code> and each <code>is_displayed()</code>: a hidden duplicate is the usual culprit.</li><li>Wait with <code>EC.element_to_be_clickable</code> for content that appears later.</li><li>Target the real <code>&lt;input&gt;</code>, not its wrapper <code>&lt;div&gt;</code> or <code>&lt;label&gt;</code>.</li><li>If the element is inside an <code>&lt;iframe&gt;</code>, <code>find_element</code> raises <code>NoSuchElementException</code> instead; switch with <code>driver.switch_to.frame(...)</code> first.</li><li>Avoid <code>execute_script("arguments[0].click()")</code> as a fix: it clicks things a user cannot, so the test no longer checks what a user sees.</li></ul>
+
+<aside class="cta"><strong>Check the status code and headers of the page your test loads:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes element not interactable in Selenium?</summary><p>The element exists but cannot receive input: it is display:none or visibility:hidden, disabled, not yet shown by JavaScript, or not an input at all (e.g. a div). Often the locator matched a hidden duplicate first.</p></details>
+<details><summary>How do I fix ElementNotInteractableException?</summary><p>Check how many elements your locator matches and pick the visible one, wait with WebDriverWait and EC.element_to_be_clickable, and send keys to the actual input element.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Selenium 4.51.0 (Python 3.13.5) and headless Chrome for Testing 156.0.8078.4. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python, Selenium and Chrome are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

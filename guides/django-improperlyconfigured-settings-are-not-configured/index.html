@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Django ImproperlyConfigured: Settings Are Not Configured</title>
+<meta name="description" content="Django &#x27;settings are not configured&#x27; tested on 6.1.2: DJANGO_SETTINGS_MODULE in scripts, Apps aren&#x27;t loaded yet, django.setup() order, and import paths.">
+<link rel="canonical" href="https://honestkit.github.io/guides/django-improperlyconfigured-settings-are-not-configured/">
+<meta property="og:title" content="Django ImproperlyConfigured: Settings Are Not Configured">
+<meta property="og:description" content="Django &#x27;settings are not configured&#x27; tested on 6.1.2: DJANGO_SETTINGS_MODULE in scripts, Apps aren&#x27;t loaded yet, django.setup() order, and import paths.">
+<meta property="og:url" content="https://honestkit.github.io/guides/django-improperlyconfigured-settings-are-not-configured/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I fix 'settings are not configured' in a standalone script?", "acceptedAnswer": {"@type": "Answer", "text": "Set os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'mysite.settings') and call django.setup() before importing models, or turn the script into a management command."}}, {"@type": "Question", "name": "What does 'Apps aren't loaded yet' mean?", "acceptedAnswer": {"@type": "Answer", "text": "Models were imported before django.setup() populated the app registry. Call django.setup() first."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Django settings are not configured (tested)</h1>
+<p class="lead"><code>ImproperlyConfigured: Requested setting X, but settings are not configured</code> means code touched Django settings outside <code>manage.py</code> without <code>DJANGO_SETTINGS_MODULE</code>. Set it, call <code>django.setup()</code>, then import models.</p>
+<h2 id="setup">Setup</h2>
+<p>A project at <code>/w/proj</code> with <code>mysite/settings.py</code> and an app <code>blog</code> with one model:</p>
+<pre><code>SECRET_KEY = &#x27;dev-only&#x27;
+INSTALLED_APPS = [&#x27;django.contrib.contenttypes&#x27;, &#x27;blog&#x27;]
+DATABASES = {&#x27;default&#x27;: {&#x27;ENGINE&#x27;: &#x27;django.db.backends.sqlite3&#x27;, &#x27;NAME&#x27;: &#x27;:memory:&#x27;}}</code></pre>
+<pre><code>from django.db import models
+class Post(models.Model):
+    title = models.CharField(max_length=100)</code></pre>
+<h2 id="repro">1. Reproduce it: a script that touches settings</h2>
+<pre><code>import sys; sys.path.insert(0, &#x27;/w/proj&#x27;)
+# a standalone script, run with: python b1.py   (no manage.py, no env var)
+from django.conf import settings
+try:
+    print(settings.DEBUG)
+except Exception as e:
+    print(type(e).__module__ + &#x27;.&#x27; + type(e).__name__ + &#x27;:&#x27;, e)</code></pre>
+<p>Output:</p>
+<pre><code>django.core.exceptions.ImproperlyConfigured: Requested setting DEBUG, but settings are not configured. You must either define the environment variable DJANGO_SETTINGS_MODULE or call settings.configure() before accessing settings.</code></pre>
+<p><code>manage.py</code> sets <code>DJANGO_SETTINGS_MODULE</code> for you. A plain script, a Jupyter notebook, a test runner started directly, or a Celery worker does not, so the first access to <code>settings</code> (often indirectly, through a Django import) raises this error.</p>
+<h2 id="apps">2. Next error: Apps aren't loaded yet</h2>
+<pre><code>import os, sys; sys.path.insert(0, &#x27;/w/proj&#x27;)
+os.environ[&#x27;DJANGO_SETTINGS_MODULE&#x27;] = &#x27;mysite.settings&#x27;
+# settings are found now, but django.setup() was never called
+try:
+    from blog.models import Post
+except Exception as e:
+    print(type(e).__module__ + &#x27;.&#x27; + type(e).__name__ + &#x27;:&#x27;, e)</code></pre>
+<p>Output:</p>
+<pre><code>django.core.exceptions.AppRegistryNotReady: Apps aren&#x27;t loaded yet.</code></pre>
+<p>Setting the variable is not enough to import models: the app registry is only filled by <code>django.setup()</code>. Importing <code>blog.models</code> before that raises <code>AppRegistryNotReady</code>.</p>
+<h2 id="fix">3. Fix: set the variable, call django.setup(), then import models</h2>
+<pre><code>import os, sys; sys.path.insert(0, &#x27;/w/proj&#x27;)
+os.environ.setdefault(&#x27;DJANGO_SETTINGS_MODULE&#x27;, &#x27;mysite.settings&#x27;)
+import django
+django.setup()                       # must run before importing models
+from blog.models import Post
+print(Post._meta.label, Post._meta.db_table)</code></pre>
+<p>Output:</p>
+<pre><code>blog.Post blog_post</code></pre>
+<p>Order matters: <code>os.environ.setdefault(...)</code>, <code>django.setup()</code>, and only then imports of models or anything that imports them. For one-off jobs, a <a href="https://docs.djangoproject.com/en/stable/howto/custom-management-commands/">custom management command</a> (<code>python manage.py mycommand</code>) avoids all of this, and <code>python manage.py shell</code> is already set up. For pytest, <code>pytest-django</code> reads <code>DJANGO_SETTINGS_MODULE</code> from <code>pytest.ini</code>.</p>
+<h2 id="path">4. The variable is set but the module is not importable</h2>
+<pre><code>import os, sys, subprocess; sys.path.insert(0, &#x27;/w/proj&#x27;)
+code = &quot;import django; django.setup(); print(&#x27;ok&#x27;)&quot;
+for value in [&#x27;mysite.setting&#x27;, &#x27;settings&#x27;]:     # typo / wrong package level
+    p = subprocess.run([sys.executable, &#x27;-c&#x27;, code], capture_output=True, text=True,
+                       env={**os.environ, &#x27;DJANGO_SETTINGS_MODULE&#x27;: value, &#x27;PYTHONPATH&#x27;: &#x27;/w/proj&#x27;})
+    print(value, &#x27;-&gt;&#x27;, p.stderr.strip().splitlines()[-1])</code></pre>
+<p>Output:</p>
+<pre><code>mysite.setting -&gt; ModuleNotFoundError: No module named &#x27;mysite.setting&#x27;
+settings -&gt; ModuleNotFoundError: No module named &#x27;settings&#x27;</code></pre>
+<p>The value is a Python import path, resolved against <code>sys.path</code>: <code>mysite.settings</code> needs the directory that contains <code>mysite/</code> (the one with <code>manage.py</code>) on the path. A typo or a path one level too deep gives <code>ModuleNotFoundError</code>, not <code>ImproperlyConfigured</code>.</p>
+<h2 id="checklist">Checklist</h2>
+<ol>
+<li>Running via <code>manage.py</code>? If not, set <code>DJANGO_SETTINGS_MODULE</code> (or call <code>settings.configure()</code> for a settings-free script).</li>
+<li>Call <code>django.setup()</code> before importing models.</li>
+<li>Make sure the project root is the working directory or on <code>PYTHONPATH</code>.</li>
+</ol>
+
+<aside class="cta"><strong>Once it runs, check the headers your Django app actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I fix &#x27;settings are not configured&#x27; in a standalone script?</summary><p>Set os.environ.setdefault(&#x27;DJANGO_SETTINGS_MODULE&#x27;, &#x27;mysite.settings&#x27;) and call django.setup() before importing models, or turn the script into a management command.</p></details>
+<details><summary>What does &#x27;Apps aren&#x27;t loaded yet&#x27; mean?</summary><p>Models were imported before django.setup() populated the app registry. Call django.setup() first.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Django 6.1.2 and Python 3.14.7 (python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Django are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

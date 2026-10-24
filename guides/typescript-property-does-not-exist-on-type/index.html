@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TS2339: Property Does Not Exist on Type (Tested Fixes)</title>
+<meta name="description" content="We reproduced TS2339 for typos, union types, and unknown vs any, plus the replaceAll/lib case. Exact TypeScript 7 error text for each.">
+<link rel="canonical" href="https://honestkit.github.io/guides/typescript-property-does-not-exist-on-type/">
+<meta property="og:title" content="TS2339: Property Does Not Exist on Type (Tested Fixes)">
+<meta property="og:description" content="We reproduced TS2339 for typos, union types, and unknown vs any, plus the replaceAll/lib case. Exact TypeScript 7 error text for each.">
+<meta property="og:url" content="https://honestkit.github.io/guides/typescript-property-does-not-exist-on-type/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is 'property does not exist on type' always TS2339?", "acceptedAnswer": {"@type": "Answer", "text": "No. In our tests, a plain missing property and a union type missing it on one member both gave TS2339. But unknown gave TS18046, and a missing-in-this-lib standard method (like replaceAll on an old target) gave TS2550, with a different message pointing at target/lib."}}, {"@type": "Question", "name": "Why does TypeScript let me call a method on any but not unknown?", "acceptedAnswer": {"@type": "Answer", "text": "any opts out of type checking entirely, so we measured zero errors calling toUpperCase() on a value typed any. unknown is the safe version: it blocked the same call with TS18046 until we added a typeof check to narrow it."}}, {"@type": "Question", "name": "Why does TypeScript say replaceAll does not exist on string when it works at runtime?", "acceptedAnswer": {"@type": "Answer", "text": "In our test this was TS2550, caused by target: ES2020 (or lower), which also sets an older default lib. replaceAll's type declarations were added in ES2021's lib. Raising target to ES2021+, or adding ES2021 to an explicit lib array, fixed it with no code changes."}}, {"@type": "Question", "name": "How do I fix TS2339 on a union type?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed narrowing fixes it: add a check (we used a discriminant field, a.kind === 'cat') before accessing a property that only some union members have, and TypeScript allows the access inside that branch."}}, {"@type": "Question", "name": "Does a typo in a property name always get caught at compile time?", "acceptedAnswer": {"@type": "Answer", "text": "Only if the value has a known type. In our any test, a typo'd property name on an any-typed value compiled with zero errors; it would only surface as a runtime TypeError. Typed values (interfaces, unions, string, etc.) are what TS2339 protects."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TS2339 Property does not exist on type (tested)</h1>
+<p class="lead"><code>error TS2339: Property 'X' does not exist on type 'Y'</code> fires whenever you access a property TypeScript can't find on a value's declared type. The usual cause is a typo, but the same wording also shows up for union types where only some members have the property, and for a stale <code>lib</code> setting that hides real standard-library methods. We reproduced four distinct cases in a real TypeScript 7 project and recorded the exact text tsc prints for each.</p>
+<h2>1. A genuine typo or undeclared property</h2>
+<p>The plain case: the property was never declared.</p>
+<pre><code>interface User {
+  id: number;
+  name: string;
+}
+const u: User = { id: 1, name: "Ada" };
+console.log(u.nmae);</code></pre>
+<p>tsc printed:</p>
+<pre><code>s1.ts(6,15): error TS2339: Property 'nmae' does not exist on type 'User'.</code></pre>
+<p><strong>Fix:</strong> this is almost always a typo (compare against the interface) or a property you forgot to add to the type. Editors with TypeScript language-service support usually offer an autocomplete-based spelling suggestion right at the error location.</p>
+
+<h2>2. Union types: only some members have the property</h2>
+<p>We declared two interfaces that share a discriminant but not their methods, then called a method that only one of them has:</p>
+<pre><code>interface Cat { kind: "cat"; meow(): void; }
+interface Dog { kind: "dog"; bark(): void; }
+function speak(a: Cat | Dog) {
+  a.meow();
+}</code></pre>
+<p>tsc printed a TS2339 that also names the specific union member missing the property:</p>
+<pre><code>s2.ts(4,5): error TS2339: Property 'meow' does not exist on type 'Cat | Dog'.
+  Property 'meow' does not exist on type 'Dog'.</code></pre>
+<p><strong>Fix:</strong> narrow the union before accessing the property. We added a check on the shared discriminant field and the same code compiled clean:</p>
+<pre><code>function speak(a: Cat | Dog) {
+  if (a.kind === "cat") {
+    a.meow();
+  } else {
+    a.bark();
+  }
+}
+// tsc: no errors</code></pre>
+<p>A <code>typeof</code> check, an <code>instanceof</code> check, or a user-defined type guard works the same way &mdash; TypeScript narrows the union inside each branch so only the members that actually have the property are reachable.</p>
+
+<h2>3. unknown vs any: not the same error</h2>
+<p>These two "escape hatch" types behave completely differently, and the mix-up is common enough to measure directly:</p>
+<pre><code>function f(x: unknown, y: any) {
+  console.log(x.toUpperCase());
+  console.log(y.toUpperCase());
+}</code></pre>
+<p>tsc flagged only the <code>unknown</code> line, and with a different error code &mdash; not TS2339:</p>
+<pre><code>s3.ts(2,15): error TS18046: 'x' is of type 'unknown'.</code></pre>
+<p>The <code>y.toUpperCase()</code> line produced <strong>no error at all</strong>. <code>any</code> opts a value out of type checking entirely, so every property access is allowed, correct or not &mdash; it will only fail at runtime if the property genuinely isn't there. <code>unknown</code> is the type-safe alternative: it allows a value of any shape to flow in, but blocks every operation on it (TS18046, not TS2339) until you narrow it. Adding a <code>typeof</code> check fixed it:</p>
+<pre><code>function f(x: unknown) {
+  if (typeof x === "string") {
+    console.log(x.toUpperCase());
+  }
+}
+// tsc: no errors</code></pre>
+<p>If you're searching for "property does not exist" on an <code>unknown</code> value and not finding your exact wording, check for TS18046 instead &mdash; it's the code unknown actually produces.</p>
+
+<h2>4. replaceAll "does not exist": usually a lib/target problem, not a typo</h2>
+<p>This is the case behind a lot of searches for this exact error on <code>String.prototype.replaceAll</code>. We compiled this with an older target:</p>
+<pre><code>const s: string = "a,b,c";
+console.log(s.replaceAll(",", "-"));</code></pre>
+<pre><code>npx tsc --target ES2020 --noEmit s4.ts
+s4.ts(2,15): error TS2550: Property 'replaceAll' does not exist on type 'string'. Do you need to change your target library? Try changing the 'lib' compiler option to 'es2021' or later.</code></pre>
+<p>Note the code: <strong>TS2550</strong>, not TS2339, and the message tells you the fix directly. <code>replaceAll</code> was added to the standard library's type definitions in ES2021. With an older <code>target</code> (which also sets the default <code>lib</code>), TypeScript's bundled type definitions simply don't declare that method, so it looks exactly like a missing property even though the method exists at runtime in any modern JS engine. Two fixes, both confirmed clean:</p>
+<pre><code>npx tsc --target ES2021 --noEmit s4.ts
+// no errors
+
+npx tsc --target ES2020 --lib ES2021,DOM --noEmit s4.ts
+// no errors</code></pre>
+<p>In a real project, set this once in <code>tsconfig.json</code> (<code>"target": "ES2021"</code> or higher, or an explicit <code>"lib"</code> array that includes <code>"ES2021"</code>) rather than per compile.</p>
+
+<h2>5. Quick checklist</h2>
+<ul>
+<li>Single declared type, property genuinely missing &rarr; plain TS2339. Check spelling and the type's declaration.</li>
+<li>Union type, property exists on only some members &rarr; TS2339 naming the specific member that lacks it. Fix with a discriminant check, <code>typeof</code>, <code>instanceof</code>, or a type guard.</li>
+<li><code>unknown</code> &rarr; blocked with <strong>TS18046</strong>, not TS2339. Narrow the type first.</li>
+<li><code>any</code> &rarr; no error at all, ever, from the type checker. It can still throw at runtime.</li>
+<li>A standard-library method (like <code>replaceAll</code>, <code>Array.at</code>, or similar newer additions) reported missing &rarr; check <code>target</code>/<code>lib</code> in tsconfig before assuming it's a real typo. tsc often names the fix in the message itself (<strong>TS2550</strong>).</li>
+</ul>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is &#x27;property does not exist on type&#x27; always TS2339?</summary><p>No. In our tests, a plain missing property and a union type missing it on one member both gave TS2339. But unknown gave TS18046, and a missing-in-this-lib standard method (like replaceAll on an old target) gave TS2550, with a different message pointing at target/lib.</p></details>
+<details><summary>Why does TypeScript let me call a method on any but not unknown?</summary><p>any opts out of type checking entirely, so we measured zero errors calling toUpperCase() on a value typed any. unknown is the safe version: it blocked the same call with TS18046 until we added a typeof check to narrow it.</p></details>
+<details><summary>Why does TypeScript say replaceAll does not exist on string when it works at runtime?</summary><p>In our test this was TS2550, caused by target: ES2020 (or lower), which also sets an older default lib. replaceAll&#x27;s type declarations were added in ES2021&#x27;s lib. Raising target to ES2021+, or adding ES2021 to an explicit lib array, fixed it with no code changes.</p></details>
+<details><summary>How do I fix TS2339 on a union type?</summary><p>We confirmed narrowing fixes it: add a check (we used a discriminant field, a.kind === &#x27;cat&#x27;) before accessing a property that only some union members have, and TypeScript allows the access inside that branch.</p></details>
+<details><summary>Does a typo in a property name always get caught at compile time?</summary><p>Only if the value has a known type. In our any test, a typo&#x27;d property name on an any-typed value compiled with zero errors; it would only surface as a runtime TypeError. Typed values (interfaces, unions, string, etc.) are what TS2339 protects.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with TypeScript 7.0.2 (local npm install, not npx), Node.js 24.21.0 on Linux. Each scenario is its own minimal .ts file compiled with tsc and explicit flags; all error text below is copy-pasted from real tsc runs. PlainHeaders is our extension; curl, Python, Node.js and TypeScript are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

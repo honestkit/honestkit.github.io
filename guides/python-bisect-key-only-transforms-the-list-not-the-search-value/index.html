@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bisect&#x27;s key= Doesn&#x27;t Transform the Value You&#x27;re Searching For</title>
+<meta name="description" content="We measured Python 3.13.5: bisect_left(a, x, key=f) applies f() to every element of a, never to x -- the wrong form of x errors, or gives a wrong index.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-bisect-key-only-transforms-the-list-not-the-search-value/">
+<meta property="og:title" content="bisect&#x27;s key= Doesn&#x27;t Transform the Value You&#x27;re Searching For">
+<meta property="og:description" content="We measured Python 3.13.5: bisect_left(a, x, key=f) applies f() to every element of a, never to x -- the wrong form of x errors, or gives a wrong index.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-bisect-key-only-transforms-the-list-not-the-search-value/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does bisect's key= parameter transform the value you're searching for?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured key() being called on every element of the list being searched, but never on x, the search value itself. x must already be in the same form key() would produce."}}, {"@type": "Question", "name": "Why does bisect.bisect_left(data, 'kiwi', key=len) raise TypeError?", "acceptedAnswer": {"@type": "Answer", "text": "Because key=len transforms each list element into its length (an int), and bisect then compares the raw string 'kiwi' directly against those ints -- we measured this raising \"'<' not supported between instances of 'int' and 'str'\", since bisect never applies len() to the search value."}}, {"@type": "Question", "name": "What happens if the untransformed search value is the same type as the key's output?", "acceptedAnswer": {"@type": "Answer", "text": "No error, but a silently wrong result -- we measured passing seconds (1200) into a list keyed by minutes returning a different, incorrect insertion index than passing the correctly-converted value (20), with nothing flagging the mismatch."}}, {"@type": "Question", "name": "How do you correctly search a bisect list that uses key=?", "acceptedAnswer": {"@type": "Answer", "text": "Convert your search value into the same space the key function produces before passing it -- we measured bisect_left(data, len('kiwi'), key=len) working correctly, versus bisect_left(data, 'kiwi', key=len) raising TypeError."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>bisect: key= Only Transforms the List, Never the Search Value (tested)</h1>
+<p class="lead"><code>bisect.bisect_left(a, x, key=f)</code> (added in Python 3.10) looks like it would transform both sides of the comparison the same way <code>sorted(data, key=f)</code> or <code>min(data, key=f)</code> do. We measured exactly which side the key function actually runs on.</p>
+<h2 id="repro1">1. key() runs on every element of the list -- but never on x itself</h2>
+<pre><code>import bisect
+
+data = sorted(["fig", "kiwi", "apple", "mango"], key=len)
+print(data, [len(s) for s in data])
+
+# x=4 is already "in key-space" -- it's a length, not a string
+idx = bisect.bisect_left(data, 4, key=len)
+print(idx)</code></pre>
+<pre><code>['fig', 'kiwi', 'apple', 'mango'] [3, 4, 5, 5]
+1</code></pre>
+<p><strong>Measured:</strong> this only works because <code>4</code> is passed in already transformed -- it's compared directly against each element's <code>len()</code>, not run through <code>len()</code> itself. Nothing about the call makes that obvious; <code>key=len</code> reads as "use lengths for comparison" on both sides.</p>
+
+<h2 id="repro2">2. Pass the search value in its "natural", untransformed form and it errors</h2>
+<pre><code>import bisect
+
+data = sorted(["fig", "kiwi", "apple", "mango"], key=len)
+
+try:
+    bisect.bisect_left(data, "kiwi", key=len)
+except TypeError as e:
+    print("error:", e)</code></pre>
+<pre><code>error: &apos;&lt;&apos; not supported between instances of &apos;int&apos; and &apos;str&apos;
+</code></pre>
+<p><strong>Measured:</strong> passing the string <code>"kiwi"</code> -- the natural thing to search for in a list of strings -- raises <code>TypeError</code>, because <code>bisect</code> compares it directly against the <code>int</code> lengths produced by <code>key()</code> on each list element. The fix is to pass <code>len("kiwi")</code>, not <code>"kiwi"</code>.</p>
+
+<h2 id="repro3">3. If the wrong value happens to be the same type, there's no error at all -- just a wrong index</h2>
+<pre><code>import bisect
+
+events = [{"name": "a", "minute": 5}, {"name": "b", "minute": 12}, {"name": "c", "minute": 40}]
+
+correct = bisect.bisect_left(events, 20, key=lambda e: e["minute"])
+print("x already in minutes:", correct)
+
+mistake = bisect.bisect_left(events, 20 * 60, key=lambda e: e["minute"])  # meant minute=20, passed seconds
+print("x in seconds, key extracts minutes:", mistake)</code></pre>
+<pre><code>x already in minutes: 2
+x in seconds, key extracts minutes: 3</code></pre>
+<p><strong>Measured:</strong> passing <code>1200</code> (20 minutes in seconds) where the key function extracts plain minutes doesn't raise anything -- both sides are <code>int</code>, so the comparison just runs and returns a different, wrong insertion index (<code>3</code> instead of <code>2</code>). There's no type mismatch to catch here, so this version of the mistake is silent.</p>
+<aside class="cta"><strong>Using bisect&#x27;s key= parameter to search a list of objects? Check what you&#x27;re passing as the search value -- key() never runs on it:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does bisect&#x27;s key= parameter transform the value you&#x27;re searching for?</summary><p>No -- we measured key() being called on every element of the list being searched, but never on x, the search value itself. x must already be in the same form key() would produce.</p></details>
+<details><summary>Why does bisect.bisect_left(data, &#x27;kiwi&#x27;, key=len) raise TypeError?</summary><p>Because key=len transforms each list element into its length (an int), and bisect then compares the raw string &#x27;kiwi&#x27; directly against those ints -- we measured this raising &quot;&#x27;&lt;&#x27; not supported between instances of &#x27;int&#x27; and &#x27;str&#x27;&quot;, since bisect never applies len() to the search value.</p></details>
+<details><summary>What happens if the untransformed search value is the same type as the key&#x27;s output?</summary><p>No error, but a silently wrong result -- we measured passing seconds (1200) into a list keyed by minutes returning a different, incorrect insertion index than passing the correctly-converted value (20), with nothing flagging the mismatch.</p></details>
+<details><summary>How do you correctly search a bisect list that uses key=?</summary><p>Convert your search value into the same space the key function produces before passing it -- we measured bisect_left(data, len(&#x27;kiwi&#x27;), key=len) working correctly, versus bisect_left(data, &#x27;kiwi&#x27;, key=len) raising TypeError.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in bisect module: called bisect_left() with key= and compared passing a pre-transformed search value against passing the raw, untransformed one. PlainHeaders is our extension; Python&#x27;s bisect module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

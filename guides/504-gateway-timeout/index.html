@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>504 Gateway Timeout: Causes and Fixes (Tested)</title>
+<meta name="description" content="We put a 2 s proxy in front of a 5 s upstream: 504 after 2.01 s, while the upstream kept working for 3 more seconds. Plus 504 vs 408 vs curl error 28, and the default timeouts of nginx, Cloudflare and AWS.">
+<link rel="canonical" href="https://honestkit.github.io/guides/504-gateway-timeout/">
+<meta property="og:title" content="504 Gateway Timeout: Causes and Fixes (Tested)">
+<meta property="og:description" content="We put a 2 s proxy in front of a 5 s upstream: 504 after 2.01 s, while the upstream kept working for 3 more seconds. Plus 504 vs 408 vs curl error 28, and the default timeouts of nginx, Cloudflare and AWS.">
+<meta property="og:url" content="https://honestkit.github.io/guides/504-gateway-timeout/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is a 504 my server's fault or the proxy's?", "acceptedAnswer": {"@type": "Answer", "text": "The proxy produced it, but the cause is almost always the server behind it being too slow or unreachable. In our test the proxy answered 504 after 2.01 s because the upstream needed 5 s."}}, {"@type": "Question", "name": "Did my request still run if I got a 504?", "acceptedAnswer": {"@type": "Answer", "text": "Often yes. In our test the upstream finished its work 3 seconds after the proxy had already returned 504. Check before you retry anything that writes data."}}, {"@type": "Question", "name": "What is the difference between 504 and 408?", "acceptedAnswer": {"@type": "Answer", "text": "504: a proxy waited for the server behind it. 408: the server waited for the client to finish sending the request. A client-side timeout gives no status at all, for example curl exit 28 or a TimeoutError from fetch."}}, {"@type": "Question", "name": "Why does Cloudflare show 524 instead of 504?", "acceptedAnswer": {"@type": "Answer", "text": "From Cloudflare's docs, not measured: 524 is Cloudflare's own code for an origin that did not answer within its 100 second limit. It means the same kind of thing as a 504."}}, {"@type": "Question", "name": "What is the best fix for long requests?", "acceptedAnswer": {"@type": "Answer", "text": "Return 202 Accepted with a job URL and let the client poll. Raising timeouts at every hop or streaming early can help, but async work removes the limit entirely."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>504 Gateway Timeout (tested)</h1>
+<p class="lead"><code>504 Gateway Timeout</code> means a proxy, load balancer or CDN waited for the server behind it and gave up. The server you talk to is fine. The one behind it was too slow. We built one on this box and timed it.</p>
+<h2>1. The setup</h2>
+<p>Three small Node.js processes. An upstream that waits 5 seconds before it answers. A reverse proxy that forwards to it and gives up after 2 seconds. And a plain server with short client timeouts, for the 408 comparison.</p>
+<pre><code>// proxy.js (port 8986) - the important part
+const u = http.request({host: '127.0.0.1', port: 8987, path: req.url, method: req.method, headers: req.headers}, up =&gt; {
+  res.writeHead(up.statusCode, up.headers); up.pipe(res);
+});
+u.setTimeout(2000, () =&gt; {           // upstream timeout
+  u.destroy();
+  res.writeHead(504, {'content-type': 'text/plain', 'via': '1.1 tiny-proxy'});
+  res.end('504 Gateway Timeout: upstream did not answer in 2s\n');
+});</code></pre>
+
+<h2>2. What the proxy returns</h2>
+<pre><code>$ curl -si -w 'time_total=%{time_total}\n' 'http://127.0.0.1:8986/report?ms=5000'
+HTTP/1.1 504 Gateway Timeout
+content-type: text/plain
+via: 1.1 tiny-proxy
+Connection: keep-alive
+Keep-Alive: timeout=5
+Transfer-Encoding: chunked
+
+504 Gateway Timeout: upstream did not answer in 2s
+time_total=2.012901</code></pre>
+<p>The client got a 504 after 2.01 s, not after 5 s. A request that the upstream answers in 0.5 s went through the same proxy fine: <code>200 OK</code>, <code>time_total=0.506641</code>.</p>
+<p>The body and headers of a 504 come from the proxy, not from your app. The <code>Via</code> or <code>Server</code> header often tells you which hop produced it. See <a href="/guides/via-header/">the Via header guide</a>.</p>
+
+<h2>3. The upstream keeps working after the proxy gives up</h2>
+<p>This is the part people miss. The upstream log from the same run:</p>
+<pre><code>[upstream] start /report?ms=5000 02:39:17.100Z
+[proxy] upstream timeout after 2008ms -&gt; 504
+[upstream] finished /report?ms=5000 after 5003ms (socket destroyed=true)</code></pre>
+<p>The proxy closed the connection at 2 s. The upstream did not notice. It kept running for 3 more seconds and then wrote its answer into a dead socket. That is wasted work. If the request was "charge the card" or "send the email", it may still have happened, even though the client saw an error. If the client retries, it can happen twice.</p>
+<p>Node does not stop your handler when the client goes away. To stop early, listen for <code>req.on('close')</code> or check <code>res.destroyed</code> / <code>req.socket.destroyed</code> and abort the work yourself.</p>
+
+<h2>4. 504 vs 408 vs a client-side timeout</h2>
+<p>Three different things time out in three different places. We triggered each one.</p>
+<table>
+<tr><th>What happened</th><th>Who waited</th><th>What the client sees (measured)</th></tr>
+<tr><td>Proxy waited for upstream</td><td>The proxy</td><td><code>504 Gateway Timeout</code> after 2.01 s</td></tr>
+<tr><td>Server waited for the client to finish sending the request</td><td>The server</td><td><code>408 Request Timeout</code>, <code>Connection: close</code></td></tr>
+<tr><td>Client gave up first (<code>curl --max-time 1</code>)</td><td>The client</td><td>No status at all. <code>http_code=000</code>, curl exit 28, after 1.00 s</td></tr>
+<tr><td>Client gave up first (Node <code>fetch</code> + <code>AbortSignal.timeout(1000)</code>)</td><td>The client</td><td>No status. <code>TimeoutError: The operation was aborted due to timeout</code> after 1004 ms</td></tr>
+</table>
+<pre><code>$ curl -s -o /dev/null -w 'code=%{http_code} time=%{time_total}\n' --max-time 1 'http://127.0.0.1:8987/x?ms=5000'
+code=000 time=1.001284
+$ echo $?
+28</code></pre>
+<pre><code>// fetch with a timeout
+try { await fetch(url, {signal: AbortSignal.timeout(1000)}) }
+catch (e) { console.log(e.name, e.message) }
+// TimeoutError The operation was aborted due to timeout</code></pre>
+<p>In both client-side cases the upstream again ran its full 5 s (<code>finished after 5001ms</code> and <code>5003ms</code>). Giving up on the client side does not stop the server either.</p>
+<p>For the 408 we opened a socket, sent <code>GET / HTTP/1.1</code> and one header, then never sent the blank line. More on that in <a href="/guides/408-request-timeout/">the 408 guide</a>.</p>
+
+<h2>5. Node.js http.Server defaults (measured)</h2>
+<pre><code>$ node -e "const s=require('http').createServer(); console.log(s.requestTimeout, s.headersTimeout, s.keepAliveTimeout, s.timeout, s.connectionsCheckingInterval)"
+300000 60000 5000 0 30000</code></pre>
+<ul>
+<li><code>requestTimeout</code> 300000 ms (5 min) to receive the whole request from the client.</li>
+<li><code>headersTimeout</code> 60000 ms to receive the headers.</li>
+<li><code>keepAliveTimeout</code> 5000 ms for an idle keep-alive connection. See <a href="/guides/keep-alive-header-connection/">Keep-Alive</a>.</li>
+<li><code>timeout</code> 0: no socket inactivity timeout by default.</li>
+</ul>
+<p>These are about the client being slow, not your handler. Node has no default limit on how long your handler may take to answer.</p>
+<p>One surprise: we set both timeouts to 2000 ms, but the 408 arrived after 10.95 s in one run and 20.02 s in another. Node only checks these timeouts every <code>connectionsCheckingInterval</code> (30000 ms by default). So the real cutoff is the timeout plus up to 30 s.</p>
+
+<h2>6. Common real-world causes</h2>
+<p><strong>From the docs, not measured.</strong> The usual default limits at each hop:</p>
+<table>
+<tr><th>Hop</th><th>Default limit</th><th>What you get</th></tr>
+<tr><td>nginx <code>proxy_read_timeout</code></td><td>60 s between two reads from upstream</td><td>504</td></tr>
+<tr><td>Cloudflare proxy</td><td>100 s for the origin to start answering</td><td>524 (Cloudflare's own code, not 504)</td></tr>
+<tr><td>AWS Application Load Balancer</td><td>60 s idle timeout</td><td>504</td></tr>
+<tr><td>AWS API Gateway (REST, integration timeout)</td><td>29 s</td><td>504</td></tr>
+</table>
+<p>Typical reasons the upstream is slow: a slow database query or lock, a call to a third-party API that hangs, a big report or export done inside the request, a cold start, or the app being out of workers so the request sits in a queue. Sometimes the upstream is just down and the proxy waits for a connect that never completes.</p>
+<p>The shortest timeout in the chain wins. If nginx allows 60 s but API Gateway allows 29 s, a 40 s request fails at 29 s.</p>
+
+<h2>7. Fixes</h2>
+<ol>
+<li><strong>Make long work async.</strong> Answer <code>202 Accepted</code> right away with a job URL. Do the work in the background. The client polls the job URL until it is done. Tell it how often with <code>Retry-After</code> (see <a href="/guides/retry-after-header-429/">Retry-After</a>). This is the real fix for anything that can take more than a few seconds.</li>
+<li><strong>Raise the timeout at every hop</strong>, not just one. App server, nginx, load balancer, CDN, and the client. Each one must be longer than the one behind it. Some limits (like API Gateway's) are hard to raise.</li>
+<li><strong>Stream early.</strong> Send headers and the first bytes quickly, then the rest as it is ready. Many proxies time out on silence between reads, not on total time. Note: once headers are sent, a late failure can no longer become a clean 504.</li>
+<li><strong>Make the slow part faster.</strong> Add an index, cache the result, set a short timeout on your own outbound calls so they fail fast instead of hanging.</li>
+<li><strong>Stop wasted work.</strong> Watch for the client disconnect and cancel. Make retried writes idempotent, because as we measured, the work can finish after the 504.</li>
+</ol>
+<aside class="cta"><strong>Check which proxy or CDN sits in front of your server (look at Via and Server headers):</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is a 504 my server&#x27;s fault or the proxy&#x27;s?</summary><p>The proxy produced it, but the cause is almost always the server behind it being too slow or unreachable. In our test the proxy answered 504 after 2.01 s because the upstream needed 5 s.</p></details>
+<details><summary>Did my request still run if I got a 504?</summary><p>Often yes. In our test the upstream finished its work 3 seconds after the proxy had already returned 504. Check before you retry anything that writes data.</p></details>
+<details><summary>What is the difference between 504 and 408?</summary><p>504: a proxy waited for the server behind it. 408: the server waited for the client to finish sending the request. A client-side timeout gives no status at all, for example curl exit 28 or a TimeoutError from fetch.</p></details>
+<details><summary>Why does Cloudflare show 524 instead of 504?</summary><p>From Cloudflare&#x27;s docs, not measured: 524 is Cloudflare&#x27;s own code for an origin that did not answer within its 100 second limit. It means the same kind of thing as a 504.</p></details>
+<details><summary>What is the best fix for long requests?</summary><p>Return 202 Accepted with a job URL and let the client poll. Raising timeouts at every hop or streaming early can help, but async work removes the limit entirely.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with curl 8.14.1, Node.js 24.21.0 and Python 3 stdlib: a tiny Node reverse proxy on 127.0.0.1:8986 with a 2 s upstream timeout in front of a Node upstream on 127.0.0.1:8987 that sleeps 5 s, plus a Node server on 127.0.0.1:8988 with headersTimeout and requestTimeout set to 2 s. Platform timeouts (nginx, Cloudflare, AWS) are from their docs, not measured. PlainHeaders is our extension; curl, Python and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

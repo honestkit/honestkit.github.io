@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Celery link_error Example: Task and Chain Error Handling (Tested)</title>
+<meta name="description" content="Celery link_error example tested on 5.6: errback signature (request, exc, traceback), old-style task id errbacks, and chain on_error stopping the chain.">
+<link rel="canonical" href="https://honestkit.github.io/guides/celery-link-error-errback-example/">
+<meta property="og:title" content="Celery link_error Example: Task and Chain Error Handling (Tested)">
+<meta property="og:description" content="Celery link_error example tested on 5.6: errback signature (request, exc, traceback), old-style task id errbacks, and chain on_error stopping the chain.">
+<meta property="og:url" content="https://honestkit.github.io/guides/celery-link-error-errback-example/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What arguments does a Celery link_error errback receive?", "acceptedAnswer": {"@type": "Answer", "text": "With the signature (request, exc, traceback) it gets the failed task's request, the exception and the traceback. An errback with a single parameter gets only the failed task id."}}, {"@type": "Question", "name": "Does link_error stop the task from failing?", "acceptedAnswer": {"@type": "Answer", "text": "No. The task still ends in FAILURE and the caller still sees the exception; in a chain, later tasks do not run."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Celery link_error errback example (tested)</h1>
+<p class="lead">Celery's <code>link_error</code> runs an errback task when a task fails. Define it as <code>def on_error(request, exc, traceback)</code>, pass <code>link_error=on_error.s()</code>, and use <code>chain(...).on_error(on_error.s())</code> for chains.</p>
+<h2 id="setup">Setup used in every block</h2>
+<p><code>common.py</code> sets <code>task_always_eager</code> so tasks and their callbacks run inline without a broker, and defines an errback with the current signature, <code>(request, exc, traceback)</code>:</p>
+<pre><code>from celery import Celery
+app = Celery(&#x27;tasks&#x27;)
+app.conf.task_always_eager = True        # run inline: no broker or worker needed here
+@app.task
+def add(x, y):
+    return x + y
+@app.task
+def div(x, y):
+    return x / y
+@app.task
+def on_error(request, exc, traceback):   # errback signature: (request, exc, traceback)
+    print(f&#x27;errback: task {request.task} id={request.id[:8]} failed with {exc!r}&#x27;)</code></pre>
+<h2 id="link-error">1. link_error on a single task</h2>
+<pre><code>from common import *
+r = div.apply_async((1, 0), link_error=on_error.s())
+print(&#x27;state:&#x27;, r.state, &#x27;| result:&#x27;, repr(r.result))</code></pre>
+<p>Output:</p>
+<pre><code>errback: task common.div id=a749705b failed with ZeroDivisionError(&#x27;division by zero&#x27;)
+state: FAILURE | result: ZeroDivisionError(&#x27;division by zero&#x27;)</code></pre>
+<p>Pass the errback as a signature (<code>on_error.s()</code>) in <code>link_error=</code>. When the task raises, Celery calls it with the failed task's <code>request</code> (so you get <code>request.id</code>, <code>request.task</code>, <code>request.args</code>), the exception instance and the traceback. The task itself still ends in <code>FAILURE</code>: an errback reports the error, it does not swallow it.</p>
+<h2 id="old-style">2. Old-style errbacks get only the task id</h2>
+<pre><code>from common import *
+@app.task
+def old_style(task_id):                  # pre-4.0 errback: receives only the parent task id
+    print(&#x27;old-style errback got:&#x27;, task_id[:8])
+div.apply_async((1, 0), link_error=old_style.s())</code></pre>
+<p>Output:</p>
+<pre><code>old-style errback got: 93f5db9c</code></pre>
+<p>Celery checks how many parameters the errback takes. With more than one it calls <code>errback(request, exc, traceback)</code>; with one, it falls back to the pre-4.0 style and passes just the failed task's id, so <code>old_style</code> receives a UUID string. If your errback gets an id where you expected an exception, fix its signature.</p>
+<h2 id="chain">3. Error handling in a chain: on_error()</h2>
+<pre><code>from common import *
+from celery import chain
+@app.task
+def add_loud(x, y):
+    print(f&#x27;add_loud({x}, {y}) ran&#x27;); return x + y
+try:
+    chain(add_loud.s(1, 1), div.s(0), add_loud.s(5)).on_error(on_error.s()).apply_async()
+except ZeroDivisionError as e:
+    print(&#x27;caller sees:&#x27;, repr(e))   # eager mode re-raises; with a worker, .get() would</code></pre>
+<p>Output:</p>
+<pre><code>add_loud(1, 1) ran
+errback: task common.div id=0dbf5a03 failed with ZeroDivisionError(&#x27;division by zero&#x27;)
+caller sees: ZeroDivisionError(&#x27;division by zero&#x27;)</code></pre>
+<p><code>chain(...).on_error(errback)</code> attaches the errback to the chain. When <code>div</code> fails, the errback runs with <code>div</code>'s request, and the rest of the chain (<code>add_loud(5)</code>) never runs. The caller still sees the original exception: in eager mode <code>apply_async()</code> re-raises it; with a worker, <code>result.get()</code> raises it.</p>
+<p>Errbacks run as separate tasks, so with a real worker they need a running worker that has them registered. Keep them small and idempotent: log, alert, or mark a row as failed.</p>
+<p>Related: <a href="/guides/celery-maxretriesexceedederror/">Celery MaxRetriesExceededError</a>, <a href="/guides/celery-error-111-connection-refused/">Celery Error 111 Connection refused</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers of the API your task calls:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What arguments does a Celery link_error errback receive?</summary><p>With the signature (request, exc, traceback) it gets the failed task&#x27;s request, the exception and the traceback. An errback with a single parameter gets only the failed task id.</p></details>
+<details><summary>Does link_error stop the task from failing?</summary><p>No. The task still ends in FAILURE and the caller still sees the exception; in a chain, later tasks do not run.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Celery 5.6.3 and Python 3.14.7 (python:3-alpine in Docker, task_always_eager). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Celery are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

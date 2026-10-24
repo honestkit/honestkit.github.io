@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python base64 binascii.Error: Incorrect padding (Tested Fix)</title>
+<meta name="description" content="We measured Python&#x27;s base64 Incorrect padding error: the one-line padding fix, JWTs and base64url, and inputs that decode to wrong bytes with no error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-base64-binascii-error-incorrect-padding/">
+<meta property="og:title" content="Python base64 binascii.Error: Incorrect padding (Tested Fix)">
+<meta property="og:description" content="We measured Python&#x27;s base64 Incorrect padding error: the one-line padding fix, JWTs and base64url, and inputs that decode to wrong bytes with no error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-base64-binascii-error-incorrect-padding/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I fix binascii.Error: Incorrect padding in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Add the missing = characters: base64.b64decode(s + '=' * (-len(s) % 4)). We measured this fixing 7- and 6-character inputs and leaving padded input unchanged."}}, {"@type": "Question", "name": "Why does decoding a JWT give Incorrect padding?", "acceptedAnswer": {"@type": "Answer", "text": "JWT segments are base64url with the = padding stripped. Add padding and use base64.urlsafe_b64decode; we measured the standard decoder silently dropping bytes on - and _."}}, {"@type": "Question", "name": "What does 'number of data characters cannot be 1 more than a multiple of 4' mean?", "acceptedAnswer": {"@type": "Answer", "text": "The string length is 4n+1, which no valid base64 has. Padding can't fix it; the data was truncated or corrupted."}}, {"@type": "Question", "name": "Can base64.b64decode return wrong data without an error?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We measured a data: URL prefix producing garbage bytes and a + turned into a space losing 3 bytes, both with no error. Pass validate=True to make them raise."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>binascii.Error: Incorrect padding (base64, tested)</h1>
+<p class="lead"><code>binascii.Error: Incorrect padding</code> from <code>base64.b64decode()</code> means the <code>=</code> padding was stripped, usually by a JWT, URL token or API. We measured the fix on Python 3.13.5, plus a trap: padding base64url input and using the standard decoder silently drops bytes.</p>
+<h2 id="why">1. What &ldquo;Incorrect padding&rdquo; actually means</h2>
+<p>Base64 encodes 3 bytes as 4 characters. When the input length isn't a multiple of 3, the encoder pads with <code>=</code> so the output length is a multiple of 4. Many producers (JWTs, URL tokens, some APIs) strip the <code>=</code>. Python's decoder wants it back:</p>
+<pre><code>import base64, binascii
+
+for s in [&quot;aGVsbG8&quot;, &quot;aGVsbG8=&quot;, &quot;aGVsbA&quot;, &quot;aGVsbA==&quot;, &quot;aGVsb&quot;]:
+    try:
+        print(repr(s), &quot;-&gt;&quot;, base64.b64decode(s))
+    except binascii.Error as e:
+        print(repr(s), &quot;-&gt; binascii.Error:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>&#x27;aGVsbG8&#x27; -&gt; binascii.Error: Incorrect padding
+&#x27;aGVsbG8=&#x27; -&gt; b&#x27;hello&#x27;
+&#x27;aGVsbA&#x27; -&gt; binascii.Error: Incorrect padding
+&#x27;aGVsbA==&#x27; -&gt; b&#x27;hell&#x27;
+&#x27;aGVsb&#x27; -&gt; binascii.Error: Invalid base64-encoded string: number of data characters (5) cannot be 1 more than a multiple of 4</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> 7 and 6 characters raise <code>Incorrect padding</code>; adding the missing <code>=</code> decodes them. 5 characters is a different error: a length of 4n+1 can never be valid base64, so padding won't help. That string is truncated or corrupted.</p>
+
+<h2 id="fix">2. Fix: add the missing padding</h2>
+<pre><code>import base64
+
+def b64decode_padded(s):
+    s = s.strip()
+    return base64.b64decode(s + &quot;=&quot; * (-len(s) % 4))
+
+for s in [&quot;aGVsbG8&quot;, &quot;aGVsbA&quot;, &quot;aGVsbG8=&quot;]:
+    print(repr(s), &quot;-&gt;&quot;, b64decode_padded(s))</code></pre>
+<p>Output:</p>
+<pre><code>&#x27;aGVsbG8&#x27; -&gt; b&#x27;hello&#x27;
+&#x27;aGVsbA&#x27; -&gt; b&#x27;hell&#x27;
+&#x27;aGVsbG8=&#x27; -&gt; b&#x27;hello&#x27;</code></pre>
+<p><code>-len(s) % 4</code> is the number of <code>=</code> needed (0 to 3). It's safe on already-padded input, as the third line shows.</p>
+
+<h2 id="jwt">3. JWTs and URL tokens: padding <em>and</em> the URL-safe alphabet</h2>
+<pre><code>import base64, binascii
+
+# JWT segments are base64url without padding
+seg = &quot;eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkrDtnJnIn0&quot;
+for name, fn in [(&quot;b64decode&quot;, base64.b64decode), (&quot;urlsafe_b64decode&quot;, base64.urlsafe_b64decode)]:
+    try:
+        print(name, fn(seg))
+    except binascii.Error as e:
+        print(name, &quot;binascii.Error:&quot;, e)
+
+padded = seg + &quot;=&quot; * (-len(seg) % 4)
+print(&quot;urlsafe + padding:&quot;, base64.urlsafe_b64decode(padded).decode())</code></pre>
+<p>Output:</p>
+<pre><code>b64decode binascii.Error: Incorrect padding
+urlsafe_b64decode binascii.Error: Incorrect padding
+urlsafe + padding: {&quot;sub&quot;:&quot;1234567890&quot;,&quot;name&quot;:&quot;Jörg&quot;}</code></pre>
+<p><strong>Measured:</strong> a JWT payload segment fails with <code>Incorrect padding</code> in both decoders, because JWTs never carry <code>=</code>. With padding added, <code>urlsafe_b64decode</code> works. Don't stop at padding with the standard decoder, though:</p>
+<pre><code>import base64
+
+data = b&quot;\xfb\xff\xbfOK&quot;
+token = base64.urlsafe_b64encode(data).decode().rstrip(&quot;=&quot;)   # how JWTs and URLs carry it
+padded = token + &quot;=&quot; * (-len(token) % 4)
+print(&quot;token:            &quot;, token)
+print(&quot;b64decode:        &quot;, base64.b64decode(padded))
+print(&quot;urlsafe_b64decode:&quot;, base64.urlsafe_b64decode(padded))</code></pre>
+<p>Output:</p>
+<pre><code>token:             -_-_T0s
+b64decode:         b&#x27;OK&#x27;
+urlsafe_b64decode: b&#x27;\xfb\xff\xbfOK&#x27;</code></pre>
+<p><strong>Measured:</strong> after padding, <code>b64decode</code> did not raise. It returned <code>b'OK'</code>, silently dropping the first 3 bytes, because <code>-</code> and <code>_</code> aren't in the standard alphabet and the default decoder discards characters it doesn't know (see <a href="/guides/base64-b64decode-silently-strips-invalid-characters-by-default/">b64decode silently strips invalid characters</a>). Base64url input needs <code>urlsafe_b64decode</code>.</p>
+
+<h2 id="garbage">4. Inputs that decode to the wrong bytes without any error</h2>
+<pre><code>import base64, binascii
+from urllib.parse import unquote_plus
+
+original = b&quot;\xfb\xef\xbehi!&quot;
+s = base64.b64encode(original).decode()
+print(&quot;encoded:&quot;, s)
+
+for label, v in [(&quot;data URL prefix&quot;, &quot;data:text/plain;base64,&quot; + base64.b64encode(b&quot;hello world&quot;).decode()),
+                 (&quot;+ became space (form/query decoding)&quot;, unquote_plus(s)),
+                 (&quot;line breaks (email, PEM)&quot;, s[:4] + &quot;\n&quot; + s[4:])]:
+    try:
+        print(f&quot;{label}: {v!r} -&gt; {base64.b64decode(v)}&quot;)
+    except binascii.Error as e:
+        print(f&quot;{label}: {v!r} -&gt; binascii.Error: {e}&quot;)
+
+print(&quot;validate=True:&quot;, end=&quot; &quot;)
+try:
+    base64.b64decode(unquote_plus(s), validate=True)
+except binascii.Error as e:
+    print(&quot;binascii.Error:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>encoded: ++++aGkh
+data URL prefix: &#x27;data:text/plain;base64,aGVsbG8gd29ybGQ=&#x27; -&gt; b&#x27;u\xabZ\xb5\xecm\xfe\x99Z\x8av\xda\xb1\xee\xb8hello world&#x27;
++ became space (form/query decoding): &#x27;    aGkh&#x27; -&gt; b&#x27;hi!&#x27;
+line breaks (email, PEM): &#x27;++++\naGkh&#x27; -&gt; b&#x27;\xfb\xef\xbehi!&#x27;
+validate=True: binascii.Error: Only base64 data is allowed</code></pre>
+<p><strong>Measured:</strong> a <code>data:</code> URL prefix decodes to 15 garbage bytes followed by the real content. Base64 that went through form or query-string decoding (<code>+</code> becomes a space) silently lost its first 3 bytes. Line breaks are harmless. <code>validate=True</code> turns the silent cases into an error. Strip the <code>data:...;base64,</code> prefix and URL-encode base64 before putting it in a query string.</p>
+
+<aside class="cta"><strong>Decoding tokens from HTTP headers? Check the real headers a server sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I fix binascii.Error: Incorrect padding in Python?</summary><p>Add the missing = characters: base64.b64decode(s + &#x27;=&#x27; * (-len(s) % 4)). We measured this fixing 7- and 6-character inputs and leaving padded input unchanged.</p></details>
+<details><summary>Why does decoding a JWT give Incorrect padding?</summary><p>JWT segments are base64url with the = padding stripped. Add padding and use base64.urlsafe_b64decode; we measured the standard decoder silently dropping bytes on - and _.</p></details>
+<details><summary>What does &#x27;number of data characters cannot be 1 more than a multiple of 4&#x27; mean?</summary><p>The string length is 4n+1, which no valid base64 has. Padding can&#x27;t fix it; the data was truncated or corrupted.</p></details>
+<details><summary>Can base64.b64decode return wrong data without an error?</summary><p>Yes. We measured a data: URL prefix producing garbage bytes and a + turned into a space losing 3 bytes, both with no error. Pass validate=True to make them raise.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: unpadded inputs of 5, 6 and 7 characters, the padding fix, a JWT payload segment, base64url input through both decoders, and data-URL, plus-to-space and line-break inputs with and without validate=True. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

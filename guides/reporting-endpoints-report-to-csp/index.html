@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reporting-Endpoints vs Report-To Header: CSP report-to vs report-uri, Tested in Chrome</title>
+<meta name="description" content="How to send CSP violation reports with Reporting-Endpoints and report-to, measured in Chrome 153: the exact application/reports+json payload versus report-uri&#x27;s application/csp-report, why report-uri is ignored when both are set, the CORS preflight, and why an http:// endpoint or the old Report-To header got no reports.">
+<link rel="canonical" href="https://honestkit.github.io/guides/reporting-endpoints-report-to-csp/">
+<meta property="og:title" content="Reporting-Endpoints vs Report-To Header: CSP report-to vs report-uri, Tested in Chrome">
+<meta property="og:description" content="How to send CSP violation reports with Reporting-Endpoints and report-to, measured in Chrome 153: the exact application/reports+json payload versus report-uri&#x27;s application/csp-report, why report-uri is ignored when both are set, the CORS preflight, and why an http:// endpoint or the old Report-To header got no reports.">
+<meta property="og:url" content="https://honestkit.github.io/guides/reporting-endpoints-report-to-csp/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between CSP report-to and report-uri?", "acceptedAnswer": {"@type": "Answer", "text": "report-uri puts a URL in the policy and POSTs one application/csp-report object per violation. report-to names an endpoint from the Reporting-Endpoints header and POSTs an application/reports+json array of reports with type csp-violation. In Chromium 153 both arrived in well under a second in our headless test."}}, {"@type": "Question", "name": "Should I use both report-uri and report-to?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, as a fallback, but in Chromium 153 only the report-to endpoint received the report; report-uri was ignored when report-to was present."}}, {"@type": "Question", "name": "Why are my report-to reports not arriving?", "acceptedAnswer": {"@type": "Answer", "text": "In our test an http:// endpoint got nothing; it must be HTTPS. A cross-origin endpoint also has to answer the CORS preflight. Real browsers can batch reports for about a minute."}}, {"@type": "Question", "name": "What is the difference between Report-To and Reporting-Endpoints?", "acceptedAnswer": {"@type": "Answer", "text": "Report-To is the older JSON header with group and max_age; Reporting-Endpoints is the current name=\"url\" header. With only Report-To, Chromium 153 sent no CSP report in our test."}}, {"@type": "Question", "name": "What Content-Type do CSP reports use?", "acceptedAnswer": {"@type": "Answer", "text": "application/csp-report for report-uri and application/reports+json for report-to."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Reporting-Endpoints, Report-To and CSP report-to vs report-uri (tested in Chromium)</h1>
+<p class="lead">CSP can send violation reports two ways: the old <code>report-uri</code> directive, or <code>report-to</code> plus a <code>Reporting-Endpoints</code> header. They use different payloads, different rules and different headers. We set up both in Chromium 153 and logged what actually reached the server.</p>
+<h2>1. The headers</h2>
+<pre><code>Reporting-Endpoints: csp="https://example.com/csp-reports"
+Content-Security-Policy: script-src 'self'; report-to csp</code></pre>
+<p><code>Reporting-Endpoints</code> maps a name (<code>csp</code>) to a URL. The CSP <code>report-to</code> directive names the endpoint to use. The older way puts the URL right in the policy:</p>
+<pre><code>Content-Security-Policy: script-src 'self'; report-uri https://example.com/csp-reports</code></pre>
+<h2>2. What arrived, measured</h2>
+<table><thead><tr><th>Setup</th><th>Result in Chromium 153</th></tr></thead><tbody>
+<tr><td><code>report-uri</code> only</td><td>POST in about 0.2 s, <code>Content-Type: application/csp-report</code></td></tr>
+<tr><td><code>Reporting-Endpoints</code> + <code>report-to</code>, HTTPS endpoint</td><td>POST in about 0.2 s, <code>Content-Type: application/reports+json</code> (with and without <code>--short-reporting-delay</code> in our headless run)</td></tr>
+<tr><td>Both <code>report-uri</code> and <code>report-to</code> in one policy</td><td>Only the <code>report-to</code> endpoint got a report. <strong>The report-uri URL got nothing</strong> (waited 30 s).</td></tr>
+<tr><td>Endpoint on another origin</td><td><code>OPTIONS</code> preflight first (<code>Access-Control-Request-Headers: content-type</code>), then the POST</td></tr>
+<tr><td><code>report-to</code> with an <code>http://127.0.0.1</code> endpoint</td><td><strong>No report</strong> in 60 s</td></tr>
+<tr><td>Old <code>Report-To</code> JSON header (no Reporting-Endpoints) + <code>report-to</code></td><td><strong>No report</strong> in 30 s</td></tr>
+</tbody></table>
+<h2>3. The two payloads</h2>
+<p><code>report-uri</code> sends one object per violation, with hyphenated keys:</p>
+<pre><code>Content-Type: application/csp-report
+
+{"csp-report": {"document-uri": "https://localhost:8947/", "referrer": "",
+  "violated-directive": "script-src-elem", "effective-directive": "script-src-elem",
+  "original-policy": "script-src 'none'; report-uri https://localhost:8947/r",
+  "disposition": "enforce", "blocked-uri": "inline", "line-number": 1,
+  "source-file": "https://localhost:8947/", "status-code": 200, "script-sample": ""}}</code></pre>
+<p><code>report-to</code> sends a JSON <strong>array</strong> (reports can be batched), with camelCase keys inside <code>body</code>:</p>
+<pre><code>Content-Type: application/reports+json
+
+[{"age": 0, "type": "csp-violation", "url": "https://localhost:8946/",
+  "user_agent": "Mozilla/5.0 (X11; Linux x86_64) ... HeadlessChrome/153.0.0.0 ...",
+  "body": {"blockedURL": "inline", "disposition": "enforce",
+    "documentURL": "https://localhost:8946/", "effectiveDirective": "script-src-elem",
+    "lineNumber": 1, "originalPolicy": "script-src 'none'; report-to csp",
+    "referrer": "", "sample": "", "sourceFile": "https://localhost:8946/", "statusCode": 200}}]</code></pre>
+<p>So a collector written for <code>report-uri</code> needs changes: accept the new content type, loop over the array, check <code>type</code>, and read the camelCase fields. Note there is no <code>violatedDirective</code>; use <code>effectiveDirective</code>.</p>
+<h2>4. Rules that bit us</h2>
+<ul><li><strong>The endpoint must be HTTPS.</strong> An <code>http://127.0.0.1</code> endpoint got nothing, even though <code>report-uri</code> happily posts to plain http. In an earlier run with an http page and http endpoint, reports were queued (visible over the DevTools protocol) but never sent in 80 s.</li>
+<li><strong>Cross-origin endpoints get a preflight.</strong> <code>application/reports+json</code> isn't a "simple" content type, so the browser sends <code>OPTIONS</code> first. Answer it with <code>Access-Control-Allow-Origin</code>, <code>Access-Control-Allow-Methods: POST</code> and <code>Access-Control-Allow-Headers: content-type</code>, or the reports are lost. <code>report-uri</code> had no preflight.</li>
+<li><strong>Both directives: report-to wins.</strong> When the browser understands <code>report-to</code> it ignores <code>report-uri</code>, which matches the CSP spec. Keep <code>report-uri</code> in the policy as a fallback for browsers without the Reporting API, but don't expect two copies in Chrome.</li>
+<li><strong>Report-To is not Reporting-Endpoints.</strong> The older <code>Report-To: {"group":"csp","max_age":...,"endpoints":[...]}</code> header alone produced no CSP report in Chromium 153. Use <code>Reporting-Endpoints</code>.</li>
+<li><strong>Reports may be delayed.</strong> The Reporting API batches; our headless runs delivered in under a second, but a real browser may wait about a minute. Don't conclude it's broken after 5 seconds.</li></ul>
+<h2>5. A working setup</h2>
+<pre><code>Reporting-Endpoints: csp="https://example.com/csp-reports"
+Content-Security-Policy: script-src 'self'; report-uri https://example.com/csp-reports; report-to csp</code></pre>
+<p>Make the endpoint accept both <code>application/csp-report</code> and <code>application/reports+json</code>, return 204, and handle <code>OPTIONS</code> if it is on another origin. To test a policy without blocking anything, send it as <a href="/guides/content-security-policy-report-only/">Content-Security-Policy-Report-Only</a>; for a starting policy see <a href="/guides/content-security-policy-header-example/">CSP header examples</a>. Related: <a href="/guides/sec-fetch-site-mode-dest-headers/">Sec-Fetch-* headers</a>.</p>
+<aside class="cta"><strong>Check which reporting headers a live site sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between CSP report-to and report-uri?</summary><p>report-uri puts a URL in the policy and POSTs one application/csp-report object per violation. report-to names an endpoint from the Reporting-Endpoints header and POSTs an application/reports+json array of reports with type csp-violation. In Chromium 153 both arrived in well under a second in our headless test.</p></details>
+<details><summary>Should I use both report-uri and report-to?</summary><p>Yes, as a fallback, but in Chromium 153 only the report-to endpoint received the report; report-uri was ignored when report-to was present.</p></details>
+<details><summary>Why are my report-to reports not arriving?</summary><p>In our test an http:// endpoint got nothing; it must be HTTPS. A cross-origin endpoint also has to answer the CORS preflight. Real browsers can batch reports for about a minute.</p></details>
+<details><summary>What is the difference between Report-To and Reporting-Endpoints?</summary><p>Report-To is the older JSON header with group and max_age; Reporting-Endpoints is the current name=&quot;url&quot; header. With only Report-To, Chromium 153 sent no CSP report in our test.</p></details>
+<details><summary>What Content-Type do CSP reports use?</summary><p>application/csp-report for report-uri and application/reports+json for report-to.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 in headless Chromium 153.0.8010.12 (Playwright) against Node.js servers on localhost with a self-signed certificate (HTTPS page, HTTPS endpoint, certificate errors ignored for the test). The page had one inline script blocked by script-src &#x27;none&#x27;; the server logged every request to the report endpoint. Delivery timing was measured with and without Chromium&#x27;s --short-reporting-delay switch. A normal desktop browser may batch reports for up to about a minute, so don&#x27;t expect the instant delivery we saw. Other browsers were not tested. PlainHeaders is our extension; DevTools → Network → Headers or curl -I shows the same response headers, free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

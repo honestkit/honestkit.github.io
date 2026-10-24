@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx Server disconnected without sending a response (tested)</title>
+<meta name="description" content="httpx.RemoteProtocolError explained by reproducing it: server disconnected without a response, incomplete message body, illegal status line.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-remoteprotocolerror-server-disconnected-without-sending-a-response/">
+<meta property="og:title" content="httpx Server disconnected without sending a response (tested)">
+<meta property="og:description" content="httpx.RemoteProtocolError explained by reproducing it: server disconnected without a response, incomplete message body, illegal status line.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-remoteprotocolerror-server-disconnected-without-sending-a-response/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes httpx 'Server disconnected without sending a response'?", "acceptedAnswer": {"@type": "Answer", "text": "The server closed the connection after receiving the request without writing a response; reproduced with a socket server that reads and closes."}}, {"@type": "Question", "name": "What does 'peer closed connection without sending complete message body' mean?", "acceptedAnswer": {"@type": "Answer", "text": "The response was cut off before Content-Length bytes arrived: received 18 bytes, expected 100 in the test."}}, {"@type": "Question", "name": "Is RemoteProtocolError a TransportError?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, in httpx 0.28.1 isinstance(e, httpx.TransportError) is True."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx RemoteProtocolError: Server disconnected without sending a response (tested)</h1>
+<p class="lead"><code>httpx.RemoteProtocolError: Server disconnected without sending a response.</code> means the server closed the connection after reading your request and before answering. It is a server/proxy-side problem; check its logs, and retry only idempotent requests.</p>
+<p><code>httpx.RemoteProtocolError</code> means the server broke the HTTP protocol: it closed the connection early or sent something that is not valid HTTP. The message tells you which. Measured with httpx 0.28.1 on Python 3.13.5 using tiny raw-socket servers that misbehave on purpose.</p>
+<h2 id="noresponse">1. "Server disconnected without sending a response."</h2>
+<pre><code>import httpx, socket, threading
+
+# a server that reads the request and closes the connection without answering
+srv = socket.create_server((&quot;127.0.0.1&quot;, 8963))
+def serve():
+    while True:
+        conn, _ = srv.accept()
+        conn.recv(65536)
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+
+try:
+    httpx.get(&quot;http://127.0.0.1:8963/&quot;)
+except httpx.RemoteProtocolError as e:
+    print(type(e).__name__ + &quot;:&quot;, e)
+    print(&quot;is TransportError:&quot;, isinstance(e, httpx.TransportError))</code></pre>
+<p>Output:</p>
+<pre><code>RemoteProtocolError: Server disconnected without sending a response.
+is TransportError: True</code></pre>
+<p>The server accepted the connection, read the request and closed the socket without writing anything. Typical real causes: the server process crashed or was restarted mid-request, a proxy/load balancer dropped the connection, or the server rejected the request at a lower level. Check the server-side logs for that moment; on the client, it is a <code>TransportError</code>, so it can be caught together with connect errors and retried for idempotent requests.</p>
+<h2 id="partial">2. "peer closed connection without sending complete message body"</h2>
+<pre><code>import httpx, socket, threading
+
+# answers HTTP/1.1 but sends a Content-Length larger than the body, then closes
+srv = socket.create_server((&quot;127.0.0.1&quot;, 8964))
+def serve():
+    while True:
+        conn, _ = srv.accept()
+        conn.recv(65536)
+        conn.sendall(b&quot;HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nonly 18 bytes here&quot;)
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+
+try:
+    httpx.get(&quot;http://127.0.0.1:8964/&quot;)
+except httpx.RemoteProtocolError as e:
+    print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>RemoteProtocolError: peer closed connection without sending complete message body (received 18 bytes, expected 100)</code></pre>
+<p>The headers promised 100 bytes (<code>Content-Length</code>) but the connection closed after 18. The response was cut off: a crashed upstream, a timeout in a proxy, or a server that sets a wrong <code>Content-Length</code>.</p>
+<h2 id="garbage">3. "illegal status line"</h2>
+<pre><code>import httpx, socket, threading
+srv = socket.create_server((&quot;127.0.0.1&quot;, 8965))
+def serve():
+    while True:
+        conn, _ = srv.accept()
+        conn.recv(65536)
+        conn.sendall(b&quot;this is not http\r\n\r\n&quot;)
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+try:
+    httpx.get(&quot;http://127.0.0.1:8965/&quot;)
+except httpx.RemoteProtocolError as e:
+    print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>RemoteProtocolError: illegal status line: bytearray(b&#x27;this is not http&#x27;)</code></pre>
+<p>The first line back was not <code>HTTP/1.1 200 OK</code>-style. Something other than an HTTP server is listening on that port (a database, an SSH server, a custom TCP service).</p>
+<h2 id="scheme">4. http:// to an HTTPS port is a different error</h2>
+<pre><code>import httpx
+from srv import start
+base = start()          # an HTTPS server
+print(base)
+try:
+    httpx.get(base.replace(&quot;https://&quot;, &quot;http://&quot;))   # plain http to the TLS port
+except httpx.TransportError as e:
+    print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>https://127.0.0.1:8965
+ReadError: [Errno 104] Connection reset by peer</code></pre>
+<p>Sending plain HTTP to a TLS port gave <code>httpx.ReadError: [Errno 104] Connection reset by peer</code> here, not <code>RemoteProtocolError</code>; still worth checking the scheme and port when you see either.</p>
+<p>Related: <a href="/guides/httpx-retry-transport-retries/">httpx retry</a>, <a href="/guides/httpx-timeout-default-readtimeout/">httpx timeout</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests</a>, <a href="/guides/httpx-connecterror-ssl-certificate-verify-failed/">httpx CERTIFICATE_VERIFY_FAILED</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes httpx &#x27;Server disconnected without sending a response&#x27;?</summary><p>The server closed the connection after receiving the request without writing a response; reproduced with a socket server that reads and closes.</p></details>
+<details><summary>What does &#x27;peer closed connection without sending complete message body&#x27; mean?</summary><p>The response was cut off before Content-Length bytes arrived: received 18 bytes, expected 100 in the test.</p></details>
+<details><summary>Is RemoteProtocolError a TransportError?</summary><p>Yes, in httpx 0.28.1 isinstance(e, httpx.TransportError) is True.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5 against local raw-socket and http.server test servers. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

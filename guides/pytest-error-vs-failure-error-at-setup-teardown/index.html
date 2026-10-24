@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pytest Error vs Failure: ERROR at Setup and Teardown (Tested)</title>
+<meta name="description" content="pytest error vs failure, tested on pytest 9.1: FAILED is the test body, ERROR at setup/teardown is a fixture; a test can pass and error; fixture not found.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pytest-error-vs-failure-error-at-setup-teardown/">
+<meta property="og:title" content="pytest Error vs Failure: ERROR at Setup and Teardown (Tested)">
+<meta property="og:description" content="pytest error vs failure, tested on pytest 9.1: FAILED is the test body, ERROR at setup/teardown is a fixture; a test can pass and error; fixture not found.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pytest-error-vs-failure-error-at-setup-teardown/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between error and failure in pytest?", "acceptedAnswer": {"@type": "Answer", "text": "FAILED: an assertion or exception inside the test function. ERROR: an exception in a fixture during setup or teardown, or a missing fixture."}}, {"@type": "Question", "name": "What does ERROR at setup of mean in pytest?", "acceptedAnswer": {"@type": "Answer", "text": "A fixture used by the test raised before the test ran (or the fixture name was not found), so the test itself never executed."}}, {"@type": "Question", "name": "Can a pytest test both pass and error?", "acceptedAnswer": {"@type": "Answer", "text": "Yes: if the test passes but a fixture's teardown (code after yield) raises, pytest reports PASSED and ERROR at teardown for the same test."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pytest error vs failure, ERROR at setup/teardown (tested)</h1>
+<p class="lead">In pytest, <strong>FAILED</strong> means the test function itself raised (an <code>assert</code> or any exception), while <strong>ERROR</strong> means a fixture raised, either before the test (<code>ERROR at setup of test_x</code>, the test never ran) or after it (<code>ERROR at teardown</code>). Look at the fixtures, not the test.</p>
+<h2 id="repro">1. One file with every outcome</h2>
+<pre><code>import pytest
+
+
+@pytest.fixture
+def db():
+    raise ConnectionError(&quot;database not reachable&quot;)     # fails in setup
+    yield
+
+
+@pytest.fixture
+def tmpfile():
+    yield &quot;data.txt&quot;
+    raise PermissionError(&quot;could not delete data.txt&quot;)  # fails in teardown
+
+
+def test_assert():
+    assert 1 + 1 == 3                  # FAILED: the test&#x27;s own assertion
+
+
+def test_exception_in_test():
+    {}[&quot;missing&quot;]                       # FAILED too: any exception inside the test body
+
+
+def test_uses_db(db):
+    pass                                # ERROR at setup: the test never ran
+
+
+def test_uses_tmpfile(tmpfile):
+    pass                                # PASSED, then ERROR at teardown
+
+
+def test_missing_fixture(dbb):
+    pass                                # ERROR at setup: fixture &#x27;dbb&#x27; not found</code></pre>
+<p>Run with <code>-rA</code> (summary line for every test) and filtered to the headers and <code>E</code> lines:</p>
+<pre><code>$ pytest -rA test_ef.py | grep -E &quot;^(PASSED|FAILED|ERROR)|^E  |=====|^_&quot;
+============================= test session starts ==============================
+==================================== ERRORS ====================================
+________________________ ERROR at setup of test_uses_db ________________________
+E       ConnectionError: database not reachable
+____________________ ERROR at teardown of test_uses_tmpfile ____________________
+E       PermissionError: could not delete data.txt
+____________________ ERROR at setup of test_missing_fixture ____________________
+E       fixture &#x27;dbb&#x27; not found
+=================================== FAILURES ===================================
+_________________________________ test_assert __________________________________
+E       assert (1 + 1) == 3
+____________________________ test_exception_in_test ____________________________
+E       KeyError: &#x27;missing&#x27;
+==================================== PASSES ====================================
+=========================== short test summary info ============================
+PASSED test_ef.py::test_uses_tmpfile
+ERROR test_ef.py::test_uses_db - ConnectionError: database not reachable
+ERROR test_ef.py::test_uses_tmpfile - PermissionError: could not delete data.txt
+ERROR test_ef.py::test_missing_fixture
+FAILED test_ef.py::test_assert - assert (1 + 1) == 3
+FAILED test_ef.py::test_exception_in_test - KeyError: &#x27;missing&#x27;
+==================== 2 failed, 1 passed, 3 errors in 0.03s =====================
+(exit code of pytest:)
+1</code></pre>
+<h2 id="difference">2. Error vs failure</h2>
+<ul><li><strong>FAILED</strong>: something went wrong <em>inside the test function</em>: a failing <code>assert</code>, or any other exception raised in the test body (the <code>KeyError</code> counts as a failure too, not an error).</li><li><strong>ERROR</strong>: something went wrong <em>outside</em> the test function, in a fixture: during setup (the test never ran) or during teardown (after the test already ran). A misspelled fixture name (<code>fixture 'dbb' not found</code>) is also an error at setup.</li></ul>
+<p>So "ERROR at setup of test_x" means: look at the fixtures <code>test_x</code> uses, not at the test. Here <code>db</code> raised <code>ConnectionError</code> before its <code>yield</code>.</p>
+<h2 id="teardown">3. A test can pass and error at the same time</h2>
+<p><code>test_uses_tmpfile</code> appears twice in the summary: <code>PASSED</code>, then <code>ERROR</code> for the teardown, and it is counted in both totals (2 failed, <strong>1 passed</strong>, <strong>3 errors</strong> from 5 tests). The code after <code>yield</code> in a fixture runs after the test; an exception there is reported as "ERROR at teardown of ...". Errors and failures both make pytest exit with code 1.</p>
+<h2 id="fix">4. Fixing setup and teardown errors</h2>
+<ul><li>Run the single test with <code>pytest -x path::test_name</code> and read the traceback under "ERROR at setup": the last frames are inside the fixture.</li><li><code>pytest --fixtures</code> lists the fixture names available, which catches typos.</li><li>If a setup failure means an external service is down rather than a bug, call <code>pytest.skip("database not reachable")</code> in the fixture so the test is reported as skipped instead of erroring.</li><li>Make teardown code tolerant (e.g. <code>missing_ok=True</code> when deleting files) so a cleanup problem does not hide a passing test.</li></ul>
+<p>Related: <a href="/guides/pytest-error-collecting-modulenotfounderror/">pytest ERROR collecting: ModuleNotFoundError</a>, <a href="/guides/pytest-no-tests-ran-exit-code-5/">pytest no tests ran (exit code 5)</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between error and failure in pytest?</summary><p>FAILED: an assertion or exception inside the test function. ERROR: an exception in a fixture during setup or teardown, or a missing fixture.</p></details>
+<details><summary>What does ERROR at setup of mean in pytest?</summary><p>A fixture used by the test raised before the test ran (or the fixture name was not found), so the test itself never executed.</p></details>
+<details><summary>Can a pytest test both pass and error?</summary><p>Yes: if the test passes but a fixture&#x27;s teardown (code after yield) raises, pytest reports PASSED and ERROR at teardown for the same test.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with pytest 9.1.1 and Python 3.13.5 on Linux. The test file was run verbatim and the output pasted unedited (filtered by the grep shown). PlainHeaders is our extension; Python and pytest are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

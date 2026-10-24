@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker pip error: externally-managed-environment (Tested)</title>
+<meta name="description" content="pip install fails in a Debian/Ubuntu-based Dockerfile with externally-managed-environment. Reproduced, plus 4 tested fixes: python image, venv, flag, apt.">
+<link rel="canonical" href="https://honestkit.github.io/guides/docker-pip-error-externally-managed-environment/">
+<meta property="og:title" content="Docker pip error: externally-managed-environment (Tested)">
+<meta property="og:description" content="pip install fails in a Debian/Ubuntu-based Dockerfile with externally-managed-environment. Reproduced, plus 4 tested fixes: python image, venv, flag, apt.">
+<meta property="og:url" content="https://honestkit.github.io/guides/docker-pip-error-externally-managed-environment/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does pip say externally-managed-environment in Docker?", "acceptedAnswer": {"@type": "Answer", "text": "The base image is Debian 12+ or Ubuntu 23.04+ with Python from apt, which ships an EXTERNALLY-MANAGED marker file. pip refuses to install into that system Python, even as root."}}, {"@type": "Question", "name": "Do the official python Docker images have externally-managed-environment?", "acceptedAnswer": {"@type": "Answer", "text": "No. python:3-slim has no EXTERNALLY-MANAGED file and pip install works directly."}}, {"@type": "Question", "name": "Is --break-system-packages safe in a Dockerfile?", "acceptedAnswer": {"@type": "Answer", "text": "It works and is common in throwaway images, but pip can then overwrite packages apt installed. A venv on PATH avoids the risk."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Docker pip error: externally-managed-environment in a Dockerfile (tested)</h1>
+<p class="lead"><code>pip install</code> in a Dockerfile fails with <code>error: externally-managed-environment</code> when the image's Python comes from Debian or Ubuntu packages. The official <code>python:</code> images don't have this. Below the error is reproduced and four fixes are built and run.</p>
+<h2 id="repro">1. Reproduce: five Dockerfiles</h2>
+<p><code>d1</code> is the failing pattern: a Debian base image, Python from apt, then <code>pip install</code>. <code>d2</code>-<code>d5</code> are the four ways out:</p>
+<pre><code># ---- d1/Dockerfile
+FROM debian:trixie-slim
+RUN apt-get update -qq &amp;&amp; apt-get install -y -qq python3-pip &gt;/dev/null
+RUN pip install six
+# ---- d2/Dockerfile
+FROM python:3-slim
+RUN pip install -q --root-user-action=ignore six &amp;&amp; python -c &quot;import six; print(\&quot;six\&quot;, six.__version__)&quot;
+# ---- d3/Dockerfile
+FROM debian:trixie-slim
+RUN apt-get update -qq &amp;&amp; apt-get install -y -qq python3-venv &gt;/dev/null
+RUN python3 -m venv /opt/venv
+ENV PATH=&quot;/opt/venv/bin:$PATH&quot;
+RUN pip install -q six &amp;&amp; python -c &quot;import six; print(\&quot;six\&quot;, six.__version__)&quot;
+# ---- d4/Dockerfile
+FROM debian:trixie-slim
+RUN apt-get update -qq &amp;&amp; apt-get install -y -qq python3-pip &gt;/dev/null
+RUN pip install -q --break-system-packages six &amp;&amp; python3 -c &quot;import six; print(\&quot;six\&quot;, six.__version__)&quot;
+# ---- d5/Dockerfile
+FROM debian:trixie-slim
+RUN apt-get update -qq &amp;&amp; apt-get install -y -qq python3-six &gt;/dev/null
+RUN python3 -c &quot;import six; print(\&quot;six\&quot;, six.__version__)&quot; &amp;&amp; ls /usr/lib/python3*/EXTERNALLY-MANAGED</code></pre>
+<p><code>run.sh</code> builds each one and prints only what the <code>RUN</code> steps wrote:</p>
+<pre><code>#!/bin/sh
+# build each Dockerfile; print only what the RUN steps wrote, plus the build result
+for d in d1 d2 d3 d4 d5; do
+  echo &quot;== $d&quot;
+  docker build --no-cache --progress=plain -t forever-em410:x $d &gt; build.log 2&gt;&amp;1 \
+    &amp;&amp; echo &quot;(build OK)&quot; || echo &quot;(build FAILED)&quot;
+  grep -E &#x27;^#[0-9]+ [0-9]+\.[0-9]+ &#x27; build.log | sed -E &#x27;s/^#[0-9]+ [0-9.]+ //&#x27; \
+    | grep -vE &#x27;debconf|^$|dpkg-preconfigure|^Selecting|^Preparing|^Unpacking|^Setting up|^Processing|^\(Reading&#x27;
+done</code></pre>
+<p>Output (Docker, <code>debian:trixie-slim</code> with its Python 3.13, and <code>python:3-slim</code>):</p>
+<pre><code>== d1
+(build FAILED)
+error: externally-managed-environment
+× This environment is externally managed
+╰─&gt; To install Python packages system-wide, try apt install
+    python3-xyz, where xyz is the package you are trying to
+    install.
+    
+    If you wish to install a non-Debian-packaged Python package,
+    create a virtual environment using python3 -m venv path/to/venv.
+    Then use path/to/venv/bin/python and path/to/venv/bin/pip. Make
+    sure you have python3-full installed.
+    
+    If you wish to install a non-Debian packaged Python application,
+    it may be easiest to use pipx install xyz, which will manage a
+    virtual environment for you. Make sure you have pipx installed.
+    
+    See /usr/share/doc/python3.13/README.venv for more information.
+note: If you believe this is a mistake, please contact your Python installation or OS distribution provider. You can override this, at the risk of breaking your Python installation or OS, by passing --break-system-packages.
+hint: See PEP 668 for the detailed specification.
+== d2
+(build OK)
+six 1.17.0
+== d3
+(build OK)
+six 1.17.0
+== d4
+(build OK)
+WARNING: Running pip as the &#x27;root&#x27; user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+six 1.17.0
+== d5
+(build OK)
+six 1.17.0
+/usr/lib/python3.13/EXTERNALLY-MANAGED</code></pre>
+<h2 id="why">2. Why it happens only on some images</h2>
+<p>Debian (12 and later) and Ubuntu (23.04 and later) ship a marker file <code>/usr/lib/python3.X/EXTERNALLY-MANAGED</code> (<code>d5</code> lists it on Debian trixie). When pip sees it, it refuses to install into the system Python so it can't overwrite files that <code>apt</code> owns (PEP 668). Being root inside a container does not change that. The official <code>python:*</code> images build their own Python in <code>/usr/local</code> and have no marker: in <code>python:3-slim</code> (Python 3.15.1 here) <code>find / -name EXTERNALLY-MANAGED</code> found nothing, and <code>d2</code> installed normally.</p>
+<h2 id="fix">3. Which fix to use</h2>
+<ul><li><strong>Use a <code>python:</code> base image</strong> (<code>d2</code>) when you only need Python. Simplest, and pip works as before. <code>--root-user-action=ignore</code> just silences the "running pip as root" warning.</li>
+<li><strong>Create a venv</strong> (<code>d3</code>) when you must stay on a distro image: install <code>python3-venv</code>, <code>python3 -m venv /opt/venv</code>, and put <code>/opt/venv/bin</code> first on <code>PATH</code> so later <code>pip</code> and <code>python</code> calls (including <code>CMD</code>) use it.</li>
+<li><strong><code>--break-system-packages</code></strong> (<code>d4</code>) works, with the root warning shown. In a throwaway image it is usually fine, but a pip upgrade of a package apt also installed can break apt-installed tools. <code>ENV PIP_BREAK_SYSTEM_PACKAGES=1</code> is the same switch for every pip call.</li>
+<li><strong>Install the Debian package</strong> (<code>d5</code>, <code>python3-six</code>) when it exists and its version is good enough. No pip involved.</li></ul>
+<p>If the venv build later fails with <code>ModuleNotFoundError</code>, the <code>CMD</code> is probably running the system Python instead of the venv: see <a href="/guides/docker-python-modulenotfounderror-no-module-named/">Docker Python ModuleNotFoundError</a>. Outside Docker: <a href="/guides/pip-error-externally-managed-environment/">pip error: externally-managed-environment</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does pip say externally-managed-environment in Docker?</summary><p>The base image is Debian 12+ or Ubuntu 23.04+ with Python from apt, which ships an EXTERNALLY-MANAGED marker file. pip refuses to install into that system Python, even as root.</p></details>
+<details><summary>Do the official python Docker images have externally-managed-environment?</summary><p>No. python:3-slim has no EXTERNALLY-MANAGED file and pip install works directly.</p></details>
+<details><summary>Is --break-system-packages safe in a Dockerfile?</summary><p>It works and is common in throwaway images, but pip can then overwrite packages apt installed. A venv on PATH avoids the risk.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Docker, debian:trixie-slim (Python 3.13) and python:3-slim (Python 3.15.1). The scripts ran verbatim and the output was pasted unedited. PlainTables is our extension; Docker and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

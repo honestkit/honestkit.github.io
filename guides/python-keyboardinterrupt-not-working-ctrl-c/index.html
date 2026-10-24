@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python KeyboardInterrupt Not Working? Ctrl+C Fixes (Tested)</title>
+<meta name="description" content="We sent Ctrl+C to Python scripts and measured why KeyboardInterrupt isn&#x27;t caught: bare except, threads that keep running, asyncio CancelledError, SIG_IGN.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-keyboardinterrupt-not-working-ctrl-c/">
+<meta property="og:title" content="Python KeyboardInterrupt Not Working? Ctrl+C Fixes (Tested)">
+<meta property="og:description" content="We sent Ctrl+C to Python scripts and measured why KeyboardInterrupt isn&#x27;t caught: bare except, threads that keep running, asyncio CancelledError, SIG_IGN.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-keyboardinterrupt-not-working-ctrl-c/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is KeyboardInterrupt not caught or not working in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Most often a bare except: or except BaseException: swallows it. We measured a loop with except: ignoring Ctrl+C while except Exception: stopped immediately, on Python 3.13.5."}}, {"@type": "Question", "name": "Why doesn't Ctrl+C stop my Python program with threads?", "acceptedAnswer": {"@type": "Answer", "text": "Signals go to the main thread only; it raises KeyboardInterrupt, then the interpreter waits for non-daemon threads. We measured the traceback printing while the process kept running. Use a stop Event, or daemon=True."}}, {"@type": "Question", "name": "How do I catch KeyboardInterrupt in asyncio?", "acceptedAnswer": {"@type": "Answer", "text": "Inside the coroutine you get asyncio.CancelledError; asyncio.run() raises KeyboardInterrupt to its caller. We measured both. Do cleanup in except CancelledError or finally."}}, {"@type": "Question", "name": "Does except Exception catch KeyboardInterrupt?", "acceptedAnswer": {"@type": "Answer", "text": "No. KeyboardInterrupt inherits from BaseException. We measured except Exception: letting Ctrl+C stop the loop."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>KeyboardInterrupt / Ctrl+C not working in Python (tested)</h1>
+<p class="lead">When Ctrl+C doesn't stop a Python program, or <code>except KeyboardInterrupt</code> never runs, there are four usual causes. We sent a real <code>SIGINT</code> to each one on Python 3.13.5 and measured what happens.</p>
+<h2 id="harness">How we tested</h2>
+<p>Each case runs a small script in a subprocess, sends it <code>SIGINT</code> (what Ctrl+C sends) after 0.5 s, and reports whether it exited within 2 s. The helper, <code>run.py</code>:</p>
+<pre><code># helper: run a script, send SIGINT (Ctrl+C) after 0.5s, report what happened
+import subprocess, sys, signal, time
+def ctrl_c(src, wait=0.5):
+    p = subprocess.Popen([sys.executable, &quot;-c&quot;, src], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    time.sleep(wait); p.send_signal(signal.SIGINT)
+    try:
+        out, _ = p.communicate(timeout=2)
+        status = f&quot;exited {p.returncode}&quot;
+    except subprocess.TimeoutExpired:
+        p.kill(); out, _ = p.communicate()
+        status = &quot;STILL RUNNING 2s after Ctrl+C (had to kill it)&quot;
+    lines = [l for l in out.splitlines() if l and not l.startswith(&quot; &quot;)]
+    return status + &quot;&quot;.join(f&quot;\n    {l}&quot; for l in lines[-2:])</code></pre>
+
+<h2 id="except">1. A bare except: swallows Ctrl+C</h2>
+<pre><code>from run import ctrl_c
+src = &quot;&quot;&quot;
+import time
+while True:
+    try:
+        time.sleep(0.1)
+    except:                 # bare except also catches KeyboardInterrupt
+        pass
+&quot;&quot;&quot;
+print(ctrl_c(src))
+src2 = src.replace(&quot;except:&quot;, &quot;except Exception:&quot;)
+print(ctrl_c(src2))</code></pre>
+<p>Output:</p>
+<pre><code>STILL RUNNING 2s after Ctrl+C (had to kill it)
+exited -2
+    Traceback (most recent call last):
+    KeyboardInterrupt</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> with <code>except:</code> the loop ignores Ctrl+C and keeps running; with <code>except Exception:</code> it stops at once. <code>KeyboardInterrupt</code> derives from <code>BaseException</code>, not <code>Exception</code>, exactly so that <code>except Exception</code> lets it through. <code>except BaseException:</code> swallows it the same way a bare <code>except:</code> does.</p>
+
+<h2 id="threads">2. Threads: the traceback prints but the program keeps running</h2>
+<pre><code>from run import ctrl_c
+src = &quot;&quot;&quot;
+import threading, time
+def work():
+    while True: time.sleep(0.1)
+t = threading.Thread(target=work)
+t.start()
+t.join()
+&quot;&quot;&quot;
+print(&quot;non-daemon thread:&quot;, ctrl_c(src))
+fixed = &quot;&quot;&quot;
+import threading, time
+stop = threading.Event()
+def work():
+    while not stop.is_set(): time.sleep(0.1)
+t = threading.Thread(target=work)
+t.start()
+try:
+    while t.is_alive(): t.join(0.2)
+except KeyboardInterrupt:
+    stop.set(); t.join(); print(&quot;stopped cleanly&quot;)
+&quot;&quot;&quot;
+print(&quot;Event + join(timeout):&quot;, ctrl_c(fixed))</code></pre>
+<p>Output:</p>
+<pre><code>non-daemon thread: STILL RUNNING 2s after Ctrl+C (had to kill it)
+    Traceback (most recent call last):
+    KeyboardInterrupt
+Event + join(timeout): exited 0
+    stopped cleanly</code></pre>
+<p><strong>Measured:</strong> with a non-daemon worker thread, Ctrl+C <em>does</em> raise <code>KeyboardInterrupt</code> in the main thread (the traceback prints), but the process then waits for the worker forever. Signals are only delivered to the main thread. Fix it by giving workers a stop <code>Event</code> and setting it on <code>KeyboardInterrupt</code>, as above. Marking the thread <code>daemon=True</code> also lets the process exit (we measured exit -2 with the traceback), but kills the worker mid-task with no cleanup.</p>
+
+<h2 id="asyncio">3. asyncio: your coroutine sees CancelledError</h2>
+<pre><code>from run import ctrl_c
+src = &quot;&quot;&quot;
+import asyncio
+async def main():
+    try:
+        await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        print(&quot;main got CancelledError, not KeyboardInterrupt&quot;)
+        raise
+try:
+    asyncio.run(main())
+except KeyboardInterrupt:
+    print(&quot;asyncio.run raised KeyboardInterrupt&quot;)
+&quot;&quot;&quot;
+print(ctrl_c(src))</code></pre>
+<p>Output:</p>
+<pre><code>exited 0
+    main got CancelledError, not KeyboardInterrupt
+    asyncio.run raised KeyboardInterrupt</code></pre>
+<p><strong>Measured:</strong> inside <code>asyncio.run()</code>, Ctrl+C cancels the main task, so the coroutine gets <code>asyncio.CancelledError</code>, not <code>KeyboardInterrupt</code>, and <code>asyncio.run()</code> then raises <code>KeyboardInterrupt</code> to the caller. An <code>except KeyboardInterrupt</code> inside the coroutine never runs; put cleanup in <code>except asyncio.CancelledError</code> (and re-raise) or in <code>finally</code>.</p>
+
+<h2 id="ignored">4. SIGINT set to ignored</h2>
+<pre><code>from run import ctrl_c
+src = &quot;&quot;&quot;
+import signal, time
+signal.signal(signal.SIGINT, signal.SIG_IGN)   # something set SIGINT to ignored
+time.sleep(5)
+&quot;&quot;&quot;
+print(ctrl_c(src))</code></pre>
+<p>Output:</p>
+<pre><code>STILL RUNNING 2s after Ctrl+C (had to kill it)</code></pre>
+<p><strong>Measured:</strong> if anything sets <code>SIGINT</code> to <code>SIG_IGN</code> (a library, or a parent process that started yours with it ignored, since ignored signals are inherited), Ctrl+C does nothing. Restore it with <code>signal.signal(signal.SIGINT, signal.default_int_handler)</code>, or stop the process with <code>kill</code> (SIGTERM).</p>
+
+<aside class="cta"><strong>Stuck on a long-running HTTP script? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is KeyboardInterrupt not caught or not working in Python?</summary><p>Most often a bare except: or except BaseException: swallows it. We measured a loop with except: ignoring Ctrl+C while except Exception: stopped immediately, on Python 3.13.5.</p></details>
+<details><summary>Why doesn&#x27;t Ctrl+C stop my Python program with threads?</summary><p>Signals go to the main thread only; it raises KeyboardInterrupt, then the interpreter waits for non-daemon threads. We measured the traceback printing while the process kept running. Use a stop Event, or daemon=True.</p></details>
+<details><summary>How do I catch KeyboardInterrupt in asyncio?</summary><p>Inside the coroutine you get asyncio.CancelledError; asyncio.run() raises KeyboardInterrupt to its caller. We measured both. Do cleanup in except CancelledError or finally.</p></details>
+<details><summary>Does except Exception catch KeyboardInterrupt?</summary><p>No. KeyboardInterrupt inherits from BaseException. We measured except Exception: letting Ctrl+C stop the loop.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux, by sending SIGINT to a subprocess and checking whether it exited within 2 s: bare except vs except Exception, a non-daemon thread vs a stop Event (and daemon=True, checked separately), asyncio.run with CancelledError, and SIGINT set to SIG_IGN. Every block was run verbatim and its output pasted from that run. Windows console behaviour was not tested. PlainHeaders is our extension; everything else here is the standard library.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

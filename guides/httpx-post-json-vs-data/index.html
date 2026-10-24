@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx post json vs data: send a JSON body correctly (tested)</title>
+<meta name="description" content="httpx json= sends application/json, data= sends a form, a JSON string belongs in content=. data= plus json= silently drops the JSON. Tested, httpx 0.28.1.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-post-json-vs-data/">
+<meta property="og:title" content="httpx post json vs data: send a JSON body correctly (tested)">
+<meta property="og:description" content="httpx json= sends application/json, data= sends a form, a JSON string belongs in content=. data= plus json= silently drops the JSON. Tested, httpx 0.28.1.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-post-json-vs-data/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I post JSON with httpx?", "acceptedAnswer": {"@type": "Answer", "text": "httpx.post(url, json=obj). httpx serializes it and sets Content-Type: application/json."}}, {"@type": "Question", "name": "What is the difference between json= and data= in httpx?", "acceptedAnswer": {"@type": "Answer", "text": "json= sends a JSON body; data= with a dict sends a form (application/x-www-form-urlencoded)."}}, {"@type": "Question", "name": "How do I send a JSON string with httpx?", "acceptedAnswer": {"@type": "Answer", "text": "Use content=json_string with headers={'Content-Type': 'application/json'}. data=str is deprecated and sends no Content-Type."}}, {"@type": "Question", "name": "Is the httpx JSON body the same as requests?", "acceptedAnswer": {"@type": "Answer", "text": "No. httpx 0.28 sends compact JSON with UTF-8 characters; requests adds spaces and escapes non-ASCII, which matters for signed bodies."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx post json vs data vs content (tested)</h1>
+<p class="lead">Use <code>httpx.post(url, json={...})</code> for a JSON body. <code>data=</code> sends a form; a JSON string in <code>data=</code> goes out with no Content-Type, so use <code>content=</code> plus a header. If you pass both <code>json=</code> and <code>data=</code>, the JSON is dropped.</p>
+<p>In httpx, <code>json=</code> sends a JSON body, <code>data=</code> sends an HTML form, and <code>content=</code> sends raw text or bytes. Measured with httpx 0.28.1 on Python 3.13.5 against a local <code>http.server</code> (<code>srv.py</code>) that echoes back the Content-Type and body it received.</p>
+<h2 id="json">1. httpx post json</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+r = httpx.post(base + &quot;/api&quot;, json={&quot;name&quot;: &quot;Ada&quot;, &quot;tags&quot;: [&quot;x&quot;], &quot;ok&quot;: True})
+e = r.json()
+print(e[&quot;content-type&quot;])
+print(e[&quot;body&quot;])</code></pre>
+<p>Output:</p>
+<pre><code>application/json
+{&quot;name&quot;:&quot;Ada&quot;,&quot;tags&quot;:[&quot;x&quot;],&quot;ok&quot;:true}</code></pre>
+<p><code>json=</code> serializes the object and sets <code>Content-Type: application/json</code> for you. Do not also call <code>json.dumps()</code> yourself, or the server receives a JSON string instead of an object.</p>
+<h2 id="data">2. data= sends a form, not JSON</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+r = httpx.post(base + &quot;/api&quot;, data={&quot;name&quot;: &quot;Ada&quot;, &quot;tags&quot;: [&quot;x&quot;, &quot;y&quot;]})
+e = r.json()
+print(e[&quot;content-type&quot;])
+print(e[&quot;body&quot;])</code></pre>
+<p>Output:</p>
+<pre><code>application/x-www-form-urlencoded
+name=Ada&amp;tags=x&amp;tags=y</code></pre>
+<p>A dict in <code>data=</code> is form-encoded (<code>application/x-www-form-urlencoded</code>), and a list repeats the key. An API that expects JSON usually answers this with 400, 415 or 422.</p>
+<h2 id="string">3. httpx post json string: use content=, not data=</h2>
+<pre><code>import json, httpx
+from srv import start
+base = start()
+
+payload = json.dumps({&quot;name&quot;: &quot;Ada&quot;})
+
+# a JSON string passed to data= : httpx 0.28 sends it without a Content-Type
+r = httpx.post(base + &quot;/api&quot;, data=payload)
+print(&quot;data=str:   &quot;, r.json()[&quot;content-type&quot;], r.json()[&quot;body&quot;])
+
+# raw text/bytes go in content=, and you set the header yourself
+r = httpx.post(base + &quot;/api&quot;, content=payload, headers={&quot;Content-Type&quot;: &quot;application/json&quot;})
+print(&quot;content=str:&quot;, r.json()[&quot;content-type&quot;], r.json()[&quot;body&quot;])</code></pre>
+<p>Output:</p>
+<pre><code>data=str:    None {&quot;name&quot;: &quot;Ada&quot;}
+content=str: application/json {&quot;name&quot;: &quot;Ada&quot;}</code></pre>
+<p>A pre-serialized JSON string in <code>data=</code> is sent with <strong>no Content-Type at all</strong>, so many servers will not parse it as JSON. httpx 0.28.1 also raises a <code>DeprecationWarning</code> ("Use 'content=&lt;...&gt;' to upload raw bytes/text content"), but it is hidden by default; run with <code>-W error::DeprecationWarning</code> to see it. Use <code>content=</code> and set the header yourself.</p>
+<h2 id="format">4. JSON body format differs from requests</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+# httpx: compact separators, non-ASCII sent as UTF-8
+r = httpx.post(base + &quot;/api&quot;, json={&quot;city&quot;: &quot;Zürich&quot;, &quot;n&quot;: 1})
+print(&quot;httpx:   &quot;, r.json()[&quot;body&quot;])
+
+import requests
+r = requests.post(base + &quot;/api&quot;, json={&quot;city&quot;: &quot;Zürich&quot;, &quot;n&quot;: 1})
+print(&quot;requests:&quot;, r.json()[&quot;body&quot;])
+
+from datetime import date
+try:
+    httpx.post(base + &quot;/api&quot;, json={&quot;d&quot;: date(2026, 10, 23)})
+except TypeError as e:
+    print(&quot;TypeError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>httpx:    {&quot;city&quot;:&quot;Zürich&quot;,&quot;n&quot;:1}
+requests: {&quot;city&quot;: &quot;Z\u00fcrich&quot;, &quot;n&quot;: 1}
+TypeError: Object of type date is not JSON serializable</code></pre>
+<p>httpx 0.28 sends compact JSON with non-ASCII characters as UTF-8; requests adds spaces and escapes them as <code>\u00fc</code>. Both are valid JSON, but it matters if you sign the body (HMAC webhooks) or compare it byte for byte. Types the <code>json</code> module cannot encode, such as <code>date</code>, raise <code>TypeError</code> before anything is sent; convert them first (for example <code>d.isoformat()</code>).</p>
+<h2 id="both">5. Gotcha: json= and data= together</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+r = httpx.post(base + &quot;/api&quot;, json={&quot;a&quot;: 1}, data={&quot;b&quot;: 2})
+e = r.json()
+print(e[&quot;content-type&quot;], e[&quot;body&quot;])</code></pre>
+<p>Output:</p>
+<pre><code>application/x-www-form-urlencoded b=2</code></pre>
+<p>When both are passed, httpx 0.28.1 sends the form and silently drops the JSON. Pick one.</p>
+<h2 id="async">6. AsyncClient post json</h2>
+<pre><code>import asyncio, httpx
+from srv import start
+base = start()
+
+async def main():
+    async with httpx.AsyncClient(base_url=base) as client:
+        r = await client.post(&quot;/api&quot;, json={&quot;name&quot;: &quot;Ada&quot;})
+        r.raise_for_status()
+        print(r.status_code, r.json()[&quot;body&quot;])
+
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>200 {&quot;name&quot;:&quot;Ada&quot;}</code></pre>
+<p>Related: <a href="/guides/httpx-params-query-parameters/">httpx params</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests differences</a>, <a href="/guides/httpx-timeout-default-readtimeout/">httpx timeout</a>, <a href="/guides/fastapi-422-unprocessable-entity/">FastAPI 422 Unprocessable Entity</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I post JSON with httpx?</summary><p>httpx.post(url, json=obj). httpx serializes it and sets Content-Type: application/json.</p></details>
+<details><summary>What is the difference between json= and data= in httpx?</summary><p>json= sends a JSON body; data= with a dict sends a form (application/x-www-form-urlencoded).</p></details>
+<details><summary>How do I send a JSON string with httpx?</summary><p>Use content=json_string with headers={&#x27;Content-Type&#x27;: &#x27;application/json&#x27;}. data=str is deprecated and sends no Content-Type.</p></details>
+<details><summary>Is the httpx JSON body the same as requests?</summary><p>No. httpx 0.28 sends compact JSON with UTF-8 characters; requests adds spaces and escapes non-ASCII, which matters for signed bodies.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 (and requests 2.32 for comparison) on Python 3.13.5 against a local http.server that echoes the request body. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

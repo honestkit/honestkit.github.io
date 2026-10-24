@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>functools.partial Objects Never Compare Equal (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: two functools.partial(f,1,2) objects, same func and args, are not ==, hash differently, and both land in a set meant to dedupe them.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-functools-partial-never-equal-breaks-dedup/">
+<meta property="og:title" content="functools.partial Objects Never Compare Equal (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: two functools.partial(f,1,2) objects, same func and args, are not ==, hash differently, and both land in a set meant to dedupe them.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-functools-partial-never-equal-breaks-dedup/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Are two functools.partial objects with the same function and arguments equal?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured two partial(f, 1, 2) objects built independently: == returned False and their hashes differed, even though .func, .args and .keywords were all identical, because partial defines no __eq__ or __hash__ and falls back to identity comparison."}}, {"@type": "Question", "name": "Will a set or dict deduplicate functools.partial objects with identical arguments?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured putting two value-identical partial objects into a set and using them as dict keys: both ended up as separate entries, with no error raised, because deduplication relies on == and hash, which partial does not define in terms of its wrapped data."}}, {"@type": "Question", "name": "How do I deduplicate functools.partial callbacks by their function and arguments?", "acceptedAnswer": {"@type": "Answer", "text": "Build an explicit comparison key from the partial's own attributes, such as (p.func, p.args, tuple(sorted(p.keywords.items()))), and deduplicate on that tuple instead of on the partial object itself -- we measured this correctly collapsing two value-identical partials to one."}}, {"@type": "Question", "name": "Is this specific to functools.partial, or true of other callables too?", "acceptedAnswer": {"@type": "Answer", "text": "It follows from partial not implementing __eq__/__hash__ based on its contents -- the same default-identity behavior applies to any plain Python object that doesn't define those methods, such as a plain function wrapper or a simple class instance with no __eq__."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>functools.partial Objects With Identical Args Are Never Equal (tested)</h1>
+<p class="lead">A <code>functools.partial</code> object exposes its wrapped function and bound arguments as plain, inspectable attributes (<code>.func</code>, <code>.args</code>, <code>.keywords</code>), which looks like a value object -- something equal data should make equal. We measured that it isn't: <code>partial</code> defines no <code>__eq__</code> or <code>__hash__</code>, so it falls back to identity, and two partials built from identical inputs are simply two different objects to Python.</p>
+<h2 id="repro1">1. Same function, same args, not equal</h2>
+<pre><code>import functools
+
+def f(a, b):
+    return a + b
+
+p1 = functools.partial(f, 1, 2)
+p2 = functools.partial(f, 1, 2)
+
+print("p1 == p2:", p1 == p2)
+print("p1.func is p2.func:", p1.func is p2.func)
+print("p1.args == p2.args:", p1.args == p2.args)
+print("hash(p1) == hash(p2):", hash(p1) == hash(p2))</code></pre>
+<pre><code>p1 == p2: False
+p1.func is p2.func: True
+p1.args == p2.args: True
+hash(p1) == hash(p2): False</code></pre>
+<p><strong>Measured:</strong> every piece of data inside the two partials is identical -- same wrapped function object, same argument tuple -- yet <code>==</code> is <code>False</code> and the hashes differ. <code>functools.partial</code> inherits no <code>__eq__</code> or <code>__hash__</code> from its data, so Python's default identity-based comparison applies: two instances are equal only if they're literally the same object in memory.</p>
+
+<h2 id="repro2">2. A set or dict built to deduplicate callbacks silently keeps both</h2>
+<pre><code>import functools
+
+def f(a, b):
+    return a + b
+
+p1 = functools.partial(f, 1, 2)
+p2 = functools.partial(f, 1, 2)
+
+callbacks = {p1, p2}
+print("set length:", len(callbacks))
+
+registry = {p1: "handler A"}
+registry[p2] = "handler B"
+print("dict length:", len(registry))
+print(registry[p1], "/", registry[p2])</code></pre>
+<pre><code>set length: 2
+set length: 2
+dict length: 2
+handler A / handler B</code></pre>
+<p><strong>Measured:</strong> no exception, no warning -- the set and the dict simply hold two entries where code that assumes value-based equality expects one. <code>registry[p1]</code> and <code>registry[p2]</code> stay as two completely independent slots even though, from the caller's point of view, they represent "the same callback". A pattern like "register this callback only if an equal one isn't already registered" silently does nothing to prevent duplicates with <code>partial</code> objects.</p>
+
+<h2 id="repro3">3. Working around it</h2>
+<pre><code>import functools
+
+def f(a, b):
+    return a + b
+
+p1 = functools.partial(f, 1, 2)
+p2 = functools.partial(f, 1, 2)
+
+def partial_key(p):
+    return (p.func, p.args, tuple(sorted(p.keywords.items())))
+
+seen = {partial_key(p1), partial_key(p2)}
+print("deduped length:", len(seen))</code></pre>
+<pre><code>deduped length: 1</code></pre>
+<p><strong>Measured:</strong> building an explicit key tuple from <code>.func</code>, <code>.args</code> and <code>.keywords</code> and deduplicating on that tuple (which does use value equality) collapses the two partials to one, as expected. There is no built-in flag or subclass that does this automatically -- it has to be done by hand at every call site that needs it.</p>
+<aside class="cta"><strong>Building a set or dict of functools.partial callbacks and expecting duplicates with the same function and arguments to collapse to one? Check that first -- they don&#x27;t:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Are two functools.partial objects with the same function and arguments equal?</summary><p>No. We measured two partial(f, 1, 2) objects built independently: == returned False and their hashes differed, even though .func, .args and .keywords were all identical, because partial defines no __eq__ or __hash__ and falls back to identity comparison.</p></details>
+<details><summary>Will a set or dict deduplicate functools.partial objects with identical arguments?</summary><p>No. We measured putting two value-identical partial objects into a set and using them as dict keys: both ended up as separate entries, with no error raised, because deduplication relies on == and hash, which partial does not define in terms of its wrapped data.</p></details>
+<details><summary>How do I deduplicate functools.partial callbacks by their function and arguments?</summary><p>Build an explicit comparison key from the partial&#x27;s own attributes, such as (p.func, p.args, tuple(sorted(p.keywords.items()))), and deduplicate on that tuple instead of on the partial object itself -- we measured this correctly collapsing two value-identical partials to one.</p></details>
+<details><summary>Is this specific to functools.partial, or true of other callables too?</summary><p>It follows from partial not implementing __eq__/__hash__ based on its contents -- the same default-identity behavior applies to any plain Python object that doesn&#x27;t define those methods, such as a plain function wrapper or a simple class instance with no __eq__.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in functools.partial: created two separate partial objects wrapping the same function with identical positional arguments, then compared them with ==, hashed them, and put both into a set and a dict to see whether either deduplicated them. PlainHeaders is our extension; Python&#x27;s functools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

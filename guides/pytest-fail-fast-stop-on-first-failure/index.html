@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pytest fail fast: -x, --maxfail, --ff and --sw (tested)</title>
+<meta name="description" content="Stop pytest on the first failure with -x, after N with --maxfail, run failures first with --ff, or resume with --sw (which exits 2, not 1).">
+<link rel="canonical" href="https://honestkit.github.io/guides/pytest-fail-fast-stop-on-first-failure/">
+<meta property="og:title" content="pytest fail fast: -x, --maxfail, --ff and --sw (tested)">
+<meta property="og:description" content="Stop pytest on the first failure with -x, after N with --maxfail, run failures first with --ff, or resume with --sw (which exits 2, not 1).">
+<meta property="og:url" content="https://honestkit.github.io/guides/pytest-fail-fast-stop-on-first-failure/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I make pytest stop on the first failure?", "acceptedAnswer": {"@type": "Answer", "text": "Use pytest -x (or --exitfirst, same as --maxfail=1). pytest --maxfail=N stops after N failures."}}, {"@type": "Question", "name": "What does pytest --ff do?", "acceptedAnswer": {"@type": "Answer", "text": "--failed-first runs the tests that failed in the last run first, then the rest. It reorders but does not deselect; it needs the cache plugin."}}, {"@type": "Question", "name": "What is pytest --sw?", "acceptedAnswer": {"@type": "Answer", "text": "Stepwise mode: stop at the first failure, and on the next run skip the tests that already passed and start from the failing one. It exits with code 2 (interrupted) when it stops."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pytest fail fast: stop on first failure (-x, --maxfail, --ff, --sw)</h1>
+<p class="lead">Run <code>pytest -x</code> to stop at the first failing test, <code>pytest --maxfail=3</code> to stop after three, <code>pytest --ff -x</code> to rerun last time's failures first and stop at the first one, or <code>pytest --sw</code> to stop and resume from the failing test next run. In the test, <code>--sw</code> exited with code 2, while <code>-x</code> exited with 1.</p>
+<p>pytest has four built-in ways to fail fast: <code>-x</code> stops at the first failure, <code>--maxfail=N</code> after N failures, <code>--ff</code> runs last run's failures first, and <code>--sw</code> (stepwise) stops at a failure and resumes from it next time. Measured with pytest 9.1.1 on Python 3.13.5 on six parametrized tests where 3 and 6 fail.</p>
+<h2 id="x">1. -x and --maxfail</h2>
+<pre><code>$ cat test_ff.py
+import pytest
+
+@pytest.mark.parametrize(&quot;n&quot;, range(1, 7))
+def test_n(n):
+    assert n % 3 != 0, f&quot;{n} is divisible by 3&quot;
+$ pytest --tb=no -q test_ff.py | tail -3; echo &quot;exit ${PIPESTATUS[0]}&quot;
+FAILED test_ff.py::test_n[3] - AssertionError: 3 is divisible by 3
+FAILED test_ff.py::test_n[6] - AssertionError: 6 is divisible by 3
+2 failed, 4 passed in 0.01s
+exit 1
+$ pytest -x --tb=no -q test_ff.py | tail -3; echo &quot;exit ${PIPESTATUS[0]}&quot;
+FAILED test_ff.py::test_n[3] - AssertionError: 3 is divisible by 3
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 2 passed in 0.01s
+exit 1
+$ pytest --maxfail=2 --tb=no -q test_ff.py | tail -3; echo &quot;exit ${PIPESTATUS[0]}&quot;
+FAILED test_ff.py::test_n[6] - AssertionError: 6 is divisible by 3
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 2 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+2 failed, 4 passed in 0.01s
+exit 1</code></pre>
+<p><code>-x</code> (same as <code>--exitfirst</code> or <code>--maxfail=1</code>) stopped after <code>test_n[3]</code>; tests 4 to 6 never ran. <code>--maxfail=2</code> stopped at the second failure, which here was the last test anyway, so all six ran. The exit code stays 1 (tests failed) in both cases.</p>
+<h2 id="ff">2. --ff: run the failures from last time first</h2>
+<pre><code>$ pytest -v --ff --tb=no test_ff.py | grep -E &quot;PASSED|FAILED&quot; | head -4
+test_ff.py::test_n[3] FAILED                                             [ 16%]
+test_ff.py::test_n[6] FAILED                                             [ 33%]
+test_ff.py::test_n[1] PASSED                                             [ 50%]
+test_ff.py::test_n[2] PASSED                                             [ 66%]
+$ pytest --ff -x --tb=no -q test_ff.py | tail -3; echo &quot;exit ${PIPESTATUS[0]}&quot;
+FAILED test_ff.py::test_n[3] - AssertionError: 3 is divisible by 3
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed in 0.01s
+exit 1</code></pre>
+<p><code>--ff</code> (<code>--failed-first</code>) reorders, it does not deselect: both earlier failures ran first, then the passing tests. Combined with <code>-x</code> you get the quickest "is it still broken?" answer: 1 failed, nothing else ran. Both need the cache (<code>.pytest_cache</code>); with <code>-p no:cacheprovider</code> they are unavailable.</p>
+<h2 id="sw">3. --sw (stepwise): stop, fix, continue from there</h2>
+<pre><code>$ pytest --sw --tb=no -q test_ff.py | tail -3; echo &quot;exit ${PIPESTATUS[0]}&quot;
+FAILED test_ff.py::test_n[3] - AssertionError: 3 is divisible by 3
+!!!!!!!! Interrupted: Test failed, continuing from this test next run. !!!!!!!!!
+1 failed, 2 passed in 0.08s
+exit 2
+$ pytest --sw --tb=no -q test_ff.py | tail -3; echo &quot;exit ${PIPESTATUS[0]}&quot;
+FAILED test_ff.py::test_n[3] - AssertionError: 3 is divisible by 3
+!!!!!!!! Interrupted: Test failed, continuing from this test next run. !!!!!!!!!
+1 failed, 2 deselected in 0.07s
+exit 2</code></pre>
+<p>Stepwise stops at the first failure like <code>-x</code>, but the next run <strong>deselects</strong> the tests that already passed ("2 deselected") and starts at the failing one. Note the exit code is <strong>2</strong> (interrupted), not 1, so CI scripts that treat 1 as "tests failed" and 2 as "usage/interruption" will see it differently. Use <code>--sw-skip</code> to skip the failing test and stop at the next one.</p>
+<p>Related: <a href="/guides/pytest-rerun-only-failed-tests-last-failed/">pytest rerun only failed tests (--lf)</a>, <a href="/guides/pytest-exit-codes-discovery-failed-exit-code-2-4/">pytest exit codes</a>, <a href="/guides/pytest-raises-get-error-message/">pytest.raises: get the error message</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I make pytest stop on the first failure?</summary><p>Use pytest -x (or --exitfirst, same as --maxfail=1). pytest --maxfail=N stops after N failures.</p></details>
+<details><summary>What does pytest --ff do?</summary><p>--failed-first runs the tests that failed in the last run first, then the rest. It reorders but does not deselect; it needs the cache plugin.</p></details>
+<details><summary>What is pytest --sw?</summary><p>Stepwise mode: stop at the first failure, and on the next run skip the tests that already passed and start from the failing one. It exits with code 2 (interrupted) when it stops.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with pytest 9.1.1 on Python 3.13.5 in a clean virtualenv, starting with an empty .pytest_cache. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; pytest is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

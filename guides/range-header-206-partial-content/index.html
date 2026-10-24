@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Range Header, 206 Partial Content, Content-Range and 416, Tested with nginx</title>
+<meta name="description" content="What nginx 1.31 returned for Range: bytes=0-99, suffix ranges, open-ended ranges, multiple ranges, out-of-range and malformed ranges, If-Range with a matching or stale ETag, and Range on a gzipped response.">
+<link rel="canonical" href="https://honestkit.github.io/guides/range-header-206-partial-content/">
+<meta property="og:title" content="Range Header, 206 Partial Content, Content-Range and 416, Tested with nginx">
+<meta property="og:description" content="What nginx 1.31 returned for Range: bytes=0-99, suffix ranges, open-ended ranges, multiple ranges, out-of-range and malformed ranges, If-Range with a matching or stale ETag, and Range on a gzipped response.">
+<meta property="og:url" content="https://honestkit.github.io/guides/range-header-206-partial-content/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does HTTP 206 Partial Content mean?", "acceptedAnswer": {"@type": "Answer", "text": "The server is sending only the byte range you asked for in the Range header. In our nginx test, Range: bytes=0-99 on a 10,000-byte file returned 206 with Content-Range: bytes 0-99/10000 and Content-Length: 100."}}, {"@type": "Question", "name": "How do I know if a server supports Range requests?", "acceptedAnswer": {"@type": "Answer", "text": "Look for Accept-Ranges: bytes on a normal 200 response, then send a Range request and check for 206. nginx sent Accept-Ranges: bytes for static files, but not on gzipped responses, where it ignored Range and returned 200."}}, {"@type": "Question", "name": "Why do I get 416 Range Not Satisfiable?", "acceptedAnswer": {"@type": "Answer", "text": "The range start is past the end of the file, or the header is malformed. nginx 1.31.6 returned 416 with Content-Range: bytes */10000 for both bytes=20000- and bytes=abc. An end past EOF (bytes=9990-20000) was clipped, not rejected."}}, {"@type": "Question", "name": "What is Range: bytes=-100?", "acceptedAnswer": {"@type": "Answer", "text": "A suffix range: the last 100 bytes. nginx answered Content-Range: bytes 9900-9999/10000."}}, {"@type": "Question", "name": "What does If-Range do?", "acceptedAnswer": {"@type": "Answer", "text": "It makes the Range conditional. With the current ETag nginx returned 206; with a stale ETag it returned 200 and the full file, so a resumed download never mixes old and new versions."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Range header and 206 Partial Content (tested with nginx and curl)</h1>
+<p class="lead">A Range request asks for part of a file. If the server supports it, it answers 206 Partial Content with a Content-Range header saying which bytes you got. We sent ten different Range headers to nginx and wrote down the exact response.</p>
+<h2>1. The results</h2>
+<p>File: 10,000 bytes, served by nginx 1.31.6 with its default static-file handling. Command: <code>curl -sD- -o out -H "Range: ..." http://127.0.0.1:8957/f.bin</code>.</p>
+<table><thead><tr><th>Request header</th><th>Status</th><th>Content-Range</th><th>Content-Length</th></tr></thead><tbody>
+<tr><td>(no Range)</td><td>200</td><td>(none); <code>Accept-Ranges: bytes</code> present</td><td>10000</td></tr>
+<tr><td><code>Range: bytes=0-99</code></td><td>206</td><td><code>bytes 0-99/10000</code></td><td>100</td></tr>
+<tr><td><code>Range: bytes=-100</code> (last 100)</td><td>206</td><td><code>bytes 9900-9999/10000</code></td><td>100</td></tr>
+<tr><td><code>Range: bytes=9990-</code></td><td>206</td><td><code>bytes 9990-9999/10000</code></td><td>10</td></tr>
+<tr><td><code>Range: bytes=0-0</code> (first byte)</td><td>206</td><td><code>bytes 0-0/10000</code></td><td>1</td></tr>
+<tr><td><code>Range: bytes=9990-20000</code> (end past EOF)</td><td>206</td><td><code>bytes 9990-9999/10000</code></td><td>10</td></tr>
+<tr><td><code>Range: bytes=0-9,20-29</code></td><td>206, <code>multipart/byteranges</code></td><td>(per part)</td><td>250</td></tr>
+<tr><td><code>Range: bytes=20000-</code> (start past EOF)</td><td>416</td><td><code>bytes */10000</code></td><td>197 (HTML error page)</td></tr>
+<tr><td><code>Range: bytes=abc</code> (malformed)</td><td>416</td><td><code>bytes */10000</code></td><td>197 (HTML error page)</td></tr>
+</tbody></table>
+<p>Byte positions are zero-based and inclusive: <code>0-99</code> is 100 bytes. An end past the file was clipped to the last byte rather than rejected; only a start past the end gave 416. The 416 carried <code>Content-Range: bytes */10000</code>, which tells the client the full size.</p>
+<h2>2. Malformed ranges: 416, not ignored</h2>
+<p>We expected nginx to ignore <code>bytes=abc</code> and send the whole file with 200. It did not: nginx 1.31.6 answered 416 Requested Range Not Satisfiable. If a client builds Range headers from user input, validate them, because a bad value costs you the response rather than falling back to the full file. Other servers may behave differently; we only tested nginx.</p>
+<h2>3. Multiple ranges</h2>
+<p><code>Range: bytes=0-9,20-29</code> returned one 206 with <code>Content-Type: multipart/byteranges; boundary=00000000000000000001</code>; the next multi-range request got <code>...0002</code>, so the boundary is a counter, not random. Each part has its own headers:</p>
+<pre><code>--00000000000000000002
+Content-Type: application/octet-stream
+Content-Range: bytes 0-9/10000
+
+(10 bytes)
+--00000000000000000002
+Content-Type: application/octet-stream
+Content-Range: bytes 20-29/10000
+
+(10 bytes)
+--00000000000000000002--</code></pre>
+<p>20 bytes of data became a 250-byte body. The top-level response had no Content-Range header; it is only inside the parts.</p>
+<h2>4. If-Range: resume only if the file has not changed</h2>
+<table><thead><tr><th>Headers sent</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>Range: bytes=0-99</code> + <code>If-Range: "6abecfd6-2710"</code> (current ETag)</td><td>206, 100 bytes</td></tr>
+<tr><td><code>Range: bytes=0-99</code> + <code>If-Range: "deadbeef"</code> (stale ETag)</td><td>200, full 10,000 bytes</td></tr>
+</tbody></table>
+<p>This is the safe way to resume: if the file changed, you get the whole new file instead of a mix of old and new bytes. A stale If-Range is not an error; the Range is just dropped. nginx builds the ETag from the modification time and size (<a href="/guides/etag-header-explained/">how nginx ETags work</a>).</p>
+<h2>5. gzip and Range do not mix (in nginx)</h2>
+<p>On a 10,000-byte text file with <code>gzip on</code>, a request with <code>Accept-Encoding: gzip</code> and <code>Range: bytes=0-99</code> got <strong>200 OK</strong> with the full gzipped body (119 bytes), <code>Content-Encoding: gzip</code>, a weak ETag (<code>W/"..."</code>), no Content-Length and no Accept-Ranges header. nginx ignored the Range entirely. Without <code>Accept-Encoding</code> the same text file was served uncompressed and a two-range request on it returned 206 as in section 3. For large downloads, video and anything resumable, do not compress on the fly. The gzipped response came with <code>Transfer-Encoding: chunked</code> instead of a Content-Length: see <a href="/guides/transfer-encoding-chunked-vs-content-length/">chunked vs Content-Length</a>.</p>
+<h2>6. curl shortcuts</h2>
+<ul><li><code>curl -r 0-99 URL</code> sent the same request as <code>-H "Range: bytes=0-99"</code> and got the identical 206 with <code>Content-Range: bytes 0-99/10000</code>.</li>
+<li><code>curl -C - -o file URL</code> with a 4,000-byte partial file on disk asked for the rest and got 206 with <code>Content-Range: bytes 4000-9999/10000</code>; the finished file matched the original byte for byte.</li></ul>
+<h2>7. Things we did not test</h2>
+<p>Doc-based, not measured here: nginx's <code>max_ranges</code> directive limits how many ranges per request it honours (0 disables range support); proxied responses only support Range if the upstream does, or if nginx serves them from cache. Per RFC 9110, a server may also ignore Range and send 200, so clients must handle both.</p>
+<p>See the response headers of any URL, including Accept-Ranges, with <code>curl -sI</code> or the free <a href="/tools/http-headers/">HTTP headers tool</a>.</p>
+<aside class="cta"><strong>Check whether a URL sends Accept-Ranges and answers Range requests:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does HTTP 206 Partial Content mean?</summary><p>The server is sending only the byte range you asked for in the Range header. In our nginx test, Range: bytes=0-99 on a 10,000-byte file returned 206 with Content-Range: bytes 0-99/10000 and Content-Length: 100.</p></details>
+<details><summary>How do I know if a server supports Range requests?</summary><p>Look for Accept-Ranges: bytes on a normal 200 response, then send a Range request and check for 206. nginx sent Accept-Ranges: bytes for static files, but not on gzipped responses, where it ignored Range and returned 200.</p></details>
+<details><summary>Why do I get 416 Range Not Satisfiable?</summary><p>The range start is past the end of the file, or the header is malformed. nginx 1.31.6 returned 416 with Content-Range: bytes */10000 for both bytes=20000- and bytes=abc. An end past EOF (bytes=9990-20000) was clipped, not rejected.</p></details>
+<details><summary>What is Range: bytes=-100?</summary><p>A suffix range: the last 100 bytes. nginx answered Content-Range: bytes 9900-9999/10000.</p></details>
+<details><summary>What does If-Range do?</summary><p>It makes the Range conditional. With the current ETag nginx returned 206; with a stale ETag it returned 200 and the full file, so a resumed download never mixes old and new versions.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 with curl 8.14.1 (curl -sD-) against a throwaway nginx 1.31.6 (nginx:alpine) container serving a 10,000-byte static file, plus a 10,000-byte text file with gzip on (gzip_types text/plain). Default nginx config otherwise; container removed afterwards. PlainHeaders is our extension; the other methods are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

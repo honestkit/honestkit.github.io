@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pandas TypeError: unhashable type: &#x27;dict&#x27; (groupby, merge Fix)</title>
+<meta name="description" content="Why pandas groupby, nunique, unique and merge raise unhashable type: &#x27;dict&#x27; on JSON dict cells, and the json_normalize fix. Tested on pandas 2.3.3 and 3.1.0.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pandas-typeerror-unhashable-type-dict/">
+<meta property="og:title" content="pandas TypeError: unhashable type: &#x27;dict&#x27; (groupby, merge Fix)">
+<meta property="og:description" content="Why pandas groupby, nunique, unique and merge raise unhashable type: &#x27;dict&#x27; on JSON dict cells, and the json_normalize fix. Tested on pandas 2.3.3 and 3.1.0.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pandas-typeerror-unhashable-type-dict/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I group by a column of dicts in pandas?", "acceptedAnswer": {"@type": "Answer", "text": "Group on a string key built with df['col'].apply(lambda d: json.dumps(d, sort_keys=True)), or flatten the dicts into columns with pd.json_normalize and group on those."}}, {"@type": "Question", "name": "Why does drop_duplicates work on dict cells but groupby fails?", "acceptedAnswer": {"@type": "Answer", "text": "In our test drop_duplicates, duplicated and value_counts handled dict cells, while groupby, nunique, unique and merge raised, on both pandas 2.3.3 and 3.1.0."}}, {"@type": "Question", "name": "What does 'Passing a dict as an indexer is not supported' mean?", "acceptedAnswer": {"@type": "Answer", "text": "You used a dict inside df[...] or .loc[...]. Use rename(columns=mapping) to rename, or df[list(mapping)] to select those columns."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pandas TypeError: unhashable type: &#x27;dict&#x27; (groupby, nunique, merge)</h1>
+<p class="lead"><code>TypeError: unhashable type: 'dict'</code> in pandas means a column holds Python dicts (usually from nested JSON) and you called something that hashes cells: <code>groupby</code>, <code>nunique</code>, <code>unique</code> or <code>merge</code>. Flatten it with <code>pd.json_normalize</code> or group on a <code>json.dumps(..., sort_keys=True)</code> key. Tested on pandas 2.3.3 and 3.1.0.</p>
+<h2 id="which">1. Which pandas methods fail on dict cells</h2>
+<pre><code>import pandas as pd
+rows = [{&quot;id&quot;: 1, &quot;meta&quot;: {&quot;src&quot;: &quot;web&quot;, &quot;v&quot;: 2}},
+        {&quot;id&quot;: 2, &quot;meta&quot;: {&quot;src&quot;: &quot;app&quot;, &quot;v&quot;: 1}},
+        {&quot;id&quot;: 3, &quot;meta&quot;: {&quot;src&quot;: &quot;web&quot;, &quot;v&quot;: 2}}]
+df = pd.DataFrame(rows)
+for name, f in [(&quot;drop_duplicates&quot;, lambda: len(df.drop_duplicates(subset=&quot;meta&quot;))),
+                (&quot;duplicated&quot;, lambda: df[&quot;meta&quot;].duplicated().tolist()),
+                (&quot;value_counts&quot;, lambda: df[&quot;meta&quot;].value_counts().tolist()),
+                (&quot;groupby&quot;, lambda: df.groupby(&quot;meta&quot;).size()),
+                (&quot;nunique&quot;, lambda: df[&quot;meta&quot;].nunique()),
+                (&quot;unique&quot;, lambda: df[&quot;meta&quot;].unique()),
+                (&quot;set_index+loc&quot;, lambda: df.set_index(&quot;meta&quot;).loc[{&quot;src&quot;: &quot;web&quot;, &quot;v&quot;: 2}]),
+                (&quot;merge&quot;, lambda: df.merge(df, on=&quot;meta&quot;))]:
+    try:
+        print(f&quot;{name}: {f()}&quot;)
+    except TypeError as e:
+        print(f&quot;{name}: TypeError: {e}&quot;)</code></pre>
+<p>Output, identical on pandas 2.3.3 and 3.1.0:</p>
+<pre><code>drop_duplicates: 2
+duplicated: [False, False, True]
+value_counts: [2, 1]
+groupby: TypeError: unhashable type: &#x27;dict&#x27;
+nunique: TypeError: unhashable type: &#x27;dict&#x27;
+unique: TypeError: unhashable type: &#x27;dict&#x27;
+set_index+loc: TypeError: Passing a dict as an indexer is not supported. Use a list instead.
+merge: TypeError: unhashable type: &#x27;dict&#x27;</code></pre>
+<p><code>groupby</code>, <code>nunique</code>, <code>unique</code> and <code>merge</code> on a column of dicts raise <code>unhashable type: 'dict'</code>. <code>drop_duplicates</code>, <code>duplicated</code> and <code>value_counts</code> did <em>not</em> raise on either version: they found the duplicate dict and dropped it. (With list cells, <code>drop_duplicates</code> does raise; see the <a href="/guides/pandas-typeerror-unhashable-type-list/">list version</a>.) Dict cells nearly always come from loading nested JSON with <code>pd.DataFrame(records)</code> or <code>read_json</code>.</p>
+<h2 id="fix">2. Fix: a JSON key column, or flatten with json_normalize</h2>
+<pre><code>import json
+import pandas as pd
+rows = [{&quot;id&quot;: 1, &quot;meta&quot;: {&quot;src&quot;: &quot;web&quot;, &quot;v&quot;: 2}},
+        {&quot;id&quot;: 2, &quot;meta&quot;: {&quot;v&quot;: 1, &quot;src&quot;: &quot;app&quot;}},
+        {&quot;id&quot;: 3, &quot;meta&quot;: {&quot;v&quot;: 2, &quot;src&quot;: &quot;web&quot;}}]
+df = pd.DataFrame(rows)
+# Option A: a hashable key column (sort_keys so key order doesn&#x27;t matter)
+df[&quot;meta_key&quot;] = df[&quot;meta&quot;].apply(lambda d: json.dumps(d, sort_keys=True))
+print(df[&quot;meta_key&quot;].nunique())
+print(df.groupby(&quot;meta_key&quot;)[&quot;id&quot;].apply(list))
+# Option B: flatten the dicts into real columns
+flat = pd.json_normalize(rows)
+print(flat)
+print(flat.groupby([&quot;meta.src&quot;, &quot;meta.v&quot;]).size())</code></pre>
+<p>Output, identical on pandas 2.3.3 and 3.1.0:</p>
+<pre><code>2
+meta_key
+{&quot;src&quot;: &quot;app&quot;, &quot;v&quot;: 1}       [2]
+{&quot;src&quot;: &quot;web&quot;, &quot;v&quot;: 2}    [1, 3]
+Name: id, dtype: object
+   id meta.src  meta.v
+0   1      web       2
+1   2      app       1
+2   3      web       2
+meta.src  meta.v
+app       1         1
+web       2         2
+dtype: int64</code></pre>
+<p><code>json.dumps(d, sort_keys=True)</code> gives each dict a string key that is hashable, and <code>sort_keys</code> makes <code>{"v": 2, "src": "web"}</code> and <code>{"src": "web", "v": 2}</code> the same key (rows 1 and 3 group together above). If you need the values themselves, <code>pd.json_normalize</code> turns the nested keys into real columns (<code>meta.src</code>, <code>meta.v</code>) that group, merge and filter normally.</p>
+<h2 id="indexer">3. Passing a dict where pandas expects labels</h2>
+<pre><code>import pandas as pd
+df = pd.DataFrame({&quot;a&quot;: [1, 2], &quot;b&quot;: [3, 4]})
+mapping = {&quot;a&quot;: &quot;A&quot;}
+try:
+    df[mapping]
+except TypeError as e:
+    print(&quot;df[dict]: TypeError:&quot;, e)
+print(df.rename(columns=mapping).columns.tolist())</code></pre>
+<p>Output, identical on pandas 2.3.3 and 3.1.0:</p>
+<pre><code>df[dict]: TypeError: Passing a dict as an indexer is not supported. Use a list instead.
+[&#x27;A&#x27;, &#x27;b&#x27;]</code></pre>
+<p>Indexing with a dict, <code>df[mapping]</code> or <code>.loc[dict]</code>, gives a different message: <code>Passing a dict as an indexer is not supported</code>. If the dict was meant to rename columns, pass it to <code>rename(columns=...)</code>; if you wanted to select columns, use <code>df[list(mapping)]</code>. For the plain-Python version of this error (dict as a dict key or set member), see <a href="/guides/python-typeerror-unhashable-type-dict/">TypeError: unhashable type: 'dict'</a>.</p>
+<p>Related: <a href="/guides/pandas-typeerror-unhashable-type-series/">unhashable type: 'Series'</a> · <a href="/guides/pandas-typeerror-unhashable-type-numpy-ndarray/">unhashable type: 'numpy.ndarray'</a> · <a href="/guides/pandas-merge-keyerror-and-not-matching/">merge KeyError</a>.</p>
+
+<aside class="cta"><strong>Pulling a table off a web page into pandas? Copy it as CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I group by a column of dicts in pandas?</summary><p>Group on a string key built with df[&#x27;col&#x27;].apply(lambda d: json.dumps(d, sort_keys=True)), or flatten the dicts into columns with pd.json_normalize and group on those.</p></details>
+<details><summary>Why does drop_duplicates work on dict cells but groupby fails?</summary><p>In our test drop_duplicates, duplicated and value_counts handled dict cells, while groupby, nunique, unique and merge raised, on both pandas 2.3.3 and 3.1.0.</p></details>
+<details><summary>What does &#x27;Passing a dict as an indexer is not supported&#x27; mean?</summary><p>You used a dict inside df[...] or .loc[...]. Use rename(columns=mapping) to rename, or df[list(mapping)] to select those columns.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 in the python:3-alpine Docker image (Python 3.14.7) with pandas 2.3.3 and pandas 3.1.0. Outputs pasted unedited. PlainTables is our extension; Python and pandas are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

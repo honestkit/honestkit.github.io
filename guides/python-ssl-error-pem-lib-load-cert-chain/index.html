@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python ssl.SSLError: [SSL] PEM lib - Causes and Fix (Tested)</title>
+<meta name="description" content="Measured in Python 3.13.5: missing key, swapped cert/key, DER files, empty files and wrong passwords all give PEM lib. How to tell which one you have.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-ssl-error-pem-lib-load-cert-chain/">
+<meta property="og:title" content="Python ssl.SSLError: [SSL] PEM lib - Causes and Fix (Tested)">
+<meta property="og:description" content="Measured in Python 3.13.5: missing key, swapped cert/key, DER files, empty files and wrong passwords all give PEM lib. How to tell which one you have.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-ssl-error-pem-lib-load-cert-chain/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does ssl.SSLError: [SSL] PEM lib mean in Python?", "acceptedAnswer": {"@type": "Answer", "text": "OpenSSL couldn't load the certificate or key from the file. We measured four causes giving the same message: no key provided, cert and key swapped, a DER certificate, and an empty file. A wrong key password gives it too."}}, {"@type": "Question", "name": "What does KEY_VALUES_MISMATCH mean?", "acceptedAnswer": {"@type": "Answer", "text": "The private key doesn't belong to the certificate. We measured it by loading a cert with a key from another certificate."}}, {"@type": "Question", "name": "Why does load_cert_chain hang or ask for a PEM pass phrase?", "acceptedAnswer": {"@type": "Answer", "text": "The key file is encrypted and no password= was given, so OpenSSL prompts on the terminal. We measured the prompt, and OSError Errno 22 when there was no stdin. Pass password= as a string or callable."}}, {"@type": "Question", "name": "How do I convert a DER certificate to PEM?", "acceptedAnswer": {"@type": "Answer", "text": "openssl x509 -inform DER -in cert.der -out cert.pem. We measured a DER certificate giving PEM lib in load_cert_chain."}}, {"@type": "Question", "name": "Can the certificate and key be in one file?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We measured load_cert_chain('combined.pem') with the certificate followed by the key loading fine without keyfile."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ssl.SSLError: [SSL] PEM lib in Python (tested)</h1>
+<p class="lead"><code>ssl.SSLError: [SSL] PEM lib (_ssl.c:...)</code> from <code>load_cert_chain()</code> is OpenSSL saying it couldn't load your certificate or key, without saying why. We generated test certificates and broke them in every common way to see which messages you get and how to tell the causes apart.</p>
+<h2 id="causes">1. Every cause we found gives the same "PEM lib"</h2>
+<pre><code>import os, ssl
+
+os.chdir(&quot;/tmp/pe&quot;)   # cert.pem/key.pem made with: openssl req -x509 -newkey rsa:2048 -nodes ...
+open(&quot;empty.pem&quot;, &quot;w&quot;).close()
+
+cases = [
+    (&quot;cert + matching key&quot;,        (&quot;cert.pem&quot;, &quot;key.pem&quot;)),
+    (&quot;cert+key in one file&quot;,       (&quot;combined.pem&quot;, None)),
+    (&quot;cert only, key missing&quot;,     (&quot;cert.pem&quot;, None)),
+    (&quot;key and cert swapped&quot;,       (&quot;key.pem&quot;, &quot;cert.pem&quot;)),
+    (&quot;key from another cert&quot;,      (&quot;cert.pem&quot;, &quot;other_key.pem&quot;)),
+    (&quot;DER (binary) certificate&quot;,   (&quot;cert.der&quot;, &quot;key.pem&quot;)),
+    (&quot;empty file&quot;,                 (&quot;empty.pem&quot;, &quot;key.pem&quot;)),
+    (&quot;path does not exist&quot;,        (&quot;nope.pem&quot;, &quot;key.pem&quot;)),
+]
+for label, (certfile, keyfile) in cases:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        ctx.load_cert_chain(certfile, keyfile)
+        print(f&quot;{label:26} OK&quot;)
+    except Exception as e:
+        print(f&quot;{label:26} {type(e).__module__}.{type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>cert + matching key        OK
+cert+key in one file       OK
+cert only, key missing     ssl.SSLError: [SSL] PEM lib (_ssl.c:4114)
+key and cert swapped       ssl.SSLError: [SSL] PEM lib (_ssl.c:4093)
+key from another cert      ssl.SSLError: [X509: KEY_VALUES_MISMATCH] key values mismatch (_ssl.c:4114)
+DER (binary) certificate   ssl.SSLError: [SSL] PEM lib (_ssl.c:4093)
+empty file                 ssl.SSLError: [SSL] PEM lib (_ssl.c:4093)
+path does not exist        builtins.FileNotFoundError: [Errno 2] No such file or directory</code></pre>
+<p><strong>Measured on Python 3.13.5 (OpenSSL 3, Debian):</strong> <code>ssl.SSLError: [SSL] PEM lib</code> came from four different problems: a certificate file with no key and no <code>keyfile</code>, the cert and key arguments swapped, a DER (binary) certificate, and an empty file. Only a key that belongs to a different certificate got its own message, <code>KEY_VALUES_MISMATCH</code>. A missing path is a plain <code>FileNotFoundError</code> that doesn't name the file.</p>
+<p>A small clue in our build: the number in <code>(_ssl.c:NNNN)</code> was <code>4093</code> when the <em>certificate</em> failed to load and <code>4114</code> when the <em>key</em> did. The numbers change between Python builds, so compare them against a case you know, not against these values.</p>
+
+<h2 id="password">2. Encrypted private keys: the hidden prompt</h2>
+<pre><code>import os, ssl
+
+os.chdir(&quot;/tmp/pe&quot;)   # enc_key.pem = key.pem encrypted with: openssl pkey -aes256 -passout pass:secret
+for label, kw in [(&quot;no password given&quot;, {}),
+                  (&quot;wrong password&quot;, {&quot;password&quot;: &quot;guess&quot;}),
+                  (&quot;right password&quot;, {&quot;password&quot;: &quot;secret&quot;}),
+                  (&quot;password callback&quot;, {&quot;password&quot;: lambda: os.environ.get(&quot;KEY_PASS&quot;, &quot;secret&quot;)})]:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        ctx.load_cert_chain(&quot;cert.pem&quot;, &quot;enc_key.pem&quot;, **kw)
+        print(f&quot;{label:18} OK&quot;)
+    except Exception as e:
+        print(f&quot;{label:18} {type(e).__module__}.{type(e).__name__}: {e}&quot;)
+
+# CA bundles go to load_verify_locations, and it says something different
+ctx = ssl.create_default_context()
+for f in (&quot;key.pem&quot;, &quot;empty.pem&quot;):
+    try:
+        ctx.load_verify_locations(cafile=f)
+        print(f&quot;load_verify_locations({f}) OK&quot;)
+    except Exception as e:
+        print(f&quot;load_verify_locations({f}) {type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>no password given  builtins.OSError: [Errno 22] Invalid argument
+wrong password     ssl.SSLError: [SSL] PEM lib (_ssl.c:4114)
+right password     OK
+password callback  OK
+load_verify_locations(key.pem) SSLError: [X509: NO_CERTIFICATE_OR_CRL_FOUND] no certificate or crl found (_ssl.c:4346)
+load_verify_locations(empty.pem) SSLError: [X509: NO_CERTIFICATE_OR_CRL_FOUND] no certificate or crl found (_ssl.c:4346)</code></pre>
+<p><strong>Measured:</strong> with an encrypted key and no <code>password=</code>, OpenSSL printed <code>Enter PEM pass phrase:</code> to the terminal and tried to read it. With no stdin (a service, cron, a container) we got <code>OSError: [Errno 22] Invalid argument</code>; in an interactive shell it would sit waiting for input. A wrong password gives the same <code>PEM lib</code> as the other causes. Pass <code>password=</code> as a string or a callable, e.g. one that reads an environment variable. CA bundles belong in <code>load_verify_locations()</code>, which reports <code>NO_CERTIFICATE_OR_CRL_FOUND</code> for a key file or an empty file instead of <code>PEM lib</code>.</p>
+
+<h2 id="check">3. Look inside the files before you blame OpenSSL</h2>
+<pre><code>import os, re
+
+os.chdir(&quot;/tmp/pe&quot;)
+def pem_report(path):
+    data = open(path, &quot;rb&quot;).read()
+    if not data.strip():
+        return &quot;EMPTY&quot;
+    blocks = re.findall(rb&quot;-----BEGIN ([A-Z0-9 ]+)-----&quot;, data)
+    if not blocks:
+        return f&quot;NOT PEM (first bytes {data[:4].hex()}: DER? convert with openssl x509 -inform DER)&quot;
+    return &quot;, &quot;.join(b.decode() for b in blocks)
+
+for f in (&quot;cert.pem&quot;, &quot;key.pem&quot;, &quot;enc_key.pem&quot;, &quot;combined.pem&quot;, &quot;cert.der&quot;, &quot;empty.pem&quot;):
+    print(f&quot;{f:13} {pem_report(f)}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>cert.pem      CERTIFICATE
+key.pem       PRIVATE KEY
+enc_key.pem   ENCRYPTED PRIVATE KEY
+combined.pem  CERTIFICATE, PRIVATE KEY
+cert.der      NOT PEM (first bytes 30820309: DER? convert with openssl x509 -inform DER)
+empty.pem     EMPTY</code></pre>
+<p><strong>Measured:</strong> reading the <code>-----BEGIN ...-----</code> lines tells the cases apart. <code>certfile</code> must contain <code>CERTIFICATE</code> (it may also contain the key, as in <code>combined.pem</code>). <code>keyfile</code> must contain <code>PRIVATE KEY</code> (with <code>ENCRYPTED</code> meaning you need <code>password=</code>). A file starting with <code>30 82</code> is DER: convert it with <code>openssl x509 -inform DER -in cert.der -out cert.pem</code>. For a mismatch, compare the public keys: <code>openssl x509 -noout -pubkey -in cert.pem</code> and <code>openssl pkey -pubout -in key.pem</code> must print the same thing. For certificate verification errors on the client side, see our <a href="/guides/python-ssl-certificate-verify-failed/">CERTIFICATE_VERIFY_FAILED guide</a>.</p>
+
+<aside class="cta"><strong>Serving HTTPS from Python? Check the headers your server actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does ssl.SSLError: [SSL] PEM lib mean in Python?</summary><p>OpenSSL couldn&#x27;t load the certificate or key from the file. We measured four causes giving the same message: no key provided, cert and key swapped, a DER certificate, and an empty file. A wrong key password gives it too.</p></details>
+<details><summary>What does KEY_VALUES_MISMATCH mean?</summary><p>The private key doesn&#x27;t belong to the certificate. We measured it by loading a cert with a key from another certificate.</p></details>
+<details><summary>Why does load_cert_chain hang or ask for a PEM pass phrase?</summary><p>The key file is encrypted and no password= was given, so OpenSSL prompts on the terminal. We measured the prompt, and OSError Errno 22 when there was no stdin. Pass password= as a string or callable.</p></details>
+<details><summary>How do I convert a DER certificate to PEM?</summary><p>openssl x509 -inform DER -in cert.der -out cert.pem. We measured a DER certificate giving PEM lib in load_cert_chain.</p></details>
+<details><summary>Can the certificate and key be in one file?</summary><p>Yes. We measured load_cert_chain(&#x27;combined.pem&#x27;) with the certificate followed by the key loading fine without keyfile.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 on Debian with Python 3.13.5 and OpenSSL 3 using self-signed test certificates made with openssl: eight load_cert_chain inputs, encrypted keys with no, wrong and correct passwords, load_verify_locations, and a PEM inspection helper. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; Python&#x27;s ssl module and OpenSSL are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebSocket connection to &#x27;ws://...&#x27; failed: 9 Causes (Tested)</title>
+<meta name="description" content="We triggered common WebSocket failures in Chromium 153 and Node 24: refused, 404, 200, 400, 403, mixed content, wss to a ws port, a proxy that drops Upgrade.">
+<link rel="canonical" href="https://honestkit.github.io/guides/websocket-connection-failed/">
+<meta property="og:title" content="WebSocket connection to &#x27;ws://...&#x27; failed: 9 Causes (Tested)">
+<meta property="og:description" content="We triggered common WebSocket failures in Chromium 153 and Node 24: refused, 404, 200, 400, 403, mixed content, wss to a ws port, a proxy that drops Upgrade.">
+<meta property="og:url" content="https://honestkit.github.io/guides/websocket-connection-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is close code 1006 with an empty reason?", "acceptedAnswer": {"@type": "Answer", "text": "1006 means the connection closed without a close frame. In Chromium 153 and Node 24, every failed handshake and every killed socket gave 1006, wasClean=false and an empty reason. The real cause is only in the browser console."}}, {"@type": "Question", "name": "Can I read the HTTP status of a failed WebSocket in JavaScript?", "acceptedAnswer": {"@type": "Answer", "text": "Not in the browser. Chromium printed 'Unexpected response code: 404' in the console, but the page only got an error event and close code 1006. In Node, the ws package exposes it via the 'unexpected-response' event."}}, {"@type": "Question", "name": "Why does my WebSocket get 'Unexpected response code: 200'?", "acceptedAnswer": {"@type": "Answer", "text": "The request was served as normal HTTP. In our tests this happened with no upgrade handler on the server and with a proxy that removed the Upgrade header. Fix the server or set proxy_set_header Upgrade and Connection in nginx."}}, {"@type": "Question", "name": "Why does ws:// work on localhost but fail in production?", "acceptedAnswer": {"@type": "Answer", "text": "Chromium 153 allowed ws://127.0.0.1 from an HTTPS page because loopback counts as secure. A non-local host was blocked as Mixed Content with a SecurityError. Use wss:// on HTTPS pages."}}, {"@type": "Question", "name": "Does CORS affect WebSockets?", "acceptedAnswer": {"@type": "Answer", "text": "No. The browser does not run CORS checks on WebSockets. It sends an Origin header, and the server must check it. A server that rejected our origin answered 403, which Chromium showed as 'Unexpected response code: 403'."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>WebSocket connection to &#x27;ws://...&#x27; failed (tested)</h1>
+<p class="lead"><code>WebSocket connection to 'ws://…' failed</code> is Chromium's console error when a WebSocket cannot open. The text after <code>failed:</code> tells you which cause it is. We reproduced nine causes against a local Node server and recorded the exact console line, the close event and what Node 24 reports for the same thing.</p>
+<h2>1. Read the part after "failed:"</h2>
+<p>Chromium writes one console line per failure. There are two families:</p>
+<ul>
+<li><code>Error in connection establishment: net::ERR_…</code> — the TCP or TLS connection never worked. The server never saw an HTTP request.</li>
+<li><code>Error during WebSocket handshake: Unexpected response code: NNN</code> — the server answered, but with status NNN instead of <code>101 Switching Protocols</code>.</li>
+</ul>
+<p>Your JavaScript gets much less. In every failure we tested, the page saw an <code>error</code> event and then a <code>close</code> event with <code>code=1006</code>, an empty <code>reason</code> and <code>wasClean=false</code>. The status code and the net error are only in the console. Browsers hide them from scripts on purpose.</p>
+
+<h2>2. Our test setup</h2>
+<p>A Node 24 server on 127.0.0.1 used the <code>ws</code> package in <code>noServer</code> mode. Its <code>'upgrade'</code> handler accepted <code>/ws</code>, answered 404 for unknown paths, 200 for <code>/200</code>, 403 for <code>/origin</code> unless the Origin was on an allow list, and had paths that close right after opening. A second port ran, one at a time: nothing, a <code>ws</code> server with <code>path: '/ws'</code>, a plain HTTP server with no upgrade handler, a naive proxy, and an HTTPS server. Headless Chromium 153 opened each URL with <code>new WebSocket(url)</code> from a page on the same box.</p>
+
+<h2>3. Results in Chromium 153</h2>
+<table>
+<tr><th>Cause</th><th>Console message after "failed:"</th><th>close event</th></tr>
+<tr><td>Nothing listening on the port</td><td><code>Error in connection establishment: net::ERR_CONNECTION_REFUSED</code></td><td>1006, "", wasClean=false</td></tr>
+<tr><td>Wrong path, own upgrade handler answers 404</td><td><code>Error during WebSocket handshake: Unexpected response code: 404</code></td><td>1006, "", false</td></tr>
+<tr><td>Wrong path, <code>ws</code> server with <code>path: '/ws'</code></td><td><code>Error during WebSocket handshake: Unexpected response code: 400</code></td><td>1006, "", false</td></tr>
+<tr><td>Plain HTTP server, no upgrade handler (Node passed the request to the normal handler)</td><td><code>Error during WebSocket handshake: Unexpected response code: 200</code></td><td>1006, "", false</td></tr>
+<tr><td>Proxy that drops the Upgrade and Connection headers</td><td><code>Error during WebSocket handshake: Unexpected response code: 200</code></td><td>1006, "", false</td></tr>
+<tr><td>Origin not allowed, server answers 403</td><td><code>Error during WebSocket handshake: Unexpected response code: 403</code></td><td>1006, "", false</td></tr>
+<tr><td><code>wss://</code> to a plain <code>ws</code> port</td><td><code>Error in connection establishment: net::ERR_SSL_PROTOCOL_ERROR</code></td><td>1006, "", false</td></tr>
+<tr><td><code>wss://</code> to a self-signed certificate</td><td><code>Error in connection establishment: net::ERR_CERT_AUTHORITY_INVALID</code></td><td>1006, "", false</td></tr>
+<tr><td><code>ws://</code> from an HTTPS page (non-local host)</td><td>Mixed Content error (below); the constructor throws</td><td>no events</td></tr>
+</table>
+<p>Two cases opened and then closed. These do <em>not</em> print a console error:</p>
+<table>
+<tr><th>Server action after open</th><th>close event in Chromium</th></tr>
+<tr><td><code>ws.close()</code> with no code</td><td>code=1005, reason "", wasClean=true</td></tr>
+<tr><td><code>ws.close(4000, 'go away')</code></td><td>code=4000, reason "go away", wasClean=true</td></tr>
+<tr><td><code>ws.terminate()</code> (socket destroyed, no close frame)</td><td>code=1006, reason "", wasClean=false</td></tr>
+</table>
+<p>So 1006 alone does not tell you whether the handshake failed or an open socket died. Check whether <code>open</code> fired first.</p>
+
+<h2>4. Connection refused</h2>
+<p>Nothing is listening on that host and port. The server is down, on another port, or bound to a different interface. Test the port with curl first. See <a href="/guides/err-connection-refused-econnrefused/">ERR_CONNECTION_REFUSED / ECONNREFUSED</a> for the full checklist.</p>
+
+<h2>5. Unexpected response code: 404, 400 or 200</h2>
+<p>The server got the request but did not treat it as a WebSocket upgrade. A working handshake looks like this with curl:</p>
+<pre><code>$ curl -i -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    http://127.0.0.1:8990/ws
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade</code></pre>
+<p>The same request to a wrong path got <code>HTTP/1.1 404 Not Found</code>. What each code usually means:</p>
+<ul>
+<li><strong>404</strong>: wrong path, or your upgrade handler rejects unknown paths. Compare the client URL with the server route character by character, including a trailing slash.</li>
+<li><strong>400</strong>: the <code>ws</code> package's server with a <code>path</code> option answered 400 to a different path in our test. Other servers also use 400 for a bad handshake.</li>
+<li><strong>200</strong>: the request reached a normal HTTP handler. Either no WebSocket server is attached, or a proxy in front removed the <code>Upgrade</code> header. In our proxy test the backend logged the request with no <code>Upgrade</code> header and sent its normal page.</li>
+</ul>
+
+<h2>6. Proxy drops the Upgrade header</h2>
+<p><code>Upgrade</code> and <code>Connection</code> are hop-by-hop headers. A proxy does not forward them unless told to. Our naive Node proxy deleted them and forwarded the rest; Chromium then saw a plain 200. nginx needs this in the WebSocket location (per the nginx docs, not measured):</p>
+<pre><code>location /ws {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+}</code></pre>
+<p>Per the nginx docs, the default <code>proxy_read_timeout</code> is 60 s, so an idle socket is closed after a minute unless you raise it or send pings.</p>
+
+<h2>7. Origin rejected (403)</h2>
+<p>Browsers always send an <code>Origin</code> header on the WebSocket handshake. Our server logged <code>http://127.0.0.1:8990</code> for the test page. If the server checks it against an allow list, a page on a new domain gets 403. Add the exact origin (scheme, host and port) to the list. CORS headers do not apply to WebSockets; the server must check Origin itself. In Node 24, the built-in client let us set <code>headers: { origin: 'https://allowed.example' }</code> and the same endpoint opened.</p>
+
+<h2>8. ws:// from an HTTPS page</h2>
+<p>From <code>https://page.test:8991/</code>, <code>new WebSocket('ws://api.test:8990/ws')</code> threw right away:</p>
+<pre><code>SecurityError: Failed to construct 'WebSocket': An insecure WebSocket connection may not be initiated from a page loaded over HTTPS.</code></pre>
+<p>The console said: <code>Mixed Content: The page at 'https://page.test:8991/' was loaded over HTTPS, but attempted to connect to the insecure WebSocket endpoint 'ws://api.test:8990/ws'. This request has been blocked; this endpoint must be available over WSS.</code></p>
+<p>Use <code>wss://</code>, or build the URL from the page: <code>(location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws'</code>. One catch for local testing: <code>ws://127.0.0.1</code> from the same HTTPS page was <em>allowed</em> and opened, because Chromium treats loopback as secure. So the bug can hide on localhost and appear in production. More in <a href="/guides/mixed-content-blocked-https/">Mixed Content blocked</a>.</p>
+
+<h2>9. wss:// to a plain ws port</h2>
+<p>Chromium gave <code>net::ERR_SSL_PROTOCOL_ERROR</code>. The server spoke plain HTTP to a TLS hello. Either terminate TLS in front (nginx, a load balancer) and point <code>wss://</code> there, or start the server with HTTPS. See <a href="/guides/err-ssl-protocol-error/">ERR_SSL_PROTOCOL_ERROR</a>. A self-signed certificate gives <code>net::ERR_CERT_AUTHORITY_INVALID</code> instead; see <a href="/guides/err-cert-authority-invalid/">ERR_CERT_AUTHORITY_INVALID</a>.</p>
+
+<h2>10. Node.js clients tell you less (built-in) or more (ws)</h2>
+<p>Node 24's built-in <code>WebSocket</code> gave the same close events as Chromium (1006 / 1005 / 4000, same wasClean values). But for every failure, the <code>error</code> event was an <code>ErrorEvent</code> with an empty <code>message</code>, and <code>event.error</code> was a bare <code>TypeError</code> with an empty message and no cause. Refused, 404, 403 and wss-to-ws all looked identical. A missing error listener did not crash the process. A bad scheme threw <code>SyntaxError: expected a ws: or wss: url</code>; <code>http://</code> URLs were accepted and opened.</p>
+<p>The <code>ws</code> package client is more useful for debugging:</p>
+<table>
+<tr><th>Cause</th><th>ws 8.22.0 client error</th></tr>
+<tr><td>Nothing listening</td><td><code>connect ECONNREFUSED 127.0.0.1:8991</code> (code ECONNREFUSED)</td></tr>
+<tr><td>404 / 200 / 403 response</td><td><code>Unexpected server response: 404</code> (or 200, 403); an <code>'unexpected-response'</code> listener gets the full response</td></tr>
+<tr><td>wss to a ws port</td><td><code>write EPROTO … wrong version number</code> (code EPROTO)</td></tr>
+</table>
+
+<h2>11. Fix checklist</h2>
+<ul>
+<li>Open DevTools Console and read the text after <code>failed:</code>. Your <code>onerror</code> handler will not have it.</li>
+<li><code>ERR_CONNECTION_REFUSED</code>: start the server, check host, port and bind address.</li>
+<li>404 / 400: fix the path.</li>
+<li>200: attach the WebSocket server, and make every proxy forward <code>Upgrade</code> and <code>Connection</code>.</li>
+<li>403: add the page's exact origin to the server's allow list.</li>
+<li>Mixed Content / SecurityError: use <code>wss://</code> on HTTPS pages.</li>
+<li><code>ERR_SSL_PROTOCOL_ERROR</code>: you used <code>wss://</code> on a port without TLS.</li>
+<li>Opens then 1006: the server or a proxy killed the socket. Check idle timeouts and send pings.</li>
+</ul>
+<aside class="cta"><strong>Check what your WebSocket endpoint returns to a plain request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is close code 1006 with an empty reason?</summary><p>1006 means the connection closed without a close frame. In Chromium 153 and Node 24, every failed handshake and every killed socket gave 1006, wasClean=false and an empty reason. The real cause is only in the browser console.</p></details>
+<details><summary>Can I read the HTTP status of a failed WebSocket in JavaScript?</summary><p>Not in the browser. Chromium printed &#x27;Unexpected response code: 404&#x27; in the console, but the page only got an error event and close code 1006. In Node, the ws package exposes it via the &#x27;unexpected-response&#x27; event.</p></details>
+<details><summary>Why does my WebSocket get &#x27;Unexpected response code: 200&#x27;?</summary><p>The request was served as normal HTTP. In our tests this happened with no upgrade handler on the server and with a proxy that removed the Upgrade header. Fix the server or set proxy_set_header Upgrade and Connection in nginx.</p></details>
+<details><summary>Why does ws:// work on localhost but fail in production?</summary><p>Chromium 153 allowed ws://127.0.0.1 from an HTTPS page because loopback counts as secure. A non-local host was blocked as Mixed Content with a SecurityError. Use wss:// on HTTPS pages.</p></details>
+<details><summary>Does CORS affect WebSockets?</summary><p>No. The browser does not run CORS checks on WebSockets. It sends an Origin header, and the server must check it. A server that rejected our origin answered 403, which Chromium showed as &#x27;Unexpected response code: 403&#x27;.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright), Node.js 24.21.0 (built-in WebSocket), the ws package 8.22.0 (server and client) and curl 8.14.1, against local Node servers. The nginx config is from the nginx docs, not measured. PlainHeaders is our extension; Chromium, Node.js, ws and curl are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>decimal: prec Counts Significant Digits, Not Decimal Places</title>
+<meta name="description" content="We measured Python 3.13.5: summing seven $19.99 values under Context.prec=2 gives 1.4E+2 (140), not the exact 139.93 -- prec isn&#x27;t decimal places.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-decimal-prec-is-significant-digits-not-decimal-places/">
+<meta property="og:title" content="decimal: prec Counts Significant Digits, Not Decimal Places">
+<meta property="og:description" content="We measured Python 3.13.5: summing seven $19.99 values under Context.prec=2 gives 1.4E+2 (140), not the exact 139.93 -- prec isn&#x27;t decimal places.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-decimal-prec-is-significant-digits-not-decimal-places/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does decimal.Context.prec control the number of decimal places?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured prec controlling the total number of significant digits in the result of every arithmetic operation, regardless of where the decimal point falls. Decimal('123.456') under prec=2 rounds to 1.2E+2, not to 2 digits after the decimal point."}}, {"@type": "Question", "name": "Why did my Decimal running total come out wrong even though I used Decimal instead of float?", "acceptedAnswer": {"@type": "Answer", "text": "If Context.prec was set low (for example, assuming it meant decimal places for currency), every addition in the loop rounds the running total to that many significant digits before the next value is added -- we measured summing seven $19.99 values under prec=2 giving 140 instead of the exact 139.93, with the error compounding across iterations."}}, {"@type": "Question", "name": "What's the right way to round a Decimal to 2 decimal places for currency?", "acceptedAnswer": {"@type": "Answer", "text": "Use .quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) on the final value, not Context.prec. We confirmed this gives the exact, correctly-rounded result without affecting the precision of the arithmetic that produced it."}}, {"@type": "Question", "name": "Does lowering Context.prec affect Decimal values that are just constructed, not computed?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured that constructing a Decimal from a string stays exact regardless of the active context's prec. Only the result of an arithmetic operation (+, -, *, /, etc.) gets rounded to prec significant digits."}}, {"@type": "Question", "name": "Is Python's decimal module safe for financial math by default?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, with the default context (prec=28) it has far more headroom than any realistic running total needs, and we measured the default producing the exact correct sum. The risk we measured is specifically from applications setting a low custom prec under the mistaken belief that it limits decimal places rather than total significant digits."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>decimal: Context.prec Counts Significant Digits, Not Decimal Places (tested)</h1>
+<p class="lead"><code>decimal.Context.prec</code> sounds like it might mean "how many digits after the decimal point" -- a natural guess if you're reaching for Decimal to do exact currency math and want 2 digits for cents. We measured what <code>prec</code> actually controls, and what happens to a running total computed under a context set with that assumption.</p>
+<h2 id="repro1">1. prec=2 does not mean "2 decimal places" -- it means 2 significant digits total</h2>
+<pre><code>from decimal import Decimal, localcontext
+
+with localcontext() as ctx:
+    ctx.prec = 2
+    print(Decimal("19.99") + Decimal("0"))
+    print(Decimal("123.456") + Decimal("0"))</code></pre>
+<pre><code>20
+1.2E+2</code></pre>
+<p><strong>Measured:</strong> with <code>prec=2</code>, adding zero to <code>19.99</code> rounds it to <code>20</code> -- two significant digits, zero decimal places. <code>123.456</code> rounds to <code>1.2E+2</code>. Every arithmetic operation rounds its result to <code>prec</code> significant digits, regardless of where the decimal point falls -- it has nothing to do with "decimal places" despite the name suggesting otherwise to a currency use case.</p>
+
+<h2 id="repro2">2. A running total under that context silently loses real money</h2>
+<pre><code>from decimal import Decimal, localcontext
+
+with localcontext() as ctx:
+    ctx.prec = 2
+    total = Decimal("0")
+    for _ in range(7):
+        total = total + Decimal("19.99")
+    print("running total, prec=2:", total)
+
+exact = sum([Decimal("19.99")] * 7)
+print("exact sum, default prec:", exact)</code></pre>
+<pre><code>running total, prec=2: 1.4E+2
+exact sum, default prec: 139.93</code></pre>
+<p><strong>Measured:</strong> summing seven <code>19.99</code> line items one at a time under <code>prec=2</code> gives <code>1.4E+2</code> (140), seven cents off from the exact <code>139.93</code> -- and the error compounds because every intermediate addition re-rounds the running total to 2 significant digits before the next item is added, not just the final display. The construction of each <code>Decimal('19.99')</code> stays exact; it's the <em>arithmetic</em> that rounds, silently, on every single operation.</p>
+
+<h2 id="repro3">3. The fix: leave prec at a safe default, use quantize() for display</h2>
+<pre><code>from decimal import Decimal, ROUND_HALF_UP
+
+total = sum([Decimal("19.99")] * 7)
+print("exact total:", total)
+print("rounded to cents for display:", total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))</code></pre>
+<pre><code>exact total: 139.93
+rounded to cents for display: 139.93</code></pre>
+<p><strong>Measured:</strong> computing the sum under the default context (<code>prec=28</code>, far more than any realistic running total needs) and only calling <code>.quantize(Decimal('0.01'))</code> at the point of display or storage gives the exact, correct result. <code>prec</code> is a global ceiling on significant digits for every operation in a calculation chain; decimal-place rounding is a separate, explicit, per-value operation via <code>quantize()</code>. Conflating the two turns a tool chosen specifically for exact currency math into one that silently drops money.</p>
+<aside class="cta"><strong>Setting decimal.Context.prec to control decimal places for money math? Check what prec actually counts first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does decimal.Context.prec control the number of decimal places?</summary><p>No -- we measured prec controlling the total number of significant digits in the result of every arithmetic operation, regardless of where the decimal point falls. Decimal(&#x27;123.456&#x27;) under prec=2 rounds to 1.2E+2, not to 2 digits after the decimal point.</p></details>
+<details><summary>Why did my Decimal running total come out wrong even though I used Decimal instead of float?</summary><p>If Context.prec was set low (for example, assuming it meant decimal places for currency), every addition in the loop rounds the running total to that many significant digits before the next value is added -- we measured summing seven $19.99 values under prec=2 giving 140 instead of the exact 139.93, with the error compounding across iterations.</p></details>
+<details><summary>What&#x27;s the right way to round a Decimal to 2 decimal places for currency?</summary><p>Use .quantize(Decimal(&#x27;0.01&#x27;), rounding=ROUND_HALF_UP) on the final value, not Context.prec. We confirmed this gives the exact, correctly-rounded result without affecting the precision of the arithmetic that produced it.</p></details>
+<details><summary>Does lowering Context.prec affect Decimal values that are just constructed, not computed?</summary><p>No -- we measured that constructing a Decimal from a string stays exact regardless of the active context&#x27;s prec. Only the result of an arithmetic operation (+, -, *, /, etc.) gets rounded to prec significant digits.</p></details>
+<details><summary>Is Python&#x27;s decimal module safe for financial math by default?</summary><p>Yes, with the default context (prec=28) it has far more headroom than any realistic running total needs, and we measured the default producing the exact correct sum. The risk we measured is specifically from applications setting a low custom prec under the mistaken belief that it limits decimal places rather than total significant digits.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in decimal module: set a localcontext() precision of 2, summed seven Decimal(&#x27;19.99&#x27;) values in a running total inside that context, and compared the result against the exact sum under the default context and against the correct fix using quantize(). PlainHeaders is our extension; Python&#x27;s decimal module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

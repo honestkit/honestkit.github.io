@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Django RuntimeError: populate() isn&#x27;t reentrant (Tested Fix)</title>
+<meta name="description" content="Django populate() isn&#x27;t reentrant tested on 6.1.2: it hides the first setup() error (e.g. ModuleNotFoundError), or setup() is called from inside app code.">
+<link rel="canonical" href="https://honestkit.github.io/guides/django-runtimeerror-populate-isnt-reentrant/">
+<meta property="og:title" content="Django RuntimeError: populate() isn&#x27;t reentrant (Tested Fix)">
+<meta property="og:description" content="Django populate() isn&#x27;t reentrant tested on 6.1.2: it hides the first setup() error (e.g. ModuleNotFoundError), or setup() is called from inside app code.">
+<meta property="og:url" content="https://honestkit.github.io/guides/django-runtimeerror-populate-isnt-reentrant/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes populate() isn't reentrant in Django?", "acceptedAnswer": {"@type": "Answer", "text": "django.setup() ran again in a process where an earlier setup() failed or is still running. The first failure, often an ImportError in an installed app, is the real error."}}, {"@type": "Question", "name": "How do I see the real error behind populate() isn't reentrant?", "acceptedAnswer": {"@type": "Answer", "text": "Read the first traceback in the server log after restart, or run python manage.py check in the same environment."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Django RuntimeError: populate() isn&#x27;t reentrant (tested)</h1>
+<p class="lead"><code>RuntimeError: populate() isn't reentrant</code> means <code>django.setup()</code> ran again after an earlier attempt failed or while it was still running. The message hides the real error: look for the first traceback.</p>
+<h2 id="masked">1. The usual cause: a second setup() after the first one failed</h2>
+<p><code>proj/brokenapp/models.py</code> contains one line, <code>import nonexistent_package</code>.</p>
+<pre><code>import sys; sys.path.insert(0, &#x27;/w/proj&#x27;)
+import django
+from django.conf import settings
+settings.configure(INSTALLED_APPS=[&#x27;brokenapp&#x27;])
+for attempt in (1, 2):
+    try:
+        django.setup()
+    except Exception as e:
+        print(f&#x27;setup() attempt {attempt}:&#x27;, type(e).__name__ + &#x27;:&#x27;, e)</code></pre>
+<p>Output:</p>
+<pre><code>setup() attempt 1: ModuleNotFoundError: No module named &#x27;nonexistent_package&#x27;
+setup() attempt 2: RuntimeError: populate() isn&#x27;t reentrant</code></pre>
+<p>The first <code>setup()</code> fails with the real error. Django has already marked the app registry as loading, so any later <code>setup()</code> in the same process raises <code>RuntimeError: populate() isn't reentrant</code> instead of the original error. If your server retries loading <code>wsgi.py</code> in the same process after a failed import (Apache mod_wsgi does this on the next request), the second and later requests show only this message.</p>
+<p>Fix: find the <strong>first</strong> error. Scroll up in the server log to the first traceback after the restart, or run <code>python manage.py check</code> (or <code>python -c "import django; django.setup()"</code> with your <code>DJANGO_SETTINGS_MODULE</code>) in the same virtualenv. The underlying error is typically a missing package, a typo in <code>INSTALLED_APPS</code>, or an exception in a <code>models.py</code>. Then restart the server process.</p>
+<h2 id="nested">2. setup() called while setup() is running</h2>
+<p><code>proj/selfsetup/apps.py</code>:</p>
+<pre><code>from django.apps import AppConfig
+class SelfSetupConfig(AppConfig):
+    name = &#x27;selfsetup&#x27;
+    def ready(self):
+        import django
+        django.setup()            # setup() called while setup() is running</code></pre>
+<pre><code>import sys; sys.path.insert(0, &#x27;/w/proj&#x27;)
+import django
+from django.conf import settings
+settings.configure(INSTALLED_APPS=[&#x27;selfsetup&#x27;])
+try:
+    django.setup()
+except Exception as e:
+    print(type(e).__name__ + &#x27;:&#x27;, e)</code></pre>
+<p>Output:</p>
+<pre><code>RuntimeError: populate() isn&#x27;t reentrant</code></pre>
+<p>The same error appears when code imported during setup (an <code>AppConfig.ready()</code>, a <code>models.py</code>, or a module they import) calls <code>django.setup()</code> again. Only call <code>django.setup()</code> once, in a standalone script's entry point, never inside app code.</p>
+<p>Related: <a href="/guides/django-improperlyconfigured-settings-are-not-configured/">Django ImproperlyConfigured: settings are not configured</a>, <a href="/guides/django-templatedoesnotexist/">Django TemplateDoesNotExist</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers your Django site returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes populate() isn&#x27;t reentrant in Django?</summary><p>django.setup() ran again in a process where an earlier setup() failed or is still running. The first failure, often an ImportError in an installed app, is the real error.</p></details>
+<details><summary>How do I see the real error behind populate() isn&#x27;t reentrant?</summary><p>Read the first traceback in the server log after restart, or run python manage.py check in the same environment.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Django 6.1.2 and Python 3.14.7 (python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Django are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

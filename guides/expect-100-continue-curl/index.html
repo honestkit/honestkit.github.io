@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Expect: 100-continue in curl: the 1 MB Rule, the 1 Second Delay and How to Disable It</title>
+<meta name="description" content="Tested with curl 8.14.1: curl adds Expect: 100-continue only for bodies over 1 MiB, waits 1 second if the server ignores it, and -H &#x27;Expect:&#x27; removes it. Python requests and Node fetch never send it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/expect-100-continue-curl/">
+<meta property="og:title" content="Expect: 100-continue in curl: the 1 MB Rule, the 1 Second Delay and How to Disable It">
+<meta property="og:description" content="Tested with curl 8.14.1: curl adds Expect: 100-continue only for bodies over 1 MiB, waits 1 second if the server ignores it, and -H &#x27;Expect:&#x27; removes it. Python requests and Node fetch never send it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/expect-100-continue-curl/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "When does curl send Expect: 100-continue?", "acceptedAnswer": {"@type": "Answer", "text": "In curl 8.14.1, for HTTP/1.1 uploads with a body larger than 1 MiB (1,048,576 bytes); a 5 MB chunked upload from stdin also got it (a tiny one did not). A 1,048,576-byte POST had no Expect header; 1,048,577 bytes did. It also applied to -F multipart and -T PUT uploads."}}, {"@type": "Question", "name": "Why is my curl upload 1 second slow?", "acceptedAnswer": {"@type": "Answer", "text": "curl sent Expect: 100-continue and the server never replied 100 Continue, so curl waited its default 1 second before sending the body. In our test a 1,048,577-byte POST took 1.004 s versus 0.005 s for 1,048,576 bytes."}}, {"@type": "Question", "name": "How do I disable Expect: 100-continue in curl?", "acceptedAnswer": {"@type": "Answer", "text": "Add -H 'Expect:' (an empty value). curl then removes the header and sends the body at once. A 5 MB POST went from 1.05 s to 0.094 s against a server that ignored Expect."}}, {"@type": "Question", "name": "What does --expect100-timeout do?", "acceptedAnswer": {"@type": "Answer", "text": "It sets how long curl waits for 100 Continue before sending the body anyway. With --expect100-timeout 0.2 a 5 MB POST took 0.247 s instead of 1.05 s."}}, {"@type": "Question", "name": "Do Python requests or Node fetch send Expect: 100-continue?", "acceptedAnswer": {"@type": "Answer", "text": "No. Python requests 2.32.3, Python urllib (3.13) and Node 24.21.0 fetch sent 5 MB bodies without an Expect header and with no delay."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Expect: 100-continue in curl (tested)</h1>
+<p class="lead">If a large curl upload is about 1 second slower than it should be, Expect: 100-continue is the usual cause. We measured exactly when curl 8.14.1 sends it, how long it waits, how to turn it off, and what other clients do.</p>
+<h2>1. What Expect: 100-continue does</h2>
+<p>The client sends the request headers with <code>Expect: 100-continue</code> and then pauses before the body. The server can answer <code>HTTP/1.1 100 Continue</code> ("send it"), or a final status like 401 or 413 ("don't bother"). This saves uploading a large body that would be refused anyway. If the server says nothing, the client gives up waiting after a timeout and sends the body anyway.</p>
+<h2>2. When curl 8.14.1 adds the header</h2>
+<table><thead><tr><th>Request (HTTP/1.1, plain http)</th><th>Expect sent?</th><th>Total time, server ignores Expect</th></tr></thead><tbody>
+<tr><td><code>--data-binary</code> 1,024 / 1,025 bytes</td><td>No</td><td>0.001 s</td></tr>
+<tr><td><code>--data-binary</code> 1,048,576 bytes (exactly 1 MiB)</td><td>No</td><td>0.005 s</td></tr>
+<tr><td><code>--data-binary</code> 1,048,577 bytes</td><td><strong>Yes</strong></td><td><strong>1.004 s</strong></td></tr>
+<tr><td><code>--data-binary</code> 5,000,000 bytes</td><td>Yes</td><td>about 1.05 s</td></tr>
+<tr><td><code>-F file=@</code> 5 MB (multipart)</td><td>Yes</td><td>1.047 s</td></tr>
+<tr><td><code>-T</code> 5 MB file (PUT)</td><td>Yes</td><td>1.025 s</td></tr>
+<tr><td><code>-T -</code> or <code>--data-binary @-</code> from stdin, 5 MB, chunked</td><td>Yes</td><td>1.053 s</td></tr>
+<tr><td>Any size with <code>-0</code> (HTTP/1.0)</td><td>No</td><td>0.022 s for 5 MB</td></tr>
+<tr><td>1,024 bytes with <code>-H 'Expect: 100-continue'</code></td><td>Yes (forced)</td><td>1.001 s</td></tr>
+</tbody></table>
+<p>So in curl 8.14.1 the threshold is a body larger than 1 MiB (1,048,576 bytes), not the 1,024 bytes many older answers mention. Older curl versions used a much lower limit, so if you see the header on small uploads, check <code>curl --version</code>.</p>
+<p>With the server ignoring the header, curl's verbose output shows the wait:</p>
+<pre><code>&gt; Expect: 100-continue
+&gt;
+* Done waiting for 100-continue
+* upload completely sent off: 5000000 bytes
+&lt; HTTP/1.1 200 OK</code></pre>
+<h2>3. How to disable it (or shorten the wait)</h2>
+<pre><code># remove the header: body is sent right away
+curl -H 'Expect:' --data-binary @big.bin https://example.com/upload
+
+# keep the header but wait less (seconds, decimals allowed)
+curl --expect100-timeout 0.2 --data-binary @big.bin https://example.com/upload</code></pre>
+<p>Measured with a 5 MB body and a server that ignores Expect: default 1.05 s, <code>--expect100-timeout 0.2</code> 0.247 s, <code>-H 'Expect:'</code> 0.094 s. An empty <code>Expect:</code> header tells curl to drop the header completely; the server log showed no Expect line at all. In PHP and other libcurl bindings the same trick is setting the header list entry <code>Expect:</code> (doc-based, same libcurl mechanism, not tested here).</p>
+<h2>4. When the server does answer</h2>
+<ul>
+<li><strong>100 Continue:</strong> curl sent the body right after it. A 5 MB POST took 0.085 s, no delay.</li>
+<li><strong>413 before the body:</strong> curl stopped, printed status 413, and <code>%{size_upload}</code> was 0. No body bytes were sent. This is the whole point of the header: a size or auth check can fail fast.</li>
+<li><strong>417 Expectation Failed:</strong> curl 8.14.1 returned the 417 with 0 bytes uploaded. It did not retry without the header in our test. Re-run with <code>-H 'Expect:'</code>.</li>
+</ul>
+<p>If your server reads the request headers and then waits for the body without ever replying 100, every big curl upload pays the 1 second timeout. Most real HTTP servers answer 100 Continue automatically; a hand-written socket server or some proxies may not.</p>
+<h2>5. Other clients</h2>
+<table><thead><tr><th>Client (5 MB POST)</th><th>Sent Expect?</th><th>Time</th></tr></thead><tbody>
+<tr><td>Python requests 2.32.3</td><td>No</td><td>0.023 s</td></tr>
+<tr><td>Python urllib.request (3.13)</td><td>No</td><td>0.033 s</td></tr>
+<tr><td>Node 24.21.0 fetch (undici)</td><td>No</td><td>0.080 s</td></tr>
+<tr><td>Node 24.21.0 <code>http.request</code> with <code>Expect: 100-continue</code> set by hand</td><td>Yes</td><td>0.028 s (body sent from the <code>'continue'</code> event)</td></tr>
+</tbody></table>
+<p>None of these added the header on their own, so the 1 second delay is mostly a curl and libcurl issue. In Node's http module, when you set the header yourself you must send the body in the <code>req.on('continue', ...)</code> handler.</p>
+<h2>6. Related</h2>
+<p>A body that is too large is often rejected by a size limit, and request header limits are a separate thing: see <a href="/guides/http-header-size-limit/">HTTP header size limits</a>. For how the body length is signalled, see <a href="/guides/transfer-encoding-chunked-vs-content-length/">Transfer-Encoding chunked vs Content-Length</a> and <a href="/guides/content-length-header-mismatch/">Content-Length mismatch errors</a>. To see what a server sends back, use the free <a href="/tools/http-headers/">HTTP headers checker</a>.</p>
+<aside class="cta"><strong>See the headers a URL actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>When does curl send Expect: 100-continue?</summary><p>In curl 8.14.1, for HTTP/1.1 uploads with a body larger than 1 MiB (1,048,576 bytes); a 5 MB chunked upload from stdin also got it (a tiny one did not). A 1,048,576-byte POST had no Expect header; 1,048,577 bytes did. It also applied to -F multipart and -T PUT uploads.</p></details>
+<details><summary>Why is my curl upload 1 second slow?</summary><p>curl sent Expect: 100-continue and the server never replied 100 Continue, so curl waited its default 1 second before sending the body. In our test a 1,048,577-byte POST took 1.004 s versus 0.005 s for 1,048,576 bytes.</p></details>
+<details><summary>How do I disable Expect: 100-continue in curl?</summary><p>Add -H &#x27;Expect:&#x27; (an empty value). curl then removes the header and sends the body at once. A 5 MB POST went from 1.05 s to 0.094 s against a server that ignored Expect.</p></details>
+<details><summary>What does --expect100-timeout do?</summary><p>It sets how long curl waits for 100 Continue before sending the body anyway. With --expect100-timeout 0.2 a 5 MB POST took 0.247 s instead of 1.05 s.</p></details>
+<details><summary>Do Python requests or Node fetch send Expect: 100-continue?</summary><p>No. Python requests 2.32.3, Python urllib (3.13) and Node 24.21.0 fetch sent 5 MB bodies without an Expect header and with no delay.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 with curl 8.14.1 (Debian, libcurl 8.14.1) against a raw Python 3.13 socket server on 127.0.0.1 that logs request headers and either ignores Expect, answers 100 Continue, or rejects with 413/417 before reading the body. Also checked Python requests 2.32.3, Python urllib (3.13) and Node 24.21.0 fetch (undici) and http.request. nginx was not available on the test box and was not tested. PlainHeaders is our extension; the other methods are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>boto3 &quot;Unable to locate credentials&quot; and NoRegionError: Fixes</title>
+<meta name="description" content="boto3 NoCredentialsError and NoRegionError tested on 1.43: when each is raised, credential lookup order, credentials.method, ProfileNotFound, and Docker/cron.">
+<link rel="canonical" href="https://honestkit.github.io/guides/boto3-nocredentialserror-unable-to-locate-credentials/">
+<meta property="og:title" content="boto3 &quot;Unable to locate credentials&quot; and NoRegionError: Fixes">
+<meta property="og:description" content="boto3 NoCredentialsError and NoRegionError tested on 1.43: when each is raised, credential lookup order, credentials.method, ProfileNotFound, and Docker/cron.">
+<meta property="og:url" content="https://honestkit.github.io/guides/boto3-nocredentialserror-unable-to-locate-credentials/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does boto3 say Unable to locate credentials?", "acceptedAnswer": {"@type": "Answer", "text": "No credentials were found in client arguments, environment variables, ~/.aws/credentials or config for the active profile, or an IAM role. Check as the same user and environment that runs the code."}}, {"@type": "Question", "name": "How do I fix botocore NoRegionError You must specify a region?", "acceptedAnswer": {"@type": "Answer", "text": "Pass region_name to boto3.client(), set AWS_DEFAULT_REGION, or add region to your profile in ~/.aws/config."}}, {"@type": "Question", "name": "How do I see where boto3 got its credentials?", "acceptedAnswer": {"@type": "Answer", "text": "boto3.Session().get_credentials().method returns the source, e.g. env or shared-credentials-file."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>boto3 Unable to locate credentials / You must specify a region (tested)</h1>
+<p class="lead">boto3 raises <code>NoCredentialsError: Unable to locate credentials</code> on the first API call when nothing in its credential chain (arguments, env vars, <code>~/.aws</code>, roles) has keys, and <code>NoRegionError: You must specify a region.</code> when a regional client is created with no region set.</p>
+<h2 id="repro">1. Both errors, on a machine with no AWS config</h2>
+<pre><code>import boto3, botocore.exceptions as be
+try:
+    boto3.client(&quot;s3&quot;).list_buckets()          # region not needed for S3
+except be.NoCredentialsError as e:
+    print(type(e).__name__, &quot;|&quot;, e)
+try:
+    boto3.client(&quot;dynamodb&quot;)
+except be.NoRegionError as e:
+    print(type(e).__name__, &quot;|&quot;, e)
+print(&quot;region used:&quot;, boto3.client(&quot;dynamodb&quot;, region_name=&quot;eu-west-1&quot;).meta.region_name)</code></pre>
+<p>Output:</p>
+<pre><code>NoCredentialsError | Unable to locate credentials
+NoRegionError | You must specify a region.
+region used: eu-west-1</code></pre>
+<p><code>NoCredentialsError: Unable to locate credentials</code> is raised when the client makes its <strong>first API call</strong>, not when you create it: boto3 walked its whole credential chain and found nothing. <code>NoRegionError: You must specify a region.</code> is raised earlier, when you <strong>create</strong> a client for a regional service without any region configured. The S3 client above was created without a region; DynamoDB was not. Pass <code>region_name=</code> or configure a default.</p>
+<h2 id="chain">2. Where boto3 looks, and the profile trap</h2>
+<pre><code>import os, boto3
+os.environ[&quot;AWS_ACCESS_KEY_ID&quot;] = &quot;AKIAEXAMPLE&quot;
+os.environ[&quot;AWS_SECRET_ACCESS_KEY&quot;] = &quot;example&quot;
+os.environ[&quot;AWS_DEFAULT_REGION&quot;] = &quot;us-east-1&quot;
+s = boto3.Session()
+c = s.get_credentials()
+print(&quot;credentials from:&quot;, c.method, &quot;| region:&quot;, s.region_name)
+os.environ[&quot;AWS_PROFILE&quot;] = &quot;work&quot;            # profile not in ~/.aws/config
+try:
+    boto3.Session()
+except Exception as e:
+    print(type(e).__name__, &quot;|&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>credentials from: env | region: us-east-1
+ProfileNotFound | The config profile (work) could not be found</code></pre>
+<p>boto3 checks, in order: arguments to the client or Session, environment variables (<code>AWS_ACCESS_KEY_ID</code> / <code>AWS_SECRET_ACCESS_KEY</code>, region from <code>AWS_DEFAULT_REGION</code>), then the shared files <code>~/.aws/credentials</code> and <code>~/.aws/config</code> for the selected profile, then container and instance roles. <code>credentials.method</code> tells you which source won (<code>env</code> here). If <code>AWS_PROFILE</code> names a profile that is not in your config files, you get <code>ProfileNotFound</code> as soon as the Session is created.</p>
+<p>Common reasons it works in your shell but not elsewhere: the script runs as another user or under cron/systemd, so <code>~/.aws</code> is a different home directory or the env vars are missing; inside Docker, where your host's <code>~/.aws</code> is not mounted; or <code>aws configure</code> was run for a named profile but the code uses the default one.</p>
+<h2 id="checklist">Checklist</h2>
+<ul><li>Run <code>aws sts get-caller-identity</code> (or <code>boto3.Session().get_credentials()</code>) as the same user, in the same environment, as the failing code.</li><li>Set a region: <code>region_name="..."</code>, <code>AWS_DEFAULT_REGION</code>, or <code>region</code> in <code>~/.aws/config</code>.</li><li>Docker: pass env vars or mount the AWS config directory read-only; on AWS itself, prefer an IAM role over keys.</li><li><code>ProfileNotFound</code>: check the spelling of <code>AWS_PROFILE</code> against the <code>[profile ...]</code> sections in <code>~/.aws/config</code>.</li><li>Never hard-code keys in the source; the env-var values above are dummies.</li></ul>
+
+<aside class="cta"><strong>Inspect the headers an HTTP endpoint really returns, right in the browser:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does boto3 say Unable to locate credentials?</summary><p>No credentials were found in client arguments, environment variables, ~/.aws/credentials or config for the active profile, or an IAM role. Check as the same user and environment that runs the code.</p></details>
+<details><summary>How do I fix botocore NoRegionError You must specify a region?</summary><p>Pass region_name to boto3.client(), set AWS_DEFAULT_REGION, or add region to your profile in ~/.aws/config.</p></details>
+<details><summary>How do I see where boto3 got its credentials?</summary><p>boto3.Session().get_credentials().method returns the source, e.g. env or shared-credentials-file.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with boto3/botocore 1.43.118 and Python 3.14.7 (python:3-alpine in Docker, no ~/.aws, AWS_EC2_METADATA_DISABLED=true so boto3 does not probe an instance role). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and boto3 are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cache-Control: private vs public, max-age and s-maxage (Tested)</title>
+<meta name="description" content="Chromium 153 cached private, max-age=60 exactly like public: 1 server hit for 2 navigations, even with Set-Cookie or an Authorization header. private only stops shared caches. Express 5 sends public, max-age=0 by default.">
+<link rel="canonical" href="https://honestkit.github.io/guides/cache-control-private-vs-public/">
+<meta property="og:title" content="Cache-Control: private vs public, max-age and s-maxage (Tested)">
+<meta property="og:description" content="Chromium 153 cached private, max-age=60 exactly like public: 1 server hit for 2 navigations, even with Set-Cookie or an Authorization header. private only stops shared caches. Express 5 sends public, max-age=0 by default.">
+<meta property="og:url" content="https://honestkit.github.io/guides/cache-control-private-vs-public/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Cache-Control: private stop the browser from caching?", "acceptedAnswer": {"@type": "Answer", "text": "No. In Chromium 153, a response with private, max-age=60 was served from the browser cache on the second navigation and the second fetch; the server saw 1 hit, the same as public. Use no-store to keep it out of the browser cache."}}, {"@type": "Question", "name": "What is the difference between private and public?", "acceptedAnswer": {"@type": "Answer", "text": "Only who may store the response. private: only the end user's browser. public: shared caches like CDNs and proxies too, even for requests with an Authorization header. In the browser we measured no difference."}}, {"@type": "Question", "name": "Does s-maxage work with private?", "acceptedAnswer": {"@type": "Answer", "text": "No. s-maxage only applies to shared caches, and private forbids shared caches from storing the response, so the combination does nothing extra (from RFC 9111, not measured). Browsers ignore s-maxage."}}, {"@type": "Question", "name": "Is a response with no Cache-Control header cached?", "acceptedAnswer": {"@type": "Answer", "text": "It can be. Chromium 153 reused a response that had only a Last-Modified header one day old without contacting the server (heuristic freshness). Without Last-Modified it requested it again."}}, {"@type": "Question", "name": "What Cache-Control does Express send by default?", "acceptedAnswer": {"@type": "Answer", "text": "Express 5.2.1 sent Cache-Control: public, max-age=0 for express.static and res.sendFile, and no Cache-Control for res.json. Set the header yourself with res.set before sending to use private."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Cache-Control: private vs public (tested)</h1>
+<p class="lead"><code>private</code> and <code>public</code> do not decide <em>whether</em> a response is cached; they decide <em>who</em> may cache it. <code>private</code> means only the user's own browser may store it; CDNs and proxies must not. <code>public</code> lets shared caches store it too, even in cases they normally would not (such as requests with an Authorization header). We counted server hits in Chromium 153 to see what the browser actually does with each.</p>
+<h2>1. What the browser did (measured)</h2>
+<p>A Node.js server on localhost counted every request. Chromium 153 navigated to each URL, away, then back to it with a normal navigation (<code>page.goto</code>, not reload). Separately, the page called <code>fetch()</code> twice per URL.</p>
+<table>
+<tr><th>Response headers</th><th>Request</th><th>Server hits for 2 loads</th></tr>
+<tr><td><code>Cache-Control: public, max-age=60</code></td><td>navigation</td><td>1 (second from cache)</td></tr>
+<tr><td><code>Cache-Control: private, max-age=60</code></td><td>navigation</td><td>1 (second from cache)</td></tr>
+<tr><td><code>private, max-age=60</code> + <code>Set-Cookie</code></td><td>navigation</td><td>1</td></tr>
+<tr><td><code>public, max-age=60</code> + <code>Set-Cookie</code></td><td>navigation</td><td>1</td></tr>
+<tr><td>no Cache-Control, no Last-Modified</td><td>navigation</td><td>2 (not cached)</td></tr>
+<tr><td>no Cache-Control, <code>Last-Modified</code> one day old</td><td>navigation and fetch</td><td>1 (heuristic freshness)</td></tr>
+<tr><td><code>public, max-age=60</code></td><td>fetch</td><td>1</td></tr>
+<tr><td><code>private, max-age=60</code></td><td>fetch</td><td>1</td></tr>
+<tr><td><code>public, max-age=60</code></td><td>fetch with <code>Authorization: Bearer ...</code></td><td>1</td></tr>
+<tr><td><code>private, max-age=60</code></td><td>fetch with <code>Authorization: Bearer ...</code></td><td>1</td></tr>
+<tr><td><code>private, max-age=60</code></td><td>navigation then <code>reload()</code></td><td>2 (reload revalidates)</td></tr>
+</table>
+<p>So in the browser, <code>private</code> and <code>public</code> behaved identically. The browser is a private cache, so <code>private</code> never stops it; <code>max-age</code> is what makes it reuse the response. If you want the browser not to keep a copy at all, <code>private</code> is the wrong tool: use <code>no-store</code> (see <a href="/guides/cache-control-no-cache-vs-no-store/">no-cache vs no-store</a>).</p>
+<p>Also note the heuristic row: a response with <code>Last-Modified</code> but no Cache-Control was still reused without contacting the server. Leaving the header out does not mean "don't cache".</p>
+
+<h2>2. What shared caches do (from the RFC/docs, not measured)</h2>
+<p>We did not run a CDN or proxy cache for this guide. Per RFC 9111:</p>
+<ul>
+<li><strong><code>private</code></strong>: a shared cache (CDN, nginx <code>proxy_cache</code>, Varnish, corporate proxy) must not store the response. nginx's docs state it does not cache responses with <code>Cache-Control: private</code>, <code>no-cache</code> or <code>no-store</code> by default.</li>
+<li><strong><code>public</code></strong>: a shared cache may store it even when it normally would not, notably for requests that carried an <code>Authorization</code> header (section 3.5). Never put <code>public</code> on a per-user response behind auth.</li>
+<li><strong><code>s-maxage=N</code></strong>: freshness lifetime for shared caches only; overrides <code>max-age</code> there. Browsers ignore it. Combined with <code>private</code> it is pointless, because shared caches are not allowed to store the response anyway.</li>
+<li><strong><code>Set-Cookie</code></strong>: the RFC does not forbid caching a response with Set-Cookie; many CDNs refuse by default, but do not rely on that. Mark per-user pages <code>private</code> explicitly.</li>
+</ul>
+
+<h2>3. Which to use</h2>
+<table>
+<tr><th>Content</th><th>Header</th></tr>
+<tr><td>Per-user page (account, cart, dashboard)</td><td><code>Cache-Control: private, max-age=0, must-revalidate</code> or <code>private, no-cache</code></td></tr>
+<tr><td>Per-user API data that can be briefly reused</td><td><code>Cache-Control: private, max-age=60</code></td></tr>
+<tr><td>Sensitive data that must not be stored anywhere</td><td><code>Cache-Control: no-store</code></td></tr>
+<tr><td>Same for everyone, short browser life, longer CDN life</td><td><code>Cache-Control: public, max-age=60, s-maxage=600</code></td></tr>
+<tr><td>Fingerprinted static assets</td><td><code>Cache-Control: public, max-age=31536000, immutable</code></td></tr>
+</table>
+<p>For long-lived assets see <a href="/guides/stale-while-revalidate-cache-control-immutable/">stale-while-revalidate and immutable</a>. Pair short or zero max-age with an <a href="/guides/etag-header-explained/">ETag</a> so revalidation returns a cheap 304. If the response varies by header, also send <a href="/guides/vary-header-accept-encoding-user-agent/">Vary</a>.</p>
+
+<h2>4. Express 5 defaults (measured)</h2>
+<p>Express 5.2.1, checked with <code>curl -I</code>:</p>
+<pre><code>express.static('/dir')                       Cache-Control: public, max-age=0
+res.sendFile(file)                           Cache-Control: public, max-age=0
+res.sendFile(file, {maxAge: '1h'})           Cache-Control: public, max-age=3600
+express.static(dir, {maxAge:'1d', immutable:true})
+                                             Cache-Control: public, max-age=86400, immutable
+res.json({...})                              (no Cache-Control; ETag only)</code></pre>
+<p>All of these also sent an <code>ETag</code>; the static ones sent <code>Last-Modified</code>. Express has no option to switch static files to <code>private</code>, but setting the header yourself before <code>sendFile</code> was kept:</p>
+<pre><code>app.get('/me/report', (req, res) =&gt; {
+  res.set('Cache-Control', 'private, max-age=300');
+  res.sendFile('/srv/reports/' + req.user.id + '.pdf');
+});
+// response: Cache-Control: private, max-age=300</code></pre>
+<p>Note that <code>res.json()</code> sent no Cache-Control at all. Per-user JSON behind a CDN should get an explicit <code>private</code> (or <code>no-store</code>).</p>
+
+<h2>5. Check your own headers</h2>
+<pre><code>curl -sI https://example.com/account | grep -i cache-control</code></pre>
+<p>Check while logged in (pass your cookie with <code>-H 'Cookie: ...'</code>): per-user pages should show <code>private</code> or <code>no-store</code>, never <code>public</code>.</p>
+<aside class="cta"><strong>See the Cache-Control header your pages actually return:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Cache-Control: private stop the browser from caching?</summary><p>No. In Chromium 153, a response with private, max-age=60 was served from the browser cache on the second navigation and the second fetch; the server saw 1 hit, the same as public. Use no-store to keep it out of the browser cache.</p></details>
+<details><summary>What is the difference between private and public?</summary><p>Only who may store the response. private: only the end user&#x27;s browser. public: shared caches like CDNs and proxies too, even for requests with an Authorization header. In the browser we measured no difference.</p></details>
+<details><summary>Does s-maxage work with private?</summary><p>No. s-maxage only applies to shared caches, and private forbids shared caches from storing the response, so the combination does nothing extra (from RFC 9111, not measured). Browsers ignore s-maxage.</p></details>
+<details><summary>Is a response with no Cache-Control header cached?</summary><p>It can be. Chromium 153 reused a response that had only a Last-Modified header one day old without contacting the server (heuristic freshness). Without Last-Modified it requested it again.</p></details>
+<details><summary>What Cache-Control does Express send by default?</summary><p>Express 5.2.1 sent Cache-Control: public, max-age=0 for express.static and res.sendFile, and no Cache-Control for res.json. Set the header yourself with res.set before sending to use private.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright) against a Node.js 24.21.0 http server on localhost:8983, counting server hits per URL, and Express 5.2.1 on localhost:8984 checked with curl 8.14.1. Shared-cache (CDN, nginx proxy_cache) behaviour is quoted from RFC 9111 and vendor docs, not measured. PlainHeaders is our extension; Chromium, Node.js, Express and curl are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

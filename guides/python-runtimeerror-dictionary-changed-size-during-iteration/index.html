@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python RuntimeError: dictionary changed size during iteration</title>
+<meta name="description" content="We changed a dict 5 ways inside a loop in Python 3.13: the change is applied before the error, swapping keys raises nothing, and the 3 fixes that work.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-runtimeerror-dictionary-changed-size-during-iteration/">
+<meta property="og:title" content="Python RuntimeError: dictionary changed size during iteration">
+<meta property="og:description" content="We changed a dict 5 ways inside a loop in Python 3.13: the change is applied before the error, swapping keys raises nothing, and the 3 fixes that work.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-runtimeerror-dictionary-changed-size-during-iteration/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I fix dictionary changed size during iteration?", "acceptedAnswer": {"@type": "Answer", "text": "Loop over a copy of the keys: for k in list(d). Or build a new dict with a comprehension, or collect the keys first and delete them after the loop."}}, {"@type": "Question", "name": "Can I change dict values while iterating?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Changing values or assigning to existing keys does not change the size and raised no error in our test. Only adding or removing keys does."}}, {"@type": "Question", "name": "Is the dict modified when the RuntimeError is raised?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. The deletion or addition that triggered it had already been applied, so the dict is left partly processed."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>RuntimeError: dictionary changed size during iteration (tested fixes)</h1>
+<p class="lead"><code>RuntimeError: dictionary changed size during iteration</code> means a loop over a dict added or removed a key. We tested five kinds of change inside a loop and found two less obvious things: the change has already been made when the error appears, and some changes don't raise at all.</p>
+<h2 id="what">1. What triggers it, and what doesn't</h2>
+<p>We changed a dict five different ways inside a <code>for k in d</code> loop and printed the dict afterwards:</p>
+<pre><code>def attempt(label, fn):
+    d = {&quot;a&quot;: 1, &quot;b&quot;: 2, &quot;c&quot;: 3}
+    try:
+        fn(d); print(f&quot;{label:30} OK -&gt; {d}&quot;)
+    except RuntimeError as e:
+        print(f&quot;{label:30} RuntimeError: {e} -&gt; {d}&quot;)
+
+def delete(d):
+    for k in d:
+        if d[k] == 2: del d[k]
+def add(d):
+    for k in d:
+        d[k * 2] = 0
+def pop_add(d):                       # size ends up the same
+    for k in d:
+        if k == &quot;a&quot;: d.pop(&quot;c&quot;); d[&quot;z&quot;] = 9
+def change_values(d):
+    for k in d:
+        d[k] *= 10
+def set_existing(d):
+    for k in d:
+        d[&quot;a&quot;] = 0
+
+attempt(&quot;delete a key&quot;, delete)
+attempt(&quot;add keys&quot;, add)
+attempt(&quot;pop one, add one&quot;, pop_add)
+attempt(&quot;change values&quot;, change_values)
+attempt(&quot;assign to existing key&quot;, set_existing)
+
+s = {1, 2, 3}
+try:
+    for x in s:
+        s.discard(x)
+except RuntimeError as e:
+    print(f&quot;{&#x27;set: discard while looping&#x27;:30} RuntimeError: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>delete a key                   RuntimeError: dictionary changed size during iteration -&gt; {&#x27;a&#x27;: 1, &#x27;c&#x27;: 3}
+add keys                       RuntimeError: dictionary changed size during iteration -&gt; {&#x27;a&#x27;: 1, &#x27;b&#x27;: 2, &#x27;c&#x27;: 3, &#x27;aa&#x27;: 0}
+pop one, add one               OK -&gt; {&#x27;a&#x27;: 1, &#x27;b&#x27;: 2, &#x27;z&#x27;: 9}
+change values                  OK -&gt; {&#x27;a&#x27;: 10, &#x27;b&#x27;: 20, &#x27;c&#x27;: 30}
+assign to existing key         OK -&gt; {&#x27;a&#x27;: 0, &#x27;b&#x27;: 2, &#x27;c&#x27;: 3}
+set: discard while looping     RuntimeError: Set changed size during iteration</code></pre>
+<p>Three things to notice:</p>
+<ul>
+<li><strong>The change already happened when the error is raised.</strong> After "delete a key", <code>b</code> is gone, and after "add keys", <code>aa</code> was added. Catching the <code>RuntimeError</code> and carrying on leaves the dict half-processed.</li>
+<li>Changing <strong>values</strong>, or assigning to keys that already exist, is fine. Only adding or removing keys is checked.</li>
+<li>The check is on the <strong>size</strong>. Removing one key and adding another in the same step left the size unchanged, and Python raised nothing, even though the keys changed mid-loop. No error does not mean the loop was correct.</li>
+</ul>
+<p>Sets have the same rule, with a capital S in the message: <code>Set changed size during iteration</code>.</p>
+<h2 id="fix">2. Three fixes that work</h2>
+<pre><code>d = {&quot;a&quot;: 1, &quot;b&quot;: 2, &quot;c&quot;: 3, &quot;d&quot;: 4}
+
+for k in list(d):                     # 1. loop over a copy of the keys
+    if d[k] % 2 == 0:
+        del d[k]
+print(&quot;list(d):        &quot;, d)
+
+d = {&quot;a&quot;: 1, &quot;b&quot;: 2, &quot;c&quot;: 3, &quot;d&quot;: 4}
+d = {k: v for k, v in d.items() if v % 2}       # 2. build a new dict
+print(&quot;comprehension:  &quot;, d)
+
+d = {&quot;a&quot;: 1, &quot;b&quot;: 2, &quot;c&quot;: 3, &quot;d&quot;: 4}
+to_delete = [k for k, v in d.items() if v % 2 == 0]   # 3. collect, then delete
+for k in to_delete:
+    del d[k]
+print(&quot;collect+delete: &quot;, d)</code></pre>
+<p>Output:</p>
+<pre><code>list(d):         {&#x27;a&#x27;: 1, &#x27;c&#x27;: 3}
+comprehension:   {&#x27;a&#x27;: 1, &#x27;c&#x27;: 3}
+collect+delete:  {&#x27;a&#x27;: 1, &#x27;c&#x27;: 3}</code></pre>
+<p><code>list(d)</code> makes a copy of the keys first, so the loop no longer depends on the dict. The comprehension builds a new dict, which is the cleanest option when you're filtering. Rebinding <code>d</code> doesn't change other references to the old dict, so use <code>d.clear(); d.update(new)</code> if other code holds the same object. Collect-then-delete is easiest to read when the condition is complicated. The same <code>list(...)</code> fix works for sets (<code>for x in list(s)</code>). If the dict is shared between threads, a copy isn't enough on its own: another thread can still change it while <code>list(d)</code> is copying, so protect it with a lock.</p>
+<p>Related: our <a href="/guides/python-dict-object-has-no-attribute-iteritems-has-key/">dict has no attribute iteritems guide</a> explains why Python 3's <code>items()</code> is a live view of the dict.</p>
+
+<aside class="cta"><strong>Processing headers in a dict? Check what headers a URL actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I fix dictionary changed size during iteration?</summary><p>Loop over a copy of the keys: for k in list(d). Or build a new dict with a comprehension, or collect the keys first and delete them after the loop.</p></details>
+<details><summary>Can I change dict values while iterating?</summary><p>Yes. Changing values or assigning to existing keys does not change the size and raised no error in our test. Only adding or removing keys does.</p></details>
+<details><summary>Is the dict modified when the RuntimeError is raised?</summary><p>Yes. The deletion or addition that triggered it had already been applied, so the dict is left partly processed.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-22 on Debian with Python 3.13.5: deleting, adding, swapping keys, changing values and reassigning existing keys inside a for loop over a dict, discarding from a set while looping, and three fixes. Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>plistlib.load() Crashes with a Wrong Error on None (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: plistlib.load() crashes with AttributeError: &#x27;NoneType&#x27; object has no attribute &#x27;startswith&#x27; on a transient non-blocking None read.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-plistlib-load-none-attributeerror-startswith/">
+<meta property="og:title" content="plistlib.load() Crashes with a Wrong Error on None (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: plistlib.load() crashes with AttributeError: &#x27;NoneType&#x27; object has no attribute &#x27;startswith&#x27; on a transient non-blocking None read.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-plistlib-load-none-attributeerror-startswith/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is this documented behavior?", "acceptedAnswer": {"@type": "Answer", "text": "The plistlib documentation for load() does not mention non-blocking streams or a None read result. We measured that a None-returning source produces an internal-looking AttributeError instead of a clear diagnosis."}}, {"@type": "Question", "name": "Why startswith specifically?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that plistlib's format auto-detection reads a small chunk from the start of the stream and calls .startswith() on it to check for the XML plist header; a None result has no such method, so the AttributeError fires there, before any actual plist parsing begins."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- same family already confirmed in shutil.copyfileobj, gzip/bz2/lzma, tarfile/zipfile, TextIOWrapper.readline(), ElementTree.parse(), tomllib.load(), and email.message_from_binary_file(): a correctly-returned non-blocking None gets mishandled one layer above io itself, each stdlib module failing in its own way."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>plistlib.load() Crashes on a Non-Blocking None (tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> from <code>readinto()</code> -- distinct from the empty read that means real end-of-stream. We measured that <code>plistlib.load()</code>, which needs a seekable stream to detect whether the plist is XML or binary format, crashes on the transient <code>None</code> with <code>AttributeError: 'NoneType' object has no attribute 'startswith'</code> -- an internal-looking error that gives no hint the real cause is a retryable non-blocking signal rather than a malformed or unreadable plist.</p>
+<h2 id="repro1">1. A real, valid plist behind one transient None</h2>
+<pre><code>import io, plistlib
+
+class SeekableFlakyRaw(io.RawIOBase):
+    def __init__(self, payload):
+        self.calls = 0
+        self.payload = payload
+        self.pos = 0
+    def readable(self):
+        return True
+    def seekable(self):
+        return True
+    def seek(self, offset, whence=0):
+        if whence == 0: self.pos = offset
+        elif whence == 1: self.pos += offset
+        elif whence == 2: self.pos = len(self.payload) + offset
+        return self.pos
+    def tell(self):
+        return self.pos
+    def readinto(self, b):
+        self.calls += 1
+        if self.calls == 1:
+            return None            # transient: no data ready yet
+        n = min(len(b), len(self.payload) - self.pos)
+        if n <= 0:
+            return 0
+        b[:n] = self.payload[self.pos:self.pos + n]
+        self.pos += n
+        return n
+
+payload = plistlib.dumps({"key": "value"})
+raw = SeekableFlakyRaw(payload)
+try:
+    data = plistlib.load(io.BufferedReader(raw))
+    print("data:", data)
+except Exception as e:
+    print("CRASHED:", type(e).__name__, e)
+print("raw calls made:", raw.calls)</code></pre>
+<pre><code>CRASHED: AttributeError 'NoneType' object has no attribute 'startswith'
+raw calls made: 1</code></pre>
+<p><strong>Measured:</strong> the plist is valid and complete, one read call away. <code>plistlib.load()</code>'s format-detection step peeks at the start of the stream to decide XML vs. binary format, calling <code>.startswith()</code> on whatever it read -- when that read returns <code>None</code>, the <code>.startswith()</code> call itself raises <code>AttributeError</code>, an error that looks like an internal library bug rather than anything related to stream readiness.</p>
+
+<h2 id="repro2">2. The fix: drain into a real buffer first, retrying on None</h2>
+<pre><code>def drain_retrying_on_none(raw_stream, chunk_size=65536):
+    out = io.BytesIO()
+    br = io.BufferedReader(raw_stream)
+    while True:
+        chunk = br.read(chunk_size)
+        if chunk is None:
+            continue              # retry: not ready yet, not EOF
+        if not chunk:
+            break                  # real EOF
+        out.write(chunk)
+    out.seek(0)
+    return out
+
+raw2 = SeekableFlakyRaw(payload)
+safe_buf = drain_retrying_on_none(raw2)
+print("safe data:", plistlib.load(safe_buf))</code></pre>
+<pre><code>safe data: {'key': 'value'}</code></pre>
+<p><strong>Measured:</strong> resolving the <code>None</code>/EOF distinction before the bytes reach <code>plistlib.load()</code> parses the plist correctly.</p>
+<aside class="cta"><strong>Loading a plist from a non-blocking seekable stream with plistlib.load()? A transient None read crashes with an AttributeError about startswith -- not about the plist content:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is this documented behavior?</summary><p>The plistlib documentation for load() does not mention non-blocking streams or a None read result. We measured that a None-returning source produces an internal-looking AttributeError instead of a clear diagnosis.</p></details>
+<details><summary>Why startswith specifically?</summary><p>We measured that plistlib&#x27;s format auto-detection reads a small chunk from the start of the stream and calls .startswith() on it to check for the XML plist header; a None result has no such method, so the AttributeError fires there, before any actual plist parsing begins.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>Yes -- same family already confirmed in shutil.copyfileobj, gzip/bz2/lzma, tarfile/zipfile, TextIOWrapper.readline(), ElementTree.parse(), tomllib.load(), and email.message_from_binary_file(): a correctly-returned non-blocking None gets mishandled one layer above io itself, each stdlib module failing in its own way.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in plistlib.load(), reading a genuinely valid plist through a seekable io.BufferedReader over a custom non-blocking RawIOBase whose readinto() returns None once before returning the real plist bytes. PlainHeaders is our extension; Python&#x27;s plistlib and io modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

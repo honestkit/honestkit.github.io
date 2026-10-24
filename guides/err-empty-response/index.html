@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ERR_EMPTY_RESPONSE and curl (52) Empty Reply: Causes (Tested)</title>
+<meta name="description" content="Chrome&#x27;s ERR_EMPTY_RESPONSE and curl&#x27;s (52) Empty reply mean the server closed without sending a byte. We reproduced 8 causes and logged what each client says.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-empty-response/">
+<meta property="og:title" content="ERR_EMPTY_RESPONSE and curl (52) Empty Reply: Causes (Tested)">
+<meta property="og:description" content="Chrome&#x27;s ERR_EMPTY_RESPONSE and curl&#x27;s (52) Empty reply mean the server closed without sending a byte. We reproduced 8 causes and logged what each client says.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-empty-response/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does ERR_EMPTY_RESPONSE mean?", "acceptedAnswer": {"@type": "Answer", "text": "The server accepted the connection and then closed it without sending any bytes. There is no status code. In our tests curl reported this as exit 52, \"Empty reply from server\"."}}, {"@type": "Question", "name": "Is ERR_EMPTY_RESPONSE the same as curl error 52?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. In every case we built, Chromium 153 showed net::ERR_EMPTY_RESPONSE exactly when curl 8.14.1 exited with 52. Node fetch showed UND_ERR_SOCKET \"other side closed\" and Python showed RemoteDisconnected."}}, {"@type": "Question", "name": "How is it different from ERR_CONNECTION_RESET?", "acceptedAnswer": {"@type": "Answer", "text": "A clean close (FIN) with no data gives ERR_EMPTY_RESPONSE and curl 52. A reset (RST) gives ERR_CONNECTION_RESET, curl 56 and Node ECONNRESET. We produced the reset with socket.resetAndDestroy()."}}, {"@type": "Question", "name": "Why do I get ERR_EMPTY_RESPONSE on localhost?", "acceptedAnswer": {"@type": "Answer", "text": "The most common causes we reproduced: the server process crashed in the handler, the code closed the socket, a server timeout fired, or you used http:// on a port that speaks HTTPS."}}, {"@type": "Question", "name": "Does a too-large header cause an empty reply?", "acceptedAnswer": {"@type": "Answer", "text": "Not in Node 24. A 20 KB header got a proper 431 response with Connection: close in Chromium, curl, Node fetch and Python. Other servers may behave differently."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ERR_EMPTY_RESPONSE / curl (52) Empty reply (tested)</h1>
+<p class="lead"><code>net::ERR_EMPTY_RESPONSE</code> in Chrome and <code>curl: (52) Empty reply from server</code> are the same event. The TCP connection opened, the request went out, and the server closed the connection without sending a single byte. We built eight server faults and recorded the exact error from Chromium, curl, Node fetch and Python for each one.</p>
+<h2>1. What the error means</h2>
+<p>The connection worked. The server accepted it and read the request. Then it closed the socket cleanly (a TCP FIN) before writing a status line. No status code exists, so there is nothing to show.</p>
+<p>That rules out some things. If nothing listens on the port, you get <a href="/guides/err-connection-refused-econnrefused/">ERR_CONNECTION_REFUSED</a>. If the server closes with a TCP RST instead of a FIN, you get <a href="/guides/err-connection-reset-econnreset/">ERR_CONNECTION_RESET</a>. If the server sends headers and then dies, you get a truncated-body error instead. We measured all three below.</p>
+
+<h2>2. Same event, four error messages</h2>
+<table>
+<tr><th>Client</th><th>Exact error we saw</th></tr>
+<tr><td>Chromium 153</td><td><code>net::ERR_EMPTY_RESPONSE</code>; page fetch() gives <code>TypeError: Failed to fetch</code></td></tr>
+<tr><td>curl 8.14.1</td><td><code>curl: (52) Empty reply from server</code>, exit 52, <code>%{http_code}</code> = 000</td></tr>
+<tr><td>Node 24 fetch</td><td><code>TypeError: fetch failed</code>, <code>cause.code</code> = <code>UND_ERR_SOCKET</code>, cause message "other side closed"</td></tr>
+<tr><td>Python urllib</td><td><code>http.client.RemoteDisconnected: Remote end closed connection without response</code></td></tr>
+</table>
+<p>In Node, <code>"other side closed"</code> with <code>UND_ERR_SOCKET</code> is the empty-reply signal. Many people search for <a href="/guides/socket-hang-up-nodejs/">socket hang up</a>; that is what Node's older <code>http.get</code> API reported for the same server fault in our test (<code>err.code</code> <code>ECONNRESET</code>, message <code>socket hang up</code>), even though no TCP reset happened.</p>
+
+<h2>3. Results: cause by cause</h2>
+<table>
+<tr><th>Server fault</th><th>Chromium</th><th>curl exit</th><th>Node fetch cause.code</th><th>Python</th></tr>
+<tr><td><code>req.socket.end()</code> in handler, nothing written</td><td>ERR_EMPTY_RESPONSE</td><td>52</td><td>UND_ERR_SOCKET</td><td>RemoteDisconnected</td></tr>
+<tr><td><code>req.socket.destroy()</code> in handler</td><td>ERR_EMPTY_RESPONSE</td><td>52</td><td>UND_ERR_SOCKET</td><td>RemoteDisconnected</td></tr>
+<tr><td><code>process.exit(1)</code> in handler</td><td>ERR_EMPTY_RESPONSE</td><td>52</td><td>UND_ERR_SOCKET</td><td>RemoteDisconnected</td></tr>
+<tr><td>Uncaught exception thrown in a timer (process crash)</td><td>ERR_EMPTY_RESPONSE</td><td>52</td><td>UND_ERR_SOCKET</td><td>RemoteDisconnected</td></tr>
+<tr><td>Express: <code>res.write()</code> then <code>next(err)</code> in the same tick</td><td>ERR_EMPTY_RESPONSE</td><td>52</td><td>UND_ERR_SOCKET</td><td>RemoteDisconnected</td></tr>
+<tr><td><code>server.timeout = 1000</code>, handler takes 3 s</td><td>ERR_EMPTY_RESPONSE</td><td>52 (after ~1 s)</td><td>UND_ERR_SOCKET</td><td>RemoteDisconnected (after ~1 s)</td></tr>
+<tr><td><code>http://</code> sent to an HTTPS (TLS) port</td><td>ERR_EMPTY_RESPONSE</td><td>52</td><td>UND_ERR_SOCKET</td><td>RemoteDisconnected</td></tr>
+<tr><td colspan="5"><strong>Look-alikes that are not empty replies</strong></td></tr>
+<tr><td><code>req.socket.resetAndDestroy()</code> (TCP RST)</td><td>ERR_CONNECTION_RESET</td><td>56 "Recv failure: Connection reset by peer"</td><td>ECONNRESET</td><td>ConnectionResetError 104</td></tr>
+<tr><td>Express: <code>res.flushHeaders()</code> then <code>next(err)</code></td><td>200, then ERR_INCOMPLETE_CHUNKED_ENCODING</td><td>18 "transfer closed with outstanding read data remaining"</td><td>200, then body read throws <code>TypeError: terminated</code></td><td>IncompleteRead(0 bytes read)</td></tr>
+<tr><td>20 KB request header (Node limit is 16 KB)</td><td>431 with empty body</td><td>0, status 431</td><td>status 431</td><td>HTTPError 431</td></tr>
+<tr><td>Express: error before anything is sent</td><td colspan="4">Normal 500 page. Express handles it.</td></tr>
+</table>
+<p>The server log showed one request per client try. Chromium did not retry any of these on a fresh connection.</p>
+
+<h2>4. The surprising one: Express error after <code>res.write()</code></h2>
+<p>If headers are already sent, Express cannot send a 500, so its final handler destroys the socket. We expected curl to get the headers and a truncated body. It did not. It got an empty reply:</p>
+<pre><code>app.get('/x', (req, res, next) =&gt; {
+  res.write('partial');          // res.headersSent is now true
+  next(new Error('boom'));       // same tick
+});
+
+$ curl -sS http://127.0.0.1:8992/x
+curl: (52) Empty reply from server</code></pre>
+<p><code>res.headersSent</code> was <code>true</code>, but the bytes were still in Node's write buffer. Destroying the socket in the same tick threw them away. When we called <code>next(err)</code> one tick later (<code>setImmediate</code>), curl received the 200 headers and <code>partial</code>, then failed with exit 18. Either way the client gets a broken response. The fix is to not start writing until you know the response will succeed. See <a href="/guides/err-http-headers-sent-cannot-set-headers/">ERR_HTTP_HEADERS_SENT</a> for the related "headers already sent" bug.</p>
+
+<h2>5. http:// to an HTTPS port</h2>
+<p>We sent plain HTTP to a Node <code>https</code> server. Every client reported an empty reply. The server logged:</p>
+<pre><code>tlsClientError ERR_SSL_HTTP_REQUEST ... SSL routines:tls_validate_record_header:http request</code></pre>
+<p>So if a URL gives ERR_EMPTY_RESPONSE, try <code>https://</code> on the same port. The opposite mistake (https:// to a plain HTTP port) gives <a href="/guides/err-ssl-protocol-error/">ERR_SSL_PROTOCOL_ERROR</a> instead.</p>
+
+<h2>6. Timeouts that close silently</h2>
+<p>Node's <code>server.timeout</code> is 0 (off) by default in Node 24. When we set it to 1000 ms, a 3 s handler produced an empty reply after about 1 s in every client. The handler later found <code>res.destroyed</code> was <code>true</code>. Node 24 defaults we read from a fresh server: <code>requestTimeout</code> 300000 ms, <code>headersTimeout</code> 60000 ms, <code>keepAliveTimeout</code> 5000 ms, <code>maxHeaderSize</code> 16384 bytes.</p>
+<p>Other layers do the same: a load balancer, a proxy or a platform (for example a serverless function hitting its time limit) may close the connection without a response. Not measured here: a proxy reusing a keep-alive connection that the backend just closed can also surface as an empty reply. Keep the backend keep-alive timeout longer than the proxy's.</p>
+
+<h2>7. Header too large is not an empty reply (in Node)</h2>
+<p>A 20 KB header got a real <code>431 Request Header Fields Too Large</code> with <code>Connection: close</code> from Node 24, in all four clients. Chromium showed the 431 with an empty body, not ERR_EMPTY_RESPONSE. Other servers differ; see <a href="/guides/431-request-header-fields-too-large/">431 Request Header Fields Too Large</a> and <a href="/guides/request-header-or-cookie-too-large/">Request Header Or Cookie Too Large</a>.</p>
+
+<h2>8. How to fix it</h2>
+<ul>
+<li><strong>Reproduce with curl.</strong> <code>curl -v http://host/path</code>. Exit 52 confirms an empty reply. Exit 56 means a reset; exit 18 means headers arrived but the body was cut.</li>
+<li><strong>Check the scheme.</strong> Try <code>https://</code> on the same port.</li>
+<li><strong>Read the server log at that timestamp.</strong> A crash, restart or OOM kill shows up there. In our crash tests the process exited with status 1.</li>
+<li><strong>Catch errors before writing.</strong> In Express, finish the work, then send. Do not call <code>res.write()</code> before code that can throw.</li>
+<li><strong>Look for code that closes the socket.</strong> Search for <code>socket.destroy</code>, <code>socket.end</code> and <code>server.timeout</code> / <code>setTimeout</code> on the server.</li>
+<li><strong>Align timeouts.</strong> Each layer should wait longer than the one behind it.</li>
+</ul>
+<p>Once the server responds, check the status and headers it sends with <a href="/tools/http-headers/">our HTTP header checker</a>.</p>
+<aside class="cta"><strong>Check that your server actually sends a status line and headers:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does ERR_EMPTY_RESPONSE mean?</summary><p>The server accepted the connection and then closed it without sending any bytes. There is no status code. In our tests curl reported this as exit 52, &quot;Empty reply from server&quot;.</p></details>
+<details><summary>Is ERR_EMPTY_RESPONSE the same as curl error 52?</summary><p>Yes. In every case we built, Chromium 153 showed net::ERR_EMPTY_RESPONSE exactly when curl 8.14.1 exited with 52. Node fetch showed UND_ERR_SOCKET &quot;other side closed&quot; and Python showed RemoteDisconnected.</p></details>
+<details><summary>How is it different from ERR_CONNECTION_RESET?</summary><p>A clean close (FIN) with no data gives ERR_EMPTY_RESPONSE and curl 52. A reset (RST) gives ERR_CONNECTION_RESET, curl 56 and Node ECONNRESET. We produced the reset with socket.resetAndDestroy().</p></details>
+<details><summary>Why do I get ERR_EMPTY_RESPONSE on localhost?</summary><p>The most common causes we reproduced: the server process crashed in the handler, the code closed the socket, a server timeout fired, or you used http:// on a port that speaks HTTPS.</p></details>
+<details><summary>Does a too-large header cause an empty reply?</summary><p>Not in Node 24. A 20 KB header got a proper 431 response with Connection: close in Chromium, curl, Node fetch and Python. Other servers may behave differently.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright), curl 8.14.1, Node.js 24.21.0 fetch and Python 3.13.5 urllib, against Node 24 and Express 5.2.1 test servers on 127.0.0.1. Proxy keep-alive races are from general docs, not measured. PlainHeaders is our extension; curl, Python, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

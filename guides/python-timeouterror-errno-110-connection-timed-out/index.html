@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TimeoutError: [Errno 110] Connection timed out (Python, Tested)</title>
+<meta name="description" content="Python [Errno 110] Connection timed out reproduced with a firewall DROP: 134 s with no timeout, &#x27;timed out&#x27; with errno None when you set one, and requests.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-timeouterror-errno-110-connection-timed-out/">
+<meta property="og:title" content="TimeoutError: [Errno 110] Connection timed out (Python, Tested)">
+<meta property="og:description" content="Python [Errno 110] Connection timed out reproduced with a firewall DROP: 134 s with no timeout, &#x27;timed out&#x27; with errno None when you set one, and requests.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-timeouterror-errno-110-connection-timed-out/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Errno 110 take about 2 minutes?", "acceptedAnswer": {"@type": "Answer", "text": "With no timeout, Python waits for the kernel, which retries the SYN (tcp_syn_retries, default 6). We measured 134 seconds. Pass timeout= to fail sooner."}}, {"@type": "Question", "name": "What is the difference between [Errno 110] and 'timed out'?", "acceptedAnswer": {"@type": "Answer", "text": "Errno 110 comes from the kernel when no timeout was set; 'timed out' (errno None) comes from Python's own timeout. Both are TimeoutError."}}, {"@type": "Question", "name": "What causes Connection timed out?", "acceptedAnswer": {"@type": "Answer", "text": "No reply at all: a firewall or security group dropping packets, a wrong IP or port, or a host that is down. A refused port gives Errno 111 instead."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TimeoutError: [Errno 110] Connection timed out in Python (tested)</h1>
+<p class="lead"><code>TimeoutError: [Errno 110] Connection timed out</code> (<code>ETIMEDOUT</code>) means nothing answered the connection attempt and the Linux kernel gave up retrying, which took 134 seconds in our test because no timeout was set. Set a timeout and the same failure becomes <code>TimeoutError: timed out</code> with <code>errno</code> <code>None</code>; <code>except TimeoutError</code> catches both.</p>
+<p>All blocks ran in Docker (python:3-slim) with one firewall rule, <code>iptables -A OUTPUT -d 203.0.113.5 -j DROP</code>, so connection attempts to that address are silently dropped, exactly like a host behind a firewall that drops instead of rejecting.</p>
+<h2 id="test">1. The error: no timeout set, the kernel gives up after ~2 minutes</h2>
+<pre><code>import socket, time
+# 203.0.113.5 is a documentation address; an iptables rule silently DROPs our SYN packets
+t = time.monotonic()
+try:
+    socket.create_connection((&quot;203.0.113.5&quot;, 8080))   # no timeout argument
+except OSError as e:
+    print(f&quot;after {time.monotonic() - t:.1f}s&quot;)
+    raise</code></pre>
+<p>Output:</p>
+<pre><code>after 134.3s
+Traceback (most recent call last):
+  File &quot;/w/b1.py&quot;, line 5, in &lt;module&gt;
+    socket.create_connection((&quot;203.0.113.5&quot;, 8080))   # no timeout argument
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File &quot;/usr/local/lib/python3.15/socket.py&quot;, line 883, in create_connection
+    raise exceptions[0]
+  File &quot;/usr/local/lib/python3.15/socket.py&quot;, line 868, in create_connection
+    sock.connect(sa)
+    ~~~~~~~~~~~~^^^^
+TimeoutError: [Errno 110] Connection timed out</code></pre>
+<p>With no <code>timeout</code>, Python waits as long as the kernel does. Linux resends the SYN packet with exponential backoff (<code>net.ipv4.tcp_syn_retries</code>, default 6) and then fails with <code>ETIMEDOUT</code>: here after 134 seconds. Nothing answered at all: no refusal, no ICMP error, just silence. That points at a firewall that drops packets, a wrong IP, or a server that is down behind a load balancer.</p>
+<h2 id="timed-out">2. With a timeout you get "timed out" instead, with no errno</h2>
+<pre><code>import errno, socket, time
+t = time.monotonic()
+try:
+    socket.create_connection((&quot;203.0.113.5&quot;, 8080), timeout=3)
+except OSError as e:
+    print(f&quot;{type(e).__name__}: {e!r} after {time.monotonic() - t:.1f}s&quot;)
+    print(&quot;errno:&quot;, e.errno, &quot;| isinstance TimeoutError:&quot;, isinstance(e, TimeoutError))
+    print(&quot;socket.timeout is TimeoutError:&quot;, socket.timeout is TimeoutError)
+print(&quot;ETIMEDOUT =&quot;, errno.ETIMEDOUT, &quot;-&gt;&quot;, errno.errorcode[errno.ETIMEDOUT])</code></pre>
+<p>Output:</p>
+<pre><code>TimeoutError: TimeoutError(&#x27;timed out&#x27;) after 3.0s
+errno: None | isinstance TimeoutError: True
+socket.timeout is TimeoutError: True
+ETIMEDOUT = 110 -&gt; ETIMEDOUT</code></pre>
+<p>When Python's own timeout fires first, the message is just <code>timed out</code> and <code>errno</code> is <code>None</code>. Both are the same class: since Python 3.10 <code>socket.timeout</code> is an alias of <code>TimeoutError</code>, and errno 110 is mapped to <code>TimeoutError</code> too. So <code>except TimeoutError</code> catches both; do not test <code>e.errno == 110</code>, it misses the common case.</p>
+<h2 id="requests">3. requests: timeout=None still ends in ConnectTimeout, after 134 s</h2>
+<pre><code>import requests, time
+for timeout in (None, 3):
+    t = time.monotonic()
+    try:
+        requests.get(&quot;http://203.0.113.5:8080/&quot;, timeout=timeout)
+    except requests.exceptions.RequestException as e:
+        print(f&quot;timeout={timeout}: {type(e).__name__} after {time.monotonic() - t:.1f}s&quot;)
+        print(&quot;  &quot;, str(e)[-90:])</code></pre>
+<p>Output:</p>
+<pre><code>timeout=None: ConnectTimeout after 134.0s
+   =8080) at 0x7fb8475b3e00&gt;, &#x27;Connection to 203.0.113.5 timed out. (connect timeout=None)&#x27;))
+timeout=3: ConnectTimeout after 3.0s
+   ort=8080) at 0x7fb847486710&gt;, &#x27;Connection to 203.0.113.5 timed out. (connect timeout=3)&#x27;))</code></pre>
+<p>requests with no timeout (its default) hangs for the full kernel retry period and then raises <code>ConnectTimeout</code> with <code>(connect timeout=None)</code> in the message. With <code>timeout=3</code> the same failure costs 3 seconds. Always pass a timeout; <code>(connect, read)</code> tuples such as <code>timeout=(3, 30)</code> let you fail fast on connect while allowing slow responses.</p>
+<h2 id="fix">4. Fix: short timeout, bounded retries</h2>
+<pre><code>import socket, time
+
+def connect(host, port, attempts=3, timeout=3):
+    for i in range(1, attempts + 1):
+        try:
+            return socket.create_connection((host, port), timeout=timeout)
+        except TimeoutError as e:          # catches both &quot;[Errno 110]&quot; and &quot;timed out&quot;
+            print(f&quot;attempt {i}: {e!r}&quot;)
+            time.sleep(0.5 * 2 ** i)
+    raise TimeoutError(f&quot;{host}:{port} unreachable after {attempts} attempts&quot;)
+
+try:
+    connect(&quot;203.0.113.5&quot;, 8080)
+except TimeoutError as e:
+    print(&quot;gave up:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>attempt 1: TimeoutError(&#x27;timed out&#x27;)
+attempt 2: TimeoutError(&#x27;timed out&#x27;)
+attempt 3: TimeoutError(&#x27;timed out&#x27;)
+gave up: 203.0.113.5:8080 unreachable after 3 attempts</code></pre>
+<p>Retrying makes sense for a busy or restarting server; for a firewall drop or a wrong address every attempt fails the same way, so cap the attempts and report the host and port. If it never connects: check the address and port, try <code>nc -vz host port</code> from the same machine, and check the server-side firewall or cloud security group (a security group that does not allow the port drops packets, which gives exactly this timeout).</p>
+<p>Related: <a href="/guides/python-requests-readtimeout-read-timed-out/">requests ReadTimeout</a> · <a href="/guides/python-connectionrefusederror-errno-111-connection-refused/">[Errno 111] Connection refused</a> · <a href="/guides/python-oserror-errno-113-no-route-to-host/">[Errno 113] No route to host</a> · <a href="/guides/err-connection-timed-out-etimedout/">ERR_CONNECTION_TIMED_OUT</a>.</p>
+
+<aside class="cta"><strong>Once it connects, check the headers and status the server actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Errno 110 take about 2 minutes?</summary><p>With no timeout, Python waits for the kernel, which retries the SYN (tcp_syn_retries, default 6). We measured 134 seconds. Pass timeout= to fail sooner.</p></details>
+<details><summary>What is the difference between [Errno 110] and &#x27;timed out&#x27;?</summary><p>Errno 110 comes from the kernel when no timeout was set; &#x27;timed out&#x27; (errno None) comes from Python&#x27;s own timeout. Both are TimeoutError.</p></details>
+<details><summary>What causes Connection timed out?</summary><p>No reply at all: a firewall or security group dropping packets, a wrong IP or port, or a host that is down. A refused port gives Errno 111 instead.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 in Docker (python:3-slim, Python 3.15.1, requests 2.34.2 from pip) with an iptables DROP rule for 203.0.113.5. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

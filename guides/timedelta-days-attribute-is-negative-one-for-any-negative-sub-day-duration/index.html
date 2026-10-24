@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>timedelta.days Is -1 for a 1-Minute-Negative Duration Too</title>
+<meta name="description" content="We measured timedelta(hours=-1).days returning -1, not 0 -- any negative duration under a full day still reports .days as -1, which breaks naive age-check code.">
+<link rel="canonical" href="https://honestkit.github.io/guides/timedelta-days-attribute-is-negative-one-for-any-negative-sub-day-duration/">
+<meta property="og:title" content="timedelta.days Is -1 for a 1-Minute-Negative Duration Too">
+<meta property="og:description" content="We measured timedelta(hours=-1).days returning -1, not 0 -- any negative duration under a full day still reports .days as -1, which breaks naive age-check code.">
+<meta property="og:url" content="https://honestkit.github.io/guides/timedelta-days-attribute-is-negative-one-for-any-negative-sub-day-duration/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is timedelta(hours=-1).days equal to -1 instead of 0?", "acceptedAnswer": {"@type": "Answer", "text": "Per the datetime docs, timedelta always normalizes so seconds and microseconds are non-negative, which means .days absorbs the entire sign of a negative duration -- we measured .days as -1 and .seconds as 82800 for a one-hour-negative delta."}}, {"@type": "Question", "name": "Does this mean timedelta.days is unreliable for all negative durations?", "acceptedAnswer": {"@type": "Answer", "text": "It's reliable for what it's documented to mean (whole normalized days), but we confirmed it's not a usable proxy for 'is this duration roughly zero or negative' -- any negative duration under 24 hours still reports -1."}}, {"@type": "Question", "name": "How do I check if a timedelta represents 'within the last day' correctly?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed comparing total_seconds() (abs(d.total_seconds()) < 86400) or the timedelta object itself (abs(d) < timedelta(days=1)) both give the correct answer, unlike checking d.days == 0."}}, {"@type": "Question", "name": "Does this affect timedelta subtraction results from real datetime objects?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- any datetime subtraction that produces a small negative timedelta (e.g. a timestamp slightly in the future) hits the same .days == -1 result; we tested the timedelta constructor directly, but the normalization rule is the same regardless of how the timedelta was produced."}}, {"@type": "Question", "name": "Is total_seconds() always safe to use instead of .days and .seconds?", "acceptedAnswer": {"@type": "Answer", "text": "For comparisons and magnitude checks, yes -- we confirmed it returns a single signed float reflecting the true duration. Use .days/.seconds only when you need the normalized component breakdown itself."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>timedelta.days Is -1 for Any Negative Sub-Day Duration (tested)</h1>
+<p class="lead"><code>timedelta</code> normalizes its internal fields so <code>.days</code>, <code>.seconds</code> and <code>.microseconds</code> are always consistent with the total duration. We measured what that normalization does to <code>.days</code> for a duration that's negative but less than a full day &mdash; it's not <code>0</code>.</p>
+<h2 id="repro1">1. A one-hour-negative timedelta</h2>
+<pre><code>from datetime import timedelta
+
+d = timedelta(hours=-1)
+print(repr(d))
+print("days:", d.days)
+print("seconds:", d.seconds)
+print("total_seconds():", d.total_seconds())</code></pre>
+<pre><code>datetime.timedelta(days=-1, seconds=82800)
+days: -1
+seconds: 82800
+total_seconds(): -3600.0</code></pre>
+<p><strong>Measured:</strong> <code>.days</code> is <code>-1</code> and <code>.seconds</code> is <code>82800</code> (23 hours) &mdash; not <code>0</code> and <code>-3600</code> as the "minus one hour" framing might suggest. Per the docs, <code>timedelta</code> always normalizes so <code>0 &lt;= seconds &lt; 86400</code>; the only place the negative sign can live is <code>.days</code>, so it absorbs it even for a duration that's mostly zero. <code>total_seconds()</code> gives the intuitive <code>-3600.0</code>.</p>
+
+<h2 id="repro2">2. Where this breaks an age check</h2>
+<pre><code>def is_more_than_a_week_old(delta):
+    return delta.days >= 7
+
+future_event = timedelta(hours=-1)   # a timestamp 1 hour in the FUTURE
+print(is_more_than_a_week_old(future_event))</code></pre>
+<pre><code>False</code></pre>
+<p><strong>Measured:</strong> that particular check happens to come out <code>False</code> here, but only because <code>-1 &lt; 7</code>. The real danger is the reverse pattern &mdash; code written as <code>if delta.days &lt; 0: handle_future_timestamp()</code> actually fires for <em>any</em> negative duration, which is correct, but code that instead checks <code>delta.days == 0</code> to mean "within the last day" misses every negative sub-day duration, since <code>.days</code> is <code>-1</code> for all of them, not <code>0</code>.</p>
+<pre><code>d2 = timedelta(hours=-1)
+print("is this 'within a day'?", d2.days == 0)   # intended to catch same-day deltas</code></pre>
+<pre><code>is this 'within a day'? False</code></pre>
+<p><strong>Measured:</strong> a timestamp just one hour in the future is excluded from a "same day" check written against <code>.days == 0</code>, with no exception &mdash; it silently falls through to whatever branch handles "more than a day away," even though a one-hour difference is about as "same day" as it gets.</p>
+
+<h2 id="fix">3. Fix: compare total_seconds() or the timedelta itself, not .days</h2>
+<pre><code>print("within a day (total_seconds):", abs(d2.total_seconds()) < 86400)
+print("within a day (compare timedelta):", abs(d2) < timedelta(days=1))</code></pre>
+<pre><code>within a day (total_seconds): True
+within a day (compare timedelta): True</code></pre>
+<p><strong>Measured:</strong> both alternatives give the intuitive answer. <code>total_seconds()</code> returns a single signed float with no normalization surprises, and comparing the <code>timedelta</code> object directly (optionally via <code>abs()</code>) avoids touching <code>.days</code>/<code>.seconds</code> individually at all. Reach for <code>.days</code> only when you specifically want "how many whole, normalized days are baked into this duration," not as a stand-in for "roughly how big is this duration."</p>
+<aside class="cta"><strong>Debugging an age check on a timestamp an API returned? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is timedelta(hours=-1).days equal to -1 instead of 0?</summary><p>Per the datetime docs, timedelta always normalizes so seconds and microseconds are non-negative, which means .days absorbs the entire sign of a negative duration -- we measured .days as -1 and .seconds as 82800 for a one-hour-negative delta.</p></details>
+<details><summary>Does this mean timedelta.days is unreliable for all negative durations?</summary><p>It&#x27;s reliable for what it&#x27;s documented to mean (whole normalized days), but we confirmed it&#x27;s not a usable proxy for &#x27;is this duration roughly zero or negative&#x27; -- any negative duration under 24 hours still reports -1.</p></details>
+<details><summary>How do I check if a timedelta represents &#x27;within the last day&#x27; correctly?</summary><p>We confirmed comparing total_seconds() (abs(d.total_seconds()) &lt; 86400) or the timedelta object itself (abs(d) &lt; timedelta(days=1)) both give the correct answer, unlike checking d.days == 0.</p></details>
+<details><summary>Does this affect timedelta subtraction results from real datetime objects?</summary><p>Yes -- any datetime subtraction that produces a small negative timedelta (e.g. a timestamp slightly in the future) hits the same .days == -1 result; we tested the timedelta constructor directly, but the normalization rule is the same regardless of how the timedelta was produced.</p></details>
+<details><summary>Is total_seconds() always safe to use instead of .days and .seconds?</summary><p>For comparisons and magnitude checks, yes -- we confirmed it returns a single signed float reflecting the true duration. Use .days/.seconds only when you need the normalized component breakdown itself.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in datetime.timedelta: constructed timedelta(hours=-1) and inspected .days, .seconds and total_seconds(), then ran a common age-check pattern (if delta.days &gt;= N) against it. PlainHeaders is our extension; Python&#x27;s datetime module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

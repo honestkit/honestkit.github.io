@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLAlchemy MissingGreenlet: greenlet_spawn not called (Tested)</title>
+<meta name="description" content="SQLAlchemy async MissingGreenlet &#x27;greenlet_spawn has not been called&#x27; tested on 2.1.6: lazy loads and expired attributes. Fixes: selectinload, awaitable_attrs.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlalchemy-missinggreenlet-greenlet-spawn-has-not-been-called/">
+<meta property="og:title" content="SQLAlchemy MissingGreenlet: greenlet_spawn not called (Tested)">
+<meta property="og:description" content="SQLAlchemy async MissingGreenlet &#x27;greenlet_spawn has not been called&#x27; tested on 2.1.6: lazy loads and expired attributes. Fixes: selectinload, awaitable_attrs.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlalchemy-missinggreenlet-greenlet-spawn-has-not-been-called/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does greenlet_spawn has not been called mean?", "acceptedAnswer": {"@type": "Answer", "text": "SQLAlchemy's async layer had to run a query from a plain attribute access (lazy load or refresh after commit), where it cannot await. Load the data explicitly instead."}}, {"@type": "Question", "name": "How do I fix MissingGreenlet after commit?", "acceptedAnswer": {"@type": "Answer", "text": "Create the session factory with async_sessionmaker(engine, expire_on_commit=False) so committed objects keep their loaded values."}}, {"@type": "Question", "name": "How do I lazy load a relationship with AsyncSession?", "acceptedAnswer": {"@type": "Answer", "text": "Add the AsyncAttrs mixin to Base and use await obj.awaitable_attrs.relationship_name, or eager-load with selectinload()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLAlchemy MissingGreenlet: greenlet_spawn has not been called (tested)</h1>
+<p class="lead"><code>sqlalchemy.exc.MissingGreenlet: greenlet_spawn has not been called; can't call await_() here</code> means an <code>AsyncSession</code> needed a database query you did not await: a lazy relationship, or an attribute expired by <code>commit()</code>. Use <code>expire_on_commit=False</code>, <code>selectinload()</code>, or <code>await obj.awaitable_attrs.rel</code>.</p>
+<p>All blocks import this <code>common.py</code> (async engine on aiosqlite, one author with one book):</p>
+<pre><code>from sqlalchemy import ForeignKey, select
+from sqlalchemy.ext.asyncio import AsyncAttrs, create_async_engine, async_sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+class Base(AsyncAttrs, DeclarativeBase): pass
+class Author(Base):
+    __tablename__ = &quot;authors&quot;
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    books: Mapped[list[&quot;Book&quot;]] = relationship()
+class Book(Base):
+    __tablename__ = &quot;books&quot;
+    id: Mapped[int] = mapped_column(primary_key=True)
+    author_id: Mapped[int] = mapped_column(ForeignKey(&quot;authors.id&quot;))
+    title: Mapped[str]
+
+engine = create_async_engine(&quot;sqlite+aiosqlite:///:memory:&quot;)
+async def setup(**kw):
+    async with engine.begin() as c:
+        await c.run_sync(Base.metadata.create_all)
+    Session = async_sessionmaker(engine, **kw)
+    async with Session() as s:
+        s.add(Author(name=&quot;Ada&quot;, books=[Book(title=&quot;Notes&quot;)])); await s.commit()
+    return Session</code></pre>
+<h2 id="test">1. The error: a lazy relationship inside async code</h2>
+<pre><code>import asyncio
+from common import *
+async def main():
+    Session = await setup()
+    async with Session() as s:
+        a = (await s.scalars(select(Author))).first()
+        print(a.name)
+        print(a.books)            # lazy load = implicit sync IO inside async code
+asyncio.run(main())</code></pre>
+<p>Output: <code>Ada</code>, then a 181-line traceback ending in:</p>
+<pre><code>sqlalchemy.exc.StatementError: (sqlalchemy.exc.MissingGreenlet) greenlet_spawn has not been called; can&#x27;t call await_() here. Was IO attempted in an unexpected place?
+[SQL: SELECT books.id, books.author_id, books.title 
+FROM books 
+WHERE ? = books.author_id]
+[parameters: [{&#x27;%(140460893975088 param)s&#x27;: 1}]]
+(Background on this error at: https://sqlalche.me/e/21/xd2s)
+&lt;sys&gt;:0: RuntimeWarning: coroutine &#x27;Connection.cursor&#x27; was never awaited</code></pre>
+<p>With <code>AsyncSession</code>, every database round trip must be awaited. Touching <code>a.books</code> is a plain attribute access, but the relationship is lazy, so SQLAlchemy tries to run <code>SELECT ... FROM books</code> synchronously. It cannot, and raises <code>MissingGreenlet</code> (wrapped in <code>StatementError</code>). The <code>[SQL: ...]</code> line tells you which relationship or column triggered it.</p>
+<h2 id="commit">2. Plain columns after commit fail the same way</h2>
+<pre><code>import asyncio
+from common import *
+async def main():
+    Session = await setup()          # expire_on_commit=True (the default)
+    async with Session() as s:
+        a = (await s.scalars(select(Author))).first()
+        await s.commit()
+        try:
+            print(a.name)                # expired by commit -&gt; refresh needs IO
+        except Exception as e:
+            print(type(e).__name__ + &quot;:&quot;, str(e)[:110])
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>StatementError: (sqlalchemy.exc.MissingGreenlet) greenlet_spawn has not been called; can&#x27;t call await_() here. Was IO attempte
+&lt;sys&gt;:0: RuntimeWarning: coroutine &#x27;Connection.cursor&#x27; was never awaited
+RuntimeWarning: Enable tracemalloc to get the object allocation traceback</code></pre>
+<p>The default <code>expire_on_commit=True</code> expires every attribute at <code>commit()</code>, so reading <code>a.name</code> afterwards needs a refresh query, which is again implicit IO. FastAPI handlers that return an object after committing hit this constantly.</p>
+<h2 id="fix">3. Fix: eager-load, expire_on_commit=False, or awaitable_attrs</h2>
+<pre><code>import asyncio
+from sqlalchemy.orm import selectinload
+from common import *
+async def main():
+    Session = await setup(expire_on_commit=False)
+    async with Session() as s:
+        a = (await s.scalars(select(Author).options(selectinload(Author.books)))).first()
+        await s.commit()
+        print(a.name, [b.title for b in a.books])       # eager load + no expiry
+        b = (await s.scalars(select(Author))).first()
+        print(await b.awaitable_attrs.books)           # or load lazily, but awaited
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>Ada [&#x27;Notes&#x27;]
+[&lt;common.Book object at 0x7f38ac378190&gt;]</code></pre>
+<p>Three tools, usually combined: <code>async_sessionmaker(engine, expire_on_commit=False)</code> (recommended for async), <code>selectinload()</code> for relationships you will read, and, when you really want lazy loading, <code>await obj.awaitable_attrs.books</code>, which needs the <code>AsyncAttrs</code> mixin on your <code>Base</code> (as in <code>common.py</code>; without it you get <code>AttributeError: ... has no attribute 'awaitable_attrs'</code>). For code that is easier written synchronously, <code>await session.run_sync(fn)</code> runs <code>fn</code> where lazy loads are allowed.</p>
+<p>Related: <a href="/guides/sqlalchemy-detachedinstanceerror-not-bound-to-a-session/">SQLAlchemy DetachedInstanceError</a> (the synchronous cousin) · <a href="/guides/sqlalchemy-operationalerror-no-such-table/">SQLAlchemy no such table</a> · <a href="/guides/python-asyncio-timeouterror-cancellederror/">asyncio TimeoutError and CancelledError</a>.</p>
+
+<aside class="cta"><strong>Collecting data from web tables? Copy them as CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does greenlet_spawn has not been called mean?</summary><p>SQLAlchemy&#x27;s async layer had to run a query from a plain attribute access (lazy load or refresh after commit), where it cannot await. Load the data explicitly instead.</p></details>
+<details><summary>How do I fix MissingGreenlet after commit?</summary><p>Create the session factory with async_sessionmaker(engine, expire_on_commit=False) so committed objects keep their loaded values.</p></details>
+<details><summary>How do I lazy load a relationship with AsyncSession?</summary><p>Add the AsyncAttrs mixin to Base and use await obj.awaitable_attrs.relationship_name, or eager-load with selectinload().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with SQLAlchemy 2.1.6, aiosqlite 0.22.1 and Python 3.14.7 (python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited (block 1 shows the end of the traceback). PlainTables is our extension; Python and SQLAlchemy are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

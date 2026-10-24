@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>with open()&#x27;s close() Error Hides Your Real Exception (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: if close() fails as a with block exits on an exception, the close() error replaces it -- the real error only survives in __context__.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-io-with-block-close-exception-masks-original-error/">
+<meta property="og:title" content="with open()&#x27;s close() Error Hides Your Real Exception (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: if close() fails as a with block exits on an exception, the close() error replaces it -- the real error only survives in __context__.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-io-with-block-close-exception-masks-original-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does this only happen with custom RawIOBase subclasses?", "acceptedAnswer": {"@type": "Answer", "text": "We used a custom subclass to make close() reliably fail on demand, but the mechanism is generic Python exception-chaining behavior in any with block (__exit__ raising while an exception is already propagating) -- it isn't specific to io or to our test class. A real file's close() failing on a full disk or a network filesystem going away triggers the identical replacement."}}, {"@type": "Question", "name": "Is the original exception actually lost?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured it's preserved as __context__ on the new exception, and Python's default unhandled-exception traceback prints both. It's only 'lost' in the sense that an except clause that catches and inspects the exception directly, without walking __context__, never sees it."}}, {"@type": "Question", "name": "Does using except ValueError specifically still work if the real error was a ValueError?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured that the caught exception's type is whatever close() raised (OSError in our repro), not the type of the exception that was originally raised inside the block, so a type-specific except clause for the original error type won't match at all."}}, {"@type": "Question", "name": "Is there a way to make the with block prefer the original exception?", "acceptedAnswer": {"@type": "Answer", "text": "Not from the caller's side without walking __context__ -- the replacement happens inside __exit__'s own control flow before your except clause ever runs. The only generically reliable fix is to always check __context__ when handling an exception from code that does I/O inside a with block."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>with-Block close() Exception Masks the Original Error (tested)</h1>
+<p class="lead">A <code>with open(path, "w") as f:</code> block's <code>__exit__</code> always calls <code>f.close()</code> when the block ends, whether it ends normally or because an exception was raised inside it. <code>close()</code> on a buffered writer flushes whatever is still sitting in the buffer, and that flush can fail for completely ordinary reasons -- a full disk, a broken pipe, a remote filesystem going away. When that happens while an exception is already propagating out of the <code>with</code> block, Python lets the <code>close()</code> failure <em>replace</em> the original exception as what the caller actually catches. The original error isn't gone -- it's chained onto the new one's <code>__context__</code> -- but any code that only logs <code>str(e)</code> or checks the exception type will see the close()-time error and never learn what actually went wrong first.</p>
+<h2 id="repro1">1. A write succeeds, but close() fails during normal exit</h2>
+<pre><code>import io
+
+class FailOnClose(io.RawIOBase):
+    def writable(self):
+        return True
+    def write(self, b):
+        return len(b)
+    def close(self):
+        super().close()
+        raise OSError("disk full on close")
+
+raw = FailOnClose()
+try:
+    with io.TextIOWrapper(io.BufferedWriter(raw), encoding="utf-8") as f:
+        f.write("hello")
+except OSError as e:
+    print("no exception inside the block, just this ->", e)</code></pre>
+<pre><code>no exception inside the block, just this -> disk full on close</code></pre>
+<p><strong>Measured:</strong> with nothing else going wrong, the <code>close()</code> failure surfaces on its own, which is exactly what you'd expect.</p>
+
+<h2 id="repro2">2. Raising your own exception inside the block gets replaced by the close() error</h2>
+<pre><code>raw2 = FailOnClose()
+try:
+    with io.TextIOWrapper(io.BufferedWriter(raw2), encoding="utf-8") as f:
+        f.write("hello")
+        raise ValueError("the real bug: something went wrong processing the data")
+except Exception as e:
+    print("what the caller actually sees:", type(e).__name__, "->", e)</code></pre>
+<pre><code>what the caller actually sees: OSError -> disk full on close</code></pre>
+<p><strong>Measured:</strong> the <code>ValueError</code> that was actually raised inside the block -- the real bug -- never reaches the <code>except</code> clause at all. <code>__exit__</code> calls <code>close()</code> while the <code>ValueError</code> is unwinding, <code>close()</code> raises its own <code>OSError</code>, and that <code>OSError</code> is what propagates instead.</p>
+
+<h2 id="repro3">3. The original exception still exists -- buried in __context__</h2>
+<pre><code>raw3 = FailOnClose()
+try:
+    with io.TextIOWrapper(io.BufferedWriter(raw3), encoding="utf-8") as f:
+        f.write("hello")
+        raise ValueError("the real bug: something went wrong processing the data")
+except Exception as e:
+    print("caught:", type(e).__name__, e)
+    print("original error, only here:", type(e.__context__).__name__, "->", e.__context__)</code></pre>
+<pre><code>caught: OSError disk full on close
+original error, only here: ValueError -> the real bug: something went wrong processing the data</code></pre>
+<p><strong>Measured:</strong> the original <code>ValueError</code> is chained onto <code>__context__</code> -- Python's default traceback printer shows both with "During handling of the above exception, another exception occurred", but any code that catches the exception and only inspects it directly (logging frameworks, <code>except ValueError:</code> type checks, retry logic keyed on exception type) never sees it.</p>
+
+<h2 id="repro4">4. The fix: check __context__/__cause__ when handling exceptions from a with block that does I/O</h2>
+<pre><code>raw4 = FailOnClose()
+try:
+    with io.TextIOWrapper(io.BufferedWriter(raw4), encoding="utf-8") as f:
+        f.write("hello")
+        raise ValueError("the real bug: something went wrong processing the data")
+except Exception as e:
+    root = e
+    while root.__context__ is not None:
+        root = root.__context__
+    print("actual root cause:", type(root).__name__, "->", root)</code></pre>
+<pre><code>actual root cause: ValueError -> the real bug: something went wrong processing the data</code></pre>
+<p><strong>Measured:</strong> walking <code>__context__</code> back to the end recovers the real error. If a flush/close failure during cleanup is expected to be secondary to whatever bug you're actually trying to diagnose, log or inspect <code>__context__</code> explicitly instead of trusting that the caught exception is the one that was originally raised.</p>
+<aside class="cta"><strong>Raising an exception inside a `with open(...) as f:` block? If close() also fails -- a flush error on buffered data is a common way -- the close() error replaces the one you actually raised, not the other way around:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does this only happen with custom RawIOBase subclasses?</summary><p>We used a custom subclass to make close() reliably fail on demand, but the mechanism is generic Python exception-chaining behavior in any with block (__exit__ raising while an exception is already propagating) -- it isn&#x27;t specific to io or to our test class. A real file&#x27;s close() failing on a full disk or a network filesystem going away triggers the identical replacement.</p></details>
+<details><summary>Is the original exception actually lost?</summary><p>No -- we measured it&#x27;s preserved as __context__ on the new exception, and Python&#x27;s default unhandled-exception traceback prints both. It&#x27;s only &#x27;lost&#x27; in the sense that an except clause that catches and inspects the exception directly, without walking __context__, never sees it.</p></details>
+<details><summary>Does using except ValueError specifically still work if the real error was a ValueError?</summary><p>No -- we measured that the caught exception&#x27;s type is whatever close() raised (OSError in our repro), not the type of the exception that was originally raised inside the block, so a type-specific except clause for the original error type won&#x27;t match at all.</p></details>
+<details><summary>Is there a way to make the with block prefer the original exception?</summary><p>Not from the caller&#x27;s side without walking __context__ -- the replacement happens inside __exit__&#x27;s own control flow before your except clause ever runs. The only generically reliable fix is to always check __context__ when handling an exception from code that does I/O inside a with block.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in io.TextIOWrapper/io.BufferedWriter wrapping a custom RawIOBase whose close() raises after a successful write(), inside a with block that also raises its own exception. PlainHeaders is our extension; Python&#x27;s io module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

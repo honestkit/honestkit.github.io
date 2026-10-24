@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSV to JSON in Python Without pandas (Typed Values, Nested Keys)</title>
+<meta name="description" content="A standard-library Python script that converts CSV to a JSON array of objects, auto-detects comma/semicolon/tab, types numbers and true/false, keeps ids with leading zeros as text and rebuilds nested objects from address.city headers.">
+<link rel="canonical" href="https://honestkit.github.io/guides/csv-to-json-python/">
+<meta property="og:title" content="CSV to JSON in Python Without pandas (Typed Values, Nested Keys)">
+<meta property="og:description" content="A standard-library Python script that converts CSV to a JSON array of objects, auto-detects comma/semicolon/tab, types numbers and true/false, keeps ids with leading zeros as text and rebuilds nested objects from address.city headers.">
+<meta property="og:url" content="https://honestkit.github.io/guides/csv-to-json-python/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I convert CSV to JSON in Python without pandas?", "acceptedAnswer": {"@type": "Answer", "text": "Use csv.DictReader to read rows as dictionaries and json.dump to write them, as in the two-line version above. The full script adds typing, separator detection and nesting."}}, {"@type": "Question", "name": "Why are all my numbers strings?", "acceptedAnswer": {"@type": "Answer", "text": "The csv module never converts values; every cell is text. Convert them yourself, as the typed() function above does, or with pandas (pd.read_csv(...).to_json(orient='records'))."}}, {"@type": "Question", "name": "Why does my first key start with a strange character?", "acceptedAnswer": {"@type": "Answer", "text": "The file has a UTF-8 BOM (Excel adds one). Open it with encoding='utf-8-sig'."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to convert CSV to JSON in Python</h1>
+<p class="lead">csv.DictReader plus json.dump converts CSV to JSON in two lines, but every value comes out as a string. This script also types numbers and booleans, handles Excel's BOM and semicolons, and can rebuild nested objects.</p>
+<h2>1. The two-line version</h2>
+<pre><code>import csv, json
+json.dump(list(csv.DictReader(open('data.csv', newline='', encoding='utf-8-sig'))), open('data.json', 'w'), indent=2)</code></pre>
+<p>Each row becomes an object keyed by the header row, but <code>"42"</code> stays a string and empty cells become <code>""</code>. Use <code>utf-8-sig</code>, not <code>utf-8</code>: files saved by Excel start with a BOM, which would otherwise end up in the first key (<code>"\ufeffid"</code>).</p>
+<h2>2. The full script</h2>
+<p>Save as <code>csv2json.py</code>:</p>
+<pre><code>import csv, json, re, sys
+
+NUM = re.compile(r'-?(0|[1-9]\d*)(\.\d+)?([eE][-+]?\d+)?')
+
+def typed(v):
+    # '42' -&gt; 42, '3.5' -&gt; 3.5, 'TRUE' -&gt; True, '' -&gt; None; ids with leading zeros ('02134') stay text
+    if v == '': return None
+    if NUM.fullmatch(v): return float(v) if any(c in v for c in '.eE') else int(v)
+    if v.lower() in ('true', 'false'): return v.lower() == 'true'
+    return v
+
+def nest(row):
+    # {'address.city': 'X'} -&gt; {'address': {'city': 'X'}}
+    out = {}
+    for key, value in row.items():
+        *path, last = key.split('.')
+        node = out
+        for part in path: node = node.setdefault(part, {})
+        node[last] = value
+    return out
+
+with open(sys.argv[1], newline='', encoding='utf-8-sig') as f:
+    dialect = csv.Sniffer().sniff(f.read(4096), delimiters=',;\t|'); f.seek(0)
+    rows = [nest({k: typed(v) for k, v in r.items()}) for r in csv.DictReader(f, dialect=dialect)]
+with open(sys.argv[2], 'w', encoding='utf-8') as f:
+    json.dump(rows, f, indent=2, ensure_ascii=False)
+print(f'{len(rows)} rows -&gt; {sys.argv[2]}')
+</code></pre>
+<h2>3. Run it</h2>
+<pre><code>curl -sL https://raw.githubusercontent.com/datasets/country-codes/main/data/country-codes.csv -o countries.csv
+python3 csv2json.py countries.csv countries.json</code></pre>
+<p>Our run printed <code>249 rows -&gt; countries.json</code>. The start of the first object:</p>
+<pre><code>{"FIFA": "AFG", "Dial": 93, "ISO3166-1-Alpha-3": "AFG", "MARC": "af", "is_independent": "Yes", "ISO3166-1-numeric": 4, "GAUL": 1, ...
+ "Intermediate Region Code": null, ...}</code></pre>
+<h2>4. What it handles</h2>
+<ul><li><strong>Separator</strong>: <code>csv.Sniffer</code> detects comma, semicolon (European Excel), tab or pipe from the first 4 KB.</li>
+<li><strong>Types</strong>: plain numbers become numbers, <code>TRUE</code>/<code>false</code> become booleans and empty cells <code>null</code>. Values with leading zeros (<code>08001</code>), thousands separators or currency stay text, so zip codes and ids are not mangled.</li>
+<li><strong>Nested keys</strong>: a header like <code>address.city</code> becomes <code>{"address": {"city": ...}}</code>. Our <a href="/guides/json-to-csv-python/">JSON to CSV script</a> flattens JSON that way, and this script restores it: on the JSONPlaceholder users file, the only difference after the round trip was that coordinates stored as strings (<code>"-37.3159"</code>) came back as numbers.</li>
+<li><strong>Unicode</strong>: <code>ensure_ascii=False</code> writes Zürich, not <code>Z\u00fcrich</code>.</li></ul>
+<h2>5. Limits</h2>
+<ul><li>Types are guessed per cell, so one column can mix types: in the country file, <code>Dial</code> is <code>93</code> for Afghanistan but <code>"1-264"</code> for Anguilla. If a consumer needs one type per column, convert those columns explicitly.</li>
+<li>Numbered keys (<code>tags.0</code>, <code>tags.1</code>) become an object with keys "0" and "1", not a list. The browser tool below turns them into arrays.</li>
+<li>Decimal commas (<code>1,5</code>) stay text. Replace them before typing if your file uses them.</li>
+<li>The whole file is held in memory; for very large files write one JSON object per line (JSON Lines) inside the loop instead.</li></ul>
+<h2>6. No code</h2>
+<p>Paste the cells from Excel, Google Sheets or a CSV file into the free <a href="/tools/excel-to-json/">Excel / CSV to JSON converter</a>: same typing rules, optional nesting with arrays, and nothing is uploaded.</p>
+<aside class="cta"><strong>Skip the steps:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I convert CSV to JSON in Python without pandas?</summary><p>Use csv.DictReader to read rows as dictionaries and json.dump to write them, as in the two-line version above. The full script adds typing, separator detection and nesting.</p></details>
+<details><summary>Why are all my numbers strings?</summary><p>The csv module never converts values; every cell is text. Convert them yourself, as the typed() function above does, or with pandas (pd.read_csv(...).to_json(orient=&#x27;records&#x27;)).</p></details>
+<details><summary>Why does my first key start with a strange character?</summary><p>The file has a UTF-8 BOM (Excel adds one). Open it with encoding=&#x27;utf-8-sig&#x27;.</p></details>
+</section>
+<p class="note">Written with AI assistance. The script was run on 2026-10-01 with Python 3 standard library only, on the open country-codes dataset (datasets/country-codes on GitHub: 249 rows, 56 columns), on a semicolon-separated file with a BOM, accents and empty cells, and on the CSV produced by our JSON to CSV guide (nested JSON restored). PlainTables is our extension; the other methods are free and built into Excel, Google Sheets and pandas.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

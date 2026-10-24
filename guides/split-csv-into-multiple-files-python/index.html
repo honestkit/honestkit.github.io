@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Split a CSV Into Multiple Files in Python — by Rows or by Column (no pandas)</title>
+<meta name="description" content="A standard-library Python script that splits a CSV every N rows or into one file per value of a column, keeps the header in every part, never cuts a quoted line break, and makes safe file names.">
+<link rel="canonical" href="https://honestkit.github.io/guides/split-csv-into-multiple-files-python/">
+<meta property="og:title" content="Split a CSV Into Multiple Files in Python — by Rows or by Column (no pandas)">
+<meta property="og:description" content="A standard-library Python script that splits a CSV every N rows or into one file per value of a column, keeps the header in every part, never cuts a quoted line break, and makes safe file names.">
+<meta property="og:url" content="https://honestkit.github.io/guides/split-csv-into-multiple-files-python/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I split a CSV on the command line?", "acceptedAnswer": {"@type": "Answer", "text": "tail -n +2 big.csv | split -l 1000 - part_ splits the rows; then add the header to each part: for f in part_*; do (head -n 1 big.csv; cat \"$f\") > \"$f.csv\"; rm \"$f\"; done. It counts lines, so quoted fields containing line breaks can be split in two."}}, {"@type": "Question", "name": "How do I split a CSV with pandas?", "acceptedAnswer": {"@type": "Answer", "text": "for value, part in df.groupby('Region'): part.to_csv(f'{value}.csv', index=False) splits by column, but read the file with dtype=str and keep_default_na=False so codes like NA and 02134 survive, and rows with an empty Region are dropped by groupby unless you pass dropna=False."}}, {"@type": "Question", "name": "Can I merge the parts back?", "acceptedAnswer": {"@type": "Answer", "text": "Yes: the free merge CSV files tool on this site combines them into one file and matches columns by name."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to split a CSV into multiple files in Python</h1>
+<p class="lead">Splitting by line count (split -l) breaks CSVs whose quoted fields contain line breaks and drops the header from every part but the first. This script splits by records, every N rows or by a column's value, and repeats the header.</p>
+<h2>1. The script</h2>
+<p>Save as <code>split_csv.py</code>:</p>
+<pre><code>import csv, re, sys
+from pathlib import Path
+
+def split_rows(src, size, out):
+    with open(src, newline='', encoding='utf-8-sig') as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        rows = [r for r in reader if any(c.strip() for c in r)]
+    width = len(str((len(rows) + size - 1) // size))
+    for i in range(0, len(rows), size):
+        write(out / f'part-{i // size + 1:0{width}}.csv', header, rows[i:i + size])
+
+def split_by(src, column, out):
+    groups = {}
+    with open(src, newline='', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        header = reader.fieldnames
+        for r in reader:
+            if any((v or '').strip() for v in r.values()):
+                groups.setdefault((r[column] or '').strip(), []).append([r[h] for h in header])
+    used = set()
+    for value, rows in groups.items():
+        base = re.sub(r'[\\/:*?"&lt;&gt;|\x00-\x1f]+', '_', value).strip('. ')[:60] or 'blank'
+        name, n = base, 2
+        while name.lower() in used:
+            name, n = f'{base}_{n}', n + 1
+        used.add(name.lower())
+        write(out / f'{name}.csv', header, rows)
+
+def write(path, header, rows):
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+src, how, out = sys.argv[1], sys.argv[2], Path(sys.argv[3] if len(sys.argv) &gt; 3 else 'parts')
+out.mkdir(exist_ok=True)
+split_rows(src, int(how), out) if how.isdigit() else split_by(src, how, out)
+print(f'{len(list(out.glob("*.csv")))} files in {out}/')
+</code></pre>
+<h2>2. Run it</h2>
+<pre><code>python3 split_csv.py big.csv 1000          # part-1.csv, part-2.csv, ... 1000 rows each
+python3 split_csv.py big.csv Region        # one file per value of the Region column
+python3 split_csv.py big.csv Region out    # write into ./out instead of ./parts</code></pre>
+<p>On the country-codes file (249 rows) <code>50</code> gave 5 files of 50/50/50/50/49 rows, <code>Continent</code> gave 7 files (AF, AN, AS, EU, NA, OC, SA) and <code>"Region Name"</code> gave 6, including <code>blank.csv</code> for the one row without a region (Antarctica).</p>
+<h2>3. What it does</h2>
+<ul><li><strong>Header in every part</strong>: the first row is written at the top of each file.</li>
+<li><strong>Records, not lines</strong>: <code>csv.reader</code> keeps a quoted value with a line break in one row, so no record is cut in half.</li>
+<li><strong>Safe file names</strong>: characters Windows forbids (<code>\ / : * ? " &lt; &gt; |</code>) become <code>_</code>, an empty value becomes <code>blank.csv</code>, and values that would collide on a case-insensitive disk (<code>N/S</code>, <code>n/s</code>, <code>N_S</code>) get <code>_2</code>, <code>_3</code>.</li>
+<li><strong>Excel files</strong>: <code>utf-8-sig</code> removes the BOM Excel adds, so the first column name matches. Blank rows are skipped.</li>
+<li><strong>Codes stay text</strong>: <code>NA</code> (North America, Namibia) and ids like <code>02134</code> are written exactly as read. pandas would read <code>NA</code> as a missing value unless you pass <code>keep_default_na=False</code>.</li></ul>
+<h2>4. Limits</h2>
+<ul><li>All rows are read into memory; for files of several GB, write each part while reading instead of collecting the rows first.</li>
+<li>Comma-separated only; pass <code>delimiter=';'</code> to <code>csv.reader</code> and <code>csv.DictReader</code> for European Excel files.</li></ul>
+<h2>5. No code</h2>
+<p>The free <a href="/tools/split-csv-file/">split CSV tool</a> does the same in your browser, every N rows or by column, and downloads all parts as one .zip. Nothing is uploaded.</p>
+<aside class="cta"><strong>Skip the steps:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I split a CSV on the command line?</summary><p>tail -n +2 big.csv | split -l 1000 - part_ splits the rows; then add the header to each part: for f in part_*; do (head -n 1 big.csv; cat &quot;$f&quot;) &gt; &quot;$f.csv&quot;; rm &quot;$f&quot;; done. It counts lines, so quoted fields containing line breaks can be split in two.</p></details>
+<details><summary>How do I split a CSV with pandas?</summary><p>for value, part in df.groupby(&#x27;Region&#x27;): part.to_csv(f&#x27;{value}.csv&#x27;, index=False) splits by column, but read the file with dtype=str and keep_default_na=False so codes like NA and 02134 survive, and rows with an empty Region are dropped by groupby unless you pass dropna=False.</p></details>
+<details><summary>Can I merge the parts back?</summary><p>Yes: the free merge CSV files tool on this site combines them into one file and matches columns by name.</p></details>
+</section>
+<p class="note">Written with AI assistance. The script was run on 2026-10-01 with Python 3 standard library only, on the open country-codes dataset (datasets/country-codes on GitHub: 249 rows, 56 columns) split every 50 rows, by Continent and by Region Name, and on an edge-case file (quoted line breaks, blank values, file names that collide after cleaning). Every output file was compared cell for cell with the free split CSV tool on this site: 0 mismatches. PlainTables is our extension; the other methods are free and built into Excel, Google Sheets and pandas.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>431 Request Header Fields Too Large: Node.js, Chrome and localhost Fixes (Tested)</title>
+<meta name="description" content="Why you get HTTP 431 on localhost: Node.js 24 rejects requests whose header names plus values exceed 16,384 bytes, and cookies set on localhost by any other dev app on any port are sent along. Exact cutoff, curl output, what Chrome shows, and the fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/431-request-header-fields-too-large/">
+<meta property="og:title" content="431 Request Header Fields Too Large: Node.js, Chrome and localhost Fixes (Tested)">
+<meta property="og:description" content="Why you get HTTP 431 on localhost: Node.js 24 rejects requests whose header names plus values exceed 16,384 bytes, and cookies set on localhost by any other dev app on any port are sent along. Exact cutoff, curl output, what Chrome shows, and the fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/431-request-header-fields-too-large/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes 431 Request Header Fields Too Large?", "acceptedAnswer": {"@type": "Answer", "text": "The request headers exceed the server's limit. In Node.js 24 the default limit is 16,384 bytes of header names plus values; most often oversized or accumulated cookies push a request over it."}}, {"@type": "Question", "name": "Why do I get 431 on localhost?", "acceptedAnswer": {"@type": "Answer", "text": "Cookies ignore ports, so cookies set by any app on localhost are sent to every other localhost app. In Chromium 153, five 4,000-byte cookies set on localhost:8962 made a Node app on localhost:8961 return 431."}}, {"@type": "Question", "name": "How do I fix 431 in Chrome?", "acceptedAnswer": {"@type": "Answer", "text": "Clear the cookies for localhost (DevTools, Application, Cookies) or try a private window. Loading the same app via 127.0.0.1 returned 200 in our test because it is a different host name."}}, {"@type": "Question", "name": "How do I increase the header size limit in Node.js?", "acceptedAnswer": {"@type": "Answer", "text": "Start Node with --max-http-header-size=32768 (or set it in NODE_OPTIONS), or pass { maxHeaderSize: 32768 } to http.createServer. Both let a 32,500-byte header through in our test."}}, {"@type": "Question", "name": "What is the default max header size in Node.js?", "acceptedAnswer": {"@type": "Answer", "text": "16 KB. With curl's three default headers, the largest extra header value Node.js 24.21.0 accepted was 16,333 bytes, which brings names plus values to exactly 16,384 bytes."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>431 Request Header Fields Too Large (tested)</h1>
+<p class="lead">HTTP 431 Request Header Fields Too Large means the server refused the request because its headers were too big. On a dev machine the usual cause is not your code: it is a pile of cookies on <code>localhost</code> left by other apps, because cookies ignore the port. We measured the exact Node.js limit and reproduced the localhost case in Chromium.</p>
+<h2>1. The exact Node.js limit</h2>
+<p>Node.js 24 has a default <code>maxHeaderSize</code> of 16 KB. We sent curl requests with one extra header <code>X: aaaa...</code> and bisected its length:</p>
+<table><thead><tr><th>Server</th><th>Largest value that got 200</th><th>Result above it</th></tr></thead><tbody>
+<tr><td>Node.js 24.21.0, default</td><td>16,333 bytes</td><td><code>431</code></td></tr>
+<tr><td><code>http.createServer({ maxHeaderSize: 32768 })</code></td><td>32,500 bytes passed</td><td><code>431</code> at 32,800</td></tr>
+<tr><td><code>node --max-http-header-size=32768</code></td><td>32,500 bytes passed</td><td><code>431</code> at 32,800</td></tr>
+</tbody></table>
+<p>The 16,333 is not arbitrary. curl also sent <code>Host: localhost:8961</code>, <code>User-Agent: curl/8.14.1</code> and <code>Accept: */*</code>. Adding up only the header <strong>names and values</strong> (no colons, spaces or line breaks): 4+14 + 10+13 + 6+3 + 1+16,333 = <strong>16,384 bytes exactly</strong>. One more byte and Node answers 431.</p>
+<h2>2. What curl shows</h2>
+<pre><code>$ curl -si -H "X: $(head -c 17000 /dev/zero | tr '\0' a)" http://localhost:8961/
+HTTP/1.1 431 Request Header Fields Too Large
+Connection: close
+</code></pre>
+<p>No body, and your request handler never runs, so nothing appears in your app's logs: Node's HTTP parser rejects the request before your code is called.</p>
+<h2>3. The localhost cookie trap (reproduced in Chrome)</h2>
+<p>Cookies are scoped to a host name, <strong>not a port</strong>. In Chromium 153 we opened <code>http://localhost:8962/</code> and set five cookies of 4,000 bytes each with <code>document.cookie</code> (20,033 bytes in the Cookie header). Then:</p>
+<table><thead><tr><th>Next page loaded</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>http://localhost:8961/</code> (another app, default Node limit)</td><td><strong>431</strong>, blank white page (<code>&lt;body&gt;&lt;/body&gt;</code>)</td></tr>
+<tr><td><code>http://localhost:8962/</code> (maxHeaderSize 32768)</td><td>200; the server received all 20,033 cookie bytes</td></tr>
+<tr><td><code>http://127.0.0.1:8961/</code></td><td>200: different host name, so no cookies</td></tr>
+<tr><td><code>http://localhost:8961/</code> after clearing cookies</td><td>200</td></tr>
+</tbody></table>
+<p>The cookies set by the app on port 8962 were sent to the app on port 8961 and broke it. That is the classic "431 on localhost in Chrome" report: sessions, analytics and feature flags from every project you ever ran on <code>localhost:3000</code>, <code>:5173</code> or <code>:8080</code> share one cookie jar.</p>
+<h2>4. Fixes, quickest first</h2>
+<ul>
+<li><strong>Clear cookies for localhost:</strong> DevTools, Application, Storage, Cookies, <code>http://localhost</code>, Clear all. Opening the app in a private window confirms that cookies are the cause.</li>
+<li><strong>Use a different host name</strong> per project, such as <code>127.0.0.1</code>, so cookie jars stop overlapping.</li>
+<li><strong>Raise the limit</strong> if large headers are legitimate: <code>node --max-http-header-size=32768 server.js</code>, <code>NODE_OPTIONS=--max-http-header-size=32768</code> for dev servers started by a CLI, or <code>http.createServer({ maxHeaderSize: 32768 }, handler)</code>.</li>
+<li><strong>Shrink the headers</strong>: do not store a whole session or a large JWT in a cookie (inspect one with the <a href="/tools/jwt-decoder/">JWT decoder</a>), and set cookies on the narrowest path and domain.</li>
+</ul>
+<p>Behind nginx the same problem shows as <code>400 Bad Request: Request Header Or Cookie Too Large</code> instead; see <a href="/guides/request-header-or-cookie-too-large/">Request Header Or Cookie Too Large in nginx</a>. Limits for both servers side by side are in <a href="/guides/http-header-size-limit/">HTTP header size limits, measured</a>.</p>
+<aside class="cta"><strong>See the headers your server sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes 431 Request Header Fields Too Large?</summary><p>The request headers exceed the server&#x27;s limit. In Node.js 24 the default limit is 16,384 bytes of header names plus values; most often oversized or accumulated cookies push a request over it.</p></details>
+<details><summary>Why do I get 431 on localhost?</summary><p>Cookies ignore ports, so cookies set by any app on localhost are sent to every other localhost app. In Chromium 153, five 4,000-byte cookies set on localhost:8962 made a Node app on localhost:8961 return 431.</p></details>
+<details><summary>How do I fix 431 in Chrome?</summary><p>Clear the cookies for localhost (DevTools, Application, Cookies) or try a private window. Loading the same app via 127.0.0.1 returned 200 in our test because it is a different host name.</p></details>
+<details><summary>How do I increase the header size limit in Node.js?</summary><p>Start Node with --max-http-header-size=32768 (or set it in NODE_OPTIONS), or pass { maxHeaderSize: 32768 } to http.createServer. Both let a 32,500-byte header through in our test.</p></details>
+<details><summary>What is the default max header size in Node.js?</summary><p>16 KB. With curl&#x27;s three default headers, the largest extra header value Node.js 24.21.0 accepted was 16,333 bytes, which brings names plus values to exactly 16,384 bytes.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-01 with Node.js 24.21.0 (plain http.createServer on localhost:8961-8963), curl 8.14.1 and headless Chromium 153.0.8010.12 (Playwright, fresh context). We grew one request header to find the exact cutoff, then set five 4,000-byte cookies on localhost from one port and loaded a server on another port. PlainHeaders is our extension; Node.js, curl and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

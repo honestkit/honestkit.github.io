@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL Column Does Not Exist Error: Causes and Fixes, Tested</title>
+<meta name="description" content="We reproduced PostgreSQL&#x27;s &quot;column does not exist&quot; error across SELECT, WHERE, INSERT, UPDATE, ORDER BY, plus the typo hint and the ADD COLUMN fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sql-column-does-not-exist/">
+<meta property="og:title" content="SQL Column Does Not Exist Error: Causes and Fixes, Tested">
+<meta property="og:description" content="We reproduced PostgreSQL&#x27;s &quot;column does not exist&quot; error across SELECT, WHERE, INSERT, UPDATE, ORDER BY, plus the typo hint and the ADD COLUMN fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sql-column-does-not-exist/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does the error wording change between SELECT and INSERT?", "acceptedAnswer": {"@type": "Answer", "text": "In our tests, SELECT/WHERE/ORDER BY produced column \"sku\" does not exist, while INSERT and UPDATE produced column \"sku\" of relation \"products\" does not exist. PostgreSQL already knows the single target table for INSERT/UPDATE, so it names it; SELECT can span multiple tables, so it doesn't."}}, {"@type": "Question", "name": "Does PostgreSQL suggest the correct column name?", "acceptedAnswer": {"@type": "Answer", "text": "Sometimes. When the typo is close to a real column, we got HINT: Perhaps you meant to reference the column \"products.name\". after misspelling \"name\" as \"nam\". There's no HINT when the name isn't close to anything real."}}, {"@type": "Question", "name": "How do I add a column without erroring if it's already there?", "acceptedAnswer": {"@type": "Answer", "text": "Use ALTER TABLE ... ADD COLUMN IF NOT EXISTS. We tested running it twice: the first run added the column (ALTER TABLE), the second did nothing but succeeded, printing NOTICE: column already exists, skipping instead of an error."}}, {"@type": "Question", "name": "How can application code check if a column exists before querying it?", "acceptedAnswer": {"@type": "Answer", "text": "Query information_schema.columns, e.g. SELECT column_name FROM information_schema.columns WHERE table_name = 'x' AND column_name = 'y'. We confirmed it returns one row if the column exists and zero if not. It's part of the SQL standard, so the same query works on PostgreSQL, MySQL and SQL Server."}}, {"@type": "Question", "name": "Is this the same error in MySQL and SQL Server?", "acceptedAnswer": {"@type": "Answer", "text": "The cause and fix are the same, but the wording differs. Per their docs (not measured here): MySQL raises 'Unknown column... in field list' with code 1054; SQL Server raises 'Invalid column name'. PostgreSQL, which we tested, says 'column does not exist'."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQL &quot;column does not exist&quot; (tested)</h1>
+<p class="lead"><code>column "x" does not exist</code> means a query referenced a column name PostgreSQL can't find on any table in the query &mdash; usually a typo, a column that was renamed or dropped, or code written against a schema that changed since. It happens in any clause that names a column: SELECT, WHERE, INSERT's column list, UPDATE's SET, and ORDER BY, as the five cases below show.</p>
+<h2>1. Reading the error</h2>
+<p>PostgreSQL names the exact column it couldn't find and points at it with a caret on the line below:</p>
+<pre><code>ERROR:  column "sku" does not exist
+LINE 1: SELECT sku FROM products;
+               ^</code></pre>
+<p>If the name you typed is close to a real column, Postgres adds a HINT guessing what you meant &mdash; useful for catching typos fast:</p>
+<pre><code>ERROR:  column "nam" does not exist
+LINE 1: SELECT nam FROM products;
+               ^
+HINT:  Perhaps you meant to reference the column "products.name".</code></pre>
+
+<h2>2. Five reproduced triggers (same underlying cause, five clauses)</h2>
+<table>
+<tr><th>Statement</th><th>Exact error</th></tr>
+<tr><td><code>SELECT sku FROM products;</code></td><td><code>ERROR: column "sku" does not exist</code></td></tr>
+<tr><td><code>SELECT * FROM products WHERE sku = 'abc';</code></td><td><code>ERROR: column "sku" does not exist</code></td></tr>
+<tr><td><code>INSERT INTO products (name, sku) VALUES ('Gadget', 'g-1');</code></td><td><code>ERROR: column "sku" of relation "products" does not exist</code> (note: slightly different wording than SELECT/WHERE)</td></tr>
+<tr><td><code>UPDATE products SET sku = 'g-1' WHERE id = 1;</code></td><td><code>ERROR: column "sku" of relation "products" does not exist</code></td></tr>
+<tr><td><code>SELECT * FROM products ORDER BY sku;</code></td><td><code>ERROR: column "sku" does not exist</code></td></tr>
+</table>
+<p>INSERT and UPDATE both add <code>of relation "products"</code> to the message, because for those statements Postgres already knows exactly which table the column should belong to. SELECT/WHERE/ORDER BY can involve multiple tables, so the message is more general.</p>
+
+<h2>3. The fix depends on why the column is missing</h2>
+<ul>
+<li><strong>It's a typo</strong>: read the HINT if there is one (section 1). If there isn't, check the real column names with <code>\d products</code> in psql, or <code>SELECT column_name FROM information_schema.columns WHERE table_name = 'products';</code>, which is portable SQL (works the same on MySQL and Postgres).</li>
+<li><strong>The column genuinely doesn't exist yet</strong> (code expects a column a migration hasn't added): add it, tested below.</li>
+<li><strong>The column was renamed or dropped</strong>: update the query/code to the new name, or add it back if dropping it was a mistake.</li>
+</ul>
+
+<h2>4. Fix: add the column, idempotently</h2>
+<p><code>ADD COLUMN IF NOT EXISTS</code> adds the column if missing and does nothing (not an error) if it's already there &mdash; safe to run from a migration that might run twice:</p>
+<pre><code>psql&gt; ALTER TABLE products ADD COLUMN IF NOT EXISTS sku TEXT;
+ALTER TABLE
+psql&gt; ALTER TABLE products ADD COLUMN IF NOT EXISTS sku TEXT;
+NOTICE:  column "sku" of relation "products" already exists, skipping
+ALTER TABLE</code></pre>
+<p>Both runs succeed. The second prints a NOTICE (not an ERROR) and changes nothing. Without <code>IF NOT EXISTS</code>, the second run would fail with <code>ERROR: column "sku" of relation "products" already exists</code> &mdash; the mirror image of this guide's error.</p>
+
+<h2>5. Checking programmatically before you query</h2>
+<p>If your application code needs to check a column exists before using it (for example, supporting two schema versions during a rollout), query <code>information_schema.columns</code>, which is part of the SQL standard and works on PostgreSQL, MySQL and SQL Server alike:</p>
+<pre><code>psql&gt; SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'products' AND column_name = 'sku';
+ column_name
+-------------
+ sku
+(1 row)</code></pre>
+<p>Zero rows back means the column isn't there yet; one row means it is.</p>
+
+<h2>6. Other databases (per their docs, not measured on this box)</h2>
+<p>MySQL raises <code>ERROR 1054 (42S22): Unknown column 'sku' in 'field list'</code>. SQL Server raises <code>Invalid column name 'sku'.</code> The cause and the fixes in sections 3-5 are the same; only the wording differs.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does the error wording change between SELECT and INSERT?</summary><p>In our tests, SELECT/WHERE/ORDER BY produced column &quot;sku&quot; does not exist, while INSERT and UPDATE produced column &quot;sku&quot; of relation &quot;products&quot; does not exist. PostgreSQL already knows the single target table for INSERT/UPDATE, so it names it; SELECT can span multiple tables, so it doesn&#x27;t.</p></details>
+<details><summary>Does PostgreSQL suggest the correct column name?</summary><p>Sometimes. When the typo is close to a real column, we got HINT: Perhaps you meant to reference the column &quot;products.name&quot;. after misspelling &quot;name&quot; as &quot;nam&quot;. There&#x27;s no HINT when the name isn&#x27;t close to anything real.</p></details>
+<details><summary>How do I add a column without erroring if it&#x27;s already there?</summary><p>Use ALTER TABLE ... ADD COLUMN IF NOT EXISTS. We tested running it twice: the first run added the column (ALTER TABLE), the second did nothing but succeeded, printing NOTICE: column already exists, skipping instead of an error.</p></details>
+<details><summary>How can application code check if a column exists before querying it?</summary><p>Query information_schema.columns, e.g. SELECT column_name FROM information_schema.columns WHERE table_name = &#x27;x&#x27; AND column_name = &#x27;y&#x27;. We confirmed it returns one row if the column exists and zero if not. It&#x27;s part of the SQL standard, so the same query works on PostgreSQL, MySQL and SQL Server.</p></details>
+<details><summary>Is this the same error in MySQL and SQL Server?</summary><p>The cause and fix are the same, but the wording differs. Per their docs (not measured here): MySQL raises &#x27;Unknown column... in field list&#x27; with code 1054; SQL Server raises &#x27;Invalid column name&#x27;. PostgreSQL, which we tested, says &#x27;column does not exist&#x27;.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with PostgreSQL 16.15 (official Docker image), using psql. Every error message below is copy-pasted output, not paraphrased. MySQL and SQL Server enforce the same rule but phrase the error differently (per their docs, not measured here). PlainHeaders is our extension; PostgreSQL and Docker are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

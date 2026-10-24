@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLite &#x27;Too Many SQL Variables&#x27; — the Real Limit, Tested</title>
+<meta name="description" content="We measured the real bound-parameter limit on a live system: 250,000, not the commonly-cited 999 or 32,766 — it&#x27;s set at compile time and varies by distro.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite-too-many-sql-variables/">
+<meta property="og:title" content="SQLite &#x27;Too Many SQL Variables&#x27; — the Real Limit, Tested">
+<meta property="og:description" content="We measured the real bound-parameter limit on a live system: 250,000, not the commonly-cited 999 or 32,766 — it&#x27;s set at compile time and varies by distro.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite-too-many-sql-variables/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is SQLite's bound-variable limit really 999?", "acceptedAnswer": {"@type": "Answer", "text": "Not on this system \u2014 we measured it directly and 999 succeeded with no error, as did 32,766. The 999 figure is SQLite's pre-3.32 (2020) default; it hasn't been accurate for current SQLite builds for years."}}, {"@type": "Question", "name": "What's the actual measured limit?", "acceptedAnswer": {"@type": "Answer", "text": "250,000 on this box (Debian 13, SQLite 3.46.1 via Python 3.13.5) \u2014 we found this by binary search, confirming 250,000 placeholders succeed and 250,001 fails with 'too many SQL variables'."}}, {"@type": "Question", "name": "Why would the limit be higher than SQLite's own documented default?", "acceptedAnswer": {"@type": "Answer", "text": "SQLITE_MAX_VARIABLE_NUMBER is set at compile time, and several Linux distributions raise it above the upstream default specifically because ORMs and bulk-insert code commonly hit the smaller historical defaults. We measured the distro-shipped value directly rather than assuming a number from docs."}}, {"@type": "Question", "name": "Should I rely on this exact number (250,000) in my own code?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured it on one specific system; it will differ by OS, distro, and how SQLite was compiled. The reliable approach is batching bulk inserts into chunks well under any plausible limit, which we didn't need to tune precisely to avoid the error entirely."}}, {"@type": "Question", "name": "Does this limit apply per-statement or per-connection?", "acceptedAnswer": {"@type": "Answer", "text": "Per-statement \u2014 we tested it with a single INSERT containing many placeholders; it's the count of distinct bound parameters in one prepared statement, not a cumulative count across multiple statements on the same connection."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLite: too many SQL variables (tested)</h1>
+<p class="lead"><code>sqlite3.OperationalError: too many SQL variables</code> fires when a single statement binds more <code>?</code> placeholders than SQLite's compiled-in limit. We measured the real number on this system by binary search, and it's neither of the two numbers commonly quoted online.</p>
+<h2 id="repro">1. The commonly-cited numbers didn't fail at all</h2>
+<p>Older SQLite docs and most search results quote a default of 999 (pre-3.32, 2020) or 32,766 (3.32+). We tested both directly against a single multi-row INSERT:</p>
+<pre><code>999 placeholders: OK
+32,766 placeholders: OK
+32,768 placeholders: OK</code></pre>
+<p>None of these failed. The limit on this box is clearly higher than either commonly-quoted value.</p>
+
+<h2 id="repro2">2. Binary-searching the real boundary</h2>
+<p>We kept doubling, found failure between 100,000 and 500,000, then binary-searched between those two bounds:</p>
+<pre><code>lo, hi = 100000, 500000
+while lo < hi - 1:
+    mid = (lo + hi) // 2
+    try: ... bind mid placeholders ...; lo = mid
+    except sqlite3.OperationalError: hi = mid
+# result: last OK = 250000, first error = 250001</code></pre>
+<pre><code>sqlite3.OperationalError: too many SQL variables</code></pre>
+<p><strong>Measured: exactly 250,000</strong> on this system (Debian 13, Python 3.13.5's bundled SQLite 3.46.1). This is a known distro-level build choice &mdash; several Linux distributions compile SQLite with <code>SQLITE_MAX_VARIABLE_NUMBER</code> raised well above the upstream default specifically because so many ORMs and bulk-insert tools hit the smaller defaults in practice.</p>
+
+<h2 id="fix">3. The fix: don't hardcode a number, batch defensively instead</h2>
+<p>Since this limit is compile-time and varies by distro, Python version, and SQLite build &mdash; not something you can reliably detect in advance without testing it on your actual deployment target &mdash; the robust fix is to chunk large bulk inserts into batches well under any plausible limit (a few thousand rows per statement) rather than relying on a single INSERT with tens of thousands of parameters. This also sidesteps building one enormous SQL string in memory.</p>
+
+<aside class="cta"><strong>Debugging an app that talks to an API instead of a database? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is SQLite&#x27;s bound-variable limit really 999?</summary><p>Not on this system — we measured it directly and 999 succeeded with no error, as did 32,766. The 999 figure is SQLite&#x27;s pre-3.32 (2020) default; it hasn&#x27;t been accurate for current SQLite builds for years.</p></details>
+<details><summary>What&#x27;s the actual measured limit?</summary><p>250,000 on this box (Debian 13, SQLite 3.46.1 via Python 3.13.5) — we found this by binary search, confirming 250,000 placeholders succeed and 250,001 fails with &#x27;too many SQL variables&#x27;.</p></details>
+<details><summary>Why would the limit be higher than SQLite&#x27;s own documented default?</summary><p>SQLITE_MAX_VARIABLE_NUMBER is set at compile time, and several Linux distributions raise it above the upstream default specifically because ORMs and bulk-insert code commonly hit the smaller historical defaults. We measured the distro-shipped value directly rather than assuming a number from docs.</p></details>
+<details><summary>Should I rely on this exact number (250,000) in my own code?</summary><p>No — we measured it on one specific system; it will differ by OS, distro, and how SQLite was compiled. The reliable approach is batching bulk inserts into chunks well under any plausible limit, which we didn&#x27;t need to tune precisely to avoid the error entirely.</p></details>
+<details><summary>Does this limit apply per-statement or per-connection?</summary><p>Per-statement — we tested it with a single INSERT containing many placeholders; it&#x27;s the count of distinct bound parameters in one prepared statement, not a cumulative count across multiple statements on the same connection.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in sqlite3 module on Debian 13, by binary-searching the exact number of bound (?) placeholders a single INSERT can take before failing. Every number below is a directly measured boundary, not looked up from docs. PlainHeaders is our extension; Python&#x27;s sqlite3 is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

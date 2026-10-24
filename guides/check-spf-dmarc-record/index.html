@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Check SPF &amp; DMARC Records: dig, nslookup, and a 10-Lookup Limit Checker</title>
+<meta name="description" content="Check a domain&#x27;s SPF and DMARC records from the command line with dig or nslookup, read what each part means, and count SPF DNS lookups against the limit of 10 with a tested Python script.">
+<link rel="canonical" href="https://honestkit.github.io/guides/check-spf-dmarc-record/">
+<meta property="og:title" content="Check SPF &amp; DMARC Records: dig, nslookup, and a 10-Lookup Limit Checker">
+<meta property="og:description" content="Check a domain&#x27;s SPF and DMARC records from the command line with dig or nslookup, read what each part means, and count SPF DNS lookups against the limit of 10 with a tested Python script.">
+<meta property="og:url" content="https://honestkit.github.io/guides/check-spf-dmarc-record/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I check if SPF is set up correctly?", "acceptedAnswer": {"@type": "Answer", "text": "Read the record with dig or nslookup, make sure there is exactly one record starting with v=spf1, that it ends with -all or ~all, and that it needs at most 10 DNS lookups."}}, {"@type": "Question", "name": "Where is the DMARC record?", "acceptedAnswer": {"@type": "Answer", "text": "In a TXT record at _dmarc.yourdomain.com, not at the domain itself."}}, {"@type": "Question", "name": "What happens if SPF has more than 10 lookups?", "acceptedAnswer": {"@type": "Answer", "text": "Receivers treat SPF as a permanent error (permerror), so SPF fails for all your mail, which can also make DMARC fail."}}, {"@type": "Question", "name": "Should I start DMARC with p=reject?", "acceptedAnswer": {"@type": "Answer", "text": "Start with p=none and a rua= address, read the reports until all your real senders pass, then move to quarantine and reject."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to check SPF and DMARC records (command line)</h1>
+<p class="lead">SPF lists who may send mail for a domain; DMARC says what receivers should do when a message fails. Both are TXT records you can read in one command.</p>
+<h2>1. Read the records</h2>
+<pre><code>dig +short TXT example.com | grep -i spf1
+dig +short TXT _dmarc.example.com</code></pre>
+<p>On Windows (or anywhere without dig):</p>
+<pre><code>nslookup -type=TXT example.com
+nslookup -type=TXT _dmarc.example.com</code></pre>
+<p>Results on 2026-10-01: google.com has <code>v=spf1 include:_spf.google.com ~all</code> and <code>v=DMARC1; p=reject; rua=mailto:mailauth-reports@google.com</code>. example.com, which sends no mail, publishes <code>v=spf1 -all</code> (nobody may send as it) and a strict <code>p=reject</code> DMARC policy.</p>
+<p><strong>Long records come in pieces.</strong> github.com's SPF record arrives as two quoted strings, because a single TXT string holds at most 255 characters. Receivers join them <em>without</em> a space, so read them as one line.</p>
+<h2>2. What the parts mean</h2>
+<ul><li><strong>SPF</strong>: <code>ip4:</code> / <code>ip6:</code> list addresses; <code>include:</code> pulls in another domain's list (your email provider's); the final <code>-all</code> fails everything else, <code>~all</code> soft-fails it. A domain must have only <strong>one</strong> SPF record.</li>
+<li><strong>DMARC</strong> (at <code>_dmarc.</code> + domain): <code>p=none</code> only monitors, <code>p=quarantine</code> sends failures to spam, <code>p=reject</code> blocks them; <code>sp=</code> sets the policy for subdomains; <code>rua=</code> is where daily reports go.</li></ul>
+<h2>3. The 10-lookup limit</h2>
+<p>An SPF check may cause at most 10 DNS lookups: every <code>include</code>, <code>a</code>, <code>mx</code>, <code>ptr</code>, <code>exists</code> and <code>redirect</code> counts, including those inside included records. Above 10, SPF fails with a permanent error for every message. This script follows the includes and counts (needs <code>dig</code>):</p>
+<pre><code>import re, subprocess, sys
+
+def spf(domain):
+    out = subprocess.run(["dig", "+short", "TXT", domain], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        record = "".join(re.findall(r'"([^"]*)"', line))  # long records come in 255-char chunks
+        if record.lower().startswith("v=spf1"):
+            return record
+    return None
+
+def count(domain, depth=0):
+    record = spf(domain)
+    if record is None:
+        print("  " * depth + domain + ": no SPF record")
+        return 0
+    print("  " * depth + domain + ": " + record)
+    n = 0
+    for term in record.split()[1:]:
+        mech = term.lstrip("+-~?").lower()
+        if mech.startswith(("include:", "redirect=")):
+            n += 1 + count(re.split("[:=]", term, maxsplit=1)[1], depth + 1)
+        elif mech in ("a", "mx", "ptr") or mech.startswith(("a:", "mx:", "ptr:", "exists:", "a/", "mx/")):
+            n += 1
+    return n
+
+total = count(sys.argv[1])
+print("DNS lookups:", total, "(limit 10)" + (" - TOO MANY: SPF fails with permerror" if total &gt; 10 else ""))</code></pre>
+<p><code>python3 spf_count.py github.com</code> prints the include tree and <strong>10</strong>: eight includes, a Salesforce <code>exists</code> and one nested SendGrid include. That is exactly at the limit, so one more email service would break it. google.com needs 1 lookup, example.com 0.</p>
+<h2>Without the command line</h2>
+<p>Our free <a href="/tools/dns-lookup/">DNS lookup tool</a> checks SPF, DMARC and MX in your browser. For many domains at once, the <a href="/apify/domain-whois-dns-ssl/">Domain WHOIS, DNS &amp; SSL checker on Apify</a> returns SPF, DMARC policy, MX, SSL expiry and registration dates per domain, and the <a href="/apify/email-syntax-mx-checker/">email checker</a> tests address lists. Both export CSV, Excel or JSON.</p>
+<aside class="cta"><strong>Need it in bulk?</strong> <a href="/apify/domain-whois-dns-ssl/">DNS Lookup &amp; WHOIS Domain Checker — SPF/DMARC, SSL Expiry</a> (hosted, pay per result)</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I check if SPF is set up correctly?</summary><p>Read the record with dig or nslookup, make sure there is exactly one record starting with v=spf1, that it ends with -all or ~all, and that it needs at most 10 DNS lookups.</p></details>
+<details><summary>Where is the DMARC record?</summary><p>In a TXT record at _dmarc.yourdomain.com, not at the domain itself.</p></details>
+<details><summary>What happens if SPF has more than 10 lookups?</summary><p>Receivers treat SPF as a permanent error (permerror), so SPF fails for all your mail, which can also make DMARC fail.</p></details>
+<details><summary>Should I start DMARC with p=reject?</summary><p>Start with p=none and a rua= address, read the reports until all your real senders pass, then move to quarantine and reject.</p></details>
+</section>
+<p class="note">Written with AI assistance. The dig and nslookup commands and the Python lookup counter were run on 2026-10-01 for google.com, github.com and example.com. The Apify tool is ours; the APIs are free to call directly.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TextIOWrapper.reconfigure(errors=...) Drops Chars (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: reconfigure(errors=...) is unrestricted on the write side -- switching to errors=ignore mid-stream silently drops characters.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-io-textiowrapper-reconfigure-errors-mid-write/">
+<meta property="og:title" content="TextIOWrapper.reconfigure(errors=...) Drops Chars (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: reconfigure(errors=...) is unrestricted on the write side -- switching to errors=ignore mid-stream silently drops characters.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-io-textiowrapper-reconfigure-errors-mid-write/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does TextIOWrapper.reconfigure(errors=...) check anything before switching on the write side?", "acceptedAnswer": {"@type": "Answer", "text": "We measured no restriction at all on the write side -- it can be called after any number of writes and takes effect immediately for subsequent writes, including silently dropping characters that errors='ignore' can't encode."}}, {"@type": "Question", "name": "What's different between this and the reconfigure(encoding=...) mid-write bug?", "acceptedAnswer": {"@type": "Answer", "text": "We measured both as unrestricted on the write side, but the consequences differ: switching encoding= mid-write produces a file with two different valid byte sequences concatenated (recoverable if you know the split point); switching to errors='ignore' mid-write destroys data outright -- the dropped characters aren't recoverable from the output at all."}}, {"@type": "Question", "name": "Why does the read side block reconfigure(errors=...) but the write side doesn't?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that reconfigure() raises UnsupportedOperation on the read side as soon as any read() has happened, for both the encoding and errors parameters, because the internal incremental decoder's state can't change mid-stream. The write side has no equivalent guard for either parameter."}}, {"@type": "Question", "name": "How would I detect a file that lost characters this way?", "acceptedAnswer": {"@type": "Answer", "text": "There's no way to detect it from the file alone -- we measured that the dropped characters leave no trace, not even a placeholder. The only reliable fix is avoiding the mid-write reconfigure(errors=...) call in the first place."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>io.TextIOWrapper.reconfigure(errors=...) Mid-Write Silently Drops Characters (tested)</h1>
+<p class="lead"><code>io.TextIOWrapper.reconfigure()</code> can change <code>errors</code> on an already-open text stream, the same way it can change <code>encoding</code>. On the read side it enforces a safety rule: calling <code>reconfigure()</code> after any <code>read()</code> has happened raises <code>UnsupportedOperation</code>. The write side has no such restriction for <code>errors=</code> either -- you can switch from <code>errors='strict'</code> to <code>errors='ignore'</code> after writing any amount of text, and it takes effect immediately for everything written afterward, with no error or warning raised at write time. Unlike the <code>encoding=</code> version of this bug, which mixes two valid-but-different byte sequences, this one is quietly destructive: <code>errors='ignore'</code> means characters that can't be encoded are dropped, not flagged, so the file ends up permanently missing data with nothing in the write path telling you.</p>
+<h2 id="repro1">1. Strict mode correctly raises on an unencodable character</h2>
+<pre><code>import io
+
+buf = io.BytesIO()
+text = io.TextIOWrapper(buf, encoding="ascii", errors="strict")
+text.write("hello ")
+try:
+    text.write("café")
+except UnicodeEncodeError as e:
+    print("strict write fails ->", e)</code></pre>
+<pre><code>strict write fails -> 'ascii' codec can't encode character '\xe9' in position 3: ordinal not in range(128)</code></pre>
+<p><strong>Measured:</strong> writing a character outside the ASCII range under <code>errors='strict'</code> (the default) raises <code>UnicodeEncodeError</code> immediately, which is the expected, documented behavior.</p>
+
+<h2 id="repro2">2. reconfigure(errors='ignore') after that failure succeeds silently</h2>
+<pre><code>text.reconfigure(errors="ignore")
+text.write("café")
+text.flush()
+print(buf.getvalue())</code></pre>
+<pre><code>b'hello caf'</code></pre>
+<p><strong>Measured:</strong> after reconfiguring to <code>errors='ignore'</code>, writing the exact same unencodable string raises nothing -- but the <code>&eacute;</code> is silently dropped. The buffer contains <code>b'hello caf'</code>, not <code>b'hello café'</code> in any encoding and not an error: the character is simply gone, with no exception, no warning, and no return value indicating anything was lost.</p>
+
+<h2 id="repro3">3. The read side blocks the identical reconfigure() call</h2>
+<pre><code>reader = io.TextIOWrapper(io.BytesIO(b"hello"), encoding="utf-8", errors="strict")
+reader.read(1)
+try:
+    reader.reconfigure(errors="ignore")
+except Exception as e:
+    print("reconfigure errors after a read ->", type(e).__name__, e)</code></pre>
+<pre><code>reconfigure errors after a read -> UnsupportedOperation It is not possible to set the encoding or newline of stream after the first read</code></pre>
+<p><strong>Measured:</strong> reconfiguring <code>errors=</code> on the read side raises immediately if even one character has already been read -- the same guard that protects <code>encoding=</code> on reads. The write side has no equivalent check for either parameter.</p>
+
+<h2 id="repro4">4. The fix: never reconfigure(errors=...) on a stream you're actively writing</h2>
+<pre><code>buf2 = io.BytesIO()
+text2 = io.TextIOWrapper(buf2, encoding="utf-8", errors="strict")
+text2.write("hello ")
+text2.write("café")   # utf-8 can encode this; no need to relax errors=
+text2.flush()
+print(io.TextIOWrapper(io.BytesIO(buf2.getvalue()), encoding="utf-8").read())</code></pre>
+<pre><code>hello café</code></pre>
+<p><strong>Measured:</strong> picking an encoding that can actually represent the text you're writing (here, UTF-8 instead of ASCII) avoids the problem entirely. If some input genuinely can't be encoded and dropping it is acceptable, do the lossy conversion explicitly on the string before writing (<code>s.encode('ascii', errors='ignore').decode('ascii')</code>) so the loss is visible at the call site, instead of hiding it inside a stream's mutable state.</p>
+<aside class="cta"><strong>Calling TextIOWrapper.reconfigure(errors=...) partway through writing to a file? It silently drops unencodable characters from then on, with no error at write time:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does TextIOWrapper.reconfigure(errors=...) check anything before switching on the write side?</summary><p>We measured no restriction at all on the write side -- it can be called after any number of writes and takes effect immediately for subsequent writes, including silently dropping characters that errors=&#x27;ignore&#x27; can&#x27;t encode.</p></details>
+<details><summary>What&#x27;s different between this and the reconfigure(encoding=...) mid-write bug?</summary><p>We measured both as unrestricted on the write side, but the consequences differ: switching encoding= mid-write produces a file with two different valid byte sequences concatenated (recoverable if you know the split point); switching to errors=&#x27;ignore&#x27; mid-write destroys data outright -- the dropped characters aren&#x27;t recoverable from the output at all.</p></details>
+<details><summary>Why does the read side block reconfigure(errors=...) but the write side doesn&#x27;t?</summary><p>We measured that reconfigure() raises UnsupportedOperation on the read side as soon as any read() has happened, for both the encoding and errors parameters, because the internal incremental decoder&#x27;s state can&#x27;t change mid-stream. The write side has no equivalent guard for either parameter.</p></details>
+<details><summary>How would I detect a file that lost characters this way?</summary><p>There&#x27;s no way to detect it from the file alone -- we measured that the dropped characters leave no trace, not even a placeholder. The only reliable fix is avoiding the mid-write reconfigure(errors=...) call in the first place.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in io.TextIOWrapper: wrote text under errors=&#x27;strict&#x27;, caught the UnicodeEncodeError it correctly raises, then called reconfigure(errors=&#x27;ignore&#x27;) and wrote the same text again. PlainHeaders is our extension; Python&#x27;s io module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

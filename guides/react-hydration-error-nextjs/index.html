@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>React/Next.js Hydration Error: Causes and Fixes (Tested)</title>
+<meta name="description" content="We reproduced React&#x27;s hydration mismatch in a browser: random output and typeof window checks both break it. Exact console errors, plus the useEffect fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/react-hydration-error-nextjs/">
+<meta property="og:title" content="React/Next.js Hydration Error: Causes and Fixes (Tested)">
+<meta property="og:description" content="We reproduced React&#x27;s hydration mismatch in a browser: random output and typeof window checks both break it. Exact console errors, plus the useEffect fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/react-hydration-error-nextjs/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does \"Hydration failed because the server rendered HTML didn't match the client\" mean?", "acceptedAnswer": {"@type": "Answer", "text": "It means React rendered different markup on the server than it got on the client's first render. We measured the underlying React warning directly: \"Warning: Text content did not match. Server: ... Client: ...\", followed by React discarding and re-rendering that subtree on the client."}}, {"@type": "Question", "name": "Is a hydration error a bug in React or in my code?", "acceptedAnswer": {"@type": "Answer", "text": "In my code, almost always. React expects the server and client render to produce identical output on the first pass. In our tests, calling Math.random() in render and branching on typeof window both produced the mismatch purely from component code, with no React defect involved."}}, {"@type": "Question", "name": "Does a hydration mismatch break my page?", "acceptedAnswer": {"@type": "Answer", "text": "Not fatally, but it costs performance and can flash. In our tests React threw the server-rendered subtree away and re-rendered it client-side, per the message 'the entire root will switch to client rendering' for errors outside a Suspense boundary. The page still worked, but lost the benefit of SSR for that part."}}, {"@type": "Question", "name": "How do I fix a Math.random() or Date.now() hydration error?", "acceptedAnswer": {"@type": "Answer", "text": "Render a fixed placeholder on both server and client for the first paint, then set the real value inside useEffect, which only runs in the browser after hydration. We verified this produces zero console errors or warnings, versus two warnings and two uncaught errors without the fix."}}, {"@type": "Question", "name": "Is this the same error in plain React and in Next.js?", "acceptedAnswer": {"@type": "Answer", "text": "The underlying mechanism is identical; we measured it with plain react-dom/server and react-dom/client. Next.js wraps the same warning in its own error overlay with a visual diff, per the Next.js docs \u2014 we did not run an actual Next.js project to confirm the overlay's exact wording."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>React Hydration Error (tested)</h1>
+<p class="lead">A hydration error happens when the HTML React renders on the server does not match what React renders on the client during the first render. React warns in the console and, outside a Suspense boundary, throws the whole root away and re-renders it from scratch on the client. We built a minimal server-rendered React app (no Next.js, same underlying APIs) and reproduced the two most common causes in headless Chromium, then verified the standard fix.</p>
+<h2>1. What a hydration mismatch is</h2>
+<p>Server-side rendering runs your component once on the server to produce HTML, then the browser loads your JavaScript and runs the same component again on the client. React's hydration step assumes both renders produce the <em>same</em> output, so it can attach event handlers to the existing DOM instead of rebuilding it. When the two renders disagree, React logs a mismatch warning. If the mismatch is bigger than text content React can patch in place, it discards the server-rendered subtree and re-renders that part on the client, which is slower and can cause a visible flash.</p>
+<p>This is a React mechanism, not a Next.js-only one. Next.js's App Router and Pages Router both sit on top of <code>react-dom/server</code> and <code>react-dom/client</code>, the same APIs we tested directly.</p>
+
+<h2>2. Our test setup</h2>
+<p>We wrote a plain Express server that calls <code>renderToString()</code> for three small components, and a client <code>&lt;script&gt;</code> that calls <code>ReactDOM.hydrateRoot()</code> on the same markup, with no build step (React and ReactDOM loaded as UMD globals). We opened each page in headless Chromium via Playwright and captured every <code>console.error</code>/<code>console.warn</code> and uncaught page error, with React's <code>%s</code> placeholders substituted in so the text matches what you'd see in DevTools.</p>
+
+<h2>3. Scenario 1: non-deterministic output (<code>Math.random()</code>)</h2>
+<p>A component that calls <code>Math.random()</code> (the same applies to <code>new Date().toString()</code>, <code>Date.now()</code>, or anything else that differs per call) directly in its render body:</p>
+<pre><code>function Scenario1() {
+  return &lt;div&gt;Random: {Math.random()}&lt;/div&gt;;
+}</code></pre>
+<p>The server computes one random number, the client computes a different one on hydration. Chromium's console showed:</p>
+<pre><code>Warning: Text content did not match. Server: "Random: 0.7943628232528256" Client: "Random: 0.8602137549067519"
+    at div
+    at Scenario1
+Warning: An error occurred during hydration. The server HTML was replaced with client content in &lt;div&gt;.</code></pre>
+<p>And as an uncaught page error:</p>
+<pre><code>Text content does not match server-rendered HTML.
+There was an error while hydrating. Because the error happened outside of a Suspense boundary, the entire root will switch to client rendering.</code></pre>
+<p>The final DOM showed the client's value (<code>Random: 0.43356069424459065</code> in that run), confirming React discarded the server markup for that subtree and rendered fresh on the client.</p>
+
+<h2>4. Scenario 2: branching on <code>typeof window</code></h2>
+<p>A common pattern that looks like a safe environment check actually guarantees a mismatch, because it renders one thing on the server (where <code>window</code> is undefined) and another on the client (where it exists):</p>
+<pre><code>function Scenario2() {
+  const isBrowser = typeof window !== 'undefined';
+  return &lt;div&gt;{isBrowser ? 'Client rendered' : 'Server rendered'}&lt;/div&gt;;
+}</code></pre>
+<p>Measured console output, same shape as scenario 1:</p>
+<pre><code>Warning: Text content did not match. Server: "Server rendered" Client: "Client rendered"
+    at div
+    at Scenario2
+Warning: An error occurred during hydration. The server HTML was replaced with client content in &lt;div&gt;.</code></pre>
+<p>Same two uncaught page errors as scenario 1 followed, and the final DOM read <code>Client rendered</code>. This pattern is common in code migrated from client-only React: a <code>typeof window</code> or <code>typeof document</code> check feels like it's "handling" SSR, but it actually causes the exact mismatch hydration warns about.</p>
+
+<h2>5. The fix: defer the dynamic part to <code>useEffect</code></h2>
+<p>Render the same, deterministic markup on both server and client for the first pass, then switch to the dynamic value only after mount, using <code>useEffect</code> plus state:</p>
+<pre><code>function Scenario3() {
+  const [val, setVal] = useState(null);
+  useEffect(() =&gt; { setVal(Math.random()); }, []);
+  return &lt;div&gt;{val === null ? 'Random: (pending)' : 'Random: ' + val}&lt;/div&gt;;
+}</code></pre>
+<p><code>useEffect</code> only runs in the browser, after hydration completes, so the server HTML and the client's first render both show <code>Random: (pending)</code>. There is nothing to mismatch. We ran the same Playwright check against this version: <strong>zero console errors or warnings</strong>. The page hydrated cleanly, then updated to a real random value (<code>Random: 0.8524432852212221</code> in that run) in a normal post-hydration state update, which is not a hydration error.</p>
+<p>The same pattern fixes the <code>typeof window</code> case: compute a <code>mounted</code> boolean in state, set it to <code>true</code> inside <code>useEffect</code>, and render the server-safe branch until <code>mounted</code> is <code>true</code>.</p>
+
+<h2>6. Next.js specifics (per Next.js docs, not independently measured)</h2>
+<p>Next.js wraps the same React warning in its own error overlay, titled "Text content does not match server-rendered HTML" or "Hydration failed because the server rendered HTML didn't match the client," and in recent versions prints a diff of the server vs. client markup in the terminal and browser overlay. The underlying cause and fix are identical to what we measured above: the overlay is cosmetic, the mechanism is plain React hydration. Next.js also warns specifically about browser extensions injecting attributes (e.g. <code>cz-shortcut-listen</code> from Grammarly) before React runs, which look like a mismatch but come from outside your code; <code>suppressHydrationWarning</code> on that one element is the documented workaround for that specific case.</p>
+
+<h2>7. Other common causes</h2>
+<ul>
+<li><strong>Locale/timezone-dependent formatting.</strong> <code>toLocaleString()</code> or <code>toLocaleDateString()</code> can format differently if the server and the visitor's browser disagree on locale or timezone.</li>
+<li><strong>Random/unstable IDs.</strong> Generating a DOM <code>id</code> or <code>key</code> with <code>Math.random()</code> or a counter that resets on reload, instead of a stable value from your data or React's <code>useId()</code>.</li>
+<li><strong>Invalid HTML nesting.</strong> E.g. a <code>&lt;div&gt;</code> inside a <code>&lt;p&gt;</code>; the browser silently restructures the server HTML before React hydrates it, so React's expected tree no longer matches the DOM.</li>
+<li><strong>Browser extensions mutating the DOM</strong> before hydration runs (see section 6).</li>
+<li><strong>Conditionally rendering based on <code>localStorage</code>, cookies read client-side only, or <code>window.innerWidth</code></strong> — all unavailable or different on the server.</li>
+</ul>
+
+<h2>8. Checklist to fix and prevent it</h2>
+<ul>
+<li>Search your component tree for <code>Math.random()</code>, <code>Date.now()</code>, <code>new Date()</code>, and <code>typeof window</code>/<code>typeof document</code> checks used directly in render output.</li>
+<li>Move anything that can only be computed in the browser into <code>useEffect</code> + state, rendering a deterministic placeholder until mount (section 5).</li>
+<li>For values that really must come from the server per-request (e.g. a request-scoped random ID), generate them server-side and pass them down as props instead of recomputing them on the client.</li>
+<li>If the mismatch is caused by a third-party browser extension and you can't avoid it, add <code>suppressHydrationWarning</code> to that specific DOM node only, not the whole tree.</li>
+<li>Read the mismatch warning carefully: React tells you the server and client text values in the message, which usually points straight at the offending expression.</li>
+</ul>
+<aside class="cta"><strong>See the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &quot;Hydration failed because the server rendered HTML didn&#x27;t match the client&quot; mean?</summary><p>It means React rendered different markup on the server than it got on the client&#x27;s first render. We measured the underlying React warning directly: &quot;Warning: Text content did not match. Server: ... Client: ...&quot;, followed by React discarding and re-rendering that subtree on the client.</p></details>
+<details><summary>Is a hydration error a bug in React or in my code?</summary><p>In my code, almost always. React expects the server and client render to produce identical output on the first pass. In our tests, calling Math.random() in render and branching on typeof window both produced the mismatch purely from component code, with no React defect involved.</p></details>
+<details><summary>Does a hydration mismatch break my page?</summary><p>Not fatally, but it costs performance and can flash. In our tests React threw the server-rendered subtree away and re-rendered it client-side, per the message &#x27;the entire root will switch to client rendering&#x27; for errors outside a Suspense boundary. The page still worked, but lost the benefit of SSR for that part.</p></details>
+<details><summary>How do I fix a Math.random() or Date.now() hydration error?</summary><p>Render a fixed placeholder on both server and client for the first paint, then set the real value inside useEffect, which only runs in the browser after hydration. We verified this produces zero console errors or warnings, versus two warnings and two uncaught errors without the fix.</p></details>
+<details><summary>Is this the same error in plain React and in Next.js?</summary><p>The underlying mechanism is identical; we measured it with plain react-dom/server and react-dom/client. Next.js wraps the same warning in its own error overlay with a visual diff, per the Next.js docs — we did not run an actual Next.js project to confirm the overlay&#x27;s exact wording.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with React 18.3.1, react-dom 18.3.1, Express 5.2.1 and Node.js 24.21.0, using the raw react-dom/server + react-dom/client APIs (the same APIs Next.js&#x27;s App Router builds on) and headless Chromium 153.0.8010.12 via Playwright. No Next.js project was run; the Next.js-specific wrapper message is from the Next.js docs, not measured. PlainHeaders is our extension; React, Express, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

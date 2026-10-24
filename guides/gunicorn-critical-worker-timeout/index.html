@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gunicorn [CRITICAL] WORKER TIMEOUT: Causes and Fixes (Tested)</title>
+<meta name="description" content="gunicorn [CRITICAL] WORKER TIMEOUT reproduced with gunicorn 26.2: default 30s timeout, what the traceback shows, --timeout, gunicorn.conf.py and gthread.">
+<link rel="canonical" href="https://honestkit.github.io/guides/gunicorn-critical-worker-timeout/">
+<meta property="og:title" content="gunicorn [CRITICAL] WORKER TIMEOUT: Causes and Fixes (Tested)">
+<meta property="og:description" content="gunicorn [CRITICAL] WORKER TIMEOUT reproduced with gunicorn 26.2: default 30s timeout, what the traceback shows, --timeout, gunicorn.conf.py and gthread.">
+<meta property="og:url" content="https://honestkit.github.io/guides/gunicorn-critical-worker-timeout/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the default gunicorn worker timeout?", "acceptedAnswer": {"@type": "Answer", "text": "30 seconds, with the sync worker class."}}, {"@type": "Question", "name": "How do I increase the gunicorn timeout?", "acceptedAnswer": {"@type": "Answer", "text": "Pass --timeout 120 on the command line, or put timeout = 120 in gunicorn.conf.py in the working directory."}}, {"@type": "Question", "name": "What does the client see on WORKER TIMEOUT?", "acceptedAnswer": {"@type": "Answer", "text": "In this test the client got HTTP 500 right after the timeout; through a reverse proxy it often appears as 502."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>gunicorn CRITICAL WORKER TIMEOUT (tested)</h1>
+<p class="lead"><code>[CRITICAL] WORKER TIMEOUT (pid:...)</code> means a gunicorn worker spent longer than <code>--timeout</code> (default 30 seconds) on one request, so the arbiter killed it and the client got a 500. Raise <code>--timeout</code> for legitimately slow requests, switch to <code>-k gthread</code>, or fix the slow call shown in the traceback.</p>
+<h2 id="repro">1. Reproduce WORKER TIMEOUT</h2>
+<p><code>app.py</code>, a WSGI app that sleeps for <code>?N</code> seconds:</p>
+<pre><code>import time
+
+def app(environ, start_response):
+    secs = float(environ.get(&quot;QUERY_STRING&quot;) or 0)
+    time.sleep(secs)                      # stands in for a slow DB call / model load
+    start_response(&quot;200 OK&quot;, [(&quot;Content-Type&quot;, &quot;text/plain&quot;)])
+    return [f&quot;slept {secs}s\n&quot;.encode()]</code></pre>
+<p><code>run.py</code> starts gunicorn with different settings and sends one slow request each time:</p>
+<pre><code>import subprocess, sys, time, urllib.request
+G = &quot;/tmp/fx384/ve/bin/gunicorn&quot;
+def trial(args, q, full=False):
+    cmd = [G, &quot;-b&quot;, &quot;127.0.0.1:8965&quot;, *args, &quot;app:app&quot;]
+    print(&quot;$&quot;, &quot;gunicorn&quot;, &quot; &quot;.join(cmd[1:]))
+    p = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
+    time.sleep(1.5)
+    t = time.time()
+    try:
+        r = urllib.request.urlopen(f&quot;http://127.0.0.1:8965/?{q}&quot;, timeout=60).read().decode().strip()
+    except Exception as ex:
+        r = f&quot;{type(ex).__name__}: {ex}&quot;
+    print(f&quot;$ curl &#x27;http://127.0.0.1:8965/?{q}&#x27;  -&gt; {r}  ({time.time()-t:.1f}s)&quot;)
+    time.sleep(1); p.terminate(); err = p.communicate()[1]
+    for line in err.splitlines():
+        if &quot;Listening at&quot; in line or &quot;Starting gunicorn&quot; in line or &quot;Handling signal&quot; in line or &quot;Shutting down&quot; in line: continue
+        if not full and not line.startswith(&quot;[&quot;): continue
+        print(&quot;  &quot; + (line[line.index(&quot;] &quot;)+2:] if line.startswith(&quot;[&quot;) else line))
+    print()
+trial([&quot;--timeout&quot;, &quot;3&quot;], &quot;5&quot;, full=True)
+trial([&quot;--timeout&quot;, &quot;10&quot;], &quot;5&quot;)
+import os; os.rename(&quot;gc.tmp&quot;,&quot;gunicorn.conf.py&quot;)
+trial([], &quot;3&quot;)  # gunicorn.conf.py in the cwd: timeout = 2
+os.rename(&quot;gunicorn.conf.py&quot;,&quot;gc.tmp&quot;)
+trial([&quot;--timeout&quot;, &quot;3&quot;, &quot;-k&quot;, &quot;gthread&quot;, &quot;--threads&quot;, &quot;4&quot;], &quot;5&quot;)</code></pre>
+<p>Output (gunicorn 26.2.0, Python 3.13.5, Linux; first trial with the full log):</p>
+<pre><code>$ gunicorn -b 127.0.0.1:8965 --timeout 3 app:app
+$ curl &#x27;http://127.0.0.1:8965/?5&#x27;  -&gt; HTTPError: HTTP Error 500: Internal Server Error  (3.7s)
+  [3394044] [INFO] Using worker: sync
+  [3394045] [INFO] Booting worker with pid: 3394045
+  [3394044] [INFO] Control socket listening at /run/user/1000/gunicorn.ctl
+  [3394044] [CRITICAL] WORKER TIMEOUT (pid:3394045)
+  [3394045] [ERROR] Error handling request GET /?5
+  Traceback (most recent call last):
+    File &quot;/tmp/fx384/ve/lib/python3.13/site-packages/gunicorn/workers/sync.py&quot;, line 141, in handle
+      self.handle_request(listener, req, client, addr)
+      ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File &quot;/tmp/fx384/ve/lib/python3.13/site-packages/gunicorn/workers/sync.py&quot;, line 184, in handle_request
+      respiter = self.wsgi(environ, resp.start_response)
+    File &quot;/tmp/gw405/app.py&quot;, line 5, in app
+      time.sleep(secs)                      # stands in for a slow DB call / model load
+      ~~~~~~~~~~^^^^^^
+    File &quot;/tmp/fx384/ve/lib/python3.13/site-packages/gunicorn/workers/base.py&quot;, line 199, in handle_abort
+      sys.exit(1)
+      ~~~~~~~~^^^
+  SystemExit: 1
+  [3394045] [INFO] Worker exiting (pid: 3394045)
+  [3394086] [INFO] Booting worker with pid: 3394086
+  [3394044] [INFO] Control socket listening at /run/user/1000/gunicorn.ctl
+  [3394086] [INFO] Worker exiting (pid: 3394086)
+
+$ gunicorn -b 127.0.0.1:8965 --timeout 10 app:app
+$ curl &#x27;http://127.0.0.1:8965/?5&#x27;  -&gt; slept 5.0s  (5.0s)
+  [3394088] [INFO] Using worker: sync
+  [3394089] [INFO] Booting worker with pid: 3394089
+  [3394088] [INFO] Control socket listening at /run/user/1000/gunicorn.ctl
+  [3394089] [INFO] Worker exiting (pid: 3394089)
+
+$ gunicorn -b 127.0.0.1:8965 app:app
+$ curl &#x27;http://127.0.0.1:8965/?3&#x27;  -&gt; HTTPError: HTTP Error 500: Internal Server Error  (2.7s)
+  [3394307] [INFO] Using worker: sync
+  [3394308] [INFO] Booting worker with pid: 3394308
+  [3394307] [INFO] Control socket listening at /run/user/1000/gunicorn.ctl
+  [3394307] [CRITICAL] WORKER TIMEOUT (pid:3394308)
+  [3394308] [ERROR] Error handling request GET /?3
+  [3394308] [INFO] Worker exiting (pid: 3394308)
+  [3394356] [INFO] Booting worker with pid: 3394356
+  [3394307] [INFO] Control socket listening at /run/user/1000/gunicorn.ctl
+  [3394356] [INFO] Worker exiting (pid: 3394356)
+
+$ gunicorn -b 127.0.0.1:8965 --timeout 3 -k gthread --threads 4 app:app
+$ curl &#x27;http://127.0.0.1:8965/?5&#x27;  -&gt; slept 5.0s  (5.0s)
+  [3394363] [INFO] Using worker: gthread
+  [3394364] [INFO] Booting worker with pid: 3394364
+  [3394363] [INFO] Control socket listening at /run/user/1000/gunicorn.ctl
+  [3394364] [INFO] Worker exiting (pid: 3394364)</code></pre>
+<h2 id="what">2. What the log means</h2>
+<ul><li>The default worker is <code>sync</code> and the default <code>--timeout</code> is 30 seconds (checked with <code>gunicorn.config.Config().timeout</code>). A sync worker that is busy with one request for longer than that is killed by the arbiter: <code>[CRITICAL] WORKER TIMEOUT (pid:...)</code>.</li>
+<li>The traceback ends in <code>handle_abort</code> / <code>SystemExit: 1</code>. Its middle frame is <em>your</em> code (<code>app.py, line 5</code>): that is where the request was stuck. Read it to find the slow call.</li>
+<li>The client got <code>HTTP 500</code> after the timeout (3.7s with <code>--timeout 3</code>), and the arbiter booted a replacement worker. Behind nginx this usually shows up as a 502.</li></ul>
+<h2 id="fix">3. Fixes</h2>
+<ul><li><strong>Raise the timeout</strong> if the slow request is legitimate: <code>--timeout 10</code> let the 5-second request finish. The same setting in <code>gunicorn.conf.py</code> (<code>timeout = 2</code> in the third trial) is picked up from the working directory without any flag.</li>
+<li><strong>Use threads</strong>: with <code>-k gthread --threads 4</code> and <code>--timeout 3</code>, the 5-second request completed with no WORKER TIMEOUT in this test.</li>
+<li><strong>Fix the slow call</strong> (the frame in your code in the traceback): add a timeout to outbound HTTP/DB calls, or move long jobs to a task queue.</li>
+<li>If workers time out at <em>startup</em> because the app loads a large model, load it lazily, or raise <code>--timeout</code>.</li></ul>
+<p>Related: <a href="/guides/gunicorn-logs-location-access-log-error-log/">where gunicorn logs go (access log off by default)</a>.</p>
+
+<aside class="cta"><strong>See the response headers of any page in one click:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the default gunicorn worker timeout?</summary><p>30 seconds, with the sync worker class.</p></details>
+<details><summary>How do I increase the gunicorn timeout?</summary><p>Pass --timeout 120 on the command line, or put timeout = 120 in gunicorn.conf.py in the working directory.</p></details>
+<details><summary>What does the client see on WORKER TIMEOUT?</summary><p>In this test the client got HTTP 500 right after the timeout; through a reverse proxy it often appears as 502.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with gunicorn 26.2.0 and Python 3.13.5 on Linux. The script ran verbatim and the output was pasted unedited. PlainHeaders is our extension; gunicorn is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ERR_SSL_PROTOCOL_ERROR: Causes and Fixes (Tested in Chrome)</title>
+<meta name="description" content="We broke TLS 8 ways and recorded what Chrome 153, curl and Node fetch said. ERR_SSL_PROTOCOL_ERROR mostly means https:// hit a port that does not speak TLS.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-ssl-protocol-error/">
+<meta property="og:title" content="ERR_SSL_PROTOCOL_ERROR: Causes and Fixes (Tested in Chrome)">
+<meta property="og:description" content="We broke TLS 8 ways and recorded what Chrome 153, curl and Node fetch said. ERR_SSL_PROTOCOL_ERROR mostly means https:// hit a port that does not speak TLS.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-ssl-protocol-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes ERR_SSL_PROTOCOL_ERROR on localhost?", "acceptedAnswer": {"@type": "Answer", "text": "Almost always https:// pointed at a plain HTTP dev server. In our test Chromium 153 showed ERR_SSL_PROTOCOL_ERROR and curl said 'wrong version number' (exit 35). Use http://localhost, or run the dev server with TLS."}}, {"@type": "Question", "name": "Does an old TLS version cause ERR_SSL_PROTOCOL_ERROR?", "acceptedAnswer": {"@type": "Answer", "text": "Not in our test. A server limited to TLS 1.0/1.1 gave net::ERR_SSL_VERSION_OR_CIPHER_MISMATCH in Chromium 153. A server with no shared cipher gave the same error."}}, {"@type": "Question", "name": "Does a self-signed certificate cause ERR_SSL_PROTOCOL_ERROR?", "acceptedAnswer": {"@type": "Answer", "text": "No. Certificate problems give ERR_CERT_* errors. Our self-signed cert gave net::ERR_CERT_AUTHORITY_INVALID in Chromium, curl exit 60 and DEPTH_ZERO_SELF_SIGNED_CERT in Node fetch."}}, {"@type": "Question", "name": "Why does Chrome go to https when I typed http?", "acceptedAnswer": {"@type": "Answer", "text": "HSTS. In our test http://myapp.dev, .app and .foo were rewritten by a 307 Internal Redirect with Non-Authoritative-Reason: HSTS, then failed with ERR_SSL_PROTOCOL_ERROR against a plain HTTP server. .test, .local and localhost were not rewritten."}}, {"@type": "Question", "name": "How do I see the real error behind ERR_SSL_PROTOCOL_ERROR?", "acceptedAnswer": {"@type": "Answer", "text": "Run curl -v against the same URL. 'wrong version number' means the port is not speaking TLS. 'unexpected message' means a broken TLS answer. 'alert protocol version' or 'handshake failure' points to versions or ciphers."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ERR_SSL_PROTOCOL_ERROR (tested)</h1>
+<p class="lead"><code>net::ERR_SSL_PROTOCOL_ERROR</code> means Chrome started a TLS handshake and got back something that is not valid TLS. We set up eight broken servers and loaded each in Chromium 153, curl and Node fetch. Only the non-TLS answers gave ERR_SSL_PROTOCOL_ERROR. Old TLS, bad ciphers, bad certificates and dropped connections all gave different errors.</p>
+<h2>1. What the error means</h2>
+<p>Chrome sends a TLS ClientHello and waits for a TLS ServerHello. If the bytes that come back are not a well-formed TLS record, Chrome stops and shows <code>ERR_SSL_PROTOCOL_ERROR</code> ("This site can't provide a secure connection").</p>
+<p>In our tests that happened in exactly three cases. A plain HTTP server answered. A non-HTTP service answered (we used an SSH-style banner). Or the server sent a broken TLS record. In all three, the server is not speaking TLS on that port.</p>
+
+<h2>2. Our test setup</h2>
+<p>Each case was a small Node.js server on <code>127.0.0.1:8987</code>. We opened <code>https://localhost:8987/</code> and <code>https://127.0.0.1:8987/</code> in headless Chromium with Playwright and recorded the <code>net::ERR_</code> string from <code>page.goto</code>. Then we ran <code>curl -sS https://localhost:8987/</code> and Node <code>fetch()</code> against the same server and recorded <code>err.cause.code</code>.</p>
+
+<h2>3. Results: cause → Chromium → curl → Node fetch</h2>
+<table>
+<tr><th>Server on the port</th><th>Chromium 153</th><th>curl 8.14.1</th><th>Node fetch cause.code</th><th>Fix</th></tr>
+<tr><td>Plain HTTP server (no TLS)</td><td><code>net::ERR_SSL_PROTOCOL_ERROR</code></td><td>exit 35, "TLS connect error: error:0A00010B:SSL routines::wrong version number"</td><td><code>ERR_SSL_WRONG_VERSION_NUMBER</code></td><td>Use <code>http://</code>, or the real HTTPS port</td></tr>
+<tr><td>Non-HTTP service sends a text banner</td><td><code>net::ERR_SSL_PROTOCOL_ERROR</code></td><td>exit 35, "wrong version number"</td><td><code>ERR_SSL_WRONG_VERSION_NUMBER</code></td><td>Wrong port; point at the web server</td></tr>
+<tr><td>Broken TLS record (handshake header, junk body)</td><td><code>net::ERR_SSL_PROTOCOL_ERROR</code></td><td>exit 35, "error:0A0000F4:SSL routines::unexpected message"</td><td><code>ERR_SSL_UNEXPECTED_MESSAGE</code></td><td>Fix the TLS terminator or middlebox</td></tr>
+<tr><td>TLS 1.0/1.1 only</td><td><code>net::ERR_SSL_VERSION_OR_CIPHER_MISMATCH</code></td><td>exit 35, "error:0A00042E:SSL routines::tlsv1 alert protocol version"</td><td><code>ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION</code></td><td>Allow TLS 1.2 and 1.3</td></tr>
+<tr><td>No shared cipher (DHE-RSA-AES128-GCM-SHA256 only, TLS 1.2 max)</td><td><code>net::ERR_SSL_VERSION_OR_CIPHER_MISMATCH</code></td><td>exit 35, "error:0A000410:SSL routines::ssl/tls alert handshake failure"</td><td><code>ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE</code></td><td>Use default modern ciphers (ECDHE + AES-GCM / ChaCha20)</td></tr>
+<tr><td>Server closes the socket after the ClientHello</td><td><code>net::ERR_CONNECTION_CLOSED</code></td><td>exit 35, "error:0A000126:SSL routines::unexpected eof while reading"</td><td><code>ECONNRESET</code> ("Client network socket disconnected before secure TLS connection was established")</td><td>Check server logs, firewalls, SNI routing</td></tr>
+<tr><td>Self-signed certificate</td><td><code>net::ERR_CERT_AUTHORITY_INVALID</code></td><td>exit 60, "SSL certificate problem: self-signed certificate"</td><td><code>DEPTH_ZERO_SELF_SIGNED_CERT</code></td><td>Use a trusted cert (or a local CA, e.g. mkcert)</td></tr>
+<tr><td>Server asks for a client certificate (mTLS), none sent</td><td><code>net::ERR_BAD_SSL_CLIENT_AUTH_CERT</code> (with cert errors ignored)</td><td>with <code>-k</code>: exit 56, "tlsv13 alert certificate required"</td><td>not measured</td><td>Send a client cert or drop <code>requestCert</code></td></tr>
+</table>
+<p>So <code>ERR_SSL_PROTOCOL_ERROR</code> is narrow. If you see it, look for a port that is not serving TLS at all. An old TLS version or a cipher problem shows up as <code>ERR_SSL_VERSION_OR_CIPHER_MISMATCH</code> instead. Certificate problems are always <code>ERR_CERT_*</code>.</p>
+<p>The server side differs too. For the plain HTTP case our Node TLS server logged nothing, because no TLS server was involved. For the cipher case it logged <code>ERR_SSL_NO_SHARED_CIPHER</code>; for TLS 1.0/1.1 it logged <code>ERR_SSL_UNSUPPORTED_PROTOCOL</code>.</p>
+
+<h2>4. The classic localhost cause: https:// to an http port</h2>
+<p>Most dev servers (Vite, webpack, Flask, Express) listen on plain HTTP. Typing <code>https://localhost:3000</code> sends TLS to a server that answers in HTTP. That is the first row of the table.</p>
+<pre><code>$ curl -sS https://127.0.0.1:8987/
+curl: (35) TLS connect error: error:0A00010B:SSL routines::wrong version number
+$ curl -sS http://127.0.0.1:8987/
+ok</code></pre>
+<p>"wrong version number" from curl or OpenSSL is the tell. The first bytes back were <code>HTTP/1.1</code>, not a TLS record header.</p>
+<p>The reverse mistake looks different. <code>http://</code> to a TLS port gave Chromium <code>net::ERR_EMPTY_RESPONSE</code>, curl exit 52 "Empty reply from server", and Node fetch <code>UND_ERR_SOCKET</code> ("other side closed").</p>
+
+<h2>5. HSTS can force https:// on dev domains</h2>
+<p>Sometimes you type <code>http://</code> and still get this error. Chrome upgraded the URL to https before sending it. We mapped some names to 127.0.0.1 with <code>--host-resolver-rules</code> and loaded <code>http://myapp.&lt;tld&gt;:8988/</code> against a plain HTTP server:</p>
+<table>
+<tr><th>URL typed</th><th>What Chromium 153 did</th><th>Result</th></tr>
+<tr><td><code>http://myapp.dev:8988/</code></td><td>307 Internal Redirect, <code>Non-Authoritative-Reason: HSTS</code>, to https</td><td><code>net::ERR_SSL_PROTOCOL_ERROR</code></td></tr>
+<tr><td><code>http://myapp.app:8988/</code></td><td>Same HSTS redirect</td><td><code>net::ERR_SSL_PROTOCOL_ERROR</code></td></tr>
+<tr><td><code>http://myapp.foo:8988/</code></td><td>Same HSTS redirect</td><td><code>net::ERR_SSL_PROTOCOL_ERROR</code></td></tr>
+<tr><td><code>http://myapp.test:8988/</code></td><td>No redirect</td><td>200</td></tr>
+<tr><td><code>http://myapp.local:8988/</code></td><td>No redirect</td><td>200</td></tr>
+<tr><td><code>http://localhost:8988/</code></td><td>No redirect</td><td>200</td></tr>
+</table>
+<p>Whole TLDs like <code>.dev</code>, <code>.app</code> and <code>.foo</code> are on Chrome's HSTS preload list (see <a href="/guides/hsts-preload-list-requirements/">HSTS preload list requirements</a>). You cannot turn that off for them. Use <code>.test</code>, <code>.localhost</code> or plain <code>localhost</code> for local HTTP dev, or serve real TLS.</p>
+<p>A site can also teach Chrome HSTS for a single host with a <a href="/guides/strict-transport-security-header-nginx/">Strict-Transport-Security header</a>. HSTS is per host, not per port, so an HTTPS app on one port can force https on every other port of the same host. In our test we could not reproduce this for <code>localhost</code>: with an untrusted self-signed cert, Chromium did not keep the header even when told to ignore cert errors. Per the HSTS spec (RFC 6797), browsers ignore the header on connections with certificate errors. If you suspect a learned entry, query and delete it at <code>chrome://net-internals/#hsts</code> (from the Chrome docs, not measured).</p>
+
+<h2>6. Old TLS: OpenSSL refuses before Chrome does</h2>
+<p>We set <code>minVersion: 'TLSv1'</code> and <code>maxVersion: 'TLSv1.1'</code> on a Node 24 HTTPS server. With default settings, OpenSSL 3.5 on the server refused every handshake and logged <code>ERR_SSL_NO_PROTOCOLS_AVAILABLE</code>. TLS 1.0/1.1 only worked after adding <code>ciphers: 'DEFAULT:@SECLEVEL=0'</code>, and then only for a client that also lowered its level:</p>
+<pre><code>$ openssl s_client -connect 127.0.0.1:8987 -tls1 -cipher 'DEFAULT:@SECLEVEL=0'
+New, TLSv1.0, Cipher is ECDHE-RSA-AES256-SHA
+$ curl --tlsv1.0 --tls-max 1.1 --ciphers 'DEFAULT:@SECLEVEL=0' -k https://127.0.0.1:8987/
+ok</code></pre>
+<p>Chromium 153 never offered TLS 1.0 or 1.1, so it got <code>ERR_SSL_VERSION_OR_CIPHER_MISMATCH</code>. Without the special flags, curl and OpenSSL refuse too (curl said "no protocols available"). The fix is on the server: enable TLS 1.2 and 1.3.</p>
+<pre><code># nginx
+ssl_protocols TLSv1.2 TLSv1.3;
+
+// Node.js
+https.createServer({ key, cert, minVersion: 'TLSv1.2' }, app);</code></pre>
+
+<h2>7. Checklist</h2>
+<ul>
+<li>Run <code>curl -v https://host:port/</code>. "wrong version number" means the port is not serving TLS. Try <code>http://</code>.</li>
+<li>Check the port. Dev servers, admin consoles and databases often sit next to each other. Make sure 443 (or your HTTPS port) really goes to the TLS listener.</li>
+<li>Behind a proxy or load balancer, check where TLS ends. If the proxy forwards raw TCP to an HTTP backend, the browser hits plain HTTP. See <a href="/guides/x-forwarded-proto-nginx/">X-Forwarded-Proto in nginx</a> for the usual setup.</li>
+<li>If the URL changed from http to https on its own, it is HSTS (section 5).</li>
+<li>If Chrome says <code>ERR_SSL_VERSION_OR_CIPHER_MISMATCH</code> instead, fix protocol versions and ciphers. If it says <code>ERR_CERT_*</code>, fix the certificate; see <a href="/guides/check-ssl-certificate-expiry/">check SSL certificate expiry</a>.</li>
+<li>If it says <code>ERR_CONNECTION_CLOSED</code> or reset, the server dropped the handshake. See <a href="/guides/err-connection-reset-econnreset/">ERR_CONNECTION_RESET / ECONNRESET</a>.</li>
+</ul>
+<aside class="cta"><strong>Check what your server actually answers, over http and https:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes ERR_SSL_PROTOCOL_ERROR on localhost?</summary><p>Almost always https:// pointed at a plain HTTP dev server. In our test Chromium 153 showed ERR_SSL_PROTOCOL_ERROR and curl said &#x27;wrong version number&#x27; (exit 35). Use http://localhost, or run the dev server with TLS.</p></details>
+<details><summary>Does an old TLS version cause ERR_SSL_PROTOCOL_ERROR?</summary><p>Not in our test. A server limited to TLS 1.0/1.1 gave net::ERR_SSL_VERSION_OR_CIPHER_MISMATCH in Chromium 153. A server with no shared cipher gave the same error.</p></details>
+<details><summary>Does a self-signed certificate cause ERR_SSL_PROTOCOL_ERROR?</summary><p>No. Certificate problems give ERR_CERT_* errors. Our self-signed cert gave net::ERR_CERT_AUTHORITY_INVALID in Chromium, curl exit 60 and DEPTH_ZERO_SELF_SIGNED_CERT in Node fetch.</p></details>
+<details><summary>Why does Chrome go to https when I typed http?</summary><p>HSTS. In our test http://myapp.dev, .app and .foo were rewritten by a 307 Internal Redirect with Non-Authoritative-Reason: HSTS, then failed with ERR_SSL_PROTOCOL_ERROR against a plain HTTP server. .test, .local and localhost were not rewritten.</p></details>
+<details><summary>How do I see the real error behind ERR_SSL_PROTOCOL_ERROR?</summary><p>Run curl -v against the same URL. &#x27;wrong version number&#x27; means the port is not speaking TLS. &#x27;unexpected message&#x27; means a broken TLS answer. &#x27;alert protocol version&#x27; or &#x27;handshake failure&#x27; points to versions or ciphers.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright), curl 8.14.1 (OpenSSL 3.5.7), Node.js 24.21.0 fetch and an OpenSSL 3.5.7 CLI, against small Node.js test servers on 127.0.0.1. Points marked as from the docs were not measured. PlainHeaders is our extension; Chromium, curl, Node.js and OpenSSL are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

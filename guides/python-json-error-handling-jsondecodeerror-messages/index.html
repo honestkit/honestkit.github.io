@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python JSON Error Handling: JSONDecodeError Messages Explained</title>
+<meta name="description" content="10 broken inputs, each JSONDecodeError message measured in Python 3.13 and 3.11, what json accepts silently (NaN, duplicate keys) and a helper that shows where.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-json-error-handling-jsondecodeerror-messages/">
+<meta property="og:title" content="Python JSON Error Handling: JSONDecodeError Messages Explained">
+<meta property="og:description" content="10 broken inputs, each JSONDecodeError message measured in Python 3.13 and 3.11, what json accepts silently (NaN, duplicate keys) and a helper that shows where.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-json-error-handling-jsondecodeerror-messages/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I handle JSON errors in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Wrap json.loads/json.load in try/except json.JSONDecodeError (a ValueError subclass) and use e.msg, e.lineno, e.colno and e.doc[e.pos-20:e.pos+20] to report where it broke. json.dumps raises TypeError for unsupported types."}}, {"@type": "Question", "name": "Is JSONDecodeError a ValueError?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. json.JSONDecodeError subclasses ValueError, so except ValueError also catches it."}}, {"@type": "Question", "name": "Why does Python json accept NaN?", "acceptedAnswer": {"@type": "Answer", "text": "json.loads and json.dumps allow NaN, Infinity and -Infinity by default even though they are not valid JSON. Pass allow_nan=False to dumps, and a parse_constant function to loads to reject them."}}, {"@type": "Question", "name": "What does Illegal trailing comma before end of object mean?", "acceptedAnswer": {"@type": "Answer", "text": "A comma after the last item, like {\"a\": 1,}. Python 3.13 added this message; Python 3.11 reports the same input as Expecting property name enclosed in double quotes."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python JSON error handling: every JSONDecodeError message (tested)</h1>
+<p class="lead">Python's <code>json</code> module raises <code>JSONDecodeError</code> with about a dozen different messages, accepts some invalid JSON without complaint, and uses plain <code>TypeError</code> when writing. We measured each case in Python 3.13 (and 3.11 where they differ) and wrote a parse helper that shows the text around the error.</p>
+<h2 id="messages">1. Every common JSONDecodeError message and what causes it</h2>
+<p><code>json.JSONDecodeError</code> is a subclass of <code>ValueError</code>, so <code>except ValueError</code> catches it too. We fed <code>json.loads()</code> the ten broken inputs that come up most and printed <code>e.msg</code> with the position:</p>
+<pre><code>import json
+print(&quot;JSONDecodeError -&gt;&quot;, &quot; &gt; &quot;.join(c.__name__ for c in json.JSONDecodeError.__mro__[1:-2]))
+cases = [
+    (&quot;empty string&quot;,          &#x27;&#x27;),
+    (&quot;HTML error page&quot;,       &#x27;&lt;html&gt;502 Bad Gateway&lt;/html&gt;&#x27;),
+    (&quot;single quotes&quot;,         &quot;{&#x27;a&#x27;: 1}&quot;),
+    (&quot;trailing comma&quot;,        &#x27;{&quot;a&quot;: 1,}&#x27;),
+    (&quot;missing comma&quot;,         &#x27;{&quot;a&quot;: 1 &quot;b&quot;: 2}&#x27;),
+    (&quot;unterminated string&quot;,   &#x27;{&quot;a&quot;: &quot;hi}&#x27;),
+    (&quot;raw newline in string&quot;, &#x27;{&quot;a&quot;: &quot;line1\nline2&quot;}&#x27;),
+    (&quot;two documents&quot;,         &#x27;{&quot;a&quot;: 1}{&quot;b&quot;: 2}&#x27;),
+    (&quot;UTF-8 BOM&quot;,             &#x27;﻿{&quot;a&quot;: 1}&#x27;),
+    (&quot;Python True/None&quot;,      &#x27;{&quot;a&quot;: True, &quot;b&quot;: None}&#x27;),
+]
+for label, text in cases:
+    try:
+        json.loads(text); print(f&quot;{label:22} OK&quot;)
+    except json.JSONDecodeError as e:
+        print(f&quot;{label:22} {e.msg} (line {e.lineno} col {e.colno})&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>JSONDecodeError -&gt; ValueError &gt; Exception
+empty string           Expecting value (line 1 col 1)
+HTML error page        Expecting value (line 1 col 1)
+single quotes          Expecting property name enclosed in double quotes (line 1 col 2)
+trailing comma         Illegal trailing comma before end of object (line 1 col 8)
+missing comma          Expecting &#x27;,&#x27; delimiter (line 1 col 9)
+unterminated string    Unterminated string starting at (line 1 col 7)
+raw newline in string  Invalid control character at (line 1 col 13)
+two documents          Extra data (line 1 col 9)
+UTF-8 BOM              Unexpected UTF-8 BOM (decode using utf-8-sig) (line 1 col 1)
+Python True/None       Expecting value (line 1 col 7)</code></pre>
+<p>Version note: the trailing-comma message is new in Python 3.13. On Python 3.11 (we ran the same file in <code>python:3.11-alpine</code>) the same input gives <code>Expecting property name enclosed in double quotes (line 1 col 9)</code>, the same message as single quotes. So an older Python reporting "double quotes" may really mean a trailing comma.</p>
+<p>Deep dives for each message: <a href="/guides/python-jsondecodeerror-expecting-value-line-1-column-1-char-0/">Expecting value: line 1 column 1 (char 0)</a> (empty body, HTML error page, Python literals), <a href="/guides/json-expecting-property-name-double-quotes/">Expecting property name enclosed in double quotes</a>, <a href="/guides/json-decode-error-invalid-control-character/">Invalid control character</a>, <a href="/guides/json-decode-error-extra-data/">Extra data</a>. For the BOM, open the file with <code>encoding=&quot;utf-8-sig&quot;</code> as the message says.</p>
+<h2 id="silent">2. What json accepts without any error</h2>
+<p>Some invalid JSON does <strong>not</strong> raise, which matters if other systems will read your data:</p>
+<pre><code>import json, math
+print(json.loads(&#x27;{&quot;a&quot;: NaN, &quot;b&quot;: Infinity}&#x27;))           # accepted by default
+print(json.dumps({&quot;x&quot;: math.nan}))                         # written by default
+
+def strict_const(name):
+    raise ValueError(f&quot;non-standard JSON constant {name}&quot;)
+try:
+    json.loads(&#x27;{&quot;a&quot;: NaN}&#x27;, parse_constant=strict_const)
+except ValueError as e:
+    print(&quot;parse_constant:&quot;, e)
+try:
+    json.dumps({&quot;x&quot;: math.nan}, allow_nan=False)
+except ValueError as e:
+    print(&quot;allow_nan=False:&quot;, e)
+print(json.loads(&#x27;{&quot;a&quot;: 1, &quot;a&quot;: 2}&#x27;))                     # duplicate key: last wins</code></pre>
+<p>Output:</p>
+<pre><code>{&#x27;a&#x27;: nan, &#x27;b&#x27;: inf}
+{&quot;x&quot;: NaN}
+parse_constant: non-standard JSON constant NaN
+allow_nan=False: Out of range float values are not JSON compliant: nan
+{&#x27;a&#x27;: 2}</code></pre>
+<p><code>NaN</code> and <code>Infinity</code> are not valid JSON, but Python reads and writes them by default, and a JavaScript <code>JSON.parse</code> on the other end will fail. Use <code>allow_nan=False</code> when writing and <code>parse_constant</code> when reading if you need strict JSON. Duplicate keys are silently resolved to the last value.</p>
+<h2 id="handler">3. A parse helper that says where the JSON broke</h2>
+<p>The exception has <code>msg</code>, <code>doc</code>, <code>pos</code>, <code>lineno</code> and <code>colno</code>, so you can show the text around the error instead of only "line 1 column 26":</p>
+<pre><code>import json
+
+def parse(text, source=&quot;input&quot;):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        start = max(e.pos - 20, 0)
+        snippet = e.doc[start:e.pos + 20]
+        raise ValueError(f&quot;{source}: {e.msg} at line {e.lineno} col {e.colno}: &quot;
+                         f&quot;...{snippet!r}...&quot;) from None
+
+for text in [&#x27;{&quot;user&quot;: &quot;ann&quot;, &quot;age&quot;: 31,}&#x27;, &#x27;&lt;html&gt;502 Bad Gateway&lt;/html&gt;&#x27;]:
+    try:
+        parse(text, &quot;api response&quot;)
+    except ValueError as e:
+        print(e)
+
+data = parse(&#x27;{&quot;user&quot;: &quot;ann&quot;}&#x27;)
+print(&quot;missing key with .get():&quot;, data.get(&quot;age&quot;))
+try:
+    data[&quot;age&quot;]
+except KeyError as e:
+    print(&quot;missing key with []:&quot;, type(e).__name__, e)</code></pre>
+<p>Output:</p>
+<pre><code>api response: Illegal trailing comma before end of object at line 1 col 26: ...&#x27;r&quot;: &quot;ann&quot;, &quot;age&quot;: 31,}&#x27;...
+api response: Expecting value at line 1 col 1: ...&#x27;&lt;html&gt;502 Bad Gatewa&#x27;...
+missing key with .get(): None
+missing key with []: KeyError &#x27;age&#x27;</code></pre>
+<p>The snippet makes the second case obvious: the API returned an HTML error page, not JSON. Catch <code>JSONDecodeError</code> only around the parse call, and handle missing keys separately: a <code>KeyError</code> after a successful parse is a different problem (the JSON is valid, it just doesn't have that field). Use <code>.get()</code> for optional fields.</p>
+<h2 id="encode">4. The encoding side: TypeError is not JSON serializable</h2>
+<p><code>json.dumps()</code> raises <code>TypeError</code>, not a JSON-specific exception, for any type it doesn't know:</p>
+<pre><code>import json, datetime, decimal
+for value in [{1, 2}, datetime.date(2026, 10, 22), decimal.Decimal(&quot;1.10&quot;), b&quot;raw&quot;]:
+    try:
+        json.dumps(value)
+    except TypeError as e:
+        print(f&quot;{type(value).__name__:8} TypeError: {e}&quot;)
+
+def default(o):
+    if isinstance(o, (datetime.date, datetime.datetime)): return o.isoformat()
+    if isinstance(o, decimal.Decimal): return str(o)
+    if isinstance(o, set): return sorted(o)
+    raise TypeError(f&quot;can&#x27;t serialize {type(o).__name__}&quot;)
+print(json.dumps({&quot;d&quot;: datetime.date(2026, 10, 22), &quot;p&quot;: decimal.Decimal(&quot;1.10&quot;), &quot;s&quot;: {2, 1}}, default=default))</code></pre>
+<p>Output:</p>
+<pre><code>set      TypeError: Object of type set is not JSON serializable
+date     TypeError: Object of type date is not JSON serializable
+Decimal  TypeError: Object of type Decimal is not JSON serializable
+bytes    TypeError: Object of type bytes is not JSON serializable
+{&quot;d&quot;: &quot;2026-10-22&quot;, &quot;p&quot;: &quot;1.10&quot;, &quot;s&quot;: [1, 2]}</code></pre>
+<p>A <code>default=</code> function converts the types you know and must <code>raise TypeError</code> for the rest, so real bugs still surface. More in our <a href="/guides/json-object-not-json-serializable/">Object of type X is not JSON serializable guide</a> and the <a href="/guides/json-numpy-int64-not-json-serializable/">numpy int64 version</a>.</p>
+
+<aside class="cta"><strong>Is the API returning HTML instead of JSON? Check the status and Content-Type it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I handle JSON errors in Python?</summary><p>Wrap json.loads/json.load in try/except json.JSONDecodeError (a ValueError subclass) and use e.msg, e.lineno, e.colno and e.doc[e.pos-20:e.pos+20] to report where it broke. json.dumps raises TypeError for unsupported types.</p></details>
+<details><summary>Is JSONDecodeError a ValueError?</summary><p>Yes. json.JSONDecodeError subclasses ValueError, so except ValueError also catches it.</p></details>
+<details><summary>Why does Python json accept NaN?</summary><p>json.loads and json.dumps allow NaN, Infinity and -Infinity by default even though they are not valid JSON. Pass allow_nan=False to dumps, and a parse_constant function to loads to reject them.</p></details>
+<details><summary>What does Illegal trailing comma before end of object mean?</summary><p>A comma after the last item, like {&quot;a&quot;: 1,}. Python 3.13 added this message; Python 3.11 reports the same input as Expecting property name enclosed in double quotes.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-22 on Debian with Python 3.13.5 (json module), with the decode-message table also run on Python 3.11.17 (python:3.11-alpine) to compare the trailing-comma message. Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

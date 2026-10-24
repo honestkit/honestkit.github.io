@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python requests Exceptions: Full List and Error Handling</title>
+<meta name="description" content="Every requests.exceptions class and its parents, what triggers each (tested against a local server), and a try/except order that catches them all.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-requests-exceptions-list-and-error-handling/">
+<meta property="og:title" content="Python requests Exceptions: Full List and Error Handling">
+<meta property="og:description" content="Every requests.exceptions class and its parents, what triggers each (tested against a local server), and a try/except order that catches them all.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-requests-exceptions-list-and-error-handling/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the base exception in Python requests?", "acceptedAnswer": {"@type": "Answer", "text": "requests.exceptions.RequestException (a subclass of OSError). Catching it catches every exception requests raises."}}, {"@type": "Question", "name": "Does requests raise an exception for 404 or 500?", "acceptedAnswer": {"@type": "Answer", "text": "No. Call response.raise_for_status() to raise requests.exceptions.HTTPError for 4xx and 5xx responses."}}, {"@type": "Question", "name": "Is requests.exceptions.ConnectionError the same as Python's ConnectionError?", "acceptedAnswer": {"@type": "Answer", "text": "No. It inherits from RequestException and OSError, not the built-in ConnectionError, so catch requests.exceptions.ConnectionError explicitly."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python requests exceptions: full list and error handling (tested)</h1>
+<p class="lead">All requests exceptions inherit from <code>requests.exceptions.RequestException</code>. We printed the full hierarchy from requests 2.32.3, triggered each common one against a local server, and tested an <code>except</code> order that handles HTTP errors, timeouts, connection failures and bad JSON separately.</p>
+<p>Setup: a small local test server (<code>srv.py</code>) with a 404 path, a path that sleeps 3 seconds, a path that redirects to itself, and an HTML page:</p>
+<pre><code>import http.server, threading, time
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path == &quot;/slow&quot;:
+            time.sleep(3)
+        if self.path == &quot;/loop&quot;:
+            self.send_response(302); self.send_header(&quot;Location&quot;, &quot;/loop&quot;); self.end_headers(); return
+        code = 404 if self.path == &quot;/missing&quot; else 200
+        self.send_response(code); self.send_header(&quot;Content-Type&quot;, &quot;text/html&quot;); self.end_headers()
+        self.wfile.write(b&quot;&lt;html&gt;not json&lt;/html&gt;&quot;)
+
+def serve(port=8963):
+    srv = http.server.ThreadingHTTPServer((&quot;localhost&quot;, port), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()</code></pre>
+<h2 id="list">1. The full list of requests exceptions</h2>
+<pre><code>import inspect, requests.exceptions as rex
+
+def name(c):
+    return c.__name__ if c.__module__ == &quot;builtins&quot; else f&quot;{c.__module__}.{c.__name__}&quot;
+
+for n, cls in inspect.getmembers(rex, inspect.isclass):
+    if issubclass(cls, rex.RequestException):
+        print(f&quot;{n:22} &lt;- {&#x27;, &#x27;.join(name(b) for b in cls.__bases__)}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>ChunkedEncodingError   &lt;- requests.exceptions.RequestException
+ConnectTimeout         &lt;- requests.exceptions.ConnectionError, requests.exceptions.Timeout
+ConnectionError        &lt;- requests.exceptions.RequestException
+ContentDecodingError   &lt;- requests.exceptions.RequestException, urllib3.exceptions.HTTPError
+HTTPError              &lt;- requests.exceptions.RequestException
+InvalidHeader          &lt;- requests.exceptions.RequestException, ValueError
+InvalidJSONError       &lt;- requests.exceptions.RequestException
+InvalidProxyURL        &lt;- requests.exceptions.InvalidURL
+InvalidSchema          &lt;- requests.exceptions.RequestException, ValueError
+InvalidURL             &lt;- requests.exceptions.RequestException, ValueError
+JSONDecodeError        &lt;- requests.exceptions.InvalidJSONError, json.decoder.JSONDecodeError
+MissingSchema          &lt;- requests.exceptions.RequestException, ValueError
+ProxyError             &lt;- requests.exceptions.ConnectionError
+ReadTimeout            &lt;- requests.exceptions.Timeout
+RequestException       &lt;- OSError
+RetryError             &lt;- requests.exceptions.RequestException
+SSLError               &lt;- requests.exceptions.ConnectionError
+StreamConsumedError    &lt;- requests.exceptions.RequestException, TypeError
+Timeout                &lt;- requests.exceptions.RequestException
+TooManyRedirects       &lt;- requests.exceptions.RequestException
+URLRequired            &lt;- requests.exceptions.RequestException
+UnrewindableBodyError  &lt;- requests.exceptions.RequestException</code></pre>
+<p>Everything requests raises derives from <code>RequestException</code>, which itself is an <code>OSError</code>. The URL errors (<code>MissingSchema</code>, <code>InvalidSchema</code>, <code>InvalidURL</code>) are also <code>ValueError</code>s, and <code>JSONDecodeError</code> is also a <code>json.JSONDecodeError</code>.</p>
+<h2 id="trigger">2. What raises which exception</h2>
+<pre><code>import requests
+from srv import serve
+
+serve(8963)
+tests = [(&quot;example.com/api&quot;, {}), (&quot;ftp://example.com/&quot;, {}), (&quot;http://&quot;, {}),
+         (&quot;http://localhost:8967/&quot;, {}),                       # nothing listening
+         (&quot;http://localhost:8963/slow&quot;, {&quot;timeout&quot;: 1}),
+         (&quot;http://localhost:8963/loop&quot;, {}),
+         (&quot;https://localhost:8963/&quot;, {})]                      # https on a plain-HTTP port
+for url, kw in tests:
+    try:
+        requests.get(url, **kw)
+    except requests.exceptions.RequestException as e:
+        print(f&quot;{url}\n  {type(e).__name__}: {str(e)[:150]}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>example.com/api
+  MissingSchema: Invalid URL &#x27;example.com/api&#x27;: No scheme supplied. Perhaps you meant https://example.com/api?
+ftp://example.com/
+  InvalidSchema: No connection adapters were found for &#x27;ftp://example.com/&#x27;
+http://
+  InvalidURL: Invalid URL &#x27;http://&#x27;: No host supplied
+http://localhost:8967/
+  ConnectionError: HTTPConnectionPool(host=&#x27;localhost&#x27;, port=8967): Max retries exceeded with url: / (Caused by NewConnectionError(&#x27;&lt;urllib3.connection.HTTPConnection ob
+http://localhost:8963/slow
+  ReadTimeout: HTTPConnectionPool(host=&#x27;localhost&#x27;, port=8963): Read timed out. (read timeout=1)
+http://localhost:8963/loop
+  TooManyRedirects: Exceeded 30 redirects.
+https://localhost:8963/
+  SSLError: HTTPSConnectionPool(host=&#x27;localhost&#x27;, port=8963): Max retries exceeded with url: / (Caused by SSLError(SSLError(1, &#x27;[SSL: WRONG_VERSION_NUMBER] wrong</code></pre>
+<p>Messages are cut at 150 characters. <code>ConnectionError</code> (nothing listening) and <code>SSLError</code> share the long <code>Max retries exceeded</code> text; the real cause is in the <code>Caused by</code> part. A read timeout and a redirect loop each get their own class.</p>
+<h2 id="status">3. HTTP errors and bad JSON do not raise by themselves</h2>
+<pre><code>import requests
+from srv import serve
+
+serve(8963)
+r = requests.get(&quot;http://localhost:8963/missing&quot;, timeout=5)
+print(&quot;no exception yet, status&quot;, r.status_code)
+try:
+    r.raise_for_status()
+except requests.exceptions.HTTPError as e:
+    print(&quot;HTTPError:&quot;, e, &quot;| e.response.status_code =&quot;, e.response.status_code)
+
+r = requests.get(&quot;http://localhost:8963/&quot;, timeout=5)
+try:
+    r.json()
+except requests.exceptions.JSONDecodeError as e:
+    print(&quot;JSONDecodeError:&quot;, e)
+    import json
+    print(&quot;also json.JSONDecodeError / ValueError:&quot;, isinstance(e, json.JSONDecodeError), isinstance(e, ValueError))</code></pre>
+<p>Output:</p>
+<pre><code>no exception yet, status 404
+HTTPError: 404 Client Error: Not Found for url: http://localhost:8963/missing | e.response.status_code = 404
+JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+also json.JSONDecodeError / ValueError: True True</code></pre>
+<p>A 404 or 500 is a successful request as far as requests is concerned: you get a response, no exception. Call <code>r.raise_for_status()</code> to turn 4xx/5xx into <code>HTTPError</code>; the response is on <code>e.response</code>. <code>r.json()</code> raises <code>requests.exceptions.JSONDecodeError</code>, which <code>except ValueError</code> and <code>except json.JSONDecodeError</code> also catch.</p>
+<h2 id="pattern">4. An error-handling pattern that covers everything</h2>
+<pre><code>import requests
+from srv import serve
+
+serve(8963)
+
+def fetch(url):
+    try:
+        r = requests.get(url, timeout=(3, 1))   # (connect, read) seconds
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.HTTPError as e:
+        return f&quot;HTTP {e.response.status_code}&quot;
+    except requests.exceptions.Timeout:
+        return &quot;timed out&quot;
+    except requests.exceptions.ConnectionError:
+        return &quot;could not connect&quot;
+    except requests.exceptions.JSONDecodeError:
+        return &quot;not JSON&quot;
+    except requests.exceptions.RequestException as e:   # anything else from requests
+        return f&quot;request failed: {type(e).__name__}&quot;
+
+for path in (&quot;http://localhost:8963/missing&quot;, &quot;http://localhost:8963/slow&quot;,
+             &quot;http://localhost:8967/&quot;, &quot;http://localhost:8963/&quot;, &quot;localhost:8963&quot;):
+    print(f&quot;{path:32} -&gt; {fetch(path)}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>http://localhost:8963/missing    -&gt; HTTP 404
+http://localhost:8963/slow       -&gt; timed out
+http://localhost:8967/           -&gt; could not connect
+http://localhost:8963/           -&gt; not JSON
+localhost:8963                   -&gt; request failed: InvalidSchema</code></pre>
+<p>Order matters because of the hierarchy: put specific classes first and <code>RequestException</code> last. <code>Timeout</code> must come before <code>ConnectionError</code> if you want <code>ConnectTimeout</code> reported as a timeout, since it is both. Note the last line: <code>"localhost:8963"</code> without <code>http://</code> raised <code>InvalidSchema</code>, not <code>MissingSchema</code>, because <code>localhost</code> was parsed as the scheme. Always set a timeout: without one, requests can wait forever on a server that stops responding.</p>
+<h2 id="builtin">5. requests.ConnectionError is not Python's ConnectionError</h2>
+<pre><code>import builtins, requests
+
+e = requests.exceptions.ConnectionError(&quot;x&quot;)
+print(&quot;requests ConnectionError is builtin ConnectionError:&quot;, isinstance(e, builtins.ConnectionError))
+print(&quot;requests ConnectionError is OSError:&quot;, isinstance(e, OSError))
+print(&quot;ReadTimeout is ConnectionError:&quot;, issubclass(requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError))
+print(&quot;ConnectTimeout is ConnectionError:&quot;, issubclass(requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError))</code></pre>
+<p>Output:</p>
+<pre><code>requests ConnectionError is builtin ConnectionError: False
+requests ConnectionError is OSError: True
+ReadTimeout is ConnectionError: False
+ConnectTimeout is ConnectionError: True</code></pre>
+<p><code>except ConnectionError</code> without the module prefix catches the built-in class, which requests does not raise; use <code>requests.exceptions.ConnectionError</code> (or <code>requests.ConnectionError</code>). <code>ReadTimeout</code> is not a <code>ConnectionError</code>, so a <code>ConnectionError</code> clause alone misses read timeouts.</p>
+<p>Related: <a href="/guides/python-requests-sslerror-httpsconnectionpool/">requests SSLError: HTTPSConnectionPool</a> · <a href="/guides/python-requests-connectionerror-max-retries/">ConnectionError: Max retries exceeded</a> · <a href="/guides/python-requests-readtimeout-read-timed-out/">ReadTimeout</a> · <a href="/guides/python-requests-http-error-get-response-message/">get the message from an HTTPError</a>.</p>
+
+<aside class="cta"><strong>Debugging what a server actually returns? Check the real headers and status:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the base exception in Python requests?</summary><p>requests.exceptions.RequestException (a subclass of OSError). Catching it catches every exception requests raises.</p></details>
+<details><summary>Does requests raise an exception for 404 or 500?</summary><p>No. Call response.raise_for_status() to raise requests.exceptions.HTTPError for 4xx and 5xx responses.</p></details>
+<details><summary>Is requests.exceptions.ConnectionError the same as Python&#x27;s ConnectionError?</summary><p>No. It inherits from RequestException and OSError, not the built-in ConnectionError, so catch requests.exceptions.ConnectionError explicitly.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Python 3.13.5 and requests 2.32.3 against a local http.server. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; requests is a free third-party library.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

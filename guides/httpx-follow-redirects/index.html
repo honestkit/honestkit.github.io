@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx follow redirects: why you get a 302 and the fix (tested)</title>
+<meta name="description" content="httpx doesn&#x27;t follow redirects by default, unlike requests. Use follow_redirects=True; plus r.history, raise_for_status on 3xx, POST to GET, max_redirects.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-follow-redirects/">
+<meta property="og:title" content="httpx follow redirects: why you get a 302 and the fix (tested)">
+<meta property="og:description" content="httpx doesn&#x27;t follow redirects by default, unlike requests. Use follow_redirects=True; plus r.history, raise_for_status on 3xx, POST to GET, max_redirects.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-follow-redirects/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does httpx follow redirects by default?", "acceptedAnswer": {"@type": "Answer", "text": "No. httpx 0.28.1 returned the 302 response itself, while requests followed it to the final 200. Pass follow_redirects=True."}}, {"@type": "Question", "name": "Why does httpx raise_for_status fail with 'Redirect response 302 Found'?", "acceptedAnswer": {"@type": "Answer", "text": "raise_for_status treats anything outside 2xx as an error, including redirects. Follow redirects with follow_redirects=True, or handle the Location header yourself."}}, {"@type": "Question", "name": "Does httpx keep the POST method after a redirect?", "acceptedAnswer": {"@type": "Answer", "text": "For 301, 302 and 303 it re-sends as GET; for 307 and 308 it keeps POST."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx follow redirects: why you get a 302 and how to fix it (tested)</h1>
+<p class="lead">httpx returns the 301/302 response instead of following it. Pass <code>follow_redirects=True</code> to the request or to <code>httpx.Client(...)</code> / <code>AsyncClient(...)</code>; the redirect hops are then in <code>r.history</code>.</p>
+<p>Unlike requests, httpx does <strong>not</strong> follow redirects by default: you get the 301/302 response itself. Measured with httpx 0.28.1 (and requests 2.34.2 for comparison) on Python 3.13.5 against a local <code>http.server</code> (<code>srv.start()</code> starts it in a thread; <code>/r302</code> redirects to <code>/final</code>, which echoes the method).</p>
+<h2 id="default">1. httpx returns the redirect instead of following it</h2>
+<pre><code>import httpx, requests
+from srv import start
+base = start()
+
+r = requests.get(base + &quot;/r302&quot;)
+print(&quot;requests:&quot;, r.status_code, r.url)
+
+r = httpx.get(base + &quot;/r302&quot;)
+print(&quot;httpx:   &quot;, r.status_code, r.url)
+print(&quot;is_redirect:&quot;, r.is_redirect)
+print(&quot;location:&quot;, r.headers[&quot;location&quot;])
+print(&quot;next_request:&quot;, r.next_request)</code></pre>
+<p>Output:</p>
+<pre><code>requests: 200 http://127.0.0.1:8963/final
+httpx:    302 http://127.0.0.1:8963/r302
+is_redirect: True
+location: /final
+next_request: &lt;Request(&#x27;GET&#x27;, &#x27;http://127.0.0.1:8963/final&#x27;)&gt;</code></pre>
+<p>requests ends on <code>/final</code> with 200; httpx stops at the 302. The response tells you where it would go: <code>r.is_redirect</code>, the <code>Location</code> header, and <code>r.next_request</code> (a ready-made request you can send with <code>client.send(r.next_request)</code>).</p>
+<h2 id="fix">2. Fix: follow_redirects=True (per request or on the Client)</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+# per request
+r = httpx.get(base + &quot;/r302&quot;, follow_redirects=True)
+print(r.status_code, r.url)
+print(&quot;history:&quot;, r.history)
+
+# or once, on the client
+with httpx.Client(follow_redirects=True) as client:
+    r = client.get(base + &quot;/r301&quot;)
+    print(r.status_code, r.json()[&quot;path&quot;], [h.status_code for h in r.history])</code></pre>
+<p>Output:</p>
+<pre><code>200 http://127.0.0.1:8963/final
+history: [&lt;Response [302 Found]&gt;]
+200 /final [301]</code></pre>
+<p>The redirect responses are kept in <code>r.history</code>, and <code>r.url</code> is the final URL. The old <code>allow_redirects=</code> argument (requests, and httpx before 0.20) is not accepted by httpx 0.28; use <code>follow_redirects</code>.</p>
+<h2 id="raise">3. raise_for_status() raises on a redirect</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+r = httpx.get(base + &quot;/r302&quot;)
+try:
+    r.raise_for_status()
+except httpx.HTTPStatusError as e:
+    print(type(e).__name__)
+    print(e)</code></pre>
+<p>Output:</p>
+<pre><code>HTTPStatusError
+Redirect response &#x27;302 Found&#x27; for url &#x27;http://127.0.0.1:8963/r302&#x27;
+Redirect location: &#x27;/final&#x27;
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/302</code></pre>
+<p>If you call <code>raise_for_status()</code> without following redirects, a 3xx is an error too (only 2xx passes). The message names the redirect location, which is usually the clue that <code>follow_redirects</code> is missing.</p>
+<h2 id="limits">4. Redirect loops and POST becoming GET</h2>
+<pre><code>import httpx
+from srv import start
+base = start()
+
+with httpx.Client(follow_redirects=True, max_redirects=5) as client:
+    try:
+        client.get(base + &quot;/loop&quot;)
+    except httpx.TooManyRedirects as e:
+        print(type(e).__name__, &quot;-&quot;, e)
+
+    for code in (301, 302, 303, 307, 308):
+        r = client.post(base + f&quot;/r{code}&quot;, json={&quot;a&quot;: 1})
+        print(code, &quot;-&gt;&quot;, r.json()[&quot;method&quot;])</code></pre>
+<p>Output:</p>
+<pre><code>TooManyRedirects - Exceeded maximum allowed redirects.
+301 -&gt; GET
+302 -&gt; GET
+303 -&gt; GET
+307 -&gt; POST
+308 -&gt; POST</code></pre>
+<p>A loop raises <code>httpx.TooManyRedirects</code> after <code>max_redirects</code> (default 20). When following, a POST answered with 301/302/303 is re-sent as GET (body dropped), while 307 and 308 keep the POST. If your POST "loses" its data after a redirect, the server is sending 301/302 (often a missing trailing slash or http→https); post to the final URL instead.</p>
+<h2 id="async">5. AsyncClient works the same way</h2>
+<pre><code>import asyncio, httpx
+from srv import start
+base = start()
+
+async def main():
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        r = await client.get(base + &quot;/r302&quot;)
+        print(r.status_code, r.url)
+
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>200 http://127.0.0.1:8963/final</code></pre>
+<p>Related: <a href="/guides/301-vs-302-vs-307-vs-308-redirect/">301 vs 302 vs 307 vs 308</a>, <a href="/guides/check-redirect-chain/">check a redirect chain</a>, <a href="/guides/err-too-many-redirects/">ERR_TOO_MANY_REDIRECTS</a>, <a href="/guides/python-requests-http-error-get-response-message/">requests HTTPError response message</a>.</p>
+
+<aside class="cta"><strong>See every hop and status code a URL redirects through:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does httpx follow redirects by default?</summary><p>No. httpx 0.28.1 returned the 302 response itself, while requests followed it to the final 200. Pass follow_redirects=True.</p></details>
+<details><summary>Why does httpx raise_for_status fail with &#x27;Redirect response 302 Found&#x27;?</summary><p>raise_for_status treats anything outside 2xx as an error, including redirects. Follow redirects with follow_redirects=True, or handle the Location header yourself.</p></details>
+<details><summary>Does httpx keep the POST method after a redirect?</summary><p>For 301, 302 and 303 it re-sends as GET; for 307 and 308 it keeps POST.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 and requests 2.34.2 on Python 3.13.5 against a local http.server. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

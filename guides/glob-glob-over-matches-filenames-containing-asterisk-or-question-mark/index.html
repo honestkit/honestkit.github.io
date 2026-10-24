@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>glob.glob() Over-Matches Filenames Containing * or ? (Tested)</title>
+<meta name="description" content="We measured glob.glob() on a file named &#x27;data*.csv&#x27; silently pulling in 2 unrelated files -- the &#x27;*&#x27; expands as wildcard, not literal. Fix: glob.escape().">
+<link rel="canonical" href="https://honestkit.github.io/guides/glob-glob-over-matches-filenames-containing-asterisk-or-question-mark/">
+<meta property="og:title" content="glob.glob() Over-Matches Filenames Containing * or ? (Tested)">
+<meta property="og:description" content="We measured glob.glob() on a file named &#x27;data*.csv&#x27; silently pulling in 2 unrelated files -- the &#x27;*&#x27; expands as wildcard, not literal. Fix: glob.escape().">
+<meta property="og:url" content="https://honestkit.github.io/guides/glob-glob-over-matches-filenames-containing-asterisk-or-question-mark/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does glob.glob() treat a literal '*' in a filename as a wildcard?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured it compiling '*' as a wildcard even when the exact string passed in was the file's own name, causing two unrelated files to be returned alongside it."}}, {"@type": "Question", "name": "Does glob.glob() raise an error when a filename contains * or ?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we saw no exception or warning. It silently returned extra matches with no indication the input string had been treated as a pattern."}}, {"@type": "Question", "name": "Does pathlib.Path.glob() have the same over-matching problem?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we confirmed Path.glob() returned the identical three files for the identical literal filename, since it shares the same pattern-compilation logic as the glob module."}}, {"@type": "Question", "name": "How do I glob for a file by its exact name safely?", "acceptedAnswer": {"@type": "Answer", "text": "Wrap the filename in glob.escape() before passing it to glob.glob() or Path.glob() -- we measured this correctly restricting the match to only the one literal file."}}, {"@type": "Question", "name": "Is a literal * or ? in a filename actually possible?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- both are legal characters in POSIX filenames (just not on Windows), and can show up from exports, renamed downloads, or user-supplied names, making this a realistic real-world trap, not just a contrived one."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>glob.glob() Over-Matches Filenames Containing * or ? (tested)</h1>
+<p class="lead">A filename can legally contain a literal <code>*</code> or <code>?</code> character. We measured what happens when that exact filename is handed straight to <code>glob.glob()</code>, and it silently grabs extra files that were never meant to match.</p>
+<h2 id="repro1">1. A literal '*' in a filename is parsed as a wildcard, not matched as itself</h2>
+<pre><code>import glob
+
+# directory contains: 'data*.csv', 'data1.csv', 'data2.csv'
+target = "data*.csv"  # the real, literal filename on disk
+print(sorted(glob.glob(target)))</code></pre>
+<pre><code>['data*.csv', 'data1.csv', 'data2.csv']</code></pre>
+<p><strong>Measured:</strong> passing the file's own name straight to <code>glob.glob()</code> returned three files, not one. The <code>*</code> in <code>"data*.csv"</code> was compiled as "zero or more of any character", so it matched its own literal file plus two completely unrelated ones -- with no error or warning that the string was treated as a pattern rather than a name.</p>
+
+<h2 id="repro2">2. pathlib.Path.glob() has the identical behaviour</h2>
+<pre><code>from pathlib import Path
+
+target = "data*.csv"
+print(sorted(str(p) for p in Path(".").glob(target)))</code></pre>
+<pre><code>['data*.csv', 'data1.csv', 'data2.csv']</code></pre>
+<p><strong>Measured:</strong> <code>Path.glob()</code> builds on the same pattern-compilation logic as the <code>glob</code> module, so it over-matches the exact same way. Code that loops filenames from <code>os.listdir()</code> or a database and re-globs each one to "find" it is silently vulnerable to this if any filename contains <code>*</code> or <code>?</code> -- both are legal in POSIX filenames.</p>
+
+<h2 id="fix">3. Fix: wrap any filename from outside your control in glob.escape()</h2>
+<pre><code>import glob
+
+target = "data*.csv"
+pattern = glob.escape(target)
+print("escaped pattern:", pattern)
+print(sorted(glob.glob(pattern)))</code></pre>
+<pre><code>escaped pattern: data[*].csv
+['data*.csv']</code></pre>
+<p><strong>Measured:</strong> <code>glob.escape()</code> rewrites the literal <code>*</code> into the bracket form <code>[*]</code>, which glob's own parser treats as "match the single literal character <code>*</code>" rather than a wildcard. With escaping, the call returns exactly the one file it was given and nothing else. This is the same fix as for filenames containing literal brackets -- escape first whenever the name itself, not a pattern you authored, is the input.</p>
+<aside class="cta"><strong>Globbing a list of filenames from an upload or export that you don&#x27;t fully control? Check the real headers behind that request first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does glob.glob() treat a literal &#x27;*&#x27; in a filename as a wildcard?</summary><p>Yes -- we measured it compiling &#x27;*&#x27; as a wildcard even when the exact string passed in was the file&#x27;s own name, causing two unrelated files to be returned alongside it.</p></details>
+<details><summary>Does glob.glob() raise an error when a filename contains * or ?</summary><p>No -- we saw no exception or warning. It silently returned extra matches with no indication the input string had been treated as a pattern.</p></details>
+<details><summary>Does pathlib.Path.glob() have the same over-matching problem?</summary><p>Yes -- we confirmed Path.glob() returned the identical three files for the identical literal filename, since it shares the same pattern-compilation logic as the glob module.</p></details>
+<details><summary>How do I glob for a file by its exact name safely?</summary><p>Wrap the filename in glob.escape() before passing it to glob.glob() or Path.glob() -- we measured this correctly restricting the match to only the one literal file.</p></details>
+<details><summary>Is a literal * or ? in a filename actually possible?</summary><p>Yes -- both are legal characters in POSIX filenames (just not on Windows), and can show up from exports, renamed downloads, or user-supplied names, making this a realistic real-world trap, not just a contrived one.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in glob module: created a file literally named &#x27;data*.csv&#x27; alongside two unrelated files &#x27;data1.csv&#x27; and &#x27;data2.csv&#x27;, then passed the literal filename straight to glob.glob() with and without glob.escape(). PlainHeaders is our extension; Python&#x27;s glob module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

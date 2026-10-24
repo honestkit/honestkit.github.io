@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PIL UnidentifiedImageError: cannot identify image file (Tested)</title>
+<meta name="description" content="Pillow UnidentifiedImageError: cannot identify image file, tested on Pillow 13: HTML pages saved as .jpg, empty or truncated files, consumed streams.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pil-unidentifiedimageerror-cannot-identify-image-file/">
+<meta property="og:title" content="PIL UnidentifiedImageError: cannot identify image file (Tested)">
+<meta property="og:description" content="Pillow UnidentifiedImageError: cannot identify image file, tested on Pillow 13: HTML pages saved as .jpg, empty or truncated files, consumed streams.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pil-unidentifiedimageerror-cannot-identify-image-file/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Pillow say cannot identify image file?", "acceptedAnswer": {"@type": "Answer", "text": "The data is not a recognisable image: usually an HTML page saved with an image extension, an empty or truncated download, or a stream that was already read. Check the first bytes."}}, {"@type": "Question", "name": "Do I need buf.seek(0) before Image.open(BytesIO)?", "acceptedAnswer": {"@type": "Answer", "text": "Not with Pillow 13.0.0: it seeks back itself. Non-seekable streams such as an already-read HTTP response do fail; open io.BytesIO(data) instead."}}, {"@type": "Question", "name": "How do I catch UnidentifiedImageError?", "acceptedAnswer": {"@type": "Answer", "text": "from PIL import UnidentifiedImageError, then except UnidentifiedImageError. It is also an OSError subclass."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>PIL UnidentifiedImageError: cannot identify image file (tested)</h1>
+<p class="lead"><code>PIL.UnidentifiedImageError: cannot identify image file</code> means the bytes Pillow got do not start with any image signature it knows. In our tests that was an HTML error page saved as <code>.jpg</code>, an empty file, a truncated PNG, and a network response that had already been read. Print the first bytes to see which.</p>
+<p>Test files: a real 64×64 PNG, an HTML error page saved as <code>page.jpg</code>, an empty <code>empty.png</code>, and <code>cut.png</code> (the first 10 bytes of the real PNG).</p>
+<h2 id="test">1. The error</h2>
+<pre><code>from PIL import Image
+Image.open(&quot;/tmp/page.jpg&quot;)    # actually an HTML error page saved with a .jpg name</code></pre>
+<p>Output:</p>
+<pre><code>Traceback (most recent call last):
+  File &quot;/w/b1.py&quot;, line 2, in &lt;module&gt;
+    Image.open(&quot;/tmp/page.jpg&quot;)    # actually an HTML error page saved with a .jpg name
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File &quot;/usr/local/lib/python3.14/site-packages/PIL/Image.py&quot;, line 3730, in open
+    raise UnidentifiedImageError(msg)
+PIL.UnidentifiedImageError: cannot identify image file &#x27;/tmp/page.jpg&#x27;</code></pre>
+<p>Pillow identifies a format from the file's first bytes, not its extension. If no installed decoder recognises them, <code>Image.open()</code> raises <code>UnidentifiedImageError</code>. The most common reason is that the file is not an image at all.</p>
+<h2 id="bytes">2. Look at the first bytes</h2>
+<pre><code>from PIL import Image, UnidentifiedImageError
+for p in (&quot;/tmp/page.jpg&quot;, &quot;/tmp/empty.png&quot;, &quot;/tmp/cut.png&quot;, &quot;/tmp/ok.png&quot;):
+    head = open(p, &quot;rb&quot;).read(16)
+    try:
+        Image.open(p)
+        print(f&quot;{p:16} OK     first bytes: {head[:8]!r}&quot;)
+    except UnidentifiedImageError as e:
+        print(f&quot;{p:16} FAILED first bytes: {head[:8]!r}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>/tmp/page.jpg    FAILED first bytes: b&#x27;&lt;!DOCTYP&#x27;
+/tmp/empty.png   FAILED first bytes: b&#x27;&#x27;
+/tmp/cut.png     FAILED first bytes: b&#x27;\x89PNG\r\n\x1a\n&#x27;
+/tmp/ok.png      OK     first bytes: b&#x27;\x89PNG\r\n\x1a\n&#x27;</code></pre>
+<p>The first bytes tell you what you really have: <code>&lt;!DOCTYP</code> or <code>&lt;html</code> is a web page (a login page, a 403 or 404 page, a redirect), <code>b''</code> is an empty file from a failed download or write, and a correct signature that still fails is a truncated or corrupt file. Real signatures: PNG <code>\x89PNG</code>, JPEG <code>\xff\xd8\xff</code>, GIF <code>GIF8</code>, WebP <code>RIFF....WEBP</code>.</p>
+<h2 id="stream">3. A consumed stream: pass the bytes, not the response</h2>
+<pre><code>import io, http.server, threading, urllib.request
+from PIL import Image
+
+buf = io.BytesIO()
+Image.new(&quot;RGB&quot;, (8, 8)).save(buf, &quot;PNG&quot;)
+print(&quot;BytesIO left at position&quot;, buf.tell(), &quot;-&gt;&quot;, Image.open(buf).size)   # Pillow seeks back itself
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header(&quot;Content-Type&quot;, &quot;image/png&quot;); self.end_headers()
+        self.wfile.write(buf.getvalue())
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer((&quot;127.0.0.1&quot;, 8964), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+resp = urllib.request.urlopen(&quot;http://127.0.0.1:8964/x.png&quot;)
+data = resp.read()                       # stream consumed (e.g. to check its size)
+try:
+    Image.open(resp)                     # a network stream cannot seek back
+except Exception as e:
+    print(type(e).__name__ + &quot;:&quot;, str(e)[:70])
+print(&quot;from the bytes instead -&gt;&quot;, Image.open(io.BytesIO(data)).size)
+srv.shutdown()</code></pre>
+<p>Output:</p>
+<pre><code>BytesIO left at position 69 -&gt; (8, 8)
+UnidentifiedImageError: cannot identify image file &lt;_io.BytesIO object at 0x7f6c4e6384f0&gt;
+from the bytes instead -&gt; (8, 8)</code></pre>
+<p>A <code>BytesIO</code> left at the end is fine: Pillow 13 seeks back to the start itself. A network response is not seekable, though. Once you have called <code>.read()</code> on it, there is nothing left, and the error names a <code>BytesIO</code> object because Pillow copied the (empty) remaining stream into one. Keep the bytes and open <code>io.BytesIO(data)</code>.</p>
+<h2 id="download">4. Downloads: check Content-Type before opening</h2>
+<pre><code>import io, urllib.request, http.server, threading
+from PIL import Image, UnidentifiedImageError
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b&quot;&lt;html&gt;please log in&lt;/html&gt;&quot;
+        self.send_response(200); self.send_header(&quot;Content-Type&quot;, &quot;text/html&quot;); self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer((&quot;127.0.0.1&quot;, 8964), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+resp = urllib.request.urlopen(&quot;http://127.0.0.1:8964/photo.png&quot;)
+data = resp.read()
+ctype = resp.headers.get(&quot;Content-Type&quot;)
+if not ctype.startswith(&quot;image/&quot;):
+    print(f&quot;not an image: Content-Type {ctype}, body starts {data[:30]!r}&quot;)
+else:
+    Image.open(io.BytesIO(data))
+srv.shutdown()</code></pre>
+<p>Output:</p>
+<pre><code>not an image: Content-Type text/html, body starts b&#x27;&lt;html&gt;please log in&lt;/html&gt;&#x27;</code></pre>
+<p>A server that needs a login, blocks your user agent or rate-limits you often answers with an HTML page (sometimes with status 200). Check <code>Content-Type</code> and print the first bytes before handing the data to Pillow; the real problem is in that HTML.</p>
+<h2 id="catch">5. Catching it</h2>
+<pre><code>from PIL import Image, UnidentifiedImageError
+print(UnidentifiedImageError.__mro__[1:3])
+try:
+    Image.open(&quot;/tmp/page.jpg&quot;)
+except OSError as e:          # older code catching IOError/OSError still works
+    print(&quot;caught as OSError:&quot;, type(e).__name__)</code></pre>
+<p>Output:</p>
+<pre><code>(&lt;class &#x27;OSError&#x27;&gt;, &lt;class &#x27;Exception&#x27;&gt;)
+caught as OSError: UnidentifiedImageError</code></pre>
+<p><code>UnidentifiedImageError</code> is a subclass of <code>OSError</code>, so older <code>except IOError</code> / <code>except OSError</code> code still catches it. Import it with <code>from PIL import UnidentifiedImageError</code> to catch it precisely.</p>
+<p>Related: <a href="/guides/pil-decompressionbomberror-image-size-exceeds-limit/">PIL DecompressionBombError</a> · <a href="/guides/python-badzipfile-file-is-not-a-zip-file/">BadZipFile: File is not a zip file</a> (same root cause: an HTML page saved as a file).</p>
+
+<aside class="cta"><strong>Working with images and colors? Check contrast ratios in the browser:</strong> <a href="/plaininspect/">PlainInspect</a> — Hover any text to see its font, size, weight and colors. See every font and color a page uses. No tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Pillow say cannot identify image file?</summary><p>The data is not a recognisable image: usually an HTML page saved with an image extension, an empty or truncated download, or a stream that was already read. Check the first bytes.</p></details>
+<details><summary>Do I need buf.seek(0) before Image.open(BytesIO)?</summary><p>Not with Pillow 13.0.0: it seeks back itself. Non-seekable streams such as an already-read HTTP response do fail; open io.BytesIO(data) instead.</p></details>
+<details><summary>How do I catch UnidentifiedImageError?</summary><p>from PIL import UnidentifiedImageError, then except UnidentifiedImageError. It is also an OSError subclass.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Pillow 13.0.0 and Python 3.14.7 (python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited. PlainInspect is our extension; Python and Pillow are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

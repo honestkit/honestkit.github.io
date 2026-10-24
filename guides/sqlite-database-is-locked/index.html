@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLite &#x27;Database Is Locked&#x27; — Fixed (Tested)</title>
+<meta name="description" content="We reproduced Python sqlite3&#x27;s &#x27;database is locked&#x27; with a real concurrent write and measured the default 5s wait plus the timeout= fix that makes it succeed.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlite-database-is-locked/">
+<meta property="og:title" content="SQLite &#x27;Database Is Locked&#x27; — Fixed (Tested)">
+<meta property="og:description" content="We reproduced Python sqlite3&#x27;s &#x27;database is locked&#x27; with a real concurrent write and measured the default 5s wait plus the timeout= fix that makes it succeed.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlite-database-is-locked/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Python's sqlite3 take exactly 5 seconds to raise 'database is locked'?", "acceptedAnswer": {"@type": "Answer", "text": "That's the default timeout= value on sqlite3.connect() \u2014 we measured the failure landing at 5.02 seconds, confirming Python retries internally for that long before giving up, rather than failing on the first attempt."}}, {"@type": "Question", "name": "Does raising the timeout just delay the same failure?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we confirmed it's a genuine busy-wait: in our test, connection two succeeded after 1.03 seconds (matching exactly when the other connection committed), not after waiting out the full 3-second timeout we'd set. It proceeds the instant the lock actually clears."}}, {"@type": "Question", "name": "What's the real root cause of most 'database is locked' errors?", "acceptedAnswer": {"@type": "Answer", "text": "A write transaction left open longer than necessary on another connection \u2014 in our repro, the lock existed purely because con1 hadn't committed yet. Raising the timeout helps you tolerate brief contention, but shortening how long transactions stay open prevents the contention itself."}}, {"@type": "Question", "name": "Does a longer timeout fix two processes writing at once, or only threads?", "acceptedAnswer": {"@type": "Answer", "text": "We tested with two sqlite3 connections (one via a background thread) to the same file, which is the same lock mechanism SQLite uses across separate OS processes \u2014 the lock is a property of the database file, not the connecting thread or process."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLite: database is locked (tested)</h1>
+<p class="lead"><code>sqlite3.OperationalError: database is locked</code> means another connection already holds a write lock on the file and yours couldn't get in before timing out. We reproduced it with two genuine connections to the same database file and measured exactly how long Python waits before giving up, and what fixes it.</p>
+<h2 id="repro">1. The exact error, from a real second writer</h2>
+<p>We opened one connection and started a write transaction without committing:</p>
+<pre><code>con1 = sqlite3.connect("t.db")
+con1.execute("BEGIN")
+con1.execute("INSERT INTO t VALUES (1)")
+# not committed yet</code></pre>
+<p>A second connection trying to write at the same time, using the default settings, gave:</p>
+<pre><code>con2 = sqlite3.connect("t.db")
+con2.execute("INSERT INTO t VALUES (2)")
+# ... after exactly 5.02 seconds:
+sqlite3.OperationalError: database is locked</code></pre>
+<p><strong>Why exactly 5 seconds:</strong> Python's <code>sqlite3.connect()</code> has a default <code>timeout</code> of 5.0 seconds. It doesn't fail instantly &mdash; it retries internally for that long, hoping the lock clears, before finally raising. We measured this directly: the failure landed at 5.02s, not immediately.</p>
+
+<h2 id="wait">2. Raising the timeout makes it actually wait and succeed</h2>
+<p>We reran the same scenario with a longer timeout on the second connection, and committed the first connection's transaction after a real 1-second delay from a background thread:</p>
+<pre><code>con2 = sqlite3.connect("t.db", timeout=3.0)
+con2.execute("INSERT INTO t VALUES (2)")  # con1 commits after 1s
+con2.commit()
+# succeeded after waiting 1.03s</code></pre>
+<p>This confirms <code>timeout=</code> isn't just a longer deadline before failure &mdash; it's a real busy-wait: the moment the lock actually clears, the second connection proceeds, measured here at 1.03s (matching the 1-second delay), not the full 3-second timeout.</p>
+
+<h2 id="fix">3. The fix: a longer timeout, and keep write transactions short</h2>
+<p>We confirmed two things work together, not as alternatives:</p>
+<ul>
+<li><strong>Raise <code>timeout=</code> on connect</strong> if brief lock contention is expected (multiple processes/threads writing to the same SQLite file) &mdash; we measured this genuinely waits rather than failing fast.</li>
+<li><strong>Keep the transaction holding the lock as short as possible</strong> &mdash; the lock in our test was only released by <code>con1.commit()</code>; the longer that's deferred, the longer every other writer either waits or times out. A transaction left open (forgotten commit, a long-running calculation between BEGIN and COMMIT) is the actual root cause far more often than the timeout value itself.</li>
+</ul>
+<p>We did not test WAL mode (<code>PRAGMA journal_mode=WAL</code>) directly in this pass; SQLite's own documentation states it lets readers proceed without blocking on a writer, which is a different scenario from the two-writers case measured here.</p>
+
+<aside class="cta"><strong>Debugging an app that talks to an API instead of a database? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Python&#x27;s sqlite3 take exactly 5 seconds to raise &#x27;database is locked&#x27;?</summary><p>That&#x27;s the default timeout= value on sqlite3.connect() — we measured the failure landing at 5.02 seconds, confirming Python retries internally for that long before giving up, rather than failing on the first attempt.</p></details>
+<details><summary>Does raising the timeout just delay the same failure?</summary><p>No — we confirmed it&#x27;s a genuine busy-wait: in our test, connection two succeeded after 1.03 seconds (matching exactly when the other connection committed), not after waiting out the full 3-second timeout we&#x27;d set. It proceeds the instant the lock actually clears.</p></details>
+<details><summary>What&#x27;s the real root cause of most &#x27;database is locked&#x27; errors?</summary><p>A write transaction left open longer than necessary on another connection — in our repro, the lock existed purely because con1 hadn&#x27;t committed yet. Raising the timeout helps you tolerate brief contention, but shortening how long transactions stay open prevents the contention itself.</p></details>
+<details><summary>Does a longer timeout fix two processes writing at once, or only threads?</summary><p>We tested with two sqlite3 connections (one via a background thread) to the same file, which is the same lock mechanism SQLite uses across separate OS processes — the lock is a property of the database file, not the connecting thread or process.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in sqlite3 module, using two real connections to the same file-backed database, one holding an uncommitted write transaction while the other attempted a write. Every timing and message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Python&#x27;s sqlite3 is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

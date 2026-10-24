@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proxy-Authorization Header and 407 Proxy Auth Required (Tested)</title>
+<meta name="description" content="We ran a forward proxy that needs Basic auth and logged every header. curl 8.14.1 and Python requests send Proxy-Authorization on the first request, a password with @ must be written %40 in the -x URL, and the proxy strips it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/proxy-authorization-header/">
+<meta property="og:title" content="Proxy-Authorization Header and 407 Proxy Auth Required (Tested)">
+<meta property="og:description" content="We ran a forward proxy that needs Basic auth and logged every header. curl 8.14.1 and Python requests send Proxy-Authorization on the first request, a password with @ must be written %40 in the -x URL, and the proxy strips it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/proxy-authorization-header/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between Authorization and Proxy-Authorization?", "acceptedAnswer": {"@type": "Answer", "text": "Authorization is for the website (answered with 401 and WWW-Authenticate). Proxy-Authorization is for the proxy in between (answered with 407 and Proxy-Authenticate). A request can carry both."}}, {"@type": "Question", "name": "Does curl send Proxy-Authorization before getting a 407?", "acceptedAnswer": {"@type": "Answer", "text": "Yes for Basic, the default. In our test curl 8.14.1 sent it on the first request. With --proxy-anyauth it first sent the request with no credentials, got 407, then retried."}}, {"@type": "Question", "name": "Why does curl say 'Unsupported proxy syntax' with my password?", "acceptedAnswer": {"@type": "Answer", "text": "The password contains a character like @ that breaks the URL. Write it percent-encoded (@ becomes %40) or pass it with --proxy-user 'user:pass'."}}, {"@type": "Question", "name": "Does the website receive my proxy password?", "acceptedAnswer": {"@type": "Answer", "text": "It shouldn't. Our test proxy deleted Proxy-Authorization and the origin never saw it. For HTTPS the header only goes on the CONNECT request to the proxy, never inside the tunnel."}}, {"@type": "Question", "name": "Is Basic proxy auth secure?", "acceptedAnswer": {"@type": "Answer", "text": "Only over an encrypted link. The value is base64, which anyone can decode. With an http:// proxy URL it goes across the network in plain text, even when the site itself is HTTPS."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Proxy-Authorization header (tested)</h1>
+<p class="lead"><code>Proxy-Authorization</code> carries your credentials for a proxy, not for the website. A proxy that wants a login answers <code>407 Proxy Authentication Required</code> with a <code>Proxy-Authenticate</code> header, and the client retries with <code>Proxy-Authorization</code>. We built a small proxy that requires a password, sent requests through it with curl and Python, and logged what reached the proxy and what reached the website behind it.</p>
+<h2>1. The three pieces</h2>
+<table><thead><tr><th>Header / status</th><th>Sent by</th><th>Example</th></tr></thead><tbody>
+<tr><td><code>407 Proxy Authentication Required</code></td><td>Proxy</td><td>Status code: "log in to the proxy first"</td></tr>
+<tr><td><code>Proxy-Authenticate</code></td><td>Proxy, on the 407</td><td><code>Basic realm="test-proxy"</code></td></tr>
+<tr><td><code>Proxy-Authorization</code></td><td>Client</td><td><code>Basic dXNlcjpwQHNz</code></td></tr>
+</tbody></table>
+<p>They mirror <code>401</code>, <code>WWW-Authenticate</code> and <code>Authorization</code>, which are for the website itself (see <a href="/guides/bearer-token-authorization-header/">the Authorization header guide</a>). The value is a scheme plus credentials. For Basic it is base64 of <code>user:password</code>: <code>dXNlcjpwQHNz</code> decodes to <code>user:p@ss</code>. Base64 is not encryption, so anyone who can read the request can read the password.</p>
+
+<h2>2. What a 407 looks like (measured)</h2>
+<p>A request through our proxy with no credentials:</p>
+<pre><code>$ curl -si -x http://127.0.0.1:8991 http://127.0.0.1:8992/
+HTTP/1.1 407 Proxy Authentication Required
+Proxy-Authenticate: Basic realm="test-proxy"
+...</code></pre>
+<p>A wrong password (<code>user:bad</code>) also got <code>407</code>; the proxy logged <code>Proxy-Authorization: Basic dXNlcjpiYWQ=</code>.</p>
+
+<h2>3. What curl sends (measured)</h2>
+<p>Both forms worked and sent the same header to the proxy:</p>
+<pre><code>curl -x 'http://user:p%40ss@127.0.0.1:8991' http://127.0.0.1:8992/
+curl -x http://127.0.0.1:8991 --proxy-user 'user:p@ss' http://127.0.0.1:8992/</code></pre>
+<p>Proxy log for each:</p>
+<pre><code>GET http://127.0.0.1:8992/
+proxy-authorization: Basic dXNlcjpwQHNz
+proxy-connection: Keep-Alive</code></pre>
+<table><thead><tr><th>Test</th><th>Result</th></tr></thead><tbody>
+<tr><td>When curl sends it</td><td>On the <strong>first</strong> request, before any 407. Only one request reached the proxy.</td></tr>
+<tr><td><code>--proxy-anyauth</code></td><td>Different: the first request went out with no Proxy-Authorization, got 407, then curl retried with it (two requests in the proxy log, final status 200).</td></tr>
+<tr><td>Password with <code>@</code> written raw in <code>-x</code></td><td>Failed before connecting: <code>curl: (5) Unsupported proxy syntax ... Bad hostname</code>.</td></tr>
+<tr><td>Same password written <code>p%40ss</code></td><td>200. curl decoded <code>%40</code> to <code>@</code> before encoding.</td></tr>
+<tr><td><code>--proxy-user 'user:p@ss'</code></td><td>200. No URL encoding needed here.</td></tr>
+</tbody></table>
+<p>Use <code>--proxy-user</code> when the password has <code>@ : / # %</code> or other URL-special characters.</p>
+
+<h2>4. Python requests (measured)</h2>
+<pre><code>import requests
+requests.get("http://127.0.0.1:8992/",
+             proxies={"http": "http://user:p%40ss@127.0.0.1:8991"})</code></pre>
+<p>requests 2.32.3 also sent <code>Proxy-Authorization: Basic dXNlcjpwQHNz</code> on the first request (one request in the log, status 200). As with curl, we percent-encoded the <code>@</code> in the proxy URL.</p>
+
+<h2>5. Does the website see it? (measured)</h2>
+<p>Not if the proxy strips it, which our proxy did. The origin on 8992 logged:</p>
+<pre><code>{"host":"127.0.0.1:8992","user-agent":"curl/8.14.1","accept":"*/*","connection":"keep-alive"}</code></pre>
+<p>No <code>proxy-authorization</code> and no <code>proxy-connection</code>. Our proxy has one line that deletes the header before forwarding. From the RFC, not measured: RFC 9110 says a proxy should not forward <code>Proxy-Authorization</code> if it used those credentials itself, but a chain of proxies can pass the header on so each proxy can authenticate in turn. If you write your own proxy, delete the header yourself; don't rely on something else to do it.</p>
+
+<h2>6. HTTPS goes through CONNECT</h2>
+<p>For an <code>https://</code> URL the client first sends <code>CONNECT host:443</code> to the proxy, then runs TLS inside the tunnel. Proxy-Authorization goes on the CONNECT request, in plain text to the proxy. The website's own headers are inside TLS, so the proxy can't read or strip them. We measured the first half: curl's CONNECT carried the header.</p>
+<pre><code>CONNECT 127.0.0.1:8992
+proxy-authorization: Basic dXNlcjpwQHNz</code></pre>
+<p>(Our test proxy rejected every CONNECT, so we did not measure a full HTTPS fetch.) From the docs, not measured: requests puts the credentials from an <code>https</code> proxy entry on the CONNECT, and a proxy URL that starts <code>http://</code> means the CONNECT and its Basic password go over the network unencrypted. Use an <code>https://</code> proxy URL if the proxy supports it.</p>
+
+<h2>7. Fixing a 407</h2>
+<ul>
+<li>Read <code>Proxy-Authenticate</code>: it names the scheme the proxy wants (Basic, Digest, NTLM, Negotiate).</li>
+<li>Percent-encode special characters in a proxy URL, or use <code>--proxy-user</code>.</li>
+<li>For a non-Basic scheme in curl, add <code>--proxy-anyauth</code> (or <code>--proxy-ntlm</code> / <code>--proxy-digest</code>) so it waits for the 407 and picks the scheme.</li>
+<li>Check the <code>http_proxy</code> / <code>https_proxy</code> environment variables. curl and requests read them, and a stale one without credentials gives a 407 even though your code never set a proxy.</li>
+<li>A 407 is from the proxy, not the website. Changing the <code>Authorization</code> header won't help.</li>
+</ul>
+<p>Proxies also add headers of their own. See <a href="/guides/via-header/">the Via header guide</a>.</p>
+<aside class="cta"><strong>Check which headers your proxy or CDN adds or strips:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between Authorization and Proxy-Authorization?</summary><p>Authorization is for the website (answered with 401 and WWW-Authenticate). Proxy-Authorization is for the proxy in between (answered with 407 and Proxy-Authenticate). A request can carry both.</p></details>
+<details><summary>Does curl send Proxy-Authorization before getting a 407?</summary><p>Yes for Basic, the default. In our test curl 8.14.1 sent it on the first request. With --proxy-anyauth it first sent the request with no credentials, got 407, then retried.</p></details>
+<details><summary>Why does curl say &#x27;Unsupported proxy syntax&#x27; with my password?</summary><p>The password contains a character like @ that breaks the URL. Write it percent-encoded (@ becomes %40) or pass it with --proxy-user &#x27;user:pass&#x27;.</p></details>
+<details><summary>Does the website receive my proxy password?</summary><p>It shouldn&#x27;t. Our test proxy deleted Proxy-Authorization and the origin never saw it. For HTTPS the header only goes on the CONNECT request to the proxy, never inside the tunnel.</p></details>
+<details><summary>Is Basic proxy auth secure?</summary><p>Only over an encrypted link. The value is base64, which anyone can decode. With an http:// proxy URL it goes across the network in plain text, even when the site itself is HTTPS.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with curl 8.14.1, Python requests 2.32.3 and Node.js 24.21.0: a small Node forward proxy on 127.0.0.1:8991 that requires Basic proxy auth (user &lt;code&gt;user&lt;/code&gt;, password &lt;code&gt;p@ss&lt;/code&gt;) and forwards to a Node origin on 127.0.0.1:8992 that logs every header it receives. PlainHeaders is our extension; curl, Python and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

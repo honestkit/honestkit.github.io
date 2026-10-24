@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pip &quot;subprocess-exited-with-error&quot; exit code: 1: Real Cause</title>
+<meta name="description" content="pip install error: subprocess-exited-with-error, exit code: 1. Two causes reproduced (undeclared build dependency, failed C compile) and how to read the log.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pip-install-error-subprocess-exited-with-error-exit-code-1/">
+<meta property="og:title" content="pip &quot;subprocess-exited-with-error&quot; exit code: 1: Real Cause">
+<meta property="og:description" content="pip install error: subprocess-exited-with-error, exit code: 1. Two causes reproduced (undeclared build dependency, failed C compile) and how to read the log.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pip-install-error-subprocess-exited-with-error-exit-code-1/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does pip error subprocess-exited-with-error exit code 1 mean?", "acceptedAnswer": {"@type": "Answer", "text": "pip ran a package build step (setup.py or a build backend) in a subprocess and it failed. The cause is the last error inside the boxed output."}}, {"@type": "Question", "name": "Why does pip say No module named numpy when numpy is installed?", "acceptedAnswer": {"@type": "Answer", "text": "pip builds in an isolated environment with only the declared build requirements. Add numpy to [build-system] requires, or install it and use --no-build-isolation."}}, {"@type": "Question", "name": "How do I fix a fatal error: X.h: No such file or directory during pip install?", "acceptedAnswer": {"@type": "Answer", "text": "Install the library's development headers (the -dev package on Debian/Ubuntu) or use a Python version for which the package ships a prebuilt wheel."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pip install error: subprocess-exited-with-error, exit code: 1 (tested)</h1>
+<p class="lead"><code>error: subprocess-exited-with-error ... exit code: 1</code> means a package's <strong>build step</strong> failed, not pip. Read the last lines before <code>[end of output]</code>: below, a missing build dependency (<code>No module named 'numpy'</code>) and a failed C compile (<code>fatal error: ... No such file or directory</code>), each reproduced and fixed.</p>
+<h2 id="what">1. What "exit code: 1" means</h2>
+<p>pip did not fail by itself: it ran a <strong>build step</strong> for a source package (an sdist or a local folder with <code>setup.py</code>/<code>pyproject.toml</code>) in a subprocess, and that subprocess exited with status 1. The real cause is printed <em>inside</em> the boxed output, usually the last line before <code>[end of output]</code>. The note says so: <code>This error originates from a subprocess, and is likely not a problem with pip.</code></p>
+<h2 id="build-dep">2. Case 1: setup.py imports something at build time</h2>
+<pre><code>import numpy  # build-time import that is not declared anywhere
+from setuptools import setup
+setup(name=&quot;needs-numpy&quot;, version=&quot;0.1&quot;)</code></pre>
+<pre><code># A source package whose setup.py imports numpy at build time
+python -m pip install ./a &gt; log.txt 2&gt;&amp;1; echo &quot;pip exit status: $?&quot;
+grep -E &#x27;error|×|exit code|No module|note|ERROR&#x27; log.txt</code></pre>
+<p>Output (pip 26.2.2, Python 3.13.5; the grep keeps the important lines of a 40-line log):</p>
+<pre><code>pip exit status: 1
+  Getting requirements to build wheel: finished with status &#x27;error&#x27;
+  error: subprocess-exited-with-error
+  × Getting requirements to build wheel did not run successfully.
+  │ exit code: 1
+      ModuleNotFoundError: No module named &#x27;numpy&#x27;
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+ERROR: Failed to build &#x27;file:///tmp/pc416/a&#x27; when getting requirements to build wheel</code></pre>
+<p>pip builds in an <em>isolated</em> environment that contains only the declared build requirements (here just setuptools), so <code>numpy</code> is missing even if it is installed in your venv. Fix: declare it as a build requirement:</p>
+<pre><code># Fix for ./a: declare the build-time dependency in pyproject.toml
+cat c/pyproject.toml
+python -m pip install -q ./c &gt; log3.txt 2&gt;&amp;1; echo &quot;pip exit status: $?&quot;
+python -m pip list 2&gt;/dev/null | grep -E &#x27;needs-numpy&#x27;</code></pre>
+<pre><code>[build-system]
+requires = [&quot;setuptools&quot;, &quot;numpy&quot;]
+build-backend = &quot;setuptools.build_meta&quot;
+pip exit status: 0
+needs-numpy 0.1</code></pre>
+<p>If it is someone else's package, upgrade to a version that ships a wheel for your Python, or install the build dependency first and use <code>pip install --no-build-isolation</code>.</p>
+<h2 id="compile">3. Case 2: a C extension fails to compile</h2>
+<pre><code>from setuptools import setup, Extension
+setup(name=&quot;fastthing&quot;, version=&quot;0.1&quot;,
+      ext_modules=[Extension(&quot;fastthing&quot;, [&quot;fast.c&quot;])])</code></pre>
+<p><code>fast.c</code> includes a header that is not installed (<code>#include &lt;missing_lib.h&gt;</code>):</p>
+<pre><code># A source package with a C extension that needs a missing header
+python -m pip install ./b 2&gt;&amp;1 | grep -E &#x27;error|Error|fatal|exit code|note|hint|fail&#x27; ; echo &quot;pip exit status: ${PIPESTATUS[0]}&quot;</code></pre>
+<pre><code>  Building wheel for fastthing (pyproject.toml): finished with status &#x27;error&#x27;
+  error: subprocess-exited-with-error
+  │ exit code: 1
+      fast.c:1:10: fatal error: missing_lib.h: No such file or directory
+      error: Command &#x27;[&#x27;x86_64-linux-gnu-gcc&#x27;, &#x27;-fno-strict-overflow&#x27;, &#x27;-Wsign-compare&#x27;, &#x27;-DNDEBUG&#x27;, &#x27;-g&#x27;, &#x27;-O2&#x27;, &#x27;-Wall&#x27;, &#x27;-fPIC&#x27;, &#x27;-I/tmp/ps416/ve/include&#x27;, &#x27;-I/usr/include/python3.13&#x27;, &#x27;-c&#x27;, &#x27;fast.c&#x27;, &#x27;-o&#x27;, &#x27;build/temp.linux-x86_64-cpython-313/fast.o&#x27;]&#x27; returned non-zero exit status 1.
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+error: failed-wheel-build-for-install
+pip exit status: 1</code></pre>
+<p>The line to read is <code>fatal error: missing_lib.h: No such file or directory</code>: a system library's development headers are missing (on Debian/Ubuntu these are the <code>-dev</code> packages, e.g. <code>libpq-dev</code> for psycopg2), or there is no compiler at all. Usually the better fix is to avoid compiling: use a Python version the package publishes wheels for. See <a href="/guides/numpy-error-metadata-generation-failed/">numpy metadata-generation-failed</a> and <a href="/guides/scipy-install-error-metadata-generation-failed/">scipy metadata-generation-failed</a> for that case measured.</p>
+<p>Related: <a href="/guides/pip-install-failed/">pip install failed</a>, <a href="/guides/pip-install-syntaxerror-invalid-syntax/">pip install SyntaxError: invalid syntax</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does pip error subprocess-exited-with-error exit code 1 mean?</summary><p>pip ran a package build step (setup.py or a build backend) in a subprocess and it failed. The cause is the last error inside the boxed output.</p></details>
+<details><summary>Why does pip say No module named numpy when numpy is installed?</summary><p>pip builds in an isolated environment with only the declared build requirements. Add numpy to [build-system] requires, or install it and use --no-build-isolation.</p></details>
+<details><summary>How do I fix a fatal error: X.h: No such file or directory during pip install?</summary><p>Install the library&#x27;s development headers (the -dev package on Debian/Ubuntu) or use a Python version for which the package ships a prebuilt wheel.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with pip 26.2.2, setuptools and gcc on Python 3.13.5 (Linux). The scripts ran verbatim and the output was pasted unedited. PlainTables is our extension; pip is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

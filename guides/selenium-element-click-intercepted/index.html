@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Selenium Element Click Intercepted: Fixes That Work (Tested)</title>
+<meta name="description" content="Selenium element click intercepted, tested in Chrome 156: cookie banners, spinners element_to_be_clickable misses, fixed headers, and why ActionChains hides it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/selenium-element-click-intercepted/">
+<meta property="og:title" content="Selenium Element Click Intercepted: Fixes That Work (Tested)">
+<meta property="og:description" content="Selenium element click intercepted, tested in Chrome 156: cookie banners, spinners element_to_be_clickable misses, fixed headers, and why ActionChains hides it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/selenium-element-click-intercepted/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does element click intercepted mean in Selenium?", "acceptedAnswer": {"@type": "Answer", "text": "Another element covers the centre of the element you clicked, so Chrome would deliver the click to it. The error message names that other element."}}, {"@type": "Question", "name": "Why does element_to_be_clickable not prevent ElementClickInterceptedException?", "acceptedAnswer": {"@type": "Answer", "text": "It only checks that the element is displayed and enabled, not whether an overlay covers it. Wait for the overlay with invisibility_of_element_located instead."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Selenium ElementClickInterceptedException (tested)</h1>
+<p class="lead">Selenium raises <code>ElementClickInterceptedException: element click intercepted ... Other element would receive the click</code> when another element (a cookie banner, a loading overlay, a fixed header) sits on top of the one you click. Close or wait out that element; <code>element_to_be_clickable</code> does not check for overlays.</p>
+<h2 id="setup">Setup used in every block</h2>
+<p><code>common.py</code> writes a small HTML page to a local file and starts headless Chrome. Exception messages are cut to their first line (Selenium appends the session info and a documentation link).</p>
+<pre><code>import os, pathlib
+from selenium import webdriver
+CHROME = os.path.expanduser(&quot;~/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome&quot;)
+def page(html):
+    p = pathlib.Path(&quot;/tmp/sl383/page.html&quot;); p.write_text(html); return p.as_uri()
+def driver():
+    o = webdriver.ChromeOptions()
+    o.binary_location = CHROME
+    o.add_argument(&quot;--headless=new&quot;); o.add_argument(&quot;--no-sandbox&quot;); o.add_argument(&quot;--window-size=1000,700&quot;)
+    return webdriver.Chrome(options=o)</code></pre>
+<h2 id="repro">1. Reproduce it: a cookie banner covers the button</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+d = driver()
+d.get(page(&#x27;&#x27;&#x27;&lt;button id=&quot;buy&quot; onclick=&quot;this.textContent=&#x27;clicked&#x27;&quot;&gt;Buy&lt;/button&gt;
+&lt;div id=&quot;cookie&quot; style=&quot;position:fixed;inset:0 0 auto 0;height:120px;background:#eee&quot;&gt;
+  We use cookies &lt;button id=&quot;ok&quot; onclick=&quot;this.parentNode.remove()&quot;&gt;OK&lt;/button&gt;&lt;/div&gt;&#x27;&#x27;&#x27;))
+try:
+    d.find_element(By.ID, &quot;buy&quot;).click()
+except Exception as e:
+    print(type(e).__name__ + &quot;:&quot;)
+    print(e.msg.splitlines()[0])
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>ElementClickInterceptedException:
+element click intercepted: Element &lt;button id=&quot;buy&quot; onclick=&quot;this.textContent=&#x27;clicked&#x27;&quot;&gt;...&lt;/button&gt; is not clickable at point (27, 18). Other element would receive the click: &lt;div id=&quot;cookie&quot; style=&quot;position:fixed;inset:0 0 auto 0;height:120px;background:#eee&quot;&gt;...&lt;/div&gt;</code></pre>
+<p><code>click()</code> clicks at the centre of the element, like a real user. Chrome checks which element is on top at that point, and if it is a different one it raises <code>ElementClickInterceptedException</code>. The message tells you both the point and the culprit: <em>Other element would receive the click: &lt;div id="cookie" ...&gt;</em>. Read that element first; it says which of the fixes below you need.</p>
+<h2 id="dismiss">2. Fix: close the overlay the way a user would</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+d = driver()
+d.get(page(&#x27;&#x27;&#x27;&lt;button id=&quot;buy&quot; onclick=&quot;this.textContent=&#x27;clicked&#x27;&quot;&gt;Buy&lt;/button&gt;
+&lt;div id=&quot;cookie&quot; style=&quot;position:fixed;inset:0 0 auto 0;height:120px;background:#eee&quot;&gt;
+  We use cookies &lt;button id=&quot;ok&quot; onclick=&quot;this.parentNode.remove()&quot;&gt;OK&lt;/button&gt;&lt;/div&gt;&#x27;&#x27;&#x27;))
+d.find_element(By.ID, &quot;ok&quot;).click()
+d.find_element(By.ID, &quot;buy&quot;).click()
+print(&quot;after dismissing the banner:&quot;, d.find_element(By.ID, &quot;buy&quot;).text)
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>after dismissing the banner: clicked</code></pre>
+<p>For cookie banners, chat widgets and modals, click their close or accept button first.</p>
+<h2 id="spinner">3. Fix: wait for a loading overlay to disappear</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+d = driver()
+d.get(page(&#x27;&#x27;&#x27;&lt;button id=&quot;buy&quot; onclick=&quot;this.textContent=&#x27;clicked&#x27;&quot;&gt;Buy&lt;/button&gt;
+&lt;div id=&quot;spinner&quot; style=&quot;position:fixed;inset:0;background:rgba(0,0,0,.3)&quot;&gt;&lt;/div&gt;
+&lt;script&gt;setTimeout(() =&gt; document.getElementById(&quot;spinner&quot;).remove(), 1500)&lt;/script&gt;&#x27;&#x27;&#x27;))
+el = WebDriverWait(d, 5).until(EC.element_to_be_clickable((By.ID, &quot;buy&quot;)))
+print(&quot;element_to_be_clickable returned:&quot;, el.text)
+try:
+    el.click()
+except Exception as e:
+    print(&quot;click:&quot;, type(e).__name__)
+WebDriverWait(d, 5).until(EC.invisibility_of_element_located((By.ID, &quot;spinner&quot;)))
+el.click()
+print(&quot;after invisibility wait:&quot;, el.text)
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>element_to_be_clickable returned: Buy
+click: ElementClickInterceptedException
+after invisibility wait: clicked</code></pre>
+<p>Note the trap: <code>EC.element_to_be_clickable</code> returned the button while the spinner still covered it, and the click failed. That condition only checks that the element is displayed and enabled, not that nothing is on top of it. Wait for the overlay itself with <code>EC.invisibility_of_element_located</code> (it also succeeds when the element is removed from the DOM).</p>
+<h2 id="sticky">4. Fix: a fixed header covers the element after scrolling</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+d = driver()
+d.get(page(&#x27;&#x27;&#x27;&lt;header style=&quot;position:fixed;top:0;left:0;right:0;height:80px;background:#ccc&quot;&gt;Header&lt;/header&gt;
+&lt;div style=&quot;height:2000px&quot;&gt;&lt;/div&gt;
+&lt;button id=&quot;buy&quot; onclick=&quot;this.textContent=&#x27;clicked&#x27;&quot;&gt;Buy&lt;/button&gt;
+&lt;div style=&quot;height:2000px&quot;&gt;&lt;/div&gt;&#x27;&#x27;&#x27;))
+el = d.find_element(By.ID, &quot;buy&quot;)
+d.execute_script(&quot;arguments[0].scrollIntoView(true)&quot;, el)
+print(&quot;top after scrollIntoView(true):&quot;, d.execute_script(&quot;return arguments[0].getBoundingClientRect().top&quot;, el))
+try:
+    el.click()
+except Exception as e:
+    print(&quot;click:&quot;, type(e).__name__, &quot;-&gt;&quot;, e.msg.split(&quot;Other element would receive the click: &quot;)[1].split(&quot;&gt;&quot;)[0] + &quot;&gt;&quot;)
+d.execute_script(&quot;arguments[0].scrollIntoView({block: &#x27;center&#x27;})&quot;, el)
+el.click()
+print(&quot;after scrollIntoView center:&quot;, el.text)
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>top after scrollIntoView(true): 0
+click: ElementClickInterceptedException -&gt; &lt;header style=&quot;position:fixed;top:0;left:0;right:0;height:80px;background:#ccc&quot;&gt;
+after scrollIntoView center: clicked</code></pre>
+<p><code>scrollIntoView(true)</code> puts the element at the very top of the viewport (<code>top: 0</code>), exactly under the fixed 80px header, so the header gets the click. Scrolling with <code>{block: 'center'}</code> moves it clear. Without our explicit <code>scrollIntoView(true)</code>, the same <code>click()</code> succeeded in our test: chromedriver scrolls the element into view by itself. So if your code scrolls before clicking, check where it scrolls to.</p>
+<h2 id="workarounds">5. ActionChains and JavaScript click are not fixes</h2>
+<pre><code>from common import *
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
+html = &#x27;&#x27;&#x27;&lt;button id=&quot;buy&quot; onclick=&quot;this.textContent=&#x27;clicked&#x27;&quot;&gt;Buy&lt;/button&gt;
+&lt;div id=&quot;cookie&quot; onclick=&quot;this.dataset.hits=(+this.dataset.hits||0)+1&quot;
+     style=&quot;position:fixed;inset:0 0 auto 0;height:120px;background:#eee&quot;&gt;cookies&lt;/div&gt;&#x27;&#x27;&#x27;
+d = driver()
+d.get(page(html))
+ActionChains(d).move_to_element(d.find_element(By.ID, &quot;buy&quot;)).click().perform()
+print(&quot;ActionChains: no exception; button text:&quot;, d.find_element(By.ID, &quot;buy&quot;).text,
+      &quot;| overlay clicks:&quot;, d.find_element(By.ID, &quot;cookie&quot;).get_attribute(&quot;data-hits&quot;))
+d.get(page(html))
+d.execute_script(&quot;arguments[0].click()&quot;, d.find_element(By.ID, &quot;buy&quot;))
+print(&quot;JS click: button text:&quot;, d.find_element(By.ID, &quot;buy&quot;).text)
+d.quit()</code></pre>
+<p>Output:</p>
+<pre><code>ActionChains: no exception; button text: Buy | overlay clicks: 1
+JS click: button text: clicked</code></pre>
+<p><code>ActionChains(...).click()</code> raised nothing, but the click landed on the overlay: the button was not clicked and the banner registered one hit. The test carries on in the wrong state and fails later somewhere confusing. <code>execute_script("arguments[0].click()", el)</code> does click the button, through the overlay, which a real user could not do, so the test stops testing what users see. Use it only when the overlay is something you deliberately do not care about.</p>
+<h2 id="checklist">6. Checklist</h2>
+<ul><li>Read "Other element would receive the click" to see what is on top.</li><li>Banner or modal: click its close button. Spinner: <code>EC.invisibility_of_element_located</code>.</li><li>Fixed header or footer: scroll with <code>scrollIntoView({block: 'center'})</code>.</li><li>Headless Chrome 156 started with a 780x580 window (viewport 780x380) in our test without <code>--window-size</code>; small viewports trigger mobile layouts and overlap, so set <code>--window-size</code> explicitly.</li></ul>
+<p>Related: <a href="/guides/selenium-element-not-interactable/">Selenium element not interactable</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers of the page your test loads:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does element click intercepted mean in Selenium?</summary><p>Another element covers the centre of the element you clicked, so Chrome would deliver the click to it. The error message names that other element.</p></details>
+<details><summary>Why does element_to_be_clickable not prevent ElementClickInterceptedException?</summary><p>It only checks that the element is displayed and enabled, not whether an overlay covers it. Wait for the overlay with invisibility_of_element_located instead.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Selenium 4.51.0 (Python 3.13.5) and headless Chrome for Testing 156.0.8078.4. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python, Selenium and Chrome are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

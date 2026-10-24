@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>405 Method Not Allowed: Causes and Fixes (Tested)</title>
+<meta name="description" content="We sent POST, HEAD and OPTIONS to Express, Flask and python -m http.server. Express said 404, http.server said 501, only Flask said 405. Here is what each returns, how redirects drop POST, and how to fix it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/405-method-not-allowed/">
+<meta property="og:title" content="405 Method Not Allowed: Causes and Fixes (Tested)">
+<meta property="og:description" content="We sent POST, HEAD and OPTIONS to Express, Flask and python -m http.server. Express said 404, http.server said 501, only Flask said 405. Here is what each returns, how redirects drop POST, and how to fix it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/405-method-not-allowed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Express return 404 instead of 405?", "acceptedAnswer": {"@type": "Answer", "text": "Express 5.2.1 does not check other methods on the same path. POST to a GET-only route fell through to the default handler: 404 with Cannot POST /x. Add .all() on app.route() to send 405 with an Allow header."}}, {"@type": "Question", "name": "What should the Allow header contain?", "acceptedAnswer": {"@type": "Answer", "text": "The methods the URL accepts, comma-separated. Flask sent HEAD, OPTIONS, GET for a GET-only route. Express's automatic OPTIONS reply sent GET, HEAD."}}, {"@type": "Question", "name": "Why does my POST arrive as GET?", "acceptedAnswer": {"@type": "Answer", "text": "A 301 or 302 redirect. In our test, curl -L -d followed both with GET. 307 and 308 kept POST. Fix the URL, often a trailing slash, or use 307/308."}}, {"@type": "Question", "name": "Why does python -m http.server give 501 instead of 405?", "acceptedAnswer": {"@type": "Answer", "text": "It only implements GET and HEAD. Any other method, including POST and OPTIONS, got 501 Unsupported method in our run."}}, {"@type": "Question", "name": "Is 405 a client or server problem?", "acceptedAnswer": {"@type": "Answer", "text": "Usually a client sending the wrong method or URL. It is a server problem when a route is missing a method, or a module like WebDAV on IIS blocks it."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>405 Method Not Allowed (tested)</h1>
+<p class="lead"><code>405 Method Not Allowed</code> means the URL exists, but not for the method you used. A good server also sends an <code>Allow</code> header listing the methods it accepts. In our tests, many servers do not send 405 at all for this mistake.</p>
+<h2>1. What 405 means</h2>
+<p>The server found the resource. It does not accept your method there. Example: you sent <code>POST</code> to a URL that only answers <code>GET</code>.</p>
+<p>The spec says a 405 response must include an <code>Allow</code> header. Read it first. It tells you which methods will work.</p>
+
+<h2>2. Not every server says 405</h2>
+<p>We sent the same wrong method to three servers. Only one replied 405.</p>
+<table>
+<tr><th>Server</th><th>Route</th><th>POST response</th><th>Allow header</th></tr>
+<tr><td>Express 5.2.1</td><td><code>app.get('/x')</code></td><td>404, body <code>Cannot POST /x</code></td><td>none</td></tr>
+<tr><td>Flask 3.1.3</td><td><code>methods=['GET']</code></td><td>405 METHOD NOT ALLOWED</td><td><code>HEAD, OPTIONS, GET</code></td></tr>
+<tr><td>python3 -m http.server</td><td>static file</td><td>501 Unsupported method ('POST')</td><td>none</td></tr>
+</table>
+<p>So if you search only for "405", you may miss the real problem. A 404 <code>Cannot POST</code> from Express is the same mistake.</p>
+
+<h2>3. Express: 404, not 405</h2>
+<pre><code>app.get('/x', (req, res) =&gt; res.send('hello'));
+
+$ curl -si -X POST localhost:8993/x
+HTTP/1.1 404 Not Found
+Content-Type: text/html; charset=utf-8
+Content-Length: 141
+
+&lt;pre&gt;Cannot POST /x&lt;/pre&gt;</code></pre>
+<p>Express does answer HEAD and OPTIONS for a GET route by itself:</p>
+<pre><code>$ curl -sI localhost:8993/x
+HTTP/1.1 200 OK
+Content-Length: 5
+
+$ curl -si -X OPTIONS localhost:8993/x
+HTTP/1.1 200 OK
+Allow: GET, HEAD
+Content-Type: text/plain
+
+GET, HEAD</code></pre>
+<p>To send a proper 405, add a catch-all after the real handlers:</p>
+<pre><code>app.route('/y')
+  .get((req, res) =&gt; res.send('y'))
+  .all((req, res) =&gt; res.set('Allow', 'GET, HEAD').sendStatus(405));
+
+$ curl -si -X POST localhost:8993/y
+HTTP/1.1 405 Method Not Allowed
+Allow: GET, HEAD
+Content-Type: text/plain; charset=utf-8
+
+Method Not Allowed</code></pre>
+<p>Note: <code>.all()</code> also catches OPTIONS. In our run, OPTIONS /y returned 405 too. If you need CORS preflight on that path, handle OPTIONS before the catch-all.</p>
+
+<h2>4. Flask: a real 405 with Allow</h2>
+<pre><code>@app.route('/x', methods=['GET'])
+def x(): return 'hello'
+
+$ curl -si -X POST localhost:8994/x
+HTTP/1.1 405 METHOD NOT ALLOWED
+Allow: HEAD, OPTIONS, GET
+Content-Type: text/html; charset=utf-8
+
+&lt;title&gt;405 Method Not Allowed&lt;/title&gt;</code></pre>
+<p>Flask adds HEAD and OPTIONS for you. OPTIONS /x returned 200 with the same <code>Allow</code> value and an empty body. Fix: add the method, e.g. <code>methods=['GET', 'POST']</code>, or send to the right route.</p>
+
+<h2>5. Static file servers: POST to a file</h2>
+<p>A common cause: a form or <code>fetch()</code> posts to an <code>.html</code> file or a static host. Static servers do not run code, so they refuse POST.</p>
+<pre><code>$ curl -si -X POST localhost:8995/index.html
+HTTP/1.0 501 Unsupported method ('POST')
+
+&lt;p&gt;Error code explanation: 501 - Server does not support this operation.&lt;/p&gt;</code></pre>
+<p>Python's http.server says 501, not 405. OPTIONS also got 501. From the nginx docs (not measured): nginx answers 405 for POST to a static file. Fix: point the form <code>action</code> or fetch URL at your API, not at the page.</p>
+
+<h2>6. Redirects that turn POST into GET</h2>
+<p>If your POST hits a redirect, the client may follow it with GET. Then the target can reply 405 (or your handler never sees the body). We posted form data with <code>curl -L -d a=1</code> to a redirect that lands on an echo route:</p>
+<table>
+<tr><th>Redirect</th><th>Method at the target</th></tr>
+<tr><td>301</td><td>GET</td></tr>
+<tr><td>302</td><td>GET</td></tr>
+<tr><td>307</td><td>POST</td></tr>
+<tr><td>308</td><td>POST</td></tr>
+</table>
+<pre><code>$ curl -sL -d a=1 localhost:8993/old       # 301
+method=GET
+$ curl -sL -d a=1 localhost:8993/old308    # 308
+method=POST</code></pre>
+<p>Careful: with <code>-X POST</code>, curl forced POST on every hop, even 301 and 302. That hides the bug. Test with <code>-d</code> and no <code>-X</code>.</p>
+<p>A missing or extra trailing slash is a classic trigger (from framework docs, not measured here). <code>/api/users</code> redirects to <code>/api/users/</code>, and the POST becomes a GET. Fix: call the exact final URL, or use 307/308 for redirects. See <a href="/guides/check-redirect-chain/">how to check a redirect chain</a>.</p>
+
+<h2>7. CORS preflight getting 404 or 405</h2>
+<p>For a cross-origin PUT, DELETE or JSON POST, the browser first sends <code>OPTIONS</code>. If that fails, the console says "Response to preflight request doesn't pass access control check". We sent a preflight with curl:</p>
+<pre><code>$ curl -si -X OPTIONS -H 'Origin: http://localhost:3000' \
+    -H 'Access-Control-Request-Method: PUT' localhost:8993/y
+HTTP/1.1 405 Method Not Allowed
+Allow: GET, HEAD</code></pre>
+<p>Express /x and Flask /x replied 200 to the same preflight, but with no <code>Access-Control-Allow-Origin</code>. The browser would still block it. http.server replied 501. Fix: answer OPTIONS with 204 and the CORS headers. See <a href="/guides/access-control-max-age/">Access-Control-Max-Age</a> and <a href="/guides/cors-allow-multiple-origins/">allowing multiple origins</a>.</p>
+
+<h2>8. Other causes (from docs, not measured)</h2>
+<ul>
+<li>IIS: the WebDAV module can grab PUT and DELETE and return 405. Remove WebDAV for that site.</li>
+<li>Hosting for static sites often has no POST support at all. Use a function or API endpoint.</li>
+<li>A wrong <code>Content-Type</code> gives a different error. See <a href="/guides/415-unsupported-media-type/">415 Unsupported Media Type</a>.</li>
+</ul>
+
+<h2>9. Quick checklist</h2>
+<ol>
+<li>Run <code>curl -si -X METHOD URL</code> and read the status and <code>Allow</code>.</li>
+<li>Run <code>curl -si -X OPTIONS URL</code> to see what the route accepts.</li>
+<li>Check for a 301/302 before the error with <code>curl -sIL</code>.</li>
+<li>Confirm the URL points at your API, not a static file.</li>
+<li>For browser-only failures, check the OPTIONS preflight.</li>
+</ol>
+<aside class="cta"><strong>Check the status code and Allow header your server really sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Express return 404 instead of 405?</summary><p>Express 5.2.1 does not check other methods on the same path. POST to a GET-only route fell through to the default handler: 404 with Cannot POST /x. Add .all() on app.route() to send 405 with an Allow header.</p></details>
+<details><summary>What should the Allow header contain?</summary><p>The methods the URL accepts, comma-separated. Flask sent HEAD, OPTIONS, GET for a GET-only route. Express&#x27;s automatic OPTIONS reply sent GET, HEAD.</p></details>
+<details><summary>Why does my POST arrive as GET?</summary><p>A 301 or 302 redirect. In our test, curl -L -d followed both with GET. 307 and 308 kept POST. Fix the URL, often a trailing slash, or use 307/308.</p></details>
+<details><summary>Why does python -m http.server give 501 instead of 405?</summary><p>It only implements GET and HEAD. Any other method, including POST and OPTIONS, got 501 Unsupported method in our run.</p></details>
+<details><summary>Is 405 a client or server problem?</summary><p>Usually a client sending the wrong method or URL. It is a server problem when a route is missing a method, or a module like WebDAV on IIS blocks it.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with curl 8.14.1, Node.js 24.21.0 with Express 5.2.1 on 127.0.0.1:8993, Flask 3.1.3 / Werkzeug 3.1.9 on Python 3.13.5 on port 8994, and python3 -m http.server on port 8995. Every status, header and body below is copied from those runs. The nginx, IIS and trailing-slash notes come from their docs and were not measured. PlainHeaders is our extension; curl, Express, Flask and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>functools.lru_cache Silently Confuses 1 and True (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: lru_cache(g)(1,0) then g(True,False) returns the cached int result, not a fresh bool one -- same hash, same ==, no error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-functools-lru-cache-int-bool-cache-collision/">
+<meta property="og:title" content="functools.lru_cache Silently Confuses 1 and True (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: lru_cache(g)(1,0) then g(True,False) returns the cached int result, not a fresh bool one -- same hash, same ==, no error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-functools-lru-cache-int-bool-cache-collision/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does functools.lru_cache treat 1 and True as the same cached call?", "acceptedAnswer": {"@type": "Answer", "text": "Sometimes. We measured a two-argument cached function where g(1, 0) and g(True, False) shared one cache entry -- the second call returned the first call's cached result without re-running the function. A one-argument function called with 1 then True did not collide."}}, {"@type": "Question", "name": "Why did the one-argument case not collide but the two-argument case did?", "acceptedAnswer": {"@type": "Answer", "text": "CPython's lru_cache has a fast path: with exactly one positional argument whose type is exactly int or str, it uses that value directly as the dict key, skipping the step that would merge it with equal-but-different-type values. bool fails that exact-type check (it's a subclass, not int itself), and any call with two or more arguments always goes through the normal path, where dict equality (1 == True) merges the keys."}}, {"@type": "Question", "name": "How do I stop functools.lru_cache from confusing int and bool arguments?", "acceptedAnswer": {"@type": "Answer", "text": "Pass typed=True to lru_cache. We measured this making g(1, 0) and g(True, False) into two separate cache entries, each computed fresh, at the cost of one extra cache slot per distinct type combination."}}, {"@type": "Question", "name": "Is this specific to bool and int, or does it affect other types too?", "acceptedAnswer": {"@type": "Answer", "text": "The same mechanism applies to any two values that are == and have equal hash but different types, such as int 1 and float 1.0, whenever the call doesn't take the single-argument int/str fast path -- we measured this with int/bool across a two-argument call."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>functools.lru_cache Confuses 1 and True in Some Calls, Not Others (tested)</h1>
+<p class="lead">Python's <code>1 == True</code> and <code>hash(1) == hash(True)</code>, so a dict can't tell them apart as keys. <code>functools.lru_cache</code> builds its cache key from a dict, but only sometimes -- a one-argument call with a plain <code>int</code> or <code>str</code> takes an internal fast path that skips the part of the logic where that collision happens. We measured exactly when two different-looking calls land in the same cache slot and silently return the wrong-typed result.</p>
+<h2 id="repro1">1. Two arguments: int and bool calls share one cache entry</h2>
+<pre><code>import functools
+
+@functools.lru_cache()
+def g(x, y):
+    print("MISS, computing for", repr(x), repr(y))
+    return (type(x).__name__, type(y).__name__)
+
+print(g(1, 0))
+print(g(True, False))
+print(g.cache_info())</code></pre>
+<pre><code>MISS, computing for 1 0
+('int', 'int')
+('int', 'int')
+CacheInfo(hits=1, misses=1, maxsize=128, currsize=1)</code></pre>
+<p><strong>Measured:</strong> <code>g(True, False)</code> never runs the function body -- no second "MISS" line -- and returns <code>('int', 'int')</code>, the result computed for <code>g(1, 0)</code>. <code>cache_info()</code> confirms it: one miss, one hit, one entry total. If <code>g</code>'s return value actually depended on the argument types (as in this toy example), the cached answer is wrong for the bool call, with no exception and no warning.</p>
+
+<h2 id="repro2">2. One argument, plain int vs bool: no collision at all</h2>
+<pre><code>import functools
+
+@functools.lru_cache()
+def f(x):
+    print("MISS, computing for", repr(x), type(x).__name__)
+    return "result-for-" + type(x).__name__
+
+print(f(1))
+print(f(True))
+print(f.cache_info())</code></pre>
+<pre><code>MISS, computing for 1 int
+MISS, computing for True bool
+CacheInfo(hits=0, misses=2, maxsize=128, currsize=2)</code></pre>
+<p><strong>Measured:</strong> with exactly one positional argument, <code>f(1)</code> and <code>f(True)</code> are two clean misses, two separate cache entries -- the opposite of experiment 1, even though <code>1 == True</code> here too. CPython's <code>functools.lru_cache</code> has a fast path for the single-argument, untyped case: if that one argument's type is exactly <code>int</code> or exactly <code>str</code>, the raw value is used as the dict key directly, bypassing the tuple-wrapping step where equal-but-different-type values collapse into one key. <code>bool</code> is a subclass of <code>int</code> but is not exactly <code>int</code>, so it never takes that fast path -- it, and every other case (two or more arguments, or a single non-int/str argument like <code>float</code>), goes through the normal path where Python dict semantics (<code>1 == True</code>, equal hash) merge the keys.</p>
+
+<h2 id="repro3">3. The fix: typed=True</h2>
+<pre><code>import functools
+
+@functools.lru_cache(typed=True)
+def g(x, y):
+    print("MISS, computing for", repr(x), repr(y))
+    return (type(x).__name__, type(y).__name__)
+
+print(g(1, 0))
+print(g(True, False))
+print(g.cache_info())</code></pre>
+<pre><code>MISS, computing for 1 0
+MISS, computing for True False
+CacheInfo(hits=0, misses=2, maxsize=128, currsize=2)</code></pre>
+<p><strong>Measured:</strong> <code>typed=True</code> folds each argument's exact type into the cache key, so <code>(1, 0)</code> and <code>(True, False)</code> become distinct entries -- two misses, no wrong-typed hit. It costs one extra cache slot per distinct type combination actually seen, which is rarely significant.</p>
+<aside class="cta"><strong>Caching an API call or header-parsing result with functools.lru_cache and the arguments might be 1/0 in one call site and True/False in another? Check whether that&#x27;s actually a cache hit or a wrong cached value first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does functools.lru_cache treat 1 and True as the same cached call?</summary><p>Sometimes. We measured a two-argument cached function where g(1, 0) and g(True, False) shared one cache entry -- the second call returned the first call&#x27;s cached result without re-running the function. A one-argument function called with 1 then True did not collide.</p></details>
+<details><summary>Why did the one-argument case not collide but the two-argument case did?</summary><p>CPython&#x27;s lru_cache has a fast path: with exactly one positional argument whose type is exactly int or str, it uses that value directly as the dict key, skipping the step that would merge it with equal-but-different-type values. bool fails that exact-type check (it&#x27;s a subclass, not int itself), and any call with two or more arguments always goes through the normal path, where dict equality (1 == True) merges the keys.</p></details>
+<details><summary>How do I stop functools.lru_cache from confusing int and bool arguments?</summary><p>Pass typed=True to lru_cache. We measured this making g(1, 0) and g(True, False) into two separate cache entries, each computed fresh, at the cost of one extra cache slot per distinct type combination.</p></details>
+<details><summary>Is this specific to bool and int, or does it affect other types too?</summary><p>The same mechanism applies to any two values that are == and have equal hash but different types, such as int 1 and float 1.0, whenever the call doesn&#x27;t take the single-argument int/str fast path -- we measured this with int/bool across a two-argument call.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in functools.lru_cache: called a two-argument cached function with (1, 0), then with (True, False), and separately called a one-argument cached function with 1 then True, comparing cache hits/misses and the values returned via cache_info() and explicit print statements inside the wrapped function. PlainHeaders is our extension; Python&#x27;s functools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx RuntimeError: Event loop is closed (AsyncClient fix)</title>
+<meta name="description" content="httpx AsyncClient raises RuntimeError: Event loop is closed when one client is reused over asyncio.run() calls. Reproduced and fixed (tested).">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-asyncclient-runtimeerror-event-loop-is-closed/">
+<meta property="og:title" content="httpx RuntimeError: Event loop is closed (AsyncClient fix)">
+<meta property="og:description" content="httpx AsyncClient raises RuntimeError: Event loop is closed when one client is reused over asyncio.run() calls. Reproduced and fixed (tested).">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-asyncclient-runtimeerror-event-loop-is-closed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does httpx AsyncClient raise Event loop is closed?", "acceptedAnswer": {"@type": "Answer", "text": "Its pooled connections belong to the loop they were opened on. Reusing the client after that loop closed (e.g. a second asyncio.run) touches the dead loop."}}, {"@type": "Question", "name": "Can I share one httpx AsyncClient globally?", "acceptedAnswer": {"@type": "Answer", "text": "Only within one event loop. Create it in the loop (startup hook or async with) and close it before the loop ends."}}, {"@type": "Question", "name": "What does 'Cannot send a request, as the client has been closed' mean?", "acceptedAnswer": {"@type": "Answer", "text": "The AsyncClient was used after aclose() or after its async with block ended."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx AsyncClient RuntimeError: Event loop is closed (tested)</h1>
+<p class="lead">A module-level <code>httpx.AsyncClient</code> reused across two <code>asyncio.run()</code> calls raises <code>RuntimeError: Event loop is closed</code>. Create the client inside the running loop with <code>async with httpx.AsyncClient() as client:</code>.</p>
+<p>An <code>httpx.AsyncClient</code> keeps pooled connections that belong to the event loop they were opened on. Reuse the client on a different loop (a second <code>asyncio.run()</code>, a new test loop) and httpx tries to use connections from the old, closed loop. Measured with httpx 0.28.1 on Python 3.13.5 against a local http.server (<code>srv</code>).</p>
+<h2 id="error">1. RuntimeError: Event loop is closed</h2>
+<pre><code>import asyncio, httpx, srv
+url = srv.start()
+client = httpx.AsyncClient()          # module-level, shared
+
+async def fetch():
+    r = await client.get(url + &quot;/x&quot;)
+    return r.status_code
+
+print(&quot;first asyncio.run:&quot;, asyncio.run(fetch()))
+try:
+    print(&quot;second asyncio.run:&quot;, asyncio.run(fetch()))
+except RuntimeError as e:
+    print(&quot;RuntimeError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>first asyncio.run: 200
+RuntimeError: Event loop is closed</code></pre>
+<p>The first <code>asyncio.run</code> opened a keep-alive connection on loop 1 and then closed that loop. The second run created loop 2, the client picked the pooled connection, and touching it raised <code>RuntimeError: Event loop is closed</code>.</p>
+<h2 id="fix">2. Fix: create the AsyncClient inside the running loop</h2>
+<pre><code>import asyncio, httpx, srv
+url = srv.start()
+
+async def fetch(client):
+    return (await client.get(url + &quot;/x&quot;)).status_code
+
+async def main():
+    async with httpx.AsyncClient() as client:      # created inside the running loop
+        print(await asyncio.gather(fetch(client), fetch(client)))
+
+asyncio.run(main())
+asyncio.run(main())
+print(&quot;two asyncio.run calls, no error&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>[200, 200]
+[200, 200]
+two asyncio.run calls, no error</code></pre>
+<p>Create the client inside the coroutine with <code>async with httpx.AsyncClient()</code> and pass it to the functions that need it. One client per loop still gives connection reuse within that run (see <a href="/guides/httpx-asyncclient-connection-pool-limits/">AsyncClient connection pool limits</a>). In web apps, create it in the framework's startup/lifespan hook and close it on shutdown; in pytest, create it in a fixture that runs on the test's loop.</p>
+<h2 id="closed">3. A different error: the client has been closed</h2>
+<pre><code>import asyncio, httpx, srv
+url = srv.start()
+
+async def main():
+    client = httpx.AsyncClient()
+    r = await client.get(url + &quot;/x&quot;)
+    print(r.status_code, &quot;client.is_closed =&quot;, client.is_closed)
+    await client.aclose()
+    print(&quot;after aclose: client.is_closed =&quot;, client.is_closed)
+    try:
+        await client.get(url + &quot;/x&quot;)
+    except RuntimeError as e:
+        print(&quot;RuntimeError:&quot;, e)
+
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>200 client.is_closed = False
+after aclose: client.is_closed = True
+RuntimeError: Cannot send a request, as the client has been closed.</code></pre>
+<p>If the message is <code>Cannot send a request, as the client has been closed</code>, the problem is not the loop: the client was used after <code>aclose()</code> or after its <code>async with</code> block ended. Check <code>client.is_closed</code>.</p>
+<p>Related: <a href="/guides/pytest-async-def-functions-are-not-natively-supported/">pytest async def functions are not natively supported</a>, <a href="/guides/aiohttp-unclosed-client-session/">aiohttp Unclosed client session</a>, <a href="/guides/httpx-mock-transport-pytest/">httpx MockTransport for tests</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests differences</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does httpx AsyncClient raise Event loop is closed?</summary><p>Its pooled connections belong to the loop they were opened on. Reusing the client after that loop closed (e.g. a second asyncio.run) touches the dead loop.</p></details>
+<details><summary>Can I share one httpx AsyncClient globally?</summary><p>Only within one event loop. Create it in the loop (startup hook or async with) and close it before the loop ends.</p></details>
+<details><summary>What does &#x27;Cannot send a request, as the client has been closed&#x27; mean?</summary><p>The AsyncClient was used after aclose() or after its async with block ended.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5 against a local http.server. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

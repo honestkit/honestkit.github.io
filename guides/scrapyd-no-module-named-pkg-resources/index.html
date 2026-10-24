@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>scrapyd RunnerError: No module named &#x27;pkg_resources&#x27; (fix)</title>
+<meta name="description" content="scrapyd 1.6.0 runner.py imports pkg_resources, so addversion.json and scrapyd-deploy fail on setuptools 82+. Tested fix: pin setuptools&lt;81.">
+<link rel="canonical" href="https://honestkit.github.io/guides/scrapyd-no-module-named-pkg-resources/">
+<meta property="og:title" content="scrapyd RunnerError: No module named &#x27;pkg_resources&#x27; (fix)">
+<meta property="og:description" content="scrapyd 1.6.0 runner.py imports pkg_resources, so addversion.json and scrapyd-deploy fail on setuptools 82+. Tested fix: pin setuptools&lt;81.">
+<meta property="og:url" content="https://honestkit.github.io/guides/scrapyd-no-module-named-pkg-resources/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does scrapyd start but deploy fails?", "acceptedAnswer": {"@type": "Answer", "text": "The web server does not import scrapyd.runner. Only the subprocess that lists spiders and runs jobs does, and that is where pkg_resources is imported."}}, {"@type": "Question", "name": "Where do I install the setuptools pin?", "acceptedAnswer": {"@type": "Answer", "text": "In the Python environment that runs the scrapyd server, not on the machine where you run scrapyd-deploy."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>scrapyd RunnerError: No module named &#x27;pkg_resources&#x27; (fix)</h1>
+<p class="lead">On setuptools 82 or newer, scrapyd 1.6.0 (the latest) starts, but <code>scrapyd-deploy</code> and <code>addversion.json</code> fail with <code>RunnerError: ... ModuleNotFoundError: No module named 'pkg_resources'</code>, from <code>scrapyd/runner.py</code> line 6. Tested fix: <code>pip install "setuptools&lt;81"</code> where scrapyd runs.</p>
+<h2 id="repro">1. The error: scrapyd 1.6.0 with setuptools 84</h2>
+<p><code>pip install scrapyd==1.6.0</code> (the latest release, 2025-07-22) into a Python 3.11.17 venv with setuptools 84.2.1. The <code>scrapyd</code> server starts and <code>daemonstatus.json</code> answers <code>"status": "ok"</code>. Uploading a project egg is what fails (that is what <code>scrapyd-deploy</code> sends):</p>
+<pre><code>$ curl http://127.0.0.1:6800/addversion.json -F project=demo -F version=1.0 -F egg=@demo-1.0-py3.11.egg
+{"status": "error", "message": "RunnerError: ..."}</code></pre>
+<p>The <code>message</code> field, unescaped:</p>
+<pre><code>RunnerError: RunnerError: Traceback (most recent call last):
+  File &quot;&lt;frozen runpy&gt;&quot;, line 198, in _run_module_as_main
+  File &quot;&lt;frozen runpy&gt;&quot;, line 88, in _run_code
+  File &quot;scrapyd/runner.py&quot;, line 6, in &lt;module&gt;
+    import pkg_resources
+ModuleNotFoundError: No module named &#x27;pkg_resources&#x27;</code></pre>
+<p>To list the spiders in your egg, and to run every scheduled job, scrapyd starts a subprocess with <code>python -m scrapyd.runner</code> (<code>runner = scrapyd.runner</code> in its default config). Line 6 of <code>scrapyd/runner.py</code> is a plain <code>import pkg_resources</code>, and setuptools 82.0.0 removed that module. You can reproduce it without a server:</p>
+<pre><code>$ python -m scrapyd.runner list
+...
+Traceback (most recent call last):
+  File &quot;&lt;frozen runpy&gt;&quot;, line 198, in _run_module_as_main
+  File &quot;&lt;frozen runpy&gt;&quot;, line 88, in _run_code
+  File &quot;scrapyd/runner.py&quot;, line 6, in &lt;module&gt;
+    import pkg_resources
+ModuleNotFoundError: No module named &#x27;pkg_resources&#x27;</code></pre>
+<h2 id="fix">2. Fix: pin setuptools below 81 in the scrapyd environment (tested)</h2>
+<pre><code>$ pip install &quot;setuptools&lt;81&quot;    # gave 80.10.2
+# restart scrapyd, then:
+$ curl http://127.0.0.1:6800/addversion.json -F project=demo -F version=1.0 -F egg=@demo-1.0-py3.11.egg
+{&quot;project&quot;: &quot;demo&quot;, &quot;version&quot;: &quot;1.0&quot;, &quot;spiders&quot;: 1, &quot;status&quot;: &quot;ok&quot;, &quot;node_name&quot;: &quot;myhost&quot;}
+$ curl http://127.0.0.1:6800/schedule.json -d project=demo -d spider=q
+{&quot;jobid&quot;: &quot;ce3f73d6cf7111f18ae895f0214921f0&quot;, &quot;status&quot;: &quot;ok&quot;, &quot;node_name&quot;: &quot;myhost&quot;}</code></pre>
+<p>The job finished and its log showed <code>'item_scraped_count': 1</code>. Install the pin into the Python that <strong>runs scrapyd</strong> (its venv or Docker image), not the machine you deploy from. There is no newer scrapyd release to upgrade to (1.6.0 is the latest on PyPI), so keep <code>setuptools&lt;81</code> in that image's requirements. With the pin, scrapyd's own log (not the job log) showed the harmless <a href="/guides/pkg-resources-is-deprecated-as-an-api/">pkg_resources is deprecated</a> warning. To hide it, set <code>PYTHONWARNINGS=&quot;ignore:pkg_resources is deprecated as an API&quot;</code> where scrapyd starts.</p>
+<p>Test setup: a <code>scrapy startproject</code> project with one spider on a <code>data:</code> URL, packed with <code>python setup.py bdist_egg</code>, and scrapyd on <code>127.0.0.1</code>. We used another port; the commands above show the default 6800.</p>
+<p>Related: <a href="/guides/python-modulenotfounderror-no-module-named-pkg-resources/">No module named 'pkg_resources' (general fix)</a> · <a href="/guides/supervisor-no-module-named-pkg-resources/">supervisord</a> · <a href="/guides/docker-build-no-module-named-pkg-resources/">docker build</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does scrapyd start but deploy fails?</summary><p>The web server does not import scrapyd.runner. Only the subprocess that lists spiders and runs jobs does, and that is where pkg_resources is imported.</p></details>
+<details><summary>Where do I install the setuptools pin?</summary><p>In the Python environment that runs the scrapyd server, not on the machine where you run scrapyd-deploy.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux with scrapyd 1.6.0 and the Scrapy it installed, CPython 3.11.17, setuptools 80.10.2 and 84.2.1. Output pasted unedited except shortened paths and host name. PlainTables is our extension; scrapyd is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

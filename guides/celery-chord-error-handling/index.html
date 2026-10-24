@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Celery chord error handling: on_error, ChordError (tested)</title>
+<meta name="description" content="What happens when a Celery chord header task fails: callback skipped, errback gets ChordError, caller gets the original exception, eager mode differs.">
+<link rel="canonical" href="https://honestkit.github.io/guides/celery-chord-error-handling/">
+<meta property="og:title" content="Celery chord error handling: on_error, ChordError (tested)">
+<meta property="og:description" content="What happens when a Celery chord header task fails: callback skipped, errback gets ChordError, caller gets the original exception, eager mode differs.">
+<meta property="og:url" content="https://honestkit.github.io/guides/celery-chord-error-handling/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I handle errors in a Celery chord?", "acceptedAnswer": {"@type": "Answer", "text": "Attach an errback to the callback signature: chord(header)(callback.s().on_error(on_error.s())). It runs with (request, exc, traceback) when any header task fails."}}, {"@type": "Question", "name": "What is ChordError in Celery?", "acceptedAnswer": {"@type": "Answer", "text": "The exception the worker stores on the chord callback when a header task fails; its message names the failed dependency's task id and original exception."}}, {"@type": "Question", "name": "Why is my chord errback not called in tests?", "acceptedAnswer": {"@type": "Answer", "text": "With task_always_eager the header exception is raised directly from the chord call and neither the callback nor the errback runs. Test with a real worker."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Celery chord error handling (tested with a real worker)</h1>
+<p class="lead">When a header task in a Celery chord fails, the callback is skipped, the callback's <code>on_error</code> errback receives <code>ChordError("Dependency &lt;id&gt; raised ...")</code>, and <code>result.get()</code> in the caller raises the original exception. Attach the errback to the callback: <code>chord(header)(callback.s().on_error(handler.s()))</code>.</p>
+<p>A chord runs a group of header tasks in parallel, then one callback with the list of their results. If any header task fails, the callback does <strong>not</strong> run: the worker marks the callback as failed with <code>ChordError</code> and calls the callback's <code>on_error</code> errback. Measured with Celery 5.6.3 (kombu 5.6.2, redis-py 8.1.0), a real worker and Redis 7 as broker and result backend.</p>
+<h2 id="handling">1. Chord error handling with a real worker</h2>
+<pre><code>$ cat tasks.py
+from celery import Celery
+app = Celery(&quot;tasks&quot;, broker=&quot;redis://127.0.0.1:8964/0&quot;, backend=&quot;redis://127.0.0.1:8964/1&quot;)
+
+@app.task
+def div(x, y):
+    return x / y
+
+@app.task
+def total(xs):
+    print(f&quot;callback got {xs}&quot;)
+    return sum(xs)
+
+@app.task
+def on_error(request, exc, tb):
+    print(f&quot;errback got {exc!r}&quot;)
+
+@app.task(ignore_result=True)
+def div_noresult(x, y):
+    return x / y
+$ celery -A tasks worker -P solo --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ cat run_chord.py
+from celery import chord
+from tasks import div, div_noresult, total, on_error
+
+ok = chord([div.s(1, 1), div.s(2, 1)])(total.s())
+print(&quot;ok:&quot;, ok.get(timeout=10))
+
+bad = chord([div.s(1, 1), div.s(1, 0)])(total.s().on_error(on_error.s()))
+try:
+    bad.get(timeout=10)
+except Exception as e:
+    print(&quot;caller:&quot;, type(e).__name__, e)
+print(&quot;callback state:&quot;, bad.state)
+
+try:
+    r = chord([div_noresult.s(1, 1), div_noresult.s(2, 1)])(total.s())
+    print(&quot;ignore_result:&quot;, r.get(timeout=5))
+except Exception as e:
+    print(&quot;ignore_result:&quot;, type(e).__name__, e)
+$ timeout 40 python run_chord.py
+ok: 3.0
+caller: ZeroDivisionError division by zero
+callback state: PENDING
+ignore_result: 3.0</code></pre>
+<p>The caller sees the <em>original</em> exception (<code>ZeroDivisionError</code>), because <code>get()</code> on a chord result checks the header group first. Note that <code>callback state</code> is still PENDING at that moment. The worker log shows what happened on the other side:</p>
+<pre><code>$ grep -E &quot;callback got|errback|Chord .* raised|raised unexpected&quot; worker.log | cut -c1-240
+[2026-10-23 10:55:11,145: WARNING/MainProcess] callback got [1.0, 2.0]
+[2026-10-23 10:55:11,153: ERROR/MainProcess] Chord &#x27;03412c5a-4c48-4d8a-8641-4813dd8ff4aa&#x27; raised: ChordError(&quot;Dependency f6e6e945-7b18-4162-8fb9-3c1154b203be raised ZeroDivisionError(&#x27;division by zero&#x27;)&quot;)
+[2026-10-23 10:55:11,154: WARNING/MainProcess] errback got ChordError(&quot;Dependency f6e6e945-7b18-4162-8fb9-3c1154b203be raised ZeroDivisionError(&#x27;division by zero&#x27;)&quot;)
+[2026-10-23 10:55:11,155: ERROR/MainProcess] Task tasks.div[f6e6e945-7b18-4162-8fb9-3c1154b203be] raised unexpected: ZeroDivisionError(&#x27;division by zero&#x27;)
+[2026-10-23 10:55:11,160: WARNING/MainProcess] callback got [1.0, 2.0]</code></pre>
+<p>The callback <code>total</code> was not called for the failing chord (both "callback got" lines are from the successful chords). The errback received <code>ChordError("Dependency &lt;task id&gt; raised ...")</code>, not the <code>ZeroDivisionError</code> itself, so parse or log the message, or look up the failed header task by its id. Header tasks with <code>ignore_result=True</code> still completed the chord here (last line of the script output).</p>
+<h2 id="state">2. The callback's own state flips to FAILURE a moment later</h2>
+<pre><code>$ cat run2.py
+import time
+from celery import chord
+from tasks import div, total, on_error
+
+bad = chord([div.s(1, 1), div.s(1, 0)])(total.s().on_error(on_error.s()))
+try:
+    bad.get(timeout=10)
+except Exception as e:
+    print(&quot;caller:&quot;, type(e).__name__, e)
+print(&quot;callback state right away:&quot;, bad.state)
+time.sleep(2)
+print(&quot;callback state 2s later:&quot;, bad.state, repr(bad.result))
+print(&quot;parent:&quot;, type(bad.parent).__name__, bad.parent.failed())
+$ timeout 40 python run2.py
+caller: ZeroDivisionError division by zero
+callback state right away: PENDING
+callback state 2s later: FAILURE ChordError(&quot;Dependency 9a317545-cfd4-43a9-b973-62cafebcd622 raised ZeroDivisionError(&#x27;division by zero&#x27;)&quot;)
+parent: GroupResult True</code></pre>
+<p>If you poll the callback's state instead of calling <code>get()</code>, expect PENDING briefly, then FAILURE with the <code>ChordError</code> as its result. <code>bad.parent</code> is the header <code>GroupResult</code>; <code>failed()</code> tells you whether any header task failed.</p>
+<h2 id="eager">3. Eager mode (tests) behaves differently</h2>
+<pre><code>$ cat eager.py
+from celery import chord
+from tasks import app, div, total, on_error
+app.conf.task_always_eager = True
+
+try:
+    r = chord([div.s(1, 1), div.s(1, 0)])(total.s().on_error(on_error.s()))
+    print(&quot;result:&quot;, r.get())
+except Exception as e:
+    print(&quot;raised while applying the chord:&quot;, type(e).__name__, e)
+$ timeout 20 python eager.py 2&gt;&amp;1
+raised while applying the chord: ZeroDivisionError division by zero</code></pre>
+<p>With <code>task_always_eager = True</code> the header exception is raised straight out of the <code>chord(...)(...)</code> call, and neither the callback nor the errback runs (no "errback got" line). Unit tests in eager mode therefore cannot verify your chord <code>on_error</code> handler; test it with a real worker (for example the <code>celery_worker</code> pytest fixture) or call the errback function directly.</p>
+<p>Related: <a href="/guides/celery-link-error-errback-example/">Celery link_error errback example</a>, <a href="/guides/celery-maxretriesexceedederror/">Celery MaxRetriesExceededError</a>, <a href="/guides/celery-error-111-connection-refused/">Celery Error 111 connection refused</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I handle errors in a Celery chord?</summary><p>Attach an errback to the callback signature: chord(header)(callback.s().on_error(on_error.s())). It runs with (request, exc, traceback) when any header task fails.</p></details>
+<details><summary>What is ChordError in Celery?</summary><p>The exception the worker stores on the chord callback when a header task fails; its message names the failed dependency&#x27;s task id and original exception.</p></details>
+<details><summary>Why is my chord errback not called in tests?</summary><p>With task_always_eager the header exception is raised directly from the chord call and neither the callback nor the errback runs. Test with a real worker.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Celery 5.6.3, kombu 5.6.2 and redis-py 8.1.0 on Python 3.13.5, one solo worker, Redis 7 (Docker) as broker and backend. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Celery and Redis are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

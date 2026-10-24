@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hmac: shake Digestmod Raises an Unhelpful ValueError</title>
+<meta name="description" content="We measured Python 3.13.5: hmac.new() with digestmod=shake_128 or shake_256 raises ValueError: no reason supplied, giving no hint why.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-hmac-shake-digestmod-raises-no-reason-supplied/">
+<meta property="og:title" content="hmac: shake Digestmod Raises an Unhelpful ValueError">
+<meta property="og:description" content="We measured Python 3.13.5: hmac.new() with digestmod=shake_128 or shake_256 raises ValueError: no reason supplied, giving no hint why.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-hmac-shake-digestmod-raises-no-reason-supplied/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can I use hashlib.shake_128 or shake_256 as an hmac digestmod?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured hmac.new() and hmac.digest() both raising ValueError for shake_128 and shake_256, whether passed as the hashlib constructor or the string name. HMAC's construction requires a fixed-length digest, which shake's extendable-output design doesn't provide."}}, {"@type": "Question", "name": "Why does hmac.new() raise ValueError: no reason supplied?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed this happens specifically when digestmod is a variable-length algorithm like shake_128/shake_256. The message comes from OpenSSL's HMAC implementation via Python's _hashopenssl module and gives no indication of the actual cause -- it looks identical to other ValueErrors but has nothing to do with typos or unsupported names."}}, {"@type": "Question", "name": "Does hmac.digest() fail the same way as hmac.new() for shake algorithms?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured both raising the identical ValueError('no reason supplied') for shake_128 and shake_256, so switching between the object and convenience-function APIs doesn't avoid the problem."}}, {"@type": "Question", "name": "Why can't HMAC use an extendable-output function like shake?", "acceptedAnswer": {"@type": "Answer", "text": "HMAC's construction needs a hash with a fixed block size and digest size to build its inner and outer padded keys, per RFC 2104. shake_128/shake_256 have digest_size == 0 because their output length is chosen at call time rather than fixed by the algorithm, so they don't satisfy HMAC's requirements."}}, {"@type": "Question", "name": "How do I give a useful error if a user picks an unsupported hmac digestmod?", "acceptedAnswer": {"@type": "Answer", "text": "Validate against a known set of fixed-length algorithms (sha256, sha3_256, blake2b, etc.) before calling hmac.new(), or wrap the call and catch ValueError to substitute your own message -- we confirmed the library's own error text doesn't name the real constraint."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>hmac: shake_128/shake_256 digestmod Raises &#x27;no reason supplied&#x27; (tested)</h1>
+<p class="lead"><code>hashlib.shake_128</code> and <code>hashlib.shake_256</code> are extendable-output functions (XOFs): unlike <code>sha256</code>, their digest has no fixed length until you call <code>.hexdigest(length)</code> with one. We measured what happens when one of those is handed to <code>hmac.new()</code> as a <code>digestmod</code>, the same way you'd use <code>sha256</code> or <code>blake2b</code>.</p>
+<h2 id="repro1">1. Ordinary digestmods work exactly as expected</h2>
+<pre><code>import hmac, hashlib
+
+for name in ("sha256", "sha3_256", "md5"):
+    h = hmac.new(b"key", b"msg", name)
+    print(name, "->", h.hexdigest()[:16])</code></pre>
+<pre><code>sha256 -> b60090e3...
+sha3_256 -> 1b92d4a2...
+md5 -> ed7e724d...</code></pre>
+<p><strong>Measured:</strong> passing any fixed-length digestmod -- by string name or by <code>hashlib</code> constructor -- works without issue, same as always.</p>
+
+<h2 id="repro2">2. shake_128 / shake_256 raise ValueError with no explanation</h2>
+<pre><code>import hmac, hashlib
+
+hmac.new(b"key", b"msg", hashlib.shake_128)</code></pre>
+<pre><code>Traceback (most recent call last):
+  ...
+  File ".../hmac.py", line 67, in _init_hmac
+    self._hmac = _hashopenssl.hmac_new(key, msg, digestmod=digestmod)
+ValueError: no reason supplied</code></pre>
+<p><strong>Measured:</strong> both <code>hashlib.shake_128</code> and <code>hashlib.shake_256</code> raise <code>ValueError</code> from <code>hmac.new()</code>, whether passed as the <code>hashlib</code> constructor or as the string <code>"shake_128"</code>/<code>"shake_256"</code>. The same failure happens through the <code>hmac.digest()</code> convenience function. The message is literally <code>no reason supplied</code> -- OpenSSL's HMAC implementation rejects the variable-length XOF outright, but the exception gives no indication that the problem is the algorithm's variable output length, as opposed to a typo, an unsupported name, or anything else.</p>
+
+<h2 id="repro3">3. Why: HMAC needs a fixed-length inner/outer hash, which shake doesn't have</h2>
+<pre><code>import hashlib
+
+h = hashlib.shake_128(b"msg")
+print(h.digest_size)          # 0 -- no fixed size
+print(len(h.hexdigest(16)))   # you choose the length explicitly</code></pre>
+<pre><code>0
+32</code></pre>
+<p><strong>Measured:</strong> <code>shake_128</code>'s <code>digest_size</code> is <code>0</code> because its output length is chosen at digest time, not fixed by the algorithm. HMAC's construction (RFC 2104) requires a hash with a fixed block and digest size to compute the inner/outer padding; a XOF doesn't fit that shape, so OpenSSL rejects it -- but surfaces that as an opaque <code>ValueError</code> rather than a message naming the actual constraint. If a digestmod is configurable (read from a config file, an env var, or offered as a user choice), validate it against a known fixed-length set, or catch <code>ValueError</code> and surface your own explanation, rather than trusting the library's error message to explain itself.</p>
+<aside class="cta"><strong>Switching an hmac digestmod to shake_128 or shake_256 for a shorter digest? Check the error you get first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can I use hashlib.shake_128 or shake_256 as an hmac digestmod?</summary><p>No -- we measured hmac.new() and hmac.digest() both raising ValueError for shake_128 and shake_256, whether passed as the hashlib constructor or the string name. HMAC&#x27;s construction requires a fixed-length digest, which shake&#x27;s extendable-output design doesn&#x27;t provide.</p></details>
+<details><summary>Why does hmac.new() raise ValueError: no reason supplied?</summary><p>We confirmed this happens specifically when digestmod is a variable-length algorithm like shake_128/shake_256. The message comes from OpenSSL&#x27;s HMAC implementation via Python&#x27;s _hashopenssl module and gives no indication of the actual cause -- it looks identical to other ValueErrors but has nothing to do with typos or unsupported names.</p></details>
+<details><summary>Does hmac.digest() fail the same way as hmac.new() for shake algorithms?</summary><p>Yes -- we measured both raising the identical ValueError(&#x27;no reason supplied&#x27;) for shake_128 and shake_256, so switching between the object and convenience-function APIs doesn&#x27;t avoid the problem.</p></details>
+<details><summary>Why can&#x27;t HMAC use an extendable-output function like shake?</summary><p>HMAC&#x27;s construction needs a hash with a fixed block size and digest size to build its inner and outer padded keys, per RFC 2104. shake_128/shake_256 have digest_size == 0 because their output length is chosen at call time rather than fixed by the algorithm, so they don&#x27;t satisfy HMAC&#x27;s requirements.</p></details>
+<details><summary>How do I give a useful error if a user picks an unsupported hmac digestmod?</summary><p>Validate against a known set of fixed-length algorithms (sha256, sha3_256, blake2b, etc.) before calling hmac.new(), or wrap the call and catch ValueError to substitute your own message -- we confirmed the library&#x27;s own error text doesn&#x27;t name the real constraint.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in hmac module: called hmac.new() and hmac.digest() with digestmod set to hashlib.shake_128, hashlib.shake_256, and the string names of both, then compared against ordinary fixed-length digestmods like sha256 and blake2b. PlainHeaders is our extension; Python&#x27;s hmac module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

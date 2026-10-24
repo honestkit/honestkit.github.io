@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Django CORS Error on localhost: django-cors-headers (Tested)</title>
+<meta name="description" content="Django CORS error on localhost tested on 6.1.2 + django-cors-headers 4.9.0: no Access-Control-Allow-Origin, CorsMiddleware order, 127.0.0.1 vs localhost, E014.">
+<link rel="canonical" href="https://honestkit.github.io/guides/django-cors-error-localhost/">
+<meta property="og:title" content="Django CORS Error on localhost: django-cors-headers (Tested)">
+<meta property="og:description" content="Django CORS error on localhost tested on 6.1.2 + django-cors-headers 4.9.0: no Access-Control-Allow-Origin, CorsMiddleware order, 127.0.0.1 vs localhost, E014.">
+<meta property="og:url" content="https://honestkit.github.io/guides/django-cors-error-localhost/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why do I get a CORS error from Django on localhost?", "acceptedAnswer": {"@type": "Answer", "text": "Django adds no Access-Control-Allow-Origin header. Install django-cors-headers and add the frontend origin, e.g. http://localhost:3000, to CORS_ALLOWED_ORIGINS."}}, {"@type": "Question", "name": "Is localhost the same origin as 127.0.0.1 for CORS?", "acceptedAnswer": {"@type": "Answer", "text": "No. In the test, http://127.0.0.1:3000 got no allow header when only http://localhost:3000 was listed."}}, {"@type": "Question", "name": "What is corsheaders.E014?", "acceptedAnswer": {"@type": "Answer", "text": "A system check error: an entry in CORS_ALLOWED_ORIGINS has a path, often just a trailing slash. Remove it."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Django CORS error on localhost (tested)</h1>
+<p class="lead">Django never sends <code>Access-Control-Allow-Origin</code> on its own, so a React/Vue dev server on <code>localhost:3000</code> gets a CORS error. Install <code>django-cors-headers</code>, put <code>CorsMiddleware</code> at the top, and list the exact origin.</p>
+<h2 id="setup">Setup</h2>
+<p>A single-file Django app with one JSON view at <code>/api/</code>; <code>show()</code> sends a request with an <code>Origin</code> header (as a page on <code>localhost:3000</code> would) and prints the CORS headers of the response:</p>
+<pre><code>import sys
+import django
+from django.conf import settings
+def setup(**extra):
+    settings.configure(ROOT_URLCONF=__name__, SECRET_KEY=&#x27;dev&#x27;, ALLOWED_HOSTS=[&#x27;*&#x27;], **extra)
+    django.setup()
+from django.urls import path
+from django.http import JsonResponse
+def api(request): return JsonResponse({&#x27;ok&#x27;: True})
+urlpatterns = [path(&#x27;api/&#x27;, api)]
+def show(c, method, origin, **hdr):
+    r = getattr(c, method)(&#x27;/api/&#x27;, headers={&#x27;Origin&#x27;: origin, **hdr})
+    print(f&#x27;{method.upper():7} Origin {origin:24} -&gt; {r.status_code}&#x27;,
+          {k: v for k, v in r.headers.items() if k.lower().startswith(&#x27;access-control&#x27;) or k == &#x27;Vary&#x27;})</code></pre>
+<h2 id="repro">1. Reproduce it: no CORS package</h2>
+<pre><code>from common import *
+setup(MIDDLEWARE=[])                                    # no CORS package
+from django.test import Client
+c = Client()
+show(c, &#x27;get&#x27;, &#x27;http://localhost:3000&#x27;)
+show(c, &#x27;options&#x27;, &#x27;http://localhost:3000&#x27;, **{&#x27;Access-Control-Request-Method&#x27;: &#x27;POST&#x27;})</code></pre>
+<p>Output:</p>
+<pre><code>GET     Origin http://localhost:3000    -&gt; 200 {}
+OPTIONS Origin http://localhost:3000    -&gt; 200 {}</code></pre>
+<p>Django itself never adds <code>Access-Control-Allow-Origin</code>. The server answers 200 (a plain function view even accepts <code>OPTIONS</code>), but without that header the browser blocks your frontend from reading the response: the request "works" in the Network tab and fails in JavaScript.</p>
+<h2 id="fix">2. Fix: django-cors-headers</h2>
+<p><code>pip install django-cors-headers</code>, then:</p>
+<pre><code>from common import *
+setup(INSTALLED_APPS=[&#x27;corsheaders&#x27;],
+      MIDDLEWARE=[&#x27;corsheaders.middleware.CorsMiddleware&#x27;,      # as high as possible
+                  &#x27;django.middleware.common.CommonMiddleware&#x27;],
+      CORS_ALLOWED_ORIGINS=[&#x27;http://localhost:3000&#x27;])
+from django.test import Client
+c = Client()
+show(c, &#x27;get&#x27;, &#x27;http://localhost:3000&#x27;)
+show(c, &#x27;get&#x27;, &#x27;http://127.0.0.1:3000&#x27;)                 # different origin than localhost
+show(c, &#x27;options&#x27;, &#x27;http://localhost:3000&#x27;, **{&#x27;Access-Control-Request-Method&#x27;: &#x27;POST&#x27;,
+                                               &#x27;Access-Control-Request-Headers&#x27;: &#x27;content-type&#x27;})</code></pre>
+<p>Output:</p>
+<pre><code>GET     Origin http://localhost:3000    -&gt; 200 {&#x27;Vary&#x27;: &#x27;origin&#x27;, &#x27;access-control-allow-origin&#x27;: &#x27;http://localhost:3000&#x27;}
+GET     Origin http://127.0.0.1:3000    -&gt; 200 {&#x27;Vary&#x27;: &#x27;origin&#x27;}
+OPTIONS Origin http://localhost:3000    -&gt; 200 {&#x27;Vary&#x27;: &#x27;origin&#x27;, &#x27;access-control-allow-origin&#x27;: &#x27;http://localhost:3000&#x27;, &#x27;access-control-allow-headers&#x27;: &#x27;accept, authorization, content-type, user-agent, x-csrftoken, x-requested-with&#x27;, &#x27;access-control-allow-methods&#x27;: &#x27;DELETE, GET, OPTIONS, PATCH, POST, PUT&#x27;, &#x27;access-control-max-age&#x27;: &#x27;86400&#x27;}</code></pre>
+<ul>
+<li>Add <code>'corsheaders'</code> to <code>INSTALLED_APPS</code> and put <code>CorsMiddleware</code> as high as possible in <code>MIDDLEWARE</code>, above <code>CommonMiddleware</code>.</li>
+<li><code>http://localhost:3000</code> and <code>http://127.0.0.1:3000</code> are different origins. The second gets only <code>Vary: origin</code> and no allow header, so the browser still reports a CORS error. List each origin you really open the frontend on.</li>
+<li>The preflight (<code>OPTIONS</code> with <code>Access-Control-Request-Method</code>) is answered by the middleware with the default allowed methods and headers, which already include <code>content-type</code>, <code>authorization</code> and <code>x-csrftoken</code>.</li>
+</ul>
+<h2 id="slash">3. A trailing slash in CORS_ALLOWED_ORIGINS</h2>
+<pre><code>from common import *
+from django.core.checks import run_checks
+setup(INSTALLED_APPS=[&#x27;corsheaders&#x27;], MIDDLEWARE=[&#x27;corsheaders.middleware.CorsMiddleware&#x27;],
+      CORS_ALLOWED_ORIGINS=[&#x27;http://localhost:3000/&#x27;])  # trailing slash in the setting
+for m in run_checks():
+    print(m)</code></pre>
+<p>Output:</p>
+<pre><code>?: (corsheaders.E014) Origin &#x27;http://localhost:3000/&#x27; in CORS_ALLOWED_ORIGINS should not have path</code></pre>
+<p>Origins have no path, so <code>'http://localhost:3000/'</code> is invalid. django-cors-headers reports it as system check <code>corsheaders.E014</code>, which <code>runserver</code> and <code>manage.py check</code> show at startup: scroll up in the server output.</p>
+<p>If the frontend sends cookies (session auth), you also need <code>CORS_ALLOW_CREDENTIALS = True</code> plus <code>credentials: 'include'</code> in <code>fetch</code>, and for POSTs the CSRF setup in <a href="/guides/django-csrf-verification-failed-cookie-not-set/">Django CSRF verification failed</a>.</p>
+<p>Related: <a href="/guides/fastapi-cors-error-localhost/">FastAPI CORS error on localhost</a>, <a href="/guides/flask-cors-error-localhost/">Flask CORS error on localhost</a>, <a href="/guides/cors-error-messages-explained/">CORS error messages explained</a>.</p>
+
+<aside class="cta"><strong>See the Access-Control-* headers your API really returns, right in the browser:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why do I get a CORS error from Django on localhost?</summary><p>Django adds no Access-Control-Allow-Origin header. Install django-cors-headers and add the frontend origin, e.g. http://localhost:3000, to CORS_ALLOWED_ORIGINS.</p></details>
+<details><summary>Is localhost the same origin as 127.0.0.1 for CORS?</summary><p>No. In the test, http://127.0.0.1:3000 got no allow header when only http://localhost:3000 was listed.</p></details>
+<details><summary>What is corsheaders.E014?</summary><p>A system check error: an entry in CORS_ALLOWED_ORIGINS has a path, often just a trailing slash. Remove it.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Django 6.1.2, django-cors-headers 4.9.0 and Python 3.14.7 (python:3-alpine in Docker, Django test client). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python, Django and django-cors-headers are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

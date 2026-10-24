@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>torchaudio sox_effects: libsox.so not found / removed in 2.9</title>
+<meta name="description" content="torchaudio 2.8: OSError libsox.so cannot open shared object file. 2.9: No module named &#x27;torchaudio.sox_effects&#x27;. Tested fixes: torchaudio.functional or libsox.">
+<link rel="canonical" href="https://honestkit.github.io/guides/torchaudio-sox-effects-libsox-so-cannot-open/">
+<meta property="og:title" content="torchaudio sox_effects: libsox.so not found / removed in 2.9">
+<meta property="og:description" content="torchaudio 2.8: OSError libsox.so cannot open shared object file. 2.9: No module named &#x27;torchaudio.sox_effects&#x27;. Tested fixes: torchaudio.functional or libsox.">
+<meta property="og:url" content="https://honestkit.github.io/guides/torchaudio-sox-effects-libsox-so-cannot-open/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Which torchaudio version removed sox_effects?", "acceptedAnswer": {"@type": "Answer", "text": "torchaudio 2.9.0. On 2.8.0 it still exists, warns that it will be removed in 2.9, and needs libsox.so at call time."}}, {"@type": "Question", "name": "Which package provides libsox.so on Debian/Ubuntu?", "acceptedAnswer": {"@type": "Answer", "text": "On Debian 13 the unversioned libsox.so symlink is in libsox-dev; libsox3 only ships libsox.so.3, which torchaudio does not look for."}}, {"@type": "Question", "name": "What replaces sox_effects speed and rate?", "acceptedAnswer": {"@type": "Answer", "text": "torchaudio.functional.speed (or functional.resample); gain and lowpass have functional.gain and functional.lowpass_biquad. All ran on 2.8.0 and 2.9.0 without libsox."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>torchaudio sox_effects: libsox.so not found (fix)</h1>
+<p class="lead"><code>torchaudio.sox_effects.apply_effects_tensor</code> fails with <code>OSError: libsox.so: cannot open shared object file</code> on torchaudio 2.8 and older when SoX isn&#x27;t installed, and with <code>ModuleNotFoundError: No module named 'torchaudio.sox_effects'</code> on 2.9, which removed it. We reproduced both and tested the fixes.</p>
+<h2 id="errors">1. The two errors</h2>
+<p>The same augmentation snippet (speed up 10%, keep 16 kHz):</p>
+<pre><code>import torch, torchaudio
+import torchaudio.sox_effects as sox_effects
+sr = 16000
+wav = torch.sin(2 * torch.pi * 440 * torch.arange(sr) / sr).unsqueeze(0)
+out, out_sr = sox_effects.apply_effects_tensor(wav, sr, [[&quot;speed&quot;, &quot;1.1&quot;], [&quot;rate&quot;, str(sr)]])
+print(torchaudio.__version__, out.shape, out_sr)</code></pre>
+<p>torchaudio 2.8.0, no libsox on the system (deprecation warning cut):</p>
+<pre><code>Traceback (most recent call last):
+  File &quot;b1.py&quot;, line 5, in &lt;module&gt;
+    out, out_sr = sox_effects.apply_effects_tensor(wav, sr, [[&quot;speed&quot;, &quot;1.1&quot;], [&quot;rate&quot;, str(sr)]])
+  ...
+    ctypes.CDLL(path)
+  File &quot;.../ctypes/__init__.py&quot;, line 376, in __init__
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: libsox.so: cannot open shared object file: No such file or directory</code></pre>
+<p>torchaudio 2.9.0:</p>
+<pre><code>Traceback (most recent call last):
+  File &quot;b1.py&quot;, line 2, in &lt;module&gt;
+    import torchaudio.sox_effects as sox_effects
+ModuleNotFoundError: No module named &#x27;torchaudio.sox_effects&#x27;</code></pre>
+<p>Code that uses <code>torchaudio.sox_effects</code> without importing it gets the attribute form on 2.9:</p>
+<pre><code>import torchaudio
+print(torchaudio.__version__)
+torchaudio.sox_effects.apply_effects_file(&quot;speech.wav&quot;, [[&quot;rate&quot;, &quot;16000&quot;]])</code></pre>
+<pre><code>2.9.0+cpu
+Traceback (most recent call last):
+  File &quot;b3.py&quot;, line 3, in &lt;module&gt;
+    torchaudio.sox_effects.apply_effects_file(&quot;speech.wav&quot;, [[&quot;rate&quot;, &quot;16000&quot;]])
+    ^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module &#x27;torchaudio&#x27; has no attribute &#x27;sox_effects&#x27;</code></pre>
+<p>So on 2.8 and older the module exists but needs the system <code>libsox.so</code> at call time (the import itself succeeds); on 2.9 the module is gone. The 2.8 warning says so: &quot;It will be removed from the 2.9 release.&quot;</p>
+<h2 id="functional">2. Fix (any version): use torchaudio.functional</h2>
+<p>Most effect chains used for data augmentation have pure-PyTorch equivalents that need no libsox and exist on both 2.8 and 2.9:</p>
+<pre><code>import torch, torchaudio
+import torchaudio.functional as F
+sr = 16000
+wav = torch.sin(2 * torch.pi * 440 * torch.arange(sr) / sr).unsqueeze(0)
+# sox [[&quot;speed&quot;, &quot;1.1&quot;], [&quot;rate&quot;, &quot;16000&quot;]]: 10% faster (pitch goes up too), still 16 kHz
+fast, _ = F.speed(wav, sr, 1.1)
+same = F.resample(wav, orig_freq=int(sr * 1.1), new_freq=sr)
+print(torchaudio.__version__, fast.shape, torch.allclose(fast, same))
+# other common sox effects: [&quot;gain&quot;, &quot;-3&quot;], [&quot;lowpass&quot;, &quot;3000&quot;]
+quiet = F.gain(wav, -3.0)
+low = F.lowpass_biquad(wav, sr, 3000.0)
+print(quiet.abs().max().item() &lt; wav.abs().max().item(), low.shape)</code></pre>
+<p>torchaudio 2.8.0:</p>
+<pre><code>2.8.0+cu128 torch.Size([1, 14546]) True
+True torch.Size([1, 16000])</code></pre>
+<p>torchaudio 2.9.0:</p>
+<pre><code>2.9.0+cpu torch.Size([1, 14546]) True
+True torch.Size([1, 16000])</code></pre>
+<p><code>F.speed</code> matched resampling exactly here. sox itself returned 14545 samples for the same chain, one fewer than <code>F.speed</code>, so expect tiny length differences, not identical output.</p>
+<h2 id="libsox">3. Fix (torchaudio 2.8 and older): install libsox</h2>
+<p>torchaudio loads the unversioned <code>libsox.so</code>. On Debian 13 that symlink is in <code>libsox-dev</code>, not <code>libsox3</code> (which only has <code>libsox.so.3</code>):</p>
+<pre><code>sudo apt install libsox-dev</code></pre>
+<p>Without root, conda-forge&#x27;s <code>sox</code> package ships <code>lib/libsox.so</code>; point the loader at it:</p>
+<pre><code>micromamba create -p ./soxenv -c conda-forge sox
+LD_LIBRARY_PATH=$PWD/soxenv/lib python b1.py</code></pre>
+<p>With either one, torchaudio 2.8.0 (warning lines shortened):</p>
+<pre><code>b1.py:5: UserWarning: torchaudio.sox_effects.sox_effects.apply_effects_tensor has been deprecated. This deprecation is part of a large refactoring effort to ...
+  out, out_sr = sox_effects.apply_effects_tensor(wav, sr, [[&quot;speed&quot;, &quot;1.1&quot;], [&quot;rate&quot;, str(sr)]])
+2.8.0+cu128 torch.Size([1, 14545]) 16000</code></pre>
+<p>Debian&#x27;s libsox and conda-forge&#x27;s gave identical output. This only buys time: upgrading to torchaudio 2.9 removes the module whatever is installed.</p>
+<p>Related: <a href="/guides/torchaudio-no-module-named-backend/">No module named torchaudio.backend</a> · <a href="/guides/torchaudio-no-module-named-io/">No module named torchaudio.io</a> · <a href="/guides/torchcodec-could-not-load-libtorchcodec/">Could not load libtorchcodec</a> · <a href="/guides/torchaudio-utils-has-no-attribute-download-asset/">torchaudio.utils has no attribute download_asset</a></p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Which torchaudio version removed sox_effects?</summary><p>torchaudio 2.9.0. On 2.8.0 it still exists, warns that it will be removed in 2.9, and needs libsox.so at call time.</p></details>
+<details><summary>Which package provides libsox.so on Debian/Ubuntu?</summary><p>On Debian 13 the unversioned libsox.so symlink is in libsox-dev; libsox3 only ships libsox.so.3, which torchaudio does not look for.</p></details>
+<details><summary>What replaces sox_effects speed and rate?</summary><p>torchaudio.functional.speed (or functional.resample); gain and lowpass have functional.gain and functional.lowpass_biquad. All ran on 2.8.0 and 2.9.0 without libsox.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux with CPython 3.11.17, torch/torchaudio 2.8.0 (PyPI wheels) and 2.9.0 (CPU wheels), Debian 13 libsox-dev 14.4.2 and conda-forge sox. Output pasted unedited except shortened site-packages paths, cut tracebacks and trimmed warning lines. PlainTables is our extension; torchaudio and SoX are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

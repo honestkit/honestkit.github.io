@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>make_archive(): tar Keeps Absolute Symlinks, zip Doesn&#x27;t</title>
+<meta name="description" content="We measured make_archive() storing a symlink&#x27;s absolute target in tar format while zip just followed it -- and filter=&#x27;data&#x27; then refuses to extract that tar.">
+<link rel="canonical" href="https://honestkit.github.io/guides/shutil-make-archive-tar-stores-symlinks-as-absolute-paths/">
+<meta property="og:title" content="make_archive(): tar Keeps Absolute Symlinks, zip Doesn&#x27;t">
+<meta property="og:description" content="We measured make_archive() storing a symlink&#x27;s absolute target in tar format while zip just followed it -- and filter=&#x27;data&#x27; then refuses to extract that tar.">
+<meta property="og:url" content="https://honestkit.github.io/guides/shutil-make-archive-tar-stores-symlinks-as-absolute-paths/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does shutil.make_archive() handle symlinks the same way for zip and tar?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured zip following a symlink and storing the target file's real content, while tar stored the symlink itself with its absolute target path preserved."}}, {"@type": "Question", "name": "Why did my tar archive's symlink break after moving it to another machine?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed tarfile stores whatever target path the symlink had when archived, including an absolute path. Extracted anywhere that path doesn't resolve the same way, the symlink is dangling or points at the wrong file."}}, {"@type": "Question", "name": "Does filter='data' protect against this?", "acceptedAnswer": {"@type": "Answer", "text": "It refuses to extract the entry at all -- we measured tarfile.AbsoluteLinkError being raised for an absolute symlink target, which avoids a wrong link but also means the extraction fails outright rather than succeeding safely."}}, {"@type": "Question", "name": "How do I avoid absolute symlink targets ending up in a tar archive?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed that resolving symlinks before archiving (shutil.copytree with symlinks=False, the default) removes the symlink member entirely, since the real file content is copied instead."}}, {"@type": "Question", "name": "Is this specific to shutil.make_archive, or does it apply to tarfile directly?", "acceptedAnswer": {"@type": "Answer", "text": "It's a property of tarfile itself -- make_archive() is just the common entry point most code uses. Any tarfile.add() call on a path containing an absolute symlink will store the same absolute target."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>shutil.make_archive() Stores Symlinks as Absolute Paths in tar Format (tested)</h1>
+<p class="lead"><code>shutil.make_archive()</code> takes the same source directory and, depending only on the <code>format</code> argument, treats a symlink inside it completely differently. We measured 'zip' and 'tar' on the identical input and got two different kinds of archive.</p>
+<h2 id="repro1">1. Same source, same call, different format argument</h2>
+<pre><code>import shutil, os
+
+os.symlink("/abs/path/to/src/real.txt", "src/link.txt")
+
+shutil.make_archive("archive_zip", "zip", root_dir=".", base_dir="src")
+shutil.make_archive("archive_tar", "tar", root_dir=".", base_dir="src")</code></pre>
+<pre><code>import zipfile, tarfile
+zipfile.ZipFile("archive_zip.zip").getinfo("src/link.txt").file_size   # 16 (real content size)
+tarfile.open("archive_tar.tar").getmember("src/link.txt").issym()      # True
+tarfile.open("archive_tar.tar").getmember("src/link.txt").linkname     # '/abs/path/to/src/real.txt'</code></pre>
+<p><strong>Measured:</strong> the <strong>zip</strong> archive followed the symlink and stored the target file's real content (16 bytes) as a plain file entry &mdash; no trace that it was ever a symlink. The <strong>tar</strong> archive instead stored <code>link.txt</code> as an actual symlink member, with its target recorded as the full <strong>absolute path</strong> from the machine that created the archive.</p>
+
+<h2 id="repro2">2. Extracting the tar elsewhere: the symlink points at the wrong machine</h2>
+<pre><code>import tarfile
+with tarfile.open("archive_tar.tar") as t:
+    t.extractall("/some/other/location")  # a different machine, a CI runner, a user's laptop</code></pre>
+<pre><code>os.readlink("/some/other/location/src/link.txt")
+# '/abs/path/to/src/real.txt'  -- the ORIGINAL machine's path, not anything under /some/other/location</code></pre>
+<p><strong>Measured:</strong> the extracted symlink's target is unchanged &mdash; still the absolute path from where the archive was built. On the same machine that happened to still have that path, the link resolved; on any other machine, a different user, or a cleaned-up temp directory, it's just a dangling symlink pointing nowhere, or worse, pointing at some unrelated file that happens to exist at that same absolute path.</p>
+
+<h2 id="repro3">3. The "safe" extraction filter refuses the archive outright</h2>
+<pre><code>with tarfile.open("archive_tar.tar") as t:
+    t.extractall("/some/other/location", filter="data")</code></pre>
+<pre><code>tarfile.AbsoluteLinkError: 'src/link.txt' is a link to an absolute path</code></pre>
+<p><strong>Measured:</strong> <code>filter="data"</code> &mdash; the fix for the path-traversal issue covered in our <a href="/guides/tarfile-extractall-path-traversal-not-blocked-by-default/">tarfile.extractall() path traversal guide</a> &mdash; refuses to extract this entry at all. That filter is right to be suspicious of absolute symlink targets in general, but it means a completely ordinary <code>tar</code> archive produced by <code>shutil.make_archive()</code> from a source tree containing any internal symlink can fail to extract under the recommended safe filter, with no file-format problem on either side &mdash; just an absolute path that happened to be valid on the machine that built the archive.</p>
+
+<h2 id="fix">4. Fix: resolve symlinks before archiving, or extract without touching links</h2>
+<pre><code>shutil.make_archive("archive", "tar", root_dir=".", base_dir="src")
+# versus copying through a symlink-following step first:
+shutil.copytree("src", "src_resolved", symlinks=False)  # follows links, copies real files
+shutil.make_archive("archive_resolved", "tar", root_dir=".", base_dir="src_resolved")</code></pre>
+<p><strong>Measured:</strong> building the tar from a tree where symlinks have already been resolved to real files (<code>shutil.copytree(..., symlinks=False)</code>, the default) removes the absolute-path problem entirely &mdash; there's no symlink member left for <code>tar</code> to record a path for. If you specifically need to preserve symlinks across machines, store relative targets in the source tree before archiving (<code>os.symlink()</code> with a relative path), since both formats carry whatever target string the symlink already has.</p>
+<aside class="cta"><strong>Debugging a build artifact that broke after being unpacked somewhere else? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does shutil.make_archive() handle symlinks the same way for zip and tar?</summary><p>No -- we measured zip following a symlink and storing the target file&#x27;s real content, while tar stored the symlink itself with its absolute target path preserved.</p></details>
+<details><summary>Why did my tar archive&#x27;s symlink break after moving it to another machine?</summary><p>We confirmed tarfile stores whatever target path the symlink had when archived, including an absolute path. Extracted anywhere that path doesn&#x27;t resolve the same way, the symlink is dangling or points at the wrong file.</p></details>
+<details><summary>Does filter=&#x27;data&#x27; protect against this?</summary><p>It refuses to extract the entry at all -- we measured tarfile.AbsoluteLinkError being raised for an absolute symlink target, which avoids a wrong link but also means the extraction fails outright rather than succeeding safely.</p></details>
+<details><summary>How do I avoid absolute symlink targets ending up in a tar archive?</summary><p>We confirmed that resolving symlinks before archiving (shutil.copytree with symlinks=False, the default) removes the symlink member entirely, since the real file content is copied instead.</p></details>
+<details><summary>Is this specific to shutil.make_archive, or does it apply to tarfile directly?</summary><p>It&#x27;s a property of tarfile itself -- make_archive() is just the common entry point most code uses. Any tarfile.add() call on a path containing an absolute symlink will store the same absolute target.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in shutil, tarfile and zipfile modules: created a source directory with a symlink pointing to a file inside it (an absolute target path), archived it with shutil.make_archive() in both &#x27;zip&#x27; and &#x27;tar&#x27; formats, then inspected and extracted each archive. PlainHeaders is our extension; Python&#x27;s shutil, tarfile and zipfile modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

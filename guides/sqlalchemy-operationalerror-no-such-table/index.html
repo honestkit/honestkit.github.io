@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLAlchemy OperationalError: no such table (Tested)</title>
+<meta name="description" content="SQLAlchemy (sqlite3.OperationalError) no such table, tested on 2.1.6: create_all never ran, models imported too late, relative sqlite:/// paths, in-memory DBs.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlalchemy-operationalerror-no-such-table/">
+<meta property="og:title" content="SQLAlchemy OperationalError: no such table (Tested)">
+<meta property="og:description" content="SQLAlchemy (sqlite3.OperationalError) no such table, tested on 2.1.6: create_all never ran, models imported too late, relative sqlite:/// paths, in-memory DBs.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlalchemy-operationalerror-no-such-table/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does SQLAlchemy create tables automatically?", "acceptedAnswer": {"@type": "Answer", "text": "No. Call Base.metadata.create_all(engine) after importing all models, or run your migrations (Alembic / flask db upgrade)."}}, {"@type": "Question", "name": "Why does create_all not create my table?", "acceptedAnswer": {"@type": "Answer", "text": "The model's module was not imported before create_all ran, so the table was not registered on Base.metadata. Import all model modules first."}}, {"@type": "Question", "name": "Why does it work in one directory but not another?", "acceptedAnswer": {"@type": "Answer", "text": "sqlite:///app.db is relative to the current working directory. Build an absolute path from __file__."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLAlchemy OperationalError: no such table (tested)</h1>
+<p class="lead"><code>sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) no such table</code> means the database you connected to does not contain that table. We reproduced four causes: <code>create_all()</code> never ran, it ran before the models were imported, a relative <code>sqlite:///</code> path opened a different file, and an in-memory database seen through a second connection.</p>
+<p>Blocks 1-4 import this <code>models.py</code>:</p>
+<pre><code>from sqlalchemy import String
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+class Base(DeclarativeBase): pass
+class User(Base):
+    __tablename__ = &quot;users&quot;
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String)</code></pre>
+<h2 id="test">1. The error</h2>
+<pre><code>from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+from models import User
+engine = create_engine(&quot;sqlite:///app.db&quot;)       # tables were never created
+with Session(engine) as s:
+    s.scalars(select(User)).all()</code></pre>
+<p>Output (last lines of the traceback):</p>
+<pre><code>    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) no such table: users
+[SQL: SELECT users.id, users.email 
+FROM users]
+(Background on this error at: https://sqlalche.me/e/21/e3q8)</code></pre>
+<p>SQLAlchemy never creates tables on its own. Declaring a model only describes the table; <code>create_engine("sqlite:///app.db")</code> creates an empty file on first connect. Until something runs <code>Base.metadata.create_all(engine)</code> or a migration (<code>alembic upgrade head</code>, <code>flask db upgrade</code>), the table does not exist.</p>
+<h2 id="import">2. create_all ran, but before the models were imported</h2>
+<pre><code>from sqlalchemy.orm import DeclarativeBase
+class Base(DeclarativeBase): pass</code></pre>
+<pre><code>from sqlalchemy.orm import Mapped, mapped_column
+from base import Base
+class Post(Base):
+    __tablename__ = &quot;posts&quot;
+    id: Mapped[int] = mapped_column(primary_key=True)</code></pre>
+<pre><code>from sqlalchemy import create_engine, inspect
+from base import Base
+engine = create_engine(&quot;sqlite://&quot;)
+Base.metadata.create_all(engine)          # post.py not imported yet: Base knows no tables
+print(&quot;before import:&quot;, inspect(engine).get_table_names())
+import post                               # registering the model adds it to Base.metadata
+Base.metadata.create_all(engine)
+print(&quot;after import: &quot;, inspect(engine).get_table_names())</code></pre>
+<p>Output:</p>
+<pre><code>before import: []
+after import:  [&#x27;posts&#x27;]</code></pre>
+<p><code>create_all</code> only creates tables registered on <code>Base.metadata</code> at the moment it runs, and a model registers itself when its module is imported. In apps that split models into files, import every model module before calling <code>create_all</code>; otherwise it silently creates nothing.</p>
+<h2 id="cwd">3. A relative sqlite:/// path points somewhere else</h2>
+<pre><code>import os
+from sqlalchemy import create_engine, inspect
+from models import Base
+os.makedirs(&quot;/w/project&quot;, exist_ok=True); os.chdir(&quot;/w/project&quot;)
+engine = create_engine(&quot;sqlite:///app.db&quot;)
+Base.metadata.create_all(engine)                 # creates /w/project/app.db
+os.chdir(&quot;/w&quot;)                                   # e.g. run from another directory, or by cron/systemd
+engine2 = create_engine(&quot;sqlite:///app.db&quot;)      # relative: a NEW empty /w/app.db
+print(engine2.url.database, &quot;-&gt;&quot;, os.path.abspath(engine2.url.database))
+print(&quot;tables:&quot;, inspect(engine2).get_table_names())</code></pre>
+<p>Output:</p>
+<pre><code>app.db -&gt; /w/app.db
+tables: []</code></pre>
+<p><code>sqlite:///app.db</code> (three slashes) is relative to the <strong>current working directory</strong>, not to your script. Run from another directory, by cron, systemd, a test runner or an IDE, and SQLite silently creates a new empty <code>app.db</code> there. Print <code>engine.url.database</code> and its absolute path when debugging.</p>
+<h2 id="memory">4. In-memory SQLite with more than one connection</h2>
+<pre><code>from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.pool import QueuePool
+from models import Base
+# in-memory SQLite: every new connection is a brand-new empty database
+engine = create_engine(&quot;sqlite://&quot;, poolclass=QueuePool)
+with engine.connect() as c1, engine.connect() as c2:
+    Base.metadata.create_all(c1); c1.commit()
+    print(&quot;c1:&quot;, inspect(c1).get_table_names())
+    print(&quot;c2:&quot;, inspect(c2).get_table_names())</code></pre>
+<p>Output:</p>
+<pre><code>c1: [&#x27;users&#x27;]
+c2: []</code></pre>
+<p>Each connection to <code>sqlite://</code> (in-memory) is a separate, empty database. Tables created on one connection are missing on another. By default SQLAlchemy keeps one in-memory connection per thread (<code>SingletonThreadPool</code>), so a forced pool or a second thread (common in tests and web servers) triggers this. Use a file, or <code>poolclass=StaticPool</code> with <code>connect_args={"check_same_thread": False}</code> so every session shares one connection.</p>
+<h2 id="fix">5. Fix: absolute path, then create_all (or migrate)</h2>
+<pre><code>from pathlib import Path
+from sqlalchemy import create_engine, inspect
+from models import Base
+DB = Path(__file__).resolve().parent / &quot;data.db&quot;     # absolute, independent of the cwd
+engine = create_engine(f&quot;sqlite:///{DB}&quot;)
+Base.metadata.create_all(engine)                     # no-op for tables that already exist
+print(engine.url.database)
+print(&quot;tables:&quot;, inspect(engine).get_table_names())</code></pre>
+<p>Output:</p>
+<pre><code>/w/data.db
+tables: [&#x27;users&#x27;]</code></pre>
+<p>Build the path from <code>__file__</code> (four slashes in the URL for an absolute path, as printed above), import all models, then call <code>create_all</code>; it skips tables that already exist. For a database that already has data and needs schema changes, use Alembic migrations instead.</p>
+<p>Related: <a href="/guides/sqlite-no-such-table/">sqlite3 no such table (3 causes)</a> · <a href="/guides/sqlalchemy-integrityerror-unique-constraint-failed/">SQLAlchemy IntegrityError</a> · <a href="/guides/sqlalchemy-detachedinstanceerror-not-bound-to-a-session/">SQLAlchemy DetachedInstanceError</a>.</p>
+
+<aside class="cta"><strong>Collecting data from web tables? Copy them as CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does SQLAlchemy create tables automatically?</summary><p>No. Call Base.metadata.create_all(engine) after importing all models, or run your migrations (Alembic / flask db upgrade).</p></details>
+<details><summary>Why does create_all not create my table?</summary><p>The model&#x27;s module was not imported before create_all ran, so the table was not registered on Base.metadata. Import all model modules first.</p></details>
+<details><summary>Why does it work in one directory but not another?</summary><p>sqlite:///app.db is relative to the current working directory. Build an absolute path from __file__.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with SQLAlchemy 2.1.6 and Python 3.14.7 (python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited (block 1 shows the last 5 lines of the traceback). PlainTables is our extension; Python and SQLAlchemy are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

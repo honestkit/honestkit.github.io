@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to Suppress pandas Warnings (Tested on pandas 2 and 3)</title>
+<meta name="description" content="Silence pandas FutureWarning, PerformanceWarning and SettingWithCopyWarning by category, per block or with -W, and the traps on pandas 3. Tested: 2.3.3, 3.1.0.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pandas-suppress-warnings/">
+<meta property="og:title" content="How to Suppress pandas Warnings (Tested on pandas 2 and 3)">
+<meta property="og:description" content="Silence pandas FutureWarning, PerformanceWarning and SettingWithCopyWarning by category, per block or with -W, and the traps on pandas 3. Tested: 2.3.3, 3.1.0.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pandas-suppress-warnings/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I turn off all pandas warnings?", "acceptedAnswer": {"@type": "Answer", "text": "warnings.simplefilter('ignore') inside a with warnings.catch_warnings(): block, or filterwarnings('ignore', category=...) per class. A global ignore also hides warnings about results that will change."}}, {"@type": "Question", "name": "How do I suppress SettingWithCopyWarning?", "acceptedAnswer": {"@type": "Answer", "text": "On pandas 2, filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning). pandas 3 removed the warning; the mode.chained_assignment option now only emits a Pandas4Warning."}}, {"@type": "Question", "name": "Why does python -W ignore::pandas.errors.PerformanceWarning not work?", "acceptedAnswer": {"@type": "Answer", "text": "-W is parsed before pandas is imported, so Python reports Invalid -W option ignored. Use a message filter such as -W 'ignore:DataFrame is highly fragmented'."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to suppress pandas warnings (tested on pandas 2 and 3)</h1>
+<p class="lead">Use <code>warnings.filterwarnings("ignore", category=...)</code> with the exact pandas class, ideally inside <code>warnings.catch_warnings()</code>. Measured traps: <code>module="pandas"</code> matches nothing, <code>-W ignore::pandas.errors.X</code> is rejected, and on pandas 3 <code>Pandas4Warning</code> is a DeprecationWarning, so ignoring FutureWarning misses it.</p>
+<p>All blocks import this helper, which triggers four common pandas warnings:</p>
+<pre><code># noisy.py
+import pandas as pd
+def noisy():
+    df = pd.DataFrame({&quot;a&quot;: range(3)})
+    for i in range(101):
+        df[f&quot;c{i}&quot;] = i                                   # fragmented frame
+    pd.Series([1, None, 3], dtype=object).fillna(0)       # downcasting
+    pd.concat([pd.DataFrame({&quot;x&quot;: [1.0]}), pd.DataFrame({&quot;x&quot;: [None]})])
+    sub = df[df[&quot;a&quot;] &gt; 0]
+    sub[&quot;a&quot;] = 0                                          # chained assignment</code></pre>
+<h2 id="which">1. Which warnings you actually get</h2>
+<pre><code>import warnings, collections
+import pandas as pd
+from noisy import noisy
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter(&quot;always&quot;)
+    noisy()
+print(pd.__version__, collections.Counter(type(w.message).__name__ for w in caught))
+print([n for n in dir(pd.errors) if n.endswith(&quot;Warning&quot;)])</code></pre>
+<p>Output with pandas 2.3.3:</p>
+<pre><code>2.3.3 Counter({&#x27;PerformanceWarning&#x27;: 2, &#x27;FutureWarning&#x27;: 2, &#x27;SettingWithCopyWarning&#x27;: 1})
+[&#x27;AttributeConflictWarning&#x27;, &#x27;CSSWarning&#x27;, &#x27;CategoricalConversionWarning&#x27;, &#x27;DtypeWarning&#x27;, &#x27;IncompatibilityWarning&#x27;, &#x27;ParserWarning&#x27;, &#x27;PerformanceWarning&#x27;, &#x27;SettingWithCopyWarning&#x27;]</code></pre>
+<p>Output with pandas 3.1.0:</p>
+<pre><code>3.1.0 Counter({&#x27;PerformanceWarning&#x27;: 2})
+[&#x27;AttributeConflictWarning&#x27;, &#x27;CSSWarning&#x27;, &#x27;CategoricalConversionWarning&#x27;, &#x27;DtypeWarning&#x27;, &#x27;IncompatibilityWarning&#x27;, &#x27;Pandas4Warning&#x27;, &#x27;Pandas5Warning&#x27;, &#x27;PandasChangeWarning&#x27;, &#x27;PandasDeprecationWarning&#x27;, &#x27;PandasFutureWarning&#x27;, &#x27;PandasPendingDeprecationWarning&#x27;, &#x27;ParserWarning&#x27;, &#x27;PerformanceWarning&#x27;, &#x27;_CurrentDeprecationWarning&#x27;]</code></pre>
+<p>The same code gives five warnings on pandas 2.3.3 and two on 3.1.0. pandas 3 removed <code>SettingWithCopyWarning</code> (copy-on-write makes <code>sub</code> an independent copy), and the fillna/concat behaviour that used to raise FutureWarnings is now simply the default. Before silencing anything, check whether the warning is telling you about a result that will change: see <a href="/guides/pandas-futurewarning-downcasting-object-dtype-arrays-on-fillna/">fillna downcasting</a>, <a href="/guides/pandas-futurewarning-concat-empty-or-all-na-entries/">concat empty entries</a> and <a href="/guides/pandas-groupby-futurewarning/">groupby FutureWarnings</a>.</p>
+<h2 id="category">2. Silence by category (and why module="pandas" does not work)</h2>
+<pre><code>import warnings, collections
+import pandas as pd
+from noisy import noisy
+def count():
+    with warnings.catch_warnings(record=True) as caught:
+        noisy()
+    return dict(collections.Counter(type(w.message).__name__ for w in caught))
+warnings.simplefilter(&quot;always&quot;)
+warnings.filterwarnings(&quot;ignore&quot;, category=pd.errors.PerformanceWarning)
+print(&quot;ignore PerformanceWarning:&quot;, count())
+warnings.filterwarnings(&quot;ignore&quot;, category=FutureWarning)
+print(&quot;+ ignore FutureWarning:   &quot;, count())
+warnings.filterwarnings(&quot;ignore&quot;, category=Warning, module=&quot;pandas&quot;)
+print(&quot;+ module=&#x27;pandas&#x27;:        &quot;, count())</code></pre>
+<p>Output with pandas 2.3.3:</p>
+<pre><code>ignore PerformanceWarning: {&#x27;FutureWarning&#x27;: 2, &#x27;SettingWithCopyWarning&#x27;: 1}
++ ignore FutureWarning:    {&#x27;SettingWithCopyWarning&#x27;: 1}
++ module=&#x27;pandas&#x27;:         {&#x27;SettingWithCopyWarning&#x27;: 1}</code></pre>
+<p>Output with pandas 3.1.0:</p>
+<pre><code>ignore PerformanceWarning: {}
++ ignore FutureWarning:    {}
++ module=&#x27;pandas&#x27;:         {}</code></pre>
+<p>Filter on the class: <code>pd.errors.PerformanceWarning</code>, <code>FutureWarning</code>, and so on. Adding <code>module="pandas"</code> did nothing for the remaining <code>SettingWithCopyWarning</code>, because pandas reports warnings against <em>your</em> line (the <code>/w/noisy.py:9:</code> prefix in the -W output below), and <code>module=</code> matches that file, not the library that raised it.</p>
+<h2 id="classes">3. Know the class hierarchy</h2>
+<pre><code>import warnings
+import pandas as pd
+from noisy import noisy
+for name in [&quot;SettingWithCopyWarning&quot;, &quot;ChainedAssignmentError&quot;,
+             &quot;Pandas4Warning&quot;, &quot;PandasChangeWarning&quot;]:
+    cls = getattr(pd.errors, name, None)
+    print(name, &quot;-&gt;&quot;, [c.__name__ for c in cls.__mro__[1:-2]] if cls else &quot;not in this pandas&quot;)
+warnings.simplefilter(&quot;always&quot;)
+warnings.filterwarnings(&quot;ignore&quot;, category=pd.errors.PerformanceWarning)
+warnings.filterwarnings(&quot;ignore&quot;, category=FutureWarning)
+if hasattr(pd.errors, &quot;SettingWithCopyWarning&quot;):
+    warnings.filterwarnings(&quot;ignore&quot;, category=pd.errors.SettingWithCopyWarning)
+with warnings.catch_warnings(record=True) as caught:
+    noisy()
+print(len(caught), &quot;warnings left&quot;)</code></pre>
+<p>Output with pandas 2.3.3:</p>
+<pre><code>SettingWithCopyWarning -&gt; [&#x27;Warning&#x27;, &#x27;Exception&#x27;]
+ChainedAssignmentError -&gt; [&#x27;Warning&#x27;, &#x27;Exception&#x27;]
+Pandas4Warning -&gt; not in this pandas
+PandasChangeWarning -&gt; not in this pandas
+0 warnings left</code></pre>
+<p>Output with pandas 3.1.0:</p>
+<pre><code>SettingWithCopyWarning -&gt; not in this pandas
+ChainedAssignmentError -&gt; [&#x27;Warning&#x27;, &#x27;Exception&#x27;]
+Pandas4Warning -&gt; [&#x27;PandasDeprecationWarning&#x27;, &#x27;PandasChangeWarning&#x27;, &#x27;DeprecationWarning&#x27;, &#x27;Warning&#x27;, &#x27;Exception&#x27;]
+PandasChangeWarning -&gt; [&#x27;Warning&#x27;, &#x27;Exception&#x27;]
+0 warnings left</code></pre>
+<p>On pandas 2, <code>SettingWithCopyWarning</code> derives straight from <code>Warning</code>, so ignoring FutureWarning never touches it; filter it by name. On pandas 3 it no longer exists (guard with <code>hasattr</code> as above or your filter line raises <code>AttributeError</code>), and <code>Pandas4Warning</code> is a <strong>DeprecationWarning</strong>, not a FutureWarning, so <code>ignore::FutureWarning</code> does not hide it. The <code>hasattr</code> version silenced everything on both versions (0 left).</p>
+<h2 id="scoped">4. Silence one block only, and the chained_assignment option</h2>
+<pre><code>import warnings
+import pandas as pd
+from noisy import noisy
+with warnings.catch_warnings():
+    warnings.simplefilter(&quot;ignore&quot;)
+    noisy()                       # silent only inside the with block
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter(&quot;always&quot;)
+    noisy()
+print(len(caught), &quot;warnings after the block&quot;)
+try:
+    pd.set_option(&quot;mode.chained_assignment&quot;, None)
+    print(&quot;chained_assignment option:&quot;, pd.get_option(&quot;mode.chained_assignment&quot;))
+except Exception as e:
+    print(type(e).__name__, e)</code></pre>
+<p>Output with pandas 2.3.3:</p>
+<pre><code>5 warnings after the block
+chained_assignment option: None</code></pre>
+<p>Output with pandas 3.1.0:</p>
+<pre><code>/w/b3.py:12: Pandas4Warning: The &#x27;mode.chained_assignment&#x27; option is deprecated. It has had no effect since pandas 3.0, which removed the SettingWithCopyWarning it controlled. Chained assignment now emits a ChainedAssignmentError warning instead; use warnings.filterwarnings with category=ChainedAssignmentError to silence or escalate it. This option will be removed in pandas 4.0.
+  pd.set_option(&quot;mode.chained_assignment&quot;, None)
+/w/b3.py:13: Pandas4Warning: The &#x27;mode.chained_assignment&#x27; option is deprecated. It has had no effect since pandas 3.0, which removed the SettingWithCopyWarning it controlled. Chained assignment now emits a ChainedAssignmentError warning instead; use warnings.filterwarnings with category=ChainedAssignmentError to silence or escalate it. This option will be removed in pandas 4.0.
+  print(&quot;chained_assignment option:&quot;, pd.get_option(&quot;mode.chained_assignment&quot;))
+2 warnings after the block
+chained_assignment option: None</code></pre>
+<p><code>warnings.catch_warnings()</code> restores the previous filters when the block ends, so the second run shows the warnings again; prefer it to a global filter at the top of the file. <code>pd.set_option("mode.chained_assignment", None)</code> was the old way to hide SettingWithCopyWarning. On pandas 3.1.0 it does nothing and itself emits a <code>Pandas4Warning</code>; the message says to filter <code>ChainedAssignmentError</code> instead.</p>
+<h2 id="cli">5. From the command line: -W needs a message, not pandas.errors</h2>
+<pre><code>python -W "ignore::FutureWarning" -W "ignore::pandas.errors.PerformanceWarning" -c "from noisy import noisy; noisy(); print('done')"</code></pre>
+<p>Output with pandas 2.3.3:</p>
+<pre><code>Invalid -W option ignored: invalid module name: &#x27;pandas.errors&#x27;
+/w/noisy.py:5: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`
+  df[f&quot;c{i}&quot;] = i                                   # fragmented frame
+/w/noisy.py:5: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`
+  df[f&quot;c{i}&quot;] = i                                   # fragmented frame
+/w/noisy.py:9: SettingWithCopyWarning: 
+A value is trying to be set on a copy of a slice from a DataFrame.
+Try using .loc[row_indexer,col_indexer] = value instead
+
+See the caveats in the documentation: https://pandas.pydata.org/pandas-docs/stable/user_guide/indexing.html#returning-a-view-versus-a-copy
+  sub[&quot;a&quot;] = 0                                          # chained assignment
+done</code></pre>
+<p>Output with pandas 3.1.0:</p>
+<pre><code>Invalid -W option ignored: invalid module name: &#x27;pandas.errors&#x27;
+/w/noisy.py:5: PerformanceWarning: DataFrame is highly fragmented.  This is usually the result of calling `frame.insert` many times, which has poor performance.  Consider joining all columns at once using pd.concat(axis=1) instead. To get a de-fragmented frame, use `newframe = frame.copy()`
+  df[f&quot;c{i}&quot;] = i                                   # fragmented frame
+done</code></pre>
+<p>Python parses <code>-W</code> (and <code>PYTHONWARNINGS</code>) before pandas is imported, so it rejects the pandas class with <code>Invalid -W option ignored</code> and the PerformanceWarnings still print. Match the message text instead:</p>
+<pre><code>python -W "ignore:DataFrame is highly fragmented" -W "ignore::FutureWarning" -c "from noisy import noisy; noisy(); print('done')"</code></pre>
+<p>Output with pandas 2.3.3:</p>
+<pre><code>/w/noisy.py:9: SettingWithCopyWarning: 
+A value is trying to be set on a copy of a slice from a DataFrame.
+Try using .loc[row_indexer,col_indexer] = value instead
+
+See the caveats in the documentation: https://pandas.pydata.org/pandas-docs/stable/user_guide/indexing.html#returning-a-view-versus-a-copy
+  sub[&quot;a&quot;] = 0                                          # chained assignment
+done</code></pre>
+<p>Output with pandas 3.1.0:</p>
+<pre><code>done</code></pre>
+<p>Related: <a href="/guides/pandas-3-breaking-changes/">all pandas 3 breaking changes</a> · <a href="/guides/pandas-settingwithcopywarning/">SettingWithCopyWarning</a> · <a href="/guides/pandas-performancewarning-dataframe-is-highly-fragmented/">DataFrame is highly fragmented</a> · <a href="/guides/pandas-to-datetime-errors-ignore-deprecated/">to_datetime errors='ignore' deprecated</a>.</p>
+
+<aside class="cta"><strong>Pulling a table off a web page into pandas? Copy it as CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I turn off all pandas warnings?</summary><p>warnings.simplefilter(&#x27;ignore&#x27;) inside a with warnings.catch_warnings(): block, or filterwarnings(&#x27;ignore&#x27;, category=...) per class. A global ignore also hides warnings about results that will change.</p></details>
+<details><summary>How do I suppress SettingWithCopyWarning?</summary><p>On pandas 2, filterwarnings(&#x27;ignore&#x27;, category=pd.errors.SettingWithCopyWarning). pandas 3 removed the warning; the mode.chained_assignment option now only emits a Pandas4Warning.</p></details>
+<details><summary>Why does python -W ignore::pandas.errors.PerformanceWarning not work?</summary><p>-W is parsed before pandas is imported, so Python reports Invalid -W option ignored. Use a message filter such as -W &#x27;ignore:DataFrame is highly fragmented&#x27;.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 in the python:3-alpine Docker image (Python 3.14.7) with pandas 2.3.3 and pandas 3.1.0. Every block and command was run as shown; outputs pasted unedited. PlainTables is our extension; Python and pandas are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>requests SSLError: HTTPSConnectionPool Max Retries (Tested)</title>
+<meta name="description" content="requests.exceptions.SSLError HTTPSConnectionPool decoded: 4 causes (self-signed, missing CA, hostname, wrong version number) and the fixes we tested.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-requests-sslerror-httpsconnectionpool/">
+<meta property="og:title" content="requests SSLError: HTTPSConnectionPool Max Retries (Tested)">
+<meta property="og:description" content="requests.exceptions.SSLError HTTPSConnectionPool decoded: 4 causes (self-signed, missing CA, hostname, wrong version number) and the fixes we tested.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-requests-sslerror-httpsconnectionpool/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes requests SSLError HTTPSConnectionPool Max retries exceeded?", "acceptedAnswer": {"@type": "Answer", "text": "A TLS handshake failure. Read the reason inside Caused by SSLError: self-signed certificate, unable to get local issuer certificate, Hostname mismatch, or WRONG_VERSION_NUMBER."}}, {"@type": "Question", "name": "How do I fix CERTIFICATE_VERIFY_FAILED in requests?", "acceptedAnswer": {"@type": "Answer", "text": "Pass verify='/path/to/ca.pem' (or set REQUESTS_CA_BUNDLE) pointing at the CA that signed the server certificate. Upgrade certifi if the bundle is outdated."}}, {"@type": "Question", "name": "Is verify=False safe?", "acceptedAnswer": {"@type": "Answer", "text": "No. It disables certificate and hostname checks and prints InsecureRequestWarning. Use it only to confirm the problem, then fix the CA trust."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>requests.exceptions.SSLError: HTTPSConnectionPool Max retries exceeded (tested)</h1>
+<p class="lead"><code>requests.exceptions.SSLError: HTTPSConnectionPool(...): Max retries exceeded with url ... (Caused by SSLError(...))</code> is a TLS failure, not a retry problem. The reason inside tells you the fix. We reproduced four reasons against local servers and tested <code>verify=</code>, <code>REQUESTS_CA_BUNDLE</code> and <code>verify=False</code>.</p>
+<p>Setup: a test root CA and three server certificates made with openssl (self-signed, signed by the private CA, and one issued for the wrong hostname), served by this helper on localhost ports 8963-8966:</p>
+<pre><code>import http.server, ssl, threading
+
+class Quiet(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *a): pass
+
+def serve(certfile, port, tls=True):
+    srv = http.server.HTTPServer((&quot;localhost&quot;, port), Quiet)
+    if tls:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv</code></pre>
+<h2 id="test">1. The error</h2>
+<pre><code>import requests
+from tlsserver import serve
+
+serve(&quot;selfsigned.pem&quot;, 8963)
+try:
+    requests.get(&quot;https://localhost:8963/&quot;, timeout=5)
+except Exception as e:
+    print(f&quot;{type(e).__module__}.{type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>requests.exceptions.SSLError: HTTPSConnectionPool(host=&#x27;localhost&#x27;, port=8963): Max retries exceeded with url: / (Caused by SSLError(SSLCertVerificationError(1, &#x27;[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1029)&#x27;)))</code></pre>
+<p>requests wraps the real error twice: urllib3 retries the connection, gives up with <code>Max retries exceeded</code>, and the actual cause is inside <code>Caused by SSLError(...)</code>. Ignore the HTTPSConnectionPool and retries text; the reason after <code>certificate verify failed:</code> tells you which fix you need.</p>
+<h2 id="causes">2. Four causes, four different reasons</h2>
+<pre><code>import requests
+from tlsserver import serve
+
+cases = {&quot;self-signed&quot;: (&quot;selfsigned.pem&quot;, True, True),
+         &quot;private CA&quot;: (&quot;leaf.pem&quot;, True, True),
+         &quot;wrong hostname (CA trusted)&quot;: (&quot;wrongname.pem&quot;, True, &quot;ca.pem&quot;),
+         &quot;plain HTTP port&quot;: (None, False, True)}
+for port, (label, (cert, tls, verify)) in enumerate(cases.items(), start=8963):
+    serve(cert, port, tls=tls)
+    try:
+        requests.get(f&quot;https://localhost:{port}/&quot;, verify=verify, timeout=5)
+    except requests.exceptions.SSLError as e:
+        print(f&quot;{label}:\n  {e}\n&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>self-signed:
+  HTTPSConnectionPool(host=&#x27;localhost&#x27;, port=8963): Max retries exceeded with url: / (Caused by SSLError(SSLCertVerificationError(1, &#x27;[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1029)&#x27;)))
+
+private CA:
+  HTTPSConnectionPool(host=&#x27;localhost&#x27;, port=8964): Max retries exceeded with url: / (Caused by SSLError(SSLCertVerificationError(1, &#x27;[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1029)&#x27;)))
+
+wrong hostname (CA trusted):
+  HTTPSConnectionPool(host=&#x27;localhost&#x27;, port=8965): Max retries exceeded with url: / (Caused by SSLError(SSLCertVerificationError(1, &quot;[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for &#x27;localhost&#x27;. (_ssl.c:1029)&quot;)))
+
+plain HTTP port:
+  HTTPSConnectionPool(host=&#x27;localhost&#x27;, port=8966): Max retries exceeded with url: / (Caused by SSLError(SSLError(1, &#x27;[SSL: WRONG_VERSION_NUMBER] wrong version number (_ssl.c:1029)&#x27;)))</code></pre>
+<ul><li><code>self-signed certificate</code>: the server presents its own certificate. Trust that exact certificate (pass it as <code>verify=</code>) or get a real one.</li><li><code>unable to get local issuer certificate</code>: signed by a CA your bundle does not contain (corporate proxy, internal CA, or a server missing its intermediate certificate). Point <code>verify</code> at the CA file.</li><li><code>Hostname mismatch</code>: the certificate is valid but for a different name. Use the hostname on the certificate, not an IP or alias.</li><li><code>WRONG_VERSION_NUMBER</code>: not a certificate problem at all. You used <code>https://</code> on a port that speaks plain HTTP (or a proxy that does). Use <code>http://</code> or the right port.</li></ul>
+<h2 id="reason">3. Get the reason in code</h2>
+<pre><code>import requests
+from tlsserver import serve
+
+serve(&quot;leaf.pem&quot;, 8963)
+try:
+    requests.get(&quot;https://localhost:8963/&quot;, timeout=5)
+except requests.exceptions.SSLError as e:
+    reason = e.args[0].reason          # urllib3&#x27;s MaxRetryError -&gt; the underlying SSL error
+    print(&quot;reason:&quot;, reason.args[0])
+    print(&quot;is ConnectionError:&quot;, isinstance(e, requests.exceptions.ConnectionError))</code></pre>
+<p>Output:</p>
+<pre><code>reason: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1029)
+is ConnectionError: True</code></pre>
+<p><code>requests.exceptions.SSLError</code> is a subclass of <code>ConnectionError</code>, so <code>except requests.exceptions.ConnectionError</code> also catches it. Put the <code>SSLError</code> clause first if you want to handle it separately.</p>
+<h2 id="fix">4. Fix: tell requests which CA to trust</h2>
+<pre><code>import requests
+from tlsserver import serve
+
+serve(&quot;leaf.pem&quot;, 8963)                       # cert signed by our private CA
+r = requests.get(&quot;https://localhost:8963/&quot;, verify=&quot;ca.pem&quot;, timeout=5)
+print(&quot;verify=&#x27;ca.pem&#x27;:&quot;, r.status_code)
+
+s = requests.Session()
+s.verify = &quot;ca.pem&quot;                           # applies to every request in the session
+print(&quot;session.verify:&quot;, s.get(&quot;https://localhost:8963/&quot;, timeout=5).status_code)</code></pre>
+<p>Output:</p>
+<pre><code>verify=&#x27;ca.pem&#x27;: 200
+session.verify: 200</code></pre>
+<pre><code>import os
+os.environ[&quot;REQUESTS_CA_BUNDLE&quot;] = &quot;ca.pem&quot;   # or export it in the shell
+import requests
+from tlsserver import serve
+
+serve(&quot;leaf.pem&quot;, 8963)
+print(&quot;REQUESTS_CA_BUNDLE:&quot;, requests.get(&quot;https://localhost:8963/&quot;, timeout=5).status_code)</code></pre>
+<p>Output:</p>
+<pre><code>REQUESTS_CA_BUNDLE: 200</code></pre>
+<p><code>verify=</code> takes a path to a PEM bundle (or a directory prepared with <code>c_rehash</code>). <code>REQUESTS_CA_BUNDLE</code> sets the same thing for every request without code changes. Note that this replaces the default bundle: if you point it at only your private CA, public sites will fail. Append your CA to a copy of the default bundle if you need both.</p>
+<h2 id="bundle">5. Which bundle requests uses by default</h2>
+<pre><code>import requests, certifi
+print(&quot;requests&quot;, requests.__version__)
+print(&quot;default bundle:&quot;, requests.utils.DEFAULT_CA_BUNDLE_PATH)
+print(&quot;certifi.where():&quot;, certifi.where())</code></pre>
+<p>Output:</p>
+<pre><code>requests 2.32.3
+default bundle: /etc/ssl/certs/ca-certificates.crt
+certifi.where(): /etc/ssl/certs/ca-certificates.crt</code></pre>
+<p>That was Debian's packaged requests, whose certifi is patched to use the system store. With requests installed by pip (python:3-alpine, requests 2.34.2) it is certifi's own file:</p>
+<pre><code>requests 2.34.2
+default bundle: /usr/local/lib/python3.14/site-packages/certifi/cacert.pem
+certifi.where(): /usr/local/lib/python3.14/site-packages/certifi/cacert.pem</code></pre>
+<p>So adding a CA to the operating system trust store does not help a pip-installed requests; use <code>verify=</code> or <code>REQUESTS_CA_BUNDLE</code>. Upgrading certifi (<code>pip install -U certifi</code>) fixes errors caused by an outdated bundle.</p>
+<h2 id="insecure">6. verify=False works, but only as a diagnostic</h2>
+<pre><code>import requests
+from tlsserver import serve
+
+serve(&quot;selfsigned.pem&quot;, 8963)
+r = requests.get(&quot;https://localhost:8963/&quot;, verify=False, timeout=5)
+print(&quot;verify=False:&quot;, r.status_code)</code></pre>
+<p>Output:</p>
+<pre><code>/usr/lib/python3/dist-packages/urllib3/connectionpool.py:1109: InsecureRequestWarning: Unverified HTTPS request is being made to host &#x27;localhost&#x27;. Adding certificate verification is strongly advised. See: https://urllib3.readthedocs.io/en/latest/advanced-usage.html#tls-warnings
+  warnings.warn(
+verify=False: 200</code></pre>
+<p>It returns 200 and urllib3 prints <code>InsecureRequestWarning</code> on every request. It also disables the hostname check, so anyone in the path can read and change the traffic. Use it once to confirm the problem is the certificate, then fix the trust as in step 4. For the wrong-version case, switch the scheme instead:</p>
+<pre><code>import requests
+from tlsserver import serve
+
+serve(None, 8966, tls=False)                   # a server that only speaks plain HTTP
+print(&quot;http://&quot;, requests.get(&quot;http://localhost:8966/&quot;, timeout=5).status_code)</code></pre>
+<p>Output:</p>
+<pre><code>http:// 200</code></pre>
+<p>Related: <a href="/guides/python-ssl-certificate-verify-failed/">SSL: CERTIFICATE_VERIFY_FAILED, 5 causes</a> · <a href="/guides/python-ssl-wrong-version-number/">SSL: WRONG_VERSION_NUMBER</a> · <a href="/guides/python-requests-connectionerror-max-retries/">requests ConnectionError: Max retries exceeded</a>.</p>
+
+<aside class="cta"><strong>Got past TLS? Check the headers and status the server actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes requests SSLError HTTPSConnectionPool Max retries exceeded?</summary><p>A TLS handshake failure. Read the reason inside Caused by SSLError: self-signed certificate, unable to get local issuer certificate, Hostname mismatch, or WRONG_VERSION_NUMBER.</p></details>
+<details><summary>How do I fix CERTIFICATE_VERIFY_FAILED in requests?</summary><p>Pass verify=&#x27;/path/to/ca.pem&#x27; (or set REQUESTS_CA_BUNDLE) pointing at the CA that signed the server certificate. Upgrade certifi if the bundle is outdated.</p></details>
+<details><summary>Is verify=False safe?</summary><p>No. It disables certificate and hostname checks and prints InsecureRequestWarning. Use it only to confirm the problem, then fix the CA trust.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Python 3.13.5 and requests 2.32.3 (Debian) against local HTTPS servers using certificates we generated with openssl 3; the default-bundle check was repeated with requests 2.34.2 from pip in python:3-alpine. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; requests is a free third-party library.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

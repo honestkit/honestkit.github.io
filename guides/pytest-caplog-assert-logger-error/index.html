@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pytest caplog: assert logger error (and why INFO is empty)</title>
+<meta name="description" content="Assert log messages in pytest with caplog: text, records, record_tuples. Why INFO logs are missing, logger= for named loggers, propagate=False fix.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pytest-caplog-assert-logger-error/">
+<meta property="og:title" content="pytest caplog: assert logger error (and why INFO is empty)">
+<meta property="og:description" content="Assert log messages in pytest with caplog: text, records, record_tuples. Why INFO logs are missing, logger= for named loggers, propagate=False fix.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pytest-caplog-assert-logger-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is caplog.text empty?", "acceptedAnswer": {"@type": "Answer", "text": "Either the message is below the logger's effective level (default WARNING, so use caplog.set_level), or the logger has propagate=False so records never reach caplog's root handler."}}, {"@type": "Question", "name": "How do I assert a specific log level in pytest?", "acceptedAnswer": {"@type": "Answer", "text": "Check caplog.record_tuples for (logger_name, logging.ERROR, message), or inspect caplog.records[i].levelno."}}, {"@type": "Question", "name": "How do I set the caplog level for every test?", "acceptedAnswer": {"@type": "Answer", "text": "Add log_level = INFO under [pytest] in pytest.ini (or the matching key in pyproject.toml)."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>pytest caplog: assert a logger error was logged (tested)</h1>
+<p class="lead">Use <code>caplog</code>: run the code, then <code>assert ("app", logging.ERROR, "disk full") in caplog.record_tuples</code>. If INFO messages are missing, call <code>caplog.set_level(logging.INFO)</code> first (the default level is WARNING); for a logger with its own level, pass <code>logger="app"</code>.</p>
+<p>The <code>caplog</code> fixture attaches a handler to the <strong>root</strong> logger for each test. You can assert on <code>caplog.text</code> (formatted lines), <code>caplog.messages</code>, <code>caplog.records</code> (<code>LogRecord</code> objects) or <code>caplog.record_tuples</code> (<code>(logger, level, message)</code>). Measured on pytest 9.1.1, Python 3.13.5.</p>
+<h2 id="assert">1. Assert that an error was logged (and why INFO is missing)</h2>
+<pre><code>$ cat test_cl.py
+import logging, pytest
+log = logging.getLogger(&quot;app&quot;)
+
+def work():
+    log.error(&quot;disk full&quot;)
+    log.info(&quot;done&quot;)
+
+def test_error(caplog):
+    work()
+    assert &quot;disk full&quot; in caplog.text
+    assert caplog.records[0].levelname == &quot;ERROR&quot;
+
+def test_info_default(caplog):
+    work()
+    assert &quot;done&quot; in caplog.text
+
+def test_info_level(caplog):
+    caplog.set_level(logging.INFO)
+    work()
+    assert &quot;done&quot; in caplog.text
+
+def test_tuples(caplog):
+    work()
+    assert (&quot;app&quot;, logging.ERROR, &quot;disk full&quot;) in caplog.record_tuples
+$ pytest -q | grep -E &quot;^E  |passed|failed&quot;
+E       AssertionError: assert &#x27;done&#x27; in &#x27;ERROR    app:test_cl.py:5 disk full\n&#x27;
+E        +  where &#x27;ERROR    app:test_cl.py:5 disk full\n&#x27; = &lt;_pytest.logging.LogCaptureFixture object at 0x7febc1b09d10&gt;.text
+1 failed, 3 passed in 0.01s</code></pre>
+<p><code>log.error()</code> is captured, but <code>log.info("done")</code> is not: with no configuration the root logger level is WARNING, so INFO and DEBUG records never reach caplog. Call <code>caplog.set_level(logging.INFO)</code> before the code under test (as <code>test_info_level</code> does), or set it for the whole suite:</p>
+<pre><code>$ cat pytest.ini
+[pytest]
+log_level = INFO
+$ pytest -q | tail -1
+4 passed in 0.01s</code></pre>
+<h2 id="named">2. Your app sets its own logger level, or propagate=False</h2>
+<pre><code>$ cat test_prop.py
+import logging
+log = logging.getLogger(&quot;app&quot;)
+log.setLevel(logging.WARNING)      # set by your app&#x27;s logging config
+
+def work():
+    log.warning(&quot;retrying&quot;)
+    log.info(&quot;connected&quot;)
+
+def test_root_level(caplog):
+    caplog.set_level(logging.INFO)              # root logger only
+    work()
+    assert &quot;connected&quot; in caplog.text
+
+def test_named_logger(caplog):
+    caplog.set_level(logging.INFO, logger=&quot;app&quot;)
+    work()
+    assert &quot;connected&quot; in caplog.text
+
+def test_no_propagate(caplog):
+    logging.getLogger(&quot;app&quot;).propagate = False  # e.g. dictConfig with propagate: False
+    try:
+        work()
+        assert &quot;retrying&quot; in caplog.text
+    finally:
+        logging.getLogger(&quot;app&quot;).propagate = True
+$ pytest -q | grep -E &quot;^E  |passed|failed|^-+ Captured|^retrying&quot;
+E       AssertionError: assert &#x27;connected&#x27; in &#x27;WARNING  app:test_prop.py:6 retrying\n&#x27;
+E        +  where &#x27;WARNING  app:test_prop.py:6 retrying\n&#x27; = &lt;_pytest.logging.LogCaptureFixture object at 0x7fd067ead2b0&gt;.text
+------------------------------ Captured log call -------------------------------
+E           AssertionError: assert &#x27;retrying&#x27; in &#x27;&#x27;
+E            +  where &#x27;&#x27; = &lt;_pytest.logging.LogCaptureFixture object at 0x7fd06810a5d0&gt;.text
+----------------------------- Captured stderr call -----------------------------
+retrying
+2 failed, 1 passed in 0.01s</code></pre>
+<p><code>caplog.set_level(logging.INFO)</code> only changes the root logger. If your app sets <code>logging.getLogger("app").setLevel(WARNING)</code>, pass <code>logger="app"</code>. If the logger has <code>propagate = False</code> (common in <code>dictConfig</code> setups), records never reach the root handler and <code>caplog.text</code> is empty; the message went to stderr through Python's last-resort handler instead. Attach <code>caplog.handler</code> to that logger:</p>
+<pre><code>$ cat test_fix.py
+import logging
+log = logging.getLogger(&quot;app&quot;)
+
+def test_no_propagate_fixed(caplog):
+    app = logging.getLogger(&quot;app&quot;)
+    app.propagate = False
+    app.addHandler(caplog.handler)          # attach caplog&#x27;s handler directly
+    try:
+        log.warning(&quot;retrying&quot;)
+        assert &quot;retrying&quot; in caplog.text
+    finally:
+        app.removeHandler(caplog.handler)
+        app.propagate = True
+$ pytest -q | tail -1
+1 passed in 0.00s</code></pre>
+<h2 id="more">3. at_level, log.exception, clear() and "no errors logged"</h2>
+<pre><code>$ cat test_more.py
+import logging
+log = logging.getLogger(&quot;app&quot;)
+
+def test_at_level(caplog):
+    with caplog.at_level(logging.DEBUG, logger=&quot;app&quot;):
+        log.debug(&quot;cache miss&quot;)
+    assert caplog.messages == [&quot;cache miss&quot;]
+
+def test_exception(caplog):
+    try:
+        1 / 0
+    except ZeroDivisionError:
+        log.exception(&quot;job failed&quot;)
+    rec = caplog.records[0]
+    assert rec.levelno == logging.ERROR
+    assert rec.exc_info[0] is ZeroDivisionError
+    assert &quot;ZeroDivisionError&quot; in caplog.text
+
+def test_clear(caplog):
+    log.warning(&quot;setup noise&quot;)
+    caplog.clear()
+    log.warning(&quot;real&quot;)
+    assert caplog.messages == [&quot;real&quot;]
+
+def test_no_errors(caplog):
+    log.warning(&quot;deprecated option&quot;)
+    assert not [r for r in caplog.records if r.levelno &gt;= logging.ERROR]
+$ pytest -q | tail -1
+4 passed in 0.01s</code></pre>
+<p><code>caplog.at_level()</code> restores the level when the block exits. <code>log.exception()</code> logs at ERROR with <code>exc_info</code> set, and the traceback appears in <code>caplog.text</code>. <code>caplog.clear()</code> drops records from earlier in the test.</p>
+<p>Related: <a href="/guides/pytest-fixture-not-found/">pytest fixture not found</a>, <a href="/guides/pytest-scopemismatch-function-scoped-fixture/">pytest ScopeMismatch</a> (caplog is function-scoped).</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is caplog.text empty?</summary><p>Either the message is below the logger&#x27;s effective level (default WARNING, so use caplog.set_level), or the logger has propagate=False so records never reach caplog&#x27;s root handler.</p></details>
+<details><summary>How do I assert a specific log level in pytest?</summary><p>Check caplog.record_tuples for (logger_name, logging.ERROR, message), or inspect caplog.records[i].levelno.</p></details>
+<details><summary>How do I set the caplog level for every test?</summary><p>Add log_level = INFO under [pytest] in pytest.ini (or the matching key in pyproject.toml).</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with pytest 9.1.1 on Python 3.13.5 in a clean virtualenv. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and pytest are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

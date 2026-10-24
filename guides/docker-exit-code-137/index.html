@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker Exit Code 137: What It Means and How to Fix It</title>
+<meta name="description" content="We deliberately OOM-killed a container, confirmed it in docker inspect, and tested the fix of raising its memory limit, with real output.">
+<link rel="canonical" href="https://honestkit.github.io/guides/docker-exit-code-137/">
+<meta property="og:title" content="Docker Exit Code 137: What It Means and How to Fix It">
+<meta property="og:description" content="We deliberately OOM-killed a container, confirmed it in docker inspect, and tested the fix of raising its memory limit, with real output.">
+<meta property="og:url" content="https://honestkit.github.io/guides/docker-exit-code-137/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does exit code 137 always mean out of memory?", "acceptedAnswer": {"@type": "Answer", "text": "No. It always means SIGKILL (128+9), but we confirmed via docker inspect's OOMKilled field that this specifically distinguishes a memory kill (true) from any other SIGKILL, like a manual docker kill or a stop timeout (false)."}}, {"@type": "Question", "name": "Why didn't my app log an error before it died?", "acceptedAnswer": {"@type": "Answer", "text": "We observed this directly: docker logs on our OOM-killed container returned nothing. SIGKILL doesn't give the process a chance to catch the signal or flush output, unlike a graceful SIGTERM shutdown."}}, {"@type": "Question", "name": "How do I know what memory limit to actually set?", "acceptedAnswer": {"@type": "Answer", "text": "Measure real usage under realistic load first (docker stats shows live memory use), then set -m with headroom above that measured peak, not a guess. We demonstrated the opposite failure mode: a limit set below real usage (50m vs a 300MB need) kills the container every time."}}, {"@type": "Question", "name": "Is this different in Kubernetes?", "acceptedAnswer": {"@type": "Answer", "text": "The underlying mechanism is identical (the kernel OOM-killing a process that exceeds its cgroup memory limit) but Kubernetes surfaces it as reason: OOMKilled in kubectl describe pod rather than Docker's OOMKilled field directly."}}, {"@type": "Question", "name": "What if OOMKilled is false but I still got 137?", "acceptedAnswer": {"@type": "Answer", "text": "Then something external sent SIGKILL deliberately: a manual docker kill, or docker stop escalating to SIGKILL after its grace period (10s default) expired without the process exiting on SIGTERM. Check for that first before assuming a memory problem."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Docker Exit Code 137 (tested)</h1>
+<p class="lead">Exit code 137 means a container's main process was killed by <code>SIGKILL</code> (signal 9): 128 + 9 = 137. The most common cause by far is the Linux out-of-memory killer terminating the process because the container hit its memory limit &mdash; but any external <code>SIGKILL</code>, including a manual <code>docker kill</code>, produces the same code.</p>
+<h2>1. Reproduced: a real OOM kill</h2>
+<p>We ran a container with a 50 MB memory limit and had it allocate 300 MB inside Python:</p>
+<pre><code>docker run --name forever-oom-test -m 50m python:3-alpine python3 -c "
+x = bytearray(300*1024*1024)
+print('allocated')
+"
+echo "exit code: $?"
+
+exit code: 137</code></pre>
+<p>Notice <code>'allocated'</code> never printed &mdash; the process was killed mid-allocation, before it could reach that line.</p>
+
+<h2>2. Confirming it was the OOM killer, not a crash</h2>
+<p>Exit code 137 alone doesn't prove it was memory &mdash; a manual <code>docker kill</code> on a perfectly healthy container produces the identical code. <code>docker inspect</code> has a dedicated field that removes the ambiguity:</p>
+<pre><code>docker inspect forever-oom-test2 --format '{{.State.OOMKilled}} {{.State.ExitCode}} {{.State.Status}}'
+true 137 exited</code></pre>
+<p><code>OOMKilled: true</code> is the definitive signal. If it says <code>false</code> and you still see 137, something external sent the kill signal &mdash; check for a manual <code>docker stop</code> timeout (which escalates to SIGKILL) or an orchestrator (Kubernetes, Swarm) terminating the container.</p>
+
+<h2>3. docker ps confirms the same thing more casually</h2>
+<pre><code>docker ps -a --filter name=forever-oom-test3 --format "{{.Names}}: {{.Status}}"
+forever-oom-test3: Exited (137) Less than a second ago</code></pre>
+<p><code>docker logs</code> on this same container returned nothing at all &mdash; another symptom worth recognizing: an OOM-killed process usually dies too abruptly to flush buffered output, so don't expect an error message in the application's own logs. The signal, not the app, is what killed it.</p>
+
+<h2>4. The fix: raise the memory limit, verified</h2>
+<p>We re-ran the identical script with the memory limit raised from 50m to 512m, enough for the 300 MB allocation to fit:</p>
+<pre><code>docker run --rm -m 512m python:3-alpine python3 -c "
+x = bytearray(300*1024*1024)
+print('allocated', len(x), 'bytes')
+"
+echo "exit code: $?"
+
+allocated 314572800 bytes
+exit code: 0</code></pre>
+<p>Same code, same image, only the <code>-m</code> value changed &mdash; and it completed cleanly with exit code 0.</p>
+
+<h2>5. If raising the limit isn't the right fix</h2>
+<p>Sometimes the container's memory need is supposed to be bounded, and the real bug is a leak or an unbounded allocation (e.g. loading an entire file into memory instead of streaming it). In that case, raising <code>-m</code> just delays the same kill at a larger input size. Treat <code>OOMKilled: true</code> as a prompt to check: does this process's expected memory use actually fit in the limit you intended, or is something growing unbounded that should be capped or streamed instead?</p>
+
+<h2>6. In Docker Compose and Kubernetes</h2>
+<p>The same mechanism applies under Compose (<code>mem_limit:</code> in the service definition) and Kubernetes (a Pod's container exceeding its <code>resources.limits.memory</code> gets OOMKilled by the kubelet, visible as <code>OOMKilled</code> in <code>kubectl describe pod</code> and reason <code>OOMKilled</code> in the container status) &mdash; same signal, same exit code 137, just surfaced through a different tool.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does exit code 137 always mean out of memory?</summary><p>No. It always means SIGKILL (128+9), but we confirmed via docker inspect&#x27;s OOMKilled field that this specifically distinguishes a memory kill (true) from any other SIGKILL, like a manual docker kill or a stop timeout (false).</p></details>
+<details><summary>Why didn&#x27;t my app log an error before it died?</summary><p>We observed this directly: docker logs on our OOM-killed container returned nothing. SIGKILL doesn&#x27;t give the process a chance to catch the signal or flush output, unlike a graceful SIGTERM shutdown.</p></details>
+<details><summary>How do I know what memory limit to actually set?</summary><p>Measure real usage under realistic load first (docker stats shows live memory use), then set -m with headroom above that measured peak, not a guess. We demonstrated the opposite failure mode: a limit set below real usage (50m vs a 300MB need) kills the container every time.</p></details>
+<details><summary>Is this different in Kubernetes?</summary><p>The underlying mechanism is identical (the kernel OOM-killing a process that exceeds its cgroup memory limit) but Kubernetes surfaces it as reason: OOMKilled in kubectl describe pod rather than Docker&#x27;s OOMKilled field directly.</p></details>
+<details><summary>What if OOMKilled is false but I still got 137?</summary><p>Then something external sent SIGKILL deliberately: a manual docker kill, or docker stop escalating to SIGKILL after its grace period (10s default) expired without the process exiting on SIGTERM. Check for that first before assuming a memory problem.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Docker Engine on Linux, using a real memory-limited container (python:3-alpine) that was actually OOM-killed. Every exit code and status below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Docker is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python multiprocessing Can&#x27;t Pickle Local Object (Tested Fix)</title>
+<meta name="description" content="We measured Python multiprocessing pickling errors: nested functions, lambdas, objects holding locks, and worker exceptions. partial and __getstate__ fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-multiprocessing-cant-pickle-local-object/">
+<meta property="og:title" content="Python multiprocessing Can&#x27;t Pickle Local Object (Tested Fix)">
+<meta property="og:description" content="We measured Python multiprocessing pickling errors: nested functions, lambdas, objects holding locks, and worker exceptions. partial and __getstate__ fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-multiprocessing-cant-pickle-local-object/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I fix Can't pickle local object in multiprocessing?", "acceptedAnswer": {"@type": "Answer", "text": "Move the function out of the enclosing function to module level. Use functools.partial to bind extra arguments; we measured partial(power, exp=2) working with Pool.map."}}, {"@type": "Question", "name": "Can I use a lambda with multiprocessing Pool.map?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured both a nested lambda (AttributeError: Can't get local object) and a module-level lambda (PicklingError: attribute lookup <lambda> on __main__ failed) failing on Python 3.13.5."}}, {"@type": "Question", "name": "What does cannot pickle '_thread.lock' object mean?", "acceptedAnswer": {"@type": "Answer", "text": "Something you sent to a worker, often self via a bound method, holds a lock. Remove it in __getstate__ and recreate it in __setstate__, which we measured working."}}, {"@type": "Question", "name": "What is MaybeEncodingError: Error sending result?", "acceptedAnswer": {"@type": "Answer", "text": "The worker's return value or exception couldn't be pickled back to the parent. We measured it with an exception class defined inside the worker function."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>multiprocessing: Can&#x27;t pickle local object (tested)</h1>
+<p class="lead"><code>Can't pickle local object</code> (on Python 3.13: <code>AttributeError: Can't get local object</code>) means <code>Pool.map</code> was given something it can't send to a worker process. We measured five variants on Python 3.13.5 and the fixes that work.</p>
+<h2 id="why">Why it happens</h2>
+<p><code>Pool.map</code> sends each task to a worker process by pickling it. Functions are pickled <em>by name</em> (module plus qualified name) and looked up again in the worker. Anything the worker can't find by name, or any object that can't be serialized, fails. This happens even with the <code>fork</code> start method, which is the default on Linux in 3.13.5 (we checked: <code>get_start_method()</code> returned <code>fork</code>).</p>
+
+<h2 id="local">1. Nested functions and lambdas</h2>
+<pre><code>from multiprocessing import Pool
+
+def main():
+    def square(x):
+        return x * x
+    with Pool(2) as pool:
+        try:
+            print(pool.map(square, [1, 2, 3]))
+        except Exception as e:
+            print(type(e).__name__ + &quot;:&quot;, e)
+        try:
+            print(pool.map(lambda x: x * x, [1, 2, 3]))
+        except Exception as e:
+            print(type(e).__name__ + &quot;:&quot;, e)
+
+if __name__ == &quot;__main__&quot;:
+    main()</code></pre>
+<p>Output:</p>
+<pre><code>AttributeError: Can&#x27;t get local object &#x27;main.&lt;locals&gt;.square&#x27;
+AttributeError: Can&#x27;t get local object &#x27;main.&lt;locals&gt;.&lt;lambda&gt;&#x27;</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> both raise <code>AttributeError: Can't get local object 'main.&lt;locals&gt;.square'</code>. Older Pythons word it <code>Can't pickle local object</code> (not re-tested here). A lambda at module level fails differently:</p>
+<pre><code>from multiprocessing import Pool
+
+square = lambda x: x * x
+
+if __name__ == &quot;__main__&quot;:
+    with Pool(2) as pool:
+        try:
+            print(pool.map(square, [1, 2, 3]))
+        except Exception as e:
+            print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>PicklingError: Can&#x27;t pickle &lt;function &lt;lambda&gt; at 0x7fe8a01cf560&gt;: attribute lookup &lt;lambda&gt; on __main__ failed</code></pre>
+
+<h2 id="fix">2. Fix: a top-level function, plus functools.partial for extra arguments</h2>
+<pre><code>from functools import partial
+from multiprocessing import Pool
+
+def power(x, exp):
+    return x ** exp
+
+if __name__ == &quot;__main__&quot;:
+    with Pool(2) as pool:
+        print(pool.map(partial(power, exp=2), [1, 2, 3]))</code></pre>
+<p>Output:</p>
+<pre><code>[1, 4, 9]</code></pre>
+<p>Move the function to module level. If you were using a closure or lambda to bind an argument, <code>partial</code> of a top-level function pickles fine, as measured.</p>
+
+<h2 id="lock">3. Bound methods carry the whole object</h2>
+<pre><code>import threading
+from multiprocessing import Pool
+
+class Worker:
+    def __init__(self):
+        self.lock = threading.Lock()
+    def run(self, x):
+        return x * 2
+
+if __name__ == &quot;__main__&quot;:
+    w = Worker()
+    with Pool(2) as pool:
+        try:
+            print(pool.map(w.run, [1, 2, 3]))
+        except Exception as e:
+            print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>TypeError: cannot pickle &#x27;_thread.lock&#x27; object</code></pre>
+<p><strong>Measured:</strong> passing <code>w.run</code> pickles <code>w</code>, including its <code>threading.Lock</code>, which raises <code>TypeError: cannot pickle '_thread.lock' object</code>. The same goes for open files, sockets, DB connections and clients. Drop them in <code>__getstate__</code> and rebuild them in <code>__setstate__</code>:</p>
+<pre><code>import threading
+from multiprocessing import Pool
+
+class Worker:
+    def __init__(self):
+        self.lock = threading.Lock()
+    def run(self, x):
+        return x * 2
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state[&quot;lock&quot;]                 # not picklable; rebuild in the worker
+        return state
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.lock = threading.Lock()
+
+if __name__ == &quot;__main__&quot;:
+    with Pool(2) as pool:
+        print(pool.map(Worker().run, [1, 2, 3]))</code></pre>
+<p>Output:</p>
+<pre><code>[2, 4, 6]</code></pre>
+
+<h2 id="exceptions">4. Results and exceptions go back through pickle too</h2>
+<pre><code>from multiprocessing import Pool
+
+def bad(x):
+    class Result(Exception):
+        pass
+    raise Result(x)
+
+if __name__ == &quot;__main__&quot;:
+    with Pool(2) as pool:
+        try:
+            pool.map(bad, [1])
+        except Exception as e:
+            print(type(e).__name__ + &quot;:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>MaybeEncodingError: Error sending result: &#x27;&lt;multiprocessing.pool.ExceptionWithTraceback object at 0x7f34d8ffea50&gt;&#x27;. Reason: &#x27;AttributeError(&quot;Can&#x27;t get local object &#x27;bad.&lt;locals&gt;.Result&#x27;&quot;)&#x27;</code></pre>
+<p><strong>Measured:</strong> an exception class defined inside the worker function can't be sent back, so instead of your error you get <code>MaybeEncodingError</code> wrapping the pickling failure. Define exception classes, and any classes you return, at module level.</p>
+
+<aside class="cta"><strong>Running parallel HTTP checks? See the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I fix Can&#x27;t pickle local object in multiprocessing?</summary><p>Move the function out of the enclosing function to module level. Use functools.partial to bind extra arguments; we measured partial(power, exp=2) working with Pool.map.</p></details>
+<details><summary>Can I use a lambda with multiprocessing Pool.map?</summary><p>No. We measured both a nested lambda (AttributeError: Can&#x27;t get local object) and a module-level lambda (PicklingError: attribute lookup &lt;lambda&gt; on __main__ failed) failing on Python 3.13.5.</p></details>
+<details><summary>What does cannot pickle &#x27;_thread.lock&#x27; object mean?</summary><p>Something you sent to a worker, often self via a bound method, holds a lock. Remove it in __getstate__ and recreate it in __setstate__, which we measured working.</p></details>
+<details><summary>What is MaybeEncodingError: Error sending result?</summary><p>The worker&#x27;s return value or exception couldn&#x27;t be pickled back to the parent. We measured it with an exception class defined inside the worker function.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux (fork start method): nested functions, nested and module-level lambdas, functools.partial, a bound method holding a lock with and without __getstate__, and an unpicklable exception raised in a worker. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

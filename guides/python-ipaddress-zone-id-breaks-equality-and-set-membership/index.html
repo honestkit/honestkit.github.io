@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ipaddress: An IPv6 Zone ID Breaks Equality and Set Lookups</title>
+<meta name="description" content="We measured Python 3.13.5: ip_address(&#x27;fe80::1%eth0&#x27;) != ip_address(&#x27;fe80::1&#x27;), so a zone-tagged address fails a blocklist set lookup for the same host.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-ipaddress-zone-id-breaks-equality-and-set-membership/">
+<meta property="og:title" content="ipaddress: An IPv6 Zone ID Breaks Equality and Set Lookups">
+<meta property="og:description" content="We measured Python 3.13.5: ip_address(&#x27;fe80::1%eth0&#x27;) != ip_address(&#x27;fe80::1&#x27;), so a zone-tagged address fails a blocklist set lookup for the same host.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-ipaddress-zone-id-breaks-equality-and-set-membership/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does Python's ipaddress module treat an IPv6 zone ID as part of address equality?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured ipaddress.ip_address('fe80::1%eth0') == ipaddress.ip_address('fe80::1') returning False, even though both represent the same link-local host and is_link_local is True for both."}}, {"@type": "Question", "name": "Can a zone-tagged IPv6 address bypass a set-based blocklist in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, if the blocklist was built from addresses without zone IDs -- we measured a zone-tagged address failing 'in' membership against a set containing the identical address minus the zone ID, with no error or warning."}}, {"@type": "Question", "name": "Does ipaddress.ip_network keep the zone ID from an IPv6 zone-tagged address?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured ip_network('fe80::1%eth0/64', strict=False) silently dropping the %eth0 zone ID from the resulting network object, with no indication the scope information was discarded."}}, {"@type": "Question", "name": "How do I compare IPv6 addresses that may or may not have a zone ID?", "acceptedAnswer": {"@type": "Answer", "text": "Strip or normalize the .scope_id attribute explicitly before comparing or hashing -- we confirmed Python's ipaddress module does not do this automatically, and == / hash() / set membership all treat zone-tagged and zone-less forms as entirely different values."}}, {"@type": "Question", "name": "What is scope_id on an ipaddress IPv6Address object?", "acceptedAnswer": {"@type": "Answer", "text": "It holds the zone ID suffix (e.g. 'eth0' from fe80::1%eth0) when present, or None otherwise -- we measured it populated correctly for a parsed zone-tagged address while per-address classification properties like is_link_local still work normally."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>An IPv6 Zone ID Breaks Equality and Set Membership in ipaddress (tested)</h1>
+<p class="lead">Link-local IPv6 addresses can carry a zone ID suffix (<code>%eth0</code>, <code>%1</code>) identifying which network interface they're scoped to -- the kind of value you get back from <code>socket.getnameinfo()</code> or OS networking tools. We measured whether Python's <code>ipaddress</code> module treats a zone-tagged address as the same host as the identical address without one.</p>
+<h2 id="repro1">1. ipaddress parses the zone ID without error, and is_link_local still works</h2>
+<pre><code>import ipaddress
+
+zoned = ipaddress.ip_address("fe80::1%eth0")
+print(zoned, zoned.scope_id)
+print(zoned.is_link_local)</code></pre>
+<pre><code>fe80::1%eth0 eth0
+True</code></pre>
+<p><strong>Measured:</strong> <code>ipaddress.ip_address()</code> accepts the <code>%eth0</code> zone suffix with no error, exposes it via <code>.scope_id</code>, and per-address properties like <code>is_link_local</code> correctly ignore the zone ID when classifying the address.</p>
+
+<h2 id="repro2">2. But it is never equal to the same address without a zone ID</h2>
+<pre><code>import ipaddress
+
+zoned = ipaddress.ip_address("fe80::1%eth0")
+plain = ipaddress.ip_address("fe80::1")
+
+print(zoned == plain)
+print(hash(zoned) == hash(plain))
+
+blocklist = {plain}
+print(zoned in blocklist)</code></pre>
+<pre><code>False
+False
+False</code></pre>
+<p><strong>Measured:</strong> an address with a zone ID and the same address without one are never <code>==</code>, hash differently, and fail set membership against each other -- even though they identify the same link-local host. Any code that collects link-local addresses from one source (say, a zone-tagged value from a live socket) and compares against a blocklist or cache built from zone-less strings will silently miss matches, exactly the same shape as comparing plain IPv4Address and IPv6Address objects.</p>
+
+<h2 id="repro3">3. The zone ID also silently vanishes when building a network</h2>
+<pre><code>import ipaddress
+
+net = ipaddress.ip_network("fe80::1%eth0/64", strict=False)
+print(net)</code></pre>
+<pre><code>fe80::/64</code></pre>
+<p><strong>Measured:</strong> <code>ip_network()</code> accepts the zone-tagged address and computes the network correctly, but the zone ID is dropped entirely from the result -- there is no error or warning that scope information was discarded, so code that later expects the network object to retain which interface the original address was scoped to will find nothing there. If you need to compare or deduplicate link-local addresses that may or may not carry a zone ID, strip or normalize <code>.scope_id</code> explicitly before comparing, rather than relying on <code>==</code> or set membership to see through it.</p>
+<aside class="cta"><strong>Comparing link-local IPv6 addresses from socket or interface data? Check what a zone ID does to equality first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does Python&#x27;s ipaddress module treat an IPv6 zone ID as part of address equality?</summary><p>Yes -- we measured ipaddress.ip_address(&#x27;fe80::1%eth0&#x27;) == ipaddress.ip_address(&#x27;fe80::1&#x27;) returning False, even though both represent the same link-local host and is_link_local is True for both.</p></details>
+<details><summary>Can a zone-tagged IPv6 address bypass a set-based blocklist in Python?</summary><p>Yes, if the blocklist was built from addresses without zone IDs -- we measured a zone-tagged address failing &#x27;in&#x27; membership against a set containing the identical address minus the zone ID, with no error or warning.</p></details>
+<details><summary>Does ipaddress.ip_network keep the zone ID from an IPv6 zone-tagged address?</summary><p>No -- we measured ip_network(&#x27;fe80::1%eth0/64&#x27;, strict=False) silently dropping the %eth0 zone ID from the resulting network object, with no indication the scope information was discarded.</p></details>
+<details><summary>How do I compare IPv6 addresses that may or may not have a zone ID?</summary><p>Strip or normalize the .scope_id attribute explicitly before comparing or hashing -- we confirmed Python&#x27;s ipaddress module does not do this automatically, and == / hash() / set membership all treat zone-tagged and zone-less forms as entirely different values.</p></details>
+<details><summary>What is scope_id on an ipaddress IPv6Address object?</summary><p>It holds the zone ID suffix (e.g. &#x27;eth0&#x27; from fe80::1%eth0) when present, or None otherwise -- we measured it populated correctly for a parsed zone-tagged address while per-address classification properties like is_link_local still work normally.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in ipaddress module: parsed the same link-local address with and without an IPv6 zone ID (&#x27;fe80::1%eth0&#x27; vs &#x27;fe80::1&#x27;), compared them with ==, hash(), and set membership, and checked whether is_link_local still worked on the zone-tagged form. PlainHeaders is our extension; Python&#x27;s ipaddress module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

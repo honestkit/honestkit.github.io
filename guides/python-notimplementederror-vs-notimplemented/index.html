@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python NotImplementedError vs NotImplemented (Tested Examples)</title>
+<meta name="description" content="We measured NotImplementedError vs NotImplemented: un-overridden methods, abstractmethod, why __eq__ must return NotImplemented, and raise NotImplemented.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-notimplementederror-vs-notimplemented/">
+<meta property="og:title" content="Python NotImplementedError vs NotImplemented (Tested Examples)">
+<meta property="og:description" content="We measured NotImplementedError vs NotImplemented: un-overridden methods, abstractmethod, why __eq__ must return NotImplemented, and raise NotImplemented.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-notimplementederror-vs-notimplemented/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between NotImplemented and NotImplementedError?", "acceptedAnswer": {"@type": "Answer", "text": "NotImplementedError is an exception raised for methods a subclass must override. NotImplemented is a value returned from comparison/arithmetic dunders to let Python try the other operand. We measured both on Python 3.13.5."}}, {"@type": "Question", "name": "Should __eq__ raise NotImplementedError?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured it breaking == against an int and even the in operator on a mixed list. Return NotImplemented instead."}}, {"@type": "Question", "name": "How do I fix NotImplementedError in Python?", "acceptedAnswer": {"@type": "Answer", "text": "The subclass didn't override the method, often because of a typo in the name. We measured a misspelled area() reaching the base class; abc.abstractmethod catches it when the object is created."}}, {"@type": "Question", "name": "Can I raise NotImplemented?", "acceptedAnswer": {"@type": "Answer", "text": "No, it's not an exception. We measured TypeError: exceptions must derive from BaseException. Raise NotImplementedError."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>NotImplementedError vs NotImplemented in Python (tested)</h1>
+<p class="lead"><code>NotImplementedError</code> and <code>NotImplemented</code> look alike but do opposite jobs: one is raised, one is returned. We measured what each does, and what breaks when you swap them, on Python 3.13.5.</p>
+<h2 id="diff">The difference in one line</h2>
+<p><code>NotImplementedError</code> is an exception you <em>raise</em> for "this method must be overridden". <code>NotImplemented</code> is a value you <em>return</em> from <code>__eq__</code>, <code>__lt__</code>, <code>__add__</code> and friends for "I don't know how to handle this other type, try the other operand". Mixing them up gives the bugs below.</p>
+
+<h2 id="override">1. NotImplementedError: a subclass didn't override the method</h2>
+<pre><code>class Shape:
+    def area(self):
+        raise NotImplementedError(&quot;subclasses must implement area()&quot;)
+
+class Square(Shape):
+    def __init__(self, s): self.s = s
+    def arae(self): return self.s ** 2      # typo: area() never overridden
+
+print(Square(3).area())</code></pre>
+<p>Output:</p>
+<pre><code>Traceback (most recent call last):
+  File &quot;/tmp/ni/b1.py&quot;, line 9, in &lt;module&gt;
+    print(Square(3).area())
+          ~~~~~~~~~~~~~~^^
+  File &quot;/tmp/ni/b1.py&quot;, line 3, in area
+    raise NotImplementedError(&quot;subclasses must implement area()&quot;)
+NotImplementedError: subclasses must implement area()</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> a typo (<code>arae</code>) means <code>area()</code> was never overridden, and the error only appears when the method is called, possibly deep in production. Check the subclass method name and signature against the base class.</p>
+
+<h2 id="abc">2. Catch it at construction with abc.abstractmethod</h2>
+<pre><code>from abc import ABC, abstractmethod
+
+class Shape(ABC):
+    @abstractmethod
+    def area(self): ...
+
+class Square(Shape):
+    def __init__(self, s): self.s = s
+    def arae(self): return self.s ** 2
+
+try:
+    Square(3)
+except TypeError as e:
+    print(&quot;TypeError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>TypeError: Can&#x27;t instantiate abstract class Square without an implementation for abstract method &#x27;area&#x27;</code></pre>
+<p><strong>Measured:</strong> with <code>ABC</code> + <code>@abstractmethod</code>, the same typo fails as soon as you create the object, with a message naming the missing method.</p>
+
+<h2 id="dunder">3. Raising NotImplementedError from __eq__ breaks ==, in, and list.remove</h2>
+<pre><code>class Money:
+    def __init__(self, c): self.c = c
+    def __eq__(self, other):
+        if not isinstance(other, Money):
+            raise NotImplementedError      # wrong
+        return self.c == other.c
+
+try:
+    print(Money(5) == 5)
+except NotImplementedError:
+    print(&quot;NotImplementedError from ==&quot;)
+try:
+    print(Money(5) in [1, 2, Money(5)])
+except NotImplementedError:
+    print(&quot;NotImplementedError from &#x27;in&#x27;&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>NotImplementedError from ==
+NotImplementedError from &#x27;in&#x27;</code></pre>
+<p><strong>Measured:</strong> comparing to an int raises instead of returning <code>False</code>, and so does a plain <code>in</code> check on a list that holds other types, because <code>in</code> calls <code>==</code> on each item.</p>
+
+<h2 id="fix">4. Fix: return NotImplemented</h2>
+<pre><code>class Money:
+    def __init__(self, c): self.c = c
+    def __eq__(self, other):
+        if not isinstance(other, Money):
+            return NotImplemented          # right: let Python try the other side
+        return self.c == other.c
+    def __lt__(self, other):
+        if not isinstance(other, Money):
+            return NotImplemented
+        return self.c &lt; other.c
+
+print(Money(5) == 5, Money(5) in [1, 2, Money(5)])
+try:
+    Money(5) &lt; 5
+except TypeError as e:
+    print(&quot;TypeError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>False True
+TypeError: &#x27;&lt;&#x27; not supported between instances of &#x27;Money&#x27; and &#x27;int&#x27;</code></pre>
+<p><strong>Measured:</strong> returning <code>NotImplemented</code> lets Python try the reflected operation and fall back. For <code>==</code> that ends in an identity comparison (<code>False</code>); for ordering it ends in the standard <code>TypeError: '&lt;' not supported between instances</code>, which is what callers expect.</p>
+
+<h2 id="value">5. NotImplemented is not an exception, and it's truthy</h2>
+<pre><code>import warnings
+warnings.simplefilter(&quot;always&quot;)
+print(bool(NotImplemented))       # truthy: &#x27;if a == b&#x27; can&#x27;t catch a mistake
+try:
+    raise NotImplemented          # NotImplemented is a value, not an exception
+except TypeError as e:
+    print(&quot;TypeError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>/tmp/ni/b5.py:3: DeprecationWarning: NotImplemented should not be used in a boolean context
+  print(bool(NotImplemented))       # truthy: &#x27;if a == b&#x27; can&#x27;t catch a mistake
+True
+TypeError: exceptions must derive from BaseException</code></pre>
+<p><strong>Measured on 3.13.5:</strong> <code>raise NotImplemented</code> fails with <code>TypeError: exceptions must derive from BaseException</code>, so a typo here hides the real message. <code>bool(NotImplemented)</code> is still <code>True</code> on 3.13 with a <code>DeprecationWarning</code>, so if you call <code>a.__eq__(b)</code> directly and test the result, a "don't know" reads as equal. Use the operator (<code>a == b</code>), not the dunder method.</p>
+
+<aside class="cta"><strong>Writing a Python HTTP client class? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between NotImplemented and NotImplementedError?</summary><p>NotImplementedError is an exception raised for methods a subclass must override. NotImplemented is a value returned from comparison/arithmetic dunders to let Python try the other operand. We measured both on Python 3.13.5.</p></details>
+<details><summary>Should __eq__ raise NotImplementedError?</summary><p>No. We measured it breaking == against an int and even the in operator on a mixed list. Return NotImplemented instead.</p></details>
+<details><summary>How do I fix NotImplementedError in Python?</summary><p>The subclass didn&#x27;t override the method, often because of a typo in the name. We measured a misspelled area() reaching the base class; abc.abstractmethod catches it when the object is created.</p></details>
+<details><summary>Can I raise NotImplemented?</summary><p>No, it&#x27;s not an exception. We measured TypeError: exceptions must derive from BaseException. Raise NotImplementedError.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: an un-overridden method, abc.abstractmethod, NotImplementedError raised from __eq__ (== and in), returning NotImplemented from __eq__ and __lt__, raise NotImplemented and bool(NotImplemented). Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

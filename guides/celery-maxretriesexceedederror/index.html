@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Celery MaxRetriesExceededError: Can&#x27;t retry (Tested Fixes)</title>
+<meta name="description" content="Celery MaxRetriesExceededError tested on 5.6: max_retries=2 means 3 attempts, retry(exc=...) re-raises your exception instead, and how to give up cleanly.">
+<link rel="canonical" href="https://honestkit.github.io/guides/celery-maxretriesexceedederror/">
+<meta property="og:title" content="Celery MaxRetriesExceededError: Can&#x27;t retry (Tested Fixes)">
+<meta property="og:description" content="Celery MaxRetriesExceededError tested on 5.6: max_retries=2 means 3 attempts, retry(exc=...) re-raises your exception instead, and how to give up cleanly.">
+<meta property="og:url" content="https://honestkit.github.io/guides/celery-maxretriesexceedederror/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How many times does a Celery task run with max_retries=2?", "acceptedAnswer": {"@type": "Answer", "text": "Three times: the first attempt plus two retries (request.retries 0, 1, 2)."}}, {"@type": "Question", "name": "Why is MaxRetriesExceededError not raised when I use self.retry(exc=exc)?", "acceptedAnswer": {"@type": "Answer", "text": "With exc= set, the final retry re-raises your exception instead. Check self.request.retries >= self.max_retries to handle the last attempt."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Celery MaxRetriesExceededError (tested)</h1>
+<p class="lead">Celery raises <code>MaxRetriesExceededError: Can't retry tasks.x[...]</code> when <code>self.retry()</code> is called after <code>max_retries</code> retries (default 3). If you pass <code>exc=</code>, the final retry re-raises that exception instead.</p>
+<h2 id="setup">Setup used in every block</h2>
+<p>To show the retry logic without a broker, <code>common.py</code> sets <code>task_always_eager</code>, which runs each task and its retries inline in the same process:</p>
+<pre><code>from celery import Celery
+app = Celery(&#x27;tasks&#x27;)
+app.conf.task_always_eager = True        # run inline: no broker or worker needed here
+calls = []</code></pre>
+<h2 id="repro">1. Reproduce it: retry() without exc</h2>
+<pre><code>from common import *
+@app.task(bind=True, max_retries=2, default_retry_delay=0)
+def fetch(self):
+    calls.append(self.request.retries)
+    raise self.retry()
+try:
+    fetch.delay().get()
+except Exception as e:
+    print(f&#x27;{type(e).__module__}.{type(e).__name__}: {e}&#x27;)
+print(&#x27;attempts (request.retries):&#x27;, calls)</code></pre>
+<p>Output:</p>
+<pre><code>celery.exceptions.MaxRetriesExceededError: Can&#x27;t retry tasks.fetch[ce3ff0ab-4d49-41b5-a3ca-81ea561129df] args:() kwargs:{}
+attempts (request.retries): [0, 1, 2]</code></pre>
+<p><code>max_retries=2</code> means 3 attempts in total (<code>request.retries</code> 0, 1, 2). On the last one, <code>self.retry()</code> raises <code>celery.exceptions.MaxRetriesExceededError: Can't retry tasks.fetch[...]</code> and the task fails with it. The default <code>max_retries</code> is 3.</p>
+<h2 id="exc">2. With retry(exc=...), you get your own exception back</h2>
+<pre><code>from common import *
+@app.task(bind=True, max_retries=2, default_retry_delay=0)
+def fetch(self):
+    calls.append(self.request.retries)
+    try:
+        raise ConnectionError(&#x27;upstream down&#x27;)
+    except ConnectionError as exc:
+        raise self.retry(exc=exc)
+try:
+    fetch.delay().get()
+except Exception as e:
+    print(f&#x27;{type(e).__name__}: {e}&#x27;)
+print(&#x27;attempts:&#x27;, calls)</code></pre>
+<p>Output:</p>
+<pre><code>ConnectionError: upstream down
+attempts: [0, 1, 2]</code></pre>
+<p>When you pass <code>exc=</code>, the final <code>retry()</code> re-raises <strong>that</strong> exception instead of <code>MaxRetriesExceededError</code>, so the task fails with <code>ConnectionError: upstream down</code>. This is why an <code>except MaxRetriesExceededError</code> around <code>retry(exc=exc)</code> never runs.</p>
+<h2 id="handle">3. Give up cleanly, or retry without a limit</h2>
+<pre><code>from common import *
+from celery.exceptions import MaxRetriesExceededError
+@app.task(bind=True, max_retries=2, default_retry_delay=0)
+def fetch(self):
+    calls.append(self.request.retries)
+    try:
+        raise ConnectionError(&#x27;upstream down&#x27;)
+    except ConnectionError as exc:
+        try:
+            raise self.retry(exc=exc)
+        except MaxRetriesExceededError:
+            return &#x27;gave up&#x27;          # never reached: retry re-raises exc instead
+        except ConnectionError:
+            if self.request.retries &gt;= self.max_retries:
+                return &#x27;gave up cleanly&#x27;
+            raise
+print(fetch.delay().get(), calls)
+@app.task(bind=True, autoretry_for=(ConnectionError,), max_retries=None, retry_backoff=False, default_retry_delay=0)
+def forever(self):
+    if self.request.retries &lt; 5:
+        raise ConnectionError(&#x27;flaky&#x27;)
+    return f&#x27;ok after {self.request.retries} retries&#x27;
+print(forever.delay().get())</code></pre>
+<p>Output:</p>
+<pre><code>gave up cleanly [0, 1, 2]
+ok after 5 retries</code></pre>
+<p>To handle the final failure yourself, check <code>self.request.retries &gt;= self.max_retries</code> before (or instead of) calling <code>retry()</code>; the <code>except MaxRetriesExceededError</code> branch above is dead code because <code>exc</code> was passed. For a task that should keep retrying, set <code>max_retries=None</code>; <code>autoretry_for</code> retries on the listed exceptions without an explicit <code>retry()</code> call. In production, use a real <code>default_retry_delay</code> or <code>retry_backoff=True</code> instead of 0.</p>
+<p>Related: <a href="/guides/celery-error-111-connection-refused/">Celery Error 111 Connection refused</a>, <a href="/guides/python-asyncio-task-exception-was-never-retrieved/">asyncio Task exception was never retrieved</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers of the API your task calls:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How many times does a Celery task run with max_retries=2?</summary><p>Three times: the first attempt plus two retries (request.retries 0, 1, 2).</p></details>
+<details><summary>Why is MaxRetriesExceededError not raised when I use self.retry(exc=exc)?</summary><p>With exc= set, the final retry re-raises your exception instead. Check self.request.retries &gt;= self.max_retries to handle the last attempt.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Celery 5.6.3 and Python 3.14.7 (python:3-alpine in Docker, task_always_eager). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Celery are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

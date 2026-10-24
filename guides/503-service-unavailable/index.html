@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>503 Service Unavailable: Causes, Retry-After and Fixes (Tested)</title>
+<meta name="description" content="We built a maintenance switch and a load-shedding server that return 503, then checked which clients retry. curl --retry waits for Retry-After. Python urllib and Node fetch do not retry at all.">
+<link rel="canonical" href="https://honestkit.github.io/guides/503-service-unavailable/">
+<meta property="og:title" content="503 Service Unavailable: Causes, Retry-After and Fixes (Tested)">
+<meta property="og:description" content="We built a maintenance switch and a load-shedding server that return 503, then checked which clients retry. curl --retry waits for Retry-After. Python urllib and Node fetch do not retry at all.">
+<meta property="og:url" content="https://honestkit.github.io/guides/503-service-unavailable/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does curl retry on a 503?", "acceptedAnswer": {"@type": "Answer", "text": "Only with --retry. In our test, --retry 3 made 4 requests in total and waited 2, 2 and 4 seconds, so it honoured Retry-After: 2. Without --retry it sent one request."}}, {"@type": "Question", "name": "Do Python urllib and Node fetch retry 503 automatically?", "acceptedAnswer": {"@type": "Answer", "text": "No. Each sent exactly one request in our test. urllib raised HTTPError 503; fetch returned ok: false with status 503. You must write the retry loop yourself."}}, {"@type": "Question", "name": "Should I use 503 or 429 for rate limiting?", "acceptedAnswer": {"@type": "Answer", "text": "Use 429 when one client is sending too many requests. Use 503 when the whole server is overloaded or down for maintenance. nginx limit_req returns 503 by default; change it with limit_req_status 429."}}, {"@type": "Question", "name": "Will a 503 hurt my Google rankings?", "acceptedAnswer": {"@type": "Answer", "text": "From Google's docs, not measured: a short 503 with Retry-After is the right way to do maintenance and should not hurt. If it lasts for days, Google may treat the pages as errors and drop them."}}, {"@type": "Question", "name": "What Retry-After value should I send?", "acceptedAnswer": {"@type": "Answer", "text": "A realistic number of seconds until you expect to be back, e.g. 120 for a short deploy. Clients like curl wait at least that long before retrying."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>503 Service Unavailable (tested)</h1>
+<p class="lead"><code>503 Service Unavailable</code> means the server is up but cannot handle the request right now. It is meant to be temporary. Pair it with a <code>Retry-After</code> header so clients and crawlers know when to come back.</p>
+<h2>1. What 503 means</h2>
+<p>A 503 says: the server got your request, but it is overloaded or down for maintenance. Try again later. It is not a bug in the request (that would be a 4xx). It is not a crash (that is usually 500 or 502).</p>
+<p>The server can add <code>Retry-After</code> with a number of seconds or an HTTP date. The same header is used with 429; see our <a href="/guides/retry-after-header-429/">Retry-After and 429 guide</a>.</p>
+
+<h2>2. A maintenance switch that returns 503</h2>
+<p>We wrote a tiny middleware in plain Node. When the flag is on, every request gets 503 and <code>Retry-After: 120</code>.</p>
+<pre><code>let MAINT = true;
+function maintenance(req, res, next) {
+  if (MAINT &amp;&amp; req.url !== '/health') {
+    res.writeHead(503, {
+      'Retry-After': '120',
+      'Content-Type': 'text/plain',
+      'Cache-Control': 'no-store'
+    });
+    return res.end('Down for maintenance. Back soon.\n');
+  }
+  next();
+}</code></pre>
+<p>This is the real response we got:</p>
+<pre><code>$ curl -si http://127.0.0.1:8990/site/
+HTTP/1.1 503 Service Unavailable
+Retry-After: 120
+Content-Type: text/plain
+Cache-Control: no-store
+Date: Fri, 02 Oct 2026 02:39:44 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+Transfer-Encoding: chunked
+
+Down for maintenance. Back soon.</code></pre>
+<p><code>Cache-Control: no-store</code> stops a CDN from caching the maintenance page after you switch it off. We left <code>/health</code> out of the switch so your load balancer does not mark the box dead.</p>
+
+<h2>3. Does curl retry a 503? Yes, and it waits for Retry-After</h2>
+<p>We pointed curl at a server that always answers 503 with <code>Retry-After: 2</code> and logged each hit.</p>
+<pre><code>$ curl -s -o /dev/null -w '%{http_code}\n' --retry 3 http://127.0.0.1:8990/
+503
+# elapsed: 8028 ms
+# server saw 4 hits, gaps between them: 2004, 2004, 4005 ms</code></pre>
+<p>So <code>--retry 3</code> means 1 try plus 3 retries. The first two gaps matched <code>Retry-After: 2</code>. The last gap was 4 s. That looks like curl's own doubling back-off (1, 2, 4 s) being longer than Retry-After, so it used the longer one.</p>
+<p>We also tried <code>--retry 2 --retry-delay 1</code>. The server still saw gaps of 2003 and 2004 ms. Retry-After won over the shorter delay we asked for.</p>
+<p>curl prints a warning while it waits:</p>
+<pre><code>Warning: Problem : HTTP error. Will retry in 2 seconds. 1 retry left.</code></pre>
+<p>Without <code>--retry</code>, curl sent exactly 1 request.</p>
+
+<h2>4. Python urllib and Node fetch do not retry</h2>
+<pre><code>$ python3 -c "import urllib.request
+urllib.request.urlopen('http://127.0.0.1:8990/')"
+HTTPError 503   (Retry-After header: 2)
+# server saw 1 hit
+
+$ node -e "fetch('http://127.0.0.1:8990/').then(r =&gt; console.log(r.status, r.ok, r.headers.get('retry-after')))"
+503 false 2
+# server saw 1 hit</code></pre>
+<p>urllib raises <code>HTTPError</code>. Node fetch does not throw; it gives you <code>ok: false</code>. Neither one retries. If you want retries, write the loop yourself and read <code>Retry-After</code>.</p>
+
+<h2>5. Load shedding: 503 when too busy</h2>
+<p>Our second server allowed 5 requests in flight. Each took 500 ms. Request number 6 and up got 503 straight away.</p>
+<pre><code>let inflight = 0; const MAX = 5;
+http.createServer((req, res) =&gt; {
+  if (inflight &gt;= MAX) {
+    res.writeHead(503, {'Retry-After': '1', 'Connection': 'close'});
+    return res.end('overloaded\n');
+  }
+  inflight++;
+  setTimeout(() =&gt; { inflight--; res.end('ok\n'); }, 500);
+}).listen(8991);</code></pre>
+<table>
+<tr><th>Test</th><th>200</th><th>503</th></tr>
+<tr><td>20 parallel curl requests</td><td>5</td><td>15</td></tr>
+<tr><td>50 parallel curl requests</td><td>5</td><td>45</td></tr>
+<tr><td>3 requests one after another</td><td>3</td><td>0</td></tr>
+</table>
+<p>Exactly the limit got through. Everything else failed fast instead of piling up. This is better than letting requests queue until they time out (see <a href="/guides/408-request-timeout/">408 Request Timeout</a>). We sent <code>Connection: close</code> on the 503 so busy clients do not hold a socket open; more on that in <a href="/guides/keep-alive-header-connection/">Keep-Alive and Connection</a>.</p>
+
+<h2>6. Common causes (from the docs, not measured)</h2>
+<p>We did not test these. They come from vendor docs.</p>
+<table>
+<tr><th>Source</th><th>Why you see 503</th></tr>
+<tr><td>Planned maintenance</td><td>Your app or a maintenance page returns it on purpose.</td></tr>
+<tr><td>nginx <code>limit_req</code> / <code>limit_conn</code></td><td>Requests over the limit get 503 by default. Change it with <code>limit_req_status 429;</code>.</td></tr>
+<tr><td>Kubernetes / ingress</td><td>The Service has no ready endpoints, for example all pods fail their readiness probe.</td></tr>
+<tr><td>IIS</td><td>The application pool is stopped or keeps crashing (rapid-fail protection).</td></tr>
+<tr><td>Load balancers / CDNs</td><td>No healthy backend left in the pool.</td></tr>
+<tr><td>App servers</td><td>Worker pool or connection pool exhausted.</td></tr>
+</table>
+
+<h2>7. SEO impact (from the docs, not measured)</h2>
+<p>Google's docs say 503 is the right status for planned downtime. It tells Googlebot the outage is temporary, and crawling slows down. Do not serve the maintenance page with 200 (it can get indexed) or 404 (pages can drop out).</p>
+<p>Google also says that if 503 lasts a long time (more than about two days), it starts treating the URLs like errors and may drop them from the index. Keep maintenance short. Return 503 for <code>robots.txt</code> too only if you want crawling to pause; a long 503 on robots.txt can stop crawling of the whole site. If you also want to keep a page out of search, use <a href="/guides/x-robots-tag-header-nginx-apache/">X-Robots-Tag</a>, not 503.</p>
+
+<h2>8. Fixes</h2>
+<ul>
+<li><strong>Planned work:</strong> return 503 with <code>Retry-After</code> and <code>Cache-Control: no-store</code>. Keep the health check route outside the switch.</li>
+<li><strong>Rate limits:</strong> if the client is sending too much, 429 is clearer than 503. In nginx set <code>limit_req_status 429;</code>.</li>
+<li><strong>Overload:</strong> add capacity or raise worker limits, but keep a load-shedding limit so you fail fast.</li>
+<li><strong>Kubernetes:</strong> run <code>kubectl get endpoints</code> and check readiness probes and pod logs.</li>
+<li><strong>IIS:</strong> start the app pool and read the Windows event log for why it stopped.</li>
+<li><strong>Clients:</strong> retry with back-off and honour <code>Retry-After</code>. curl does this with <code>--retry</code>; urllib and fetch need your own code.</li>
+</ul>
+<aside class="cta"><strong>Check the status code and Retry-After header your site really sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does curl retry on a 503?</summary><p>Only with --retry. In our test, --retry 3 made 4 requests in total and waited 2, 2 and 4 seconds, so it honoured Retry-After: 2. Without --retry it sent one request.</p></details>
+<details><summary>Do Python urllib and Node fetch retry 503 automatically?</summary><p>No. Each sent exactly one request in our test. urllib raised HTTPError 503; fetch returned ok: false with status 503. You must write the retry loop yourself.</p></details>
+<details><summary>Should I use 503 or 429 for rate limiting?</summary><p>Use 429 when one client is sending too many requests. Use 503 when the whole server is overloaded or down for maintenance. nginx limit_req returns 503 by default; change it with limit_req_status 429.</p></details>
+<details><summary>Will a 503 hurt my Google rankings?</summary><p>From Google&#x27;s docs, not measured: a short 503 with Retry-After is the right way to do maintenance and should not hurt. If it lasts for days, Google may treat the pages as errors and drop them.</p></details>
+<details><summary>What Retry-After value should I send?</summary><p>A realistic number of seconds until you expect to be back, e.g. 120 for a short deploy. Clients like curl wait at least that long before retrying.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with curl 8.14.1, Python 3.13 urllib and Node.js 24.21.0: a small Node server on 127.0.0.1:8990 returned 503 for maintenance and counted every hit, and a second server on 127.0.0.1:8991 shed load with 503 above 5 in-flight requests. PlainHeaders is our extension; curl, Python and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

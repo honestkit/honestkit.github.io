@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uv ignore SSL errors: invalid peer certificate: UnknownIssuer</title>
+<meta name="description" content="uv invalid peer certificate: UnknownIssuer reproduced. --allow-insecure-host skips verification; SSL_CERT_FILE or --system-certs trusts your CA. Tested.">
+<link rel="canonical" href="https://honestkit.github.io/guides/uv-ignore-ssl-errors-invalid-peer-certificate-unknownissuer/">
+<meta property="og:title" content="uv ignore SSL errors: invalid peer certificate: UnknownIssuer">
+<meta property="og:description" content="uv invalid peer certificate: UnknownIssuer reproduced. --allow-insecure-host skips verification; SSL_CERT_FILE or --system-certs trusts your CA. Tested.">
+<meta property="og:url" content="https://honestkit.github.io/guides/uv-ignore-ssl-errors-invalid-peer-certificate-unknownissuer/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I make uv ignore SSL errors?", "acceptedAnswer": {"@type": "Answer", "text": "uv pip install ... --allow-insecure-host host:port, or set UV_INSECURE_HOST. pip's --trusted-host is also accepted."}}, {"@type": "Question", "name": "How do I fix uv invalid peer certificate: UnknownIssuer?", "acceptedAnswer": {"@type": "Answer", "text": "Trust the issuing CA: SSL_CERT_FILE=/path/ca.pem, or --system-certs (UV_SYSTEM_CERTS=1) if the CA is installed in the OS store."}}, {"@type": "Question", "name": "What does CaUsedAsEndEntity mean in uv?", "acceptedAnswer": {"@type": "Answer", "text": "The server presents a CA certificate (e.g. a default openssl req -x509 self-signed cert). Issue a CA:FALSE leaf cert signed by the CA, or use --allow-insecure-host."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>uv ignore SSL errors: invalid peer certificate UnknownIssuer (tested)</h1>
+<p class="lead">Skip verification for one host with <code>--allow-insecure-host host:port</code> (or <code>UV_INSECURE_HOST</code>). Better: trust the CA with <code>SSL_CERT_FILE=ca.pem</code>, or <code>--system-certs</code> if the CA is in your OS trust store.</p>
+<p>Behind a corporate proxy or with a private package index, uv fails with <code>invalid peer certificate: UnknownIssuer</code>. To reproduce it, we served a package index over HTTPS on <code>localhost:8963</code> with a certificate signed by a private CA ("Example Corp Root CA"). Measured with uv 0.13.5 on Linux; each command ran in a fresh venv with an empty cache.</p>
+<h2 id="error">1. The error: invalid peer certificate: UnknownIssuer</h2>
+<p>Transcript:</p>
+<pre><code>$ uv pip install six --index-url https://localhost:8963/simple
+error: Failed to fetch: https://localhost:8963/simple/six/
+  cause: error sending request for url (https://localhost:8963/simple/six/)
+  cause: client error (Connect)
+  cause: invalid peer certificate: UnknownIssuer
+
+hint: Consider enabling use of system TLS certificates with the `--system-certs` command-line flag
+[exit 2]</code></pre>
+<p>uv does its own TLS (rustls) and by default trusts its bundled Mozilla roots, not your OS store and not pip's config. A certificate from an unknown CA (a TLS-inspecting proxy, an internal Nexus/Artifactory) gives <code>UnknownIssuer</code>.</p>
+<h2 id="insecure">2. Ignore SSL errors: --allow-insecure-host</h2>
+<p>Transcript:</p>
+<pre><code>$ uv pip install six --index-url https://localhost:8963/simple --allow-insecure-host localhost:8963
+Resolved 1 package in 59ms
+Prepared 1 package in 2ms
+Installed 1 package in 2ms
+ + six==1.17.0
+$ UV_INSECURE_HOST=localhost uv pip install six --index-url https://localhost:8963/simple
+Resolved 1 package in 57ms
+Prepared 1 package in 4ms
+Installed 1 package in 3ms
+ + six==1.17.0
+$ uv pip install six --index-url https://localhost:8963/simple --trusted-host localhost
+Resolved 1 package in 57ms
+Prepared 1 package in 2ms
+Installed 1 package in 2ms
+ + six==1.17.0</code></pre>
+<p><code>--allow-insecure-host localhost:8963</code> (or the <code>UV_INSECURE_HOST</code> environment variable) skips certificate verification for that host. pip's <code>--trusted-host</code> is accepted too. A bare hostname without the port also worked. This turns off protection against man-in-the-middle attacks for that host, so use it for a known internal host, not as a global workaround.</p>
+<h2 id="cafile">3. Better: trust the CA with SSL_CERT_FILE</h2>
+<p>Transcript:</p>
+<pre><code>$ SSL_CERT_FILE=/tmp/us397/ca.pem uv pip install six --index-url https://localhost:8963/simple
+Resolved 1 package in 59ms
+Prepared 1 package in 2ms
+Installed 1 package in 2ms
+ + six==1.17.0
+$ uv pip install six --index-url https://localhost:8963/simple --system-certs
+error: Failed to fetch: https://localhost:8963/simple/six/
+  cause: error sending request for url (https://localhost:8963/simple/six/)
+  cause: client error (Connect)
+  cause: invalid peer certificate: UnknownIssuer
+[exit 2]</code></pre>
+<p>Pointing <code>SSL_CERT_FILE</code> at the CA certificate (PEM) fixed it with verification still on. <code>--system-certs</code> (previously <code>--native-tls</code>, which now prints a deprecation warning) makes uv use the operating system's trust store instead; it did not help here because our test CA was not installed in the OS store. On a company laptop where IT has installed the proxy CA system-wide, <code>--system-certs</code> (or <code>UV_SYSTEM_CERTS=1</code>) is usually the right fix.</p>
+<h2 id="selfsigned">4. Self-signed certificate: CaUsedAsEndEntity</h2>
+<p>Transcript:</p>
+<pre><code>$ SSL_CERT_FILE=/tmp/us397/selfsigned.pem uv pip install six --index-url https://localhost:8963/simple
+error: Failed to fetch: https://localhost:8963/simple/six/
+  cause: error sending request for url (https://localhost:8963/simple/six/)
+  cause: client error (Connect)
+  cause: invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))
+[exit 2]</code></pre>
+<p>A certificate made with a one-line <code>openssl req -x509</code> is marked as a CA (<code>basicConstraints CA:TRUE</code>). rustls refuses to accept a CA certificate as the server certificate, so even with <code>SSL_CERT_FILE</code> pointing at it uv reports <code>CaUsedAsEndEntity</code>. Fix the server: issue a leaf certificate (<code>CA:FALSE</code>, with a subjectAltName) signed by your CA and trust the CA, as in section 3. Or use <code>--allow-insecure-host</code>.</p>
+<p>Related: <a href="/guides/uv-pip-install-vs-uv-add/">uv pip install vs uv add</a>, <a href="/guides/self-signed-certificate-in-certificate-chain/">self signed certificate in certificate chain</a>, <a href="/guides/python-ssl-certificate-verify-failed/">Python SSL: CERTIFICATE_VERIFY_FAILED</a>, <a href="/guides/httpx-connecterror-ssl-certificate-verify-failed/">httpx certificate verify failed</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I make uv ignore SSL errors?</summary><p>uv pip install ... --allow-insecure-host host:port, or set UV_INSECURE_HOST. pip&#x27;s --trusted-host is also accepted.</p></details>
+<details><summary>How do I fix uv invalid peer certificate: UnknownIssuer?</summary><p>Trust the issuing CA: SSL_CERT_FILE=/path/ca.pem, or --system-certs (UV_SYSTEM_CERTS=1) if the CA is installed in the OS store.</p></details>
+<details><summary>What does CaUsedAsEndEntity mean in uv?</summary><p>The server presents a CA certificate (e.g. a default openssl req -x509 self-signed cert). Issue a CA:FALSE leaf cert signed by the CA, or use --allow-insecure-host.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with uv 0.13.5 on Linux against a local HTTPS package index (private CA, then a self-signed certificate). Each transcript was produced by running the commands verbatim. PlainHeaders is our extension; uv is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

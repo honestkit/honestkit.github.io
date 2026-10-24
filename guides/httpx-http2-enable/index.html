@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx HTTP/2: enable http2=True and check it worked</title>
+<meta name="description" content="Enable HTTP/2 in httpx: install h2, Client(http2=True), check response.http_version, why http:// stays HTTP/1.1, and multiplexing. Tested.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-http2-enable/">
+<meta property="og:title" content="httpx HTTP/2: enable http2=True and check it worked">
+<meta property="og:description" content="Enable HTTP/2 in httpx: install h2, Client(http2=True), check response.http_version, why http:// stays HTTP/1.1, and multiplexing. Tested.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-http2-enable/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does httpx support HTTP/2?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, with pip install \"httpx[http2]\" and Client(http2=True) or AsyncClient(http2=True). It is off by default."}}, {"@type": "Question", "name": "Why is response.http_version still HTTP/1.1?", "acceptedAnswer": {"@type": "Answer", "text": "The server did not negotiate h2, or the URL is plain http://. httpx only uses HTTP/2 over http:// with http1=False."}}, {"@type": "Question", "name": "Can I pass http2=True to httpx.get()?", "acceptedAnswer": {"@type": "Answer", "text": "No. In httpx 0.28.1 it raises TypeError: get() got an unexpected keyword argument 'http2'. Use a Client."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx HTTP/2: enable http2=True (tested)</h1>
+<p class="lead"><code>pip install "httpx[http2]"</code>, then <code>httpx.Client(http2=True)</code>. HTTP/2 is negotiated over HTTPS only (unless <code>http1=False</code>); confirm with <code>response.http_version</code>.</p>
+<p>httpx speaks HTTP/1.1 by default. HTTP/2 needs the optional <code>h2</code> package and <code>http2=True</code> on a <code>Client</code> or <code>AsyncClient</code>, and it is only used when the server agrees. Measured with httpx 0.28.1, h2 4.4.1 and hypercorn on Python 3.13.5. The test server is this ASGI app, run by hypercorn with a self-signed certificate on an HTTPS port and a plain HTTP port (<code>srv.start()</code> returns both URLs):</p>
+<pre><code>async def app(scope, receive, send):
+    if scope[&quot;type&quot;] != &quot;http&quot;:
+        return
+    body = f&#x27;{scope[&quot;http_version&quot;]} client_port={scope[&quot;client&quot;][1]}&#x27;.encode()
+    await send({&quot;type&quot;: &quot;http.response.start&quot;, &quot;status&quot;: 200,
+                &quot;headers&quot;: [(b&quot;content-type&quot;, b&quot;text/plain&quot;), (b&quot;content-length&quot;, str(len(body)).encode())]})
+    await send({&quot;type&quot;: &quot;http.response.body&quot;, &quot;body&quot;: body})</code></pre>
+<h2 id="install">1. ImportError: the h2 package is not installed</h2>
+<pre><code>import httpx
+try:
+    httpx.Client(http2=True)
+except ImportError as e:
+    print(&quot;ImportError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>ImportError: Using http2=True, but the &#x27;h2&#x27; package is not installed. Make sure to install httpx using `pip install httpx[http2]`.</code></pre>
+<p>Fix: <code>pip install "httpx[http2]"</code> (or <code>pip install h2</code>). The error is raised when the client is created, not on the first request.</p>
+<h2 id="enable">2. Enable HTTP/2 and check it with response.http_version</h2>
+<pre><code>import httpx, srv
+https_url, http_url = srv.start()
+for http2 in (False, True):
+    with httpx.Client(http2=http2, verify=&quot;cert.pem&quot;) as c:
+        r = c.get(https_url)
+        print(f&quot;http2={http2}: r.http_version={r.http_version!r}  server saw {r.text}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>http2=False: r.http_version=&#x27;HTTP/1.1&#x27;  server saw 1.1 client_port=46280
+http2=True: r.http_version=&#x27;HTTP/2&#x27;  server saw 2 client_port=46292</code></pre>
+<p>Over HTTPS, httpx offers h2 via TLS ALPN and the server picks. Check <code>r.http_version</code> to see what was actually used; <code>http2=True</code> is a request, not a guarantee.</p>
+<h2 id="plain">3. Plain http:// stays HTTP/1.1 unless you disable HTTP/1</h2>
+<pre><code>import httpx, srv
+https_url, http_url = srv.start()
+with httpx.Client(http2=True) as c:
+    r = c.get(http_url)
+    print(&quot;http:// with http2=True:&quot;, r.http_version)
+with httpx.Client(http1=False, http2=True) as c:
+    r = c.get(http_url)
+    print(&quot;http:// with http1=False, http2=True:&quot;, r.http_version)</code></pre>
+<p>Output:</p>
+<pre><code>http:// with http2=True: HTTP/1.1
+http:// with http1=False, http2=True: HTTP/2</code></pre>
+<p>httpx does not do the <code>Upgrade: h2c</code> dance. On <code>http://</code> URLs it uses HTTP/1.1 even with <code>http2=True</code>. With <code>http1=False</code> it sends HTTP/2 directly (prior knowledge), which only works if the server accepts cleartext HTTP/2.</p>
+<h2 id="get">4. httpx.get() has no http2 argument</h2>
+<pre><code>import httpx
+try:
+    httpx.get(&quot;https://example.com&quot;, http2=True)
+except TypeError as e:
+    print(&quot;TypeError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>TypeError: get() got an unexpected keyword argument &#x27;http2&#x27;</code></pre>
+<p>HTTP/2 is a client setting, so the top-level <code>httpx.get()</code> helpers do not accept it. Create a <code>Client(http2=True)</code>.</p>
+<h2 id="multiplex">5. Why use it: one connection for concurrent requests</h2>
+<pre><code>import asyncio, httpx, srv
+https_url, http_url = srv.start()
+async def run(http2):
+    async with httpx.AsyncClient(http2=http2, verify=&quot;cert.pem&quot;) as c:
+        rs = await asyncio.gather(*(c.get(https_url) for _ in range(10)))
+    ports = {r.text.split(&quot;client_port=&quot;)[1] for r in rs}
+    print(f&quot;http2={http2}: 10 concurrent requests, {rs[0].http_version}, {len(ports)} connection(s)&quot;)
+asyncio.run(run(False)); asyncio.run(run(True))</code></pre>
+<p>Output:</p>
+<pre><code>http2=False: 10 concurrent requests, HTTP/1.1, 10 connection(s)
+http2=True: 10 concurrent requests, HTTP/2, 1 connection(s)</code></pre>
+<p>With HTTP/1.1, ten concurrent requests opened ten TCP+TLS connections. With HTTP/2 they were multiplexed over one. For sequential requests on a reused client the difference is small; HTTP/2 helps mostly with many concurrent requests to the same host.</p>
+<p>Related: <a href="/guides/httpx-asyncclient-connection-pool-limits/">httpx AsyncClient connection pool limits</a>, <a href="/guides/httpx-connecterror-ssl-certificate-verify-failed/">httpx SSL certificate verify failed</a>, <a href="/guides/err-http2-protocol-error/">ERR_HTTP2_PROTOCOL_ERROR</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests differences</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does httpx support HTTP/2?</summary><p>Yes, with pip install &quot;httpx[http2]&quot; and Client(http2=True) or AsyncClient(http2=True). It is off by default.</p></details>
+<details><summary>Why is response.http_version still HTTP/1.1?</summary><p>The server did not negotiate h2, or the URL is plain http://. httpx only uses HTTP/2 over http:// with http1=False.</p></details>
+<details><summary>Can I pass http2=True to httpx.get()?</summary><p>No. In httpx 0.28.1 it raises TypeError: get() got an unexpected keyword argument &#x27;http2&#x27;. Use a Client.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1, h2 4.4.1 and hypercorn on Python 3.13.5 against a local server. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

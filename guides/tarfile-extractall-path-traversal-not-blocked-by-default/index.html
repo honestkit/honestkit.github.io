@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tarfile.extractall(): Still Not Safe By Default in 3.13</title>
+<meta name="description" content="We measured extractall() writing a &#x27;../outside.txt&#x27; member outside the dest dir on Python 3.13, no exception -- just a warning. filter=&#x27;data&#x27; blocks it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/tarfile-extractall-path-traversal-not-blocked-by-default/">
+<meta property="og:title" content="tarfile.extractall(): Still Not Safe By Default in 3.13">
+<meta property="og:description" content="We measured extractall() writing a &#x27;../outside.txt&#x27; member outside the dest dir on Python 3.13, no exception -- just a warning. filter=&#x27;data&#x27; blocks it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/tarfile-extractall-path-traversal-not-blocked-by-default/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does tarfile.extractall() check for '../' in member names by default?", "acceptedAnswer": {"@type": "Answer", "text": "No -- in our Python 3.13.5 test, extractall() with no filter argument wrote a '../outside.txt' member outside the destination directory with no exception, only a DeprecationWarning."}}, {"@type": "Question", "name": "Is zipfile safe from the same path traversal?", "acceptedAnswer": {"@type": "Answer", "text": "We measured zipfile.extractall() stripping the leading '../' from an identical member name and writing the file inside the destination directory -- tarfile and zipfile behave differently for the same attack."}}, {"@type": "Question", "name": "How do I make tarfile.extractall() safe?", "acceptedAnswer": {"@type": "Answer", "text": "Pass filter=\"data\" explicitly. We confirmed it raises tarfile.OutsideDestinationError for a '../' member instead of writing outside the destination, and per the docs also strips dangerous metadata like device files and absolute paths."}}, {"@type": "Question", "name": "Will Python block this automatically in the future?", "acceptedAnswer": {"@type": "Answer", "text": "Per the tarfile docs, Python 3.14 is planned to make the 'data' filter the default. On 3.12 and 3.13, the DeprecationWarning is the only hint -- you still have to pass filter yourself to get the safe behavior."}}, {"@type": "Question", "name": "Is this only a risk for archives from the internet?", "acceptedAnswer": {"@type": "Answer", "text": "Any tar file whose contents you didn't fully control when it was created is a risk -- user uploads, third-party downloads, or anything passed through a pipeline you don't fully trust. We only tested a hand-crafted local archive, but the same member-name mechanism applies regardless of source."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>tarfile.extractall() Path Traversal Still Not Blocked By Default (tested)</h1>
+<p class="lead">A tar archive can contain a member whose name is <code>../outside.txt</code>. We measured what <code>tarfile.extractall()</code> does with one of those in Python 3.13.5: it writes the file wherever the <code>..</code> points, outside the folder you asked it to extract to, with no exception &mdash; just a warning easy to miss.</p>
+<h2 id="repro1">1. A tar member can name a path outside the extraction dir</h2>
+<pre><code>import tarfile, io
+
+with tarfile.open("evil.tar", "w") as tf:
+    data = b"pwned"
+    info = tarfile.TarInfo(name="../outside.txt")
+    info.size = len(data)
+    tf.addfile(info, io.BytesIO(data))</code></pre>
+<p><strong>Measured:</strong> <code>tarfile</code> happily writes a member named <code>../outside.txt</code> into the archive. Nothing about creating the tar stops this &mdash; the danger is entirely on the extraction side.</p>
+
+<h2 id="repro2">2. extractall() with no filter writes outside the destination, silently</h2>
+<pre><code>import tarfile
+
+with tarfile.open("evil.tar") as tf:
+    tf.extractall("extract_dir")</code></pre>
+<pre><code>&lt;string&gt;:1: DeprecationWarning: Python 3.14 will, by default, filter extracted tar
+archives and reject files or modify their metadata. Use the filter argument to
+control this behavior.</code></pre>
+<p><strong>Measured:</strong> the call completes with no exception. Checking the filesystem afterward, <code>outside.txt</code> exists <em>next to</em> <code>extract_dir</code>, not inside it &mdash; <code>extractall()</code> followed the <code>..</code> straight out of the destination. The only signal anything is wrong is a <code>DeprecationWarning</code>, which most scripts never print or notice, and nothing raises at runtime.</p>
+
+<h2 id="repro3">3. zipfile, for contrast, already strips the ".." by default</h2>
+<pre><code>import zipfile
+
+with zipfile.ZipFile("evil.zip", "w") as zf:
+    zf.writestr("../outside_zip.txt", "pwned")
+
+with zipfile.ZipFile("evil.zip") as zf:
+    zf.extractall("extract_dir2")</code></pre>
+<p><strong>Measured:</strong> with the identical <code>../outside_zip.txt</code> member name, <code>zipfile.extractall()</code> strips the leading <code>..</code> component and writes <code>outside_zip.txt</code> <em>inside</em> <code>extract_dir2</code> &mdash; no file lands outside the destination, no warning either. <code>zipfile</code> and <code>tarfile</code> handle the exact same attack shape differently; code that extracts both archive types the same way is only safe for one of them.</p>
+
+<h2 id="fix">4. Fix: pass filter="data" (or "tar") explicitly</h2>
+<pre><code>with tarfile.open("evil.tar") as tf:
+    tf.extractall("extract_dir3", filter="data")</code></pre>
+<pre><code>tarfile.OutsideDestinationError: '../outside.txt' would be extracted to
+'/tmp/.../outside.txt', which is outside the destination</code></pre>
+<p><strong>Measured:</strong> with <code>filter="data"</code>, the same archive now raises <code>tarfile.OutsideDestinationError</code> during extraction and no file is written outside <code>extract_dir3</code>. <code>filter="data"</code> (added in 3.12, per the docs) also strips absolute paths, device files, and ownership/permission bits that could affect files outside the archive. Per the docs, Python 3.14 is planned to make <code>"data"</code> the default &mdash; until then, on 3.12/3.13 you must pass it yourself, every call.</p>
+
+<h2 id="why">5. Why this matters</h2>
+<p>Any code that extracts a tar file someone else produced &mdash; a user upload, a package download, a CI artifact &mdash; is extracting attacker-controlled member names. Without <code>filter="data"</code>, a crafted archive can overwrite files anywhere the extracting process can write, not just inside the folder you intended. This is the long-standing tar path-traversal issue (sometimes called "Tarslip"); it predates Python and affects any extractor that trusts member names, but <code>tarfile</code> itself still requires you to opt in to the safe behavior on 3.12 and 3.13.</p>
+<aside class="cta"><strong>Checking what a download or API response actually sent before you extract it? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does tarfile.extractall() check for &#x27;../&#x27; in member names by default?</summary><p>No -- in our Python 3.13.5 test, extractall() with no filter argument wrote a &#x27;../outside.txt&#x27; member outside the destination directory with no exception, only a DeprecationWarning.</p></details>
+<details><summary>Is zipfile safe from the same path traversal?</summary><p>We measured zipfile.extractall() stripping the leading &#x27;../&#x27; from an identical member name and writing the file inside the destination directory -- tarfile and zipfile behave differently for the same attack.</p></details>
+<details><summary>How do I make tarfile.extractall() safe?</summary><p>Pass filter=&quot;data&quot; explicitly. We confirmed it raises tarfile.OutsideDestinationError for a &#x27;../&#x27; member instead of writing outside the destination, and per the docs also strips dangerous metadata like device files and absolute paths.</p></details>
+<details><summary>Will Python block this automatically in the future?</summary><p>Per the tarfile docs, Python 3.14 is planned to make the &#x27;data&#x27; filter the default. On 3.12 and 3.13, the DeprecationWarning is the only hint -- you still have to pass filter yourself to get the safe behavior.</p></details>
+<details><summary>Is this only a risk for archives from the internet?</summary><p>Any tar file whose contents you didn&#x27;t fully control when it was created is a risk -- user uploads, third-party downloads, or anything passed through a pipeline you don&#x27;t fully trust. We only tested a hand-crafted local archive, but the same member-name mechanism applies regardless of source.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in tarfile module: built a .tar containing one member named &#x27;../outside.txt&#x27;, extracted it with extractall() using no filter argument and again with filter=&#x27;data&#x27;, and checked whether the file landed outside the destination directory. Compared against zipfile with the same &#x27;../&#x27; member name for contrast. PlainHeaders is our extension; Python&#x27;s tarfile and zipfile modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

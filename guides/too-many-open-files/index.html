@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Too Many Open Files (EMFILE): Causes and Fixes, Tested on Linux</title>
+<meta name="description" content="We hit the real file descriptor limit on Linux and captured the exact EMFILE/Errno 24 errors from Python and Node, then fixed it with ulimit.">
+<link rel="canonical" href="https://honestkit.github.io/guides/too-many-open-files/">
+<meta property="og:title" content="Too Many Open Files (EMFILE): Causes and Fixes, Tested on Linux">
+<meta property="og:description" content="We hit the real file descriptor limit on Linux and captured the exact EMFILE/Errno 24 errors from Python and Node, then fixed it with ulimit.">
+<meta property="og:url" content="https://honestkit.github.io/guides/too-many-open-files/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Errno 24 mean in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Errno 24 is EMFILE on Linux: the calling process has too many file descriptors open already. We reproduced it directly: with ulimit -n 50, Python's open() raised OSError: [Errno 24] Too many open files after 47 successful opens."}}, {"@type": "Question", "name": "Why did my script fail a few files before the exact ulimit number?", "acceptedAnswer": {"@type": "Answer", "text": "A few descriptors are already in use for stdin, stdout and stderr (and, in Node, for internal runtime/event-loop handles) before your code opens anything. In our test, a limit of 50 let Python open 47 new files and Node only 30, under the identical limit."}}, {"@type": "Question", "name": "Is EMFILE the same as running out of disk space or memory?", "acceptedAnswer": {"@type": "Answer", "text": "No. EMFILE/Errno 24 is specifically about the count of open file descriptors hitting a limit, not disk space (ENOSPC) or memory. In our tests the disk had plenty of free space; the failure was purely the descriptor count."}}, {"@type": "Question", "name": "Does raising fs.file-max fix EMFILE in my app?", "acceptedAnswer": {"@type": "Answer", "text": "Usually not. fs.file-max is a system-wide ceiling across every process; our EMFILE errors came entirely from the much smaller per-process ulimit -n, which is what you normally need to raise. We only read fs.file-max on our box; we didn't need to touch it to fix the test failure."}}, {"@type": "Question", "name": "How do I raise the open-file limit for good, not just one shell?", "acceptedAnswer": {"@type": "Answer", "text": "ulimit -n in a shell only lasts for that shell and its children, as our tests showed (the main shell's limit of 524288 was unaffected by the subshell tests). Per the Linux docs, persistent changes go in /etc/security/limits.conf for login sessions or LimitNOFILE= in a systemd unit for services; we did not edit those files ourselves."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Too Many Open Files / EMFILE (tested)</h1>
+<p class="lead"><code>Too many open files</code> (Python's <code>OSError: [Errno 24]</code>, Node's <code>EMFILE</code>) means a process has more file descriptors open at once than its limit allows. We lowered the limit on a real Linux box, made it fail, captured the exact error text, then raised the limit and watched the same code succeed.</p>
+<h2>1. The limits on our test box</h2>
+<p>On our Debian 13 box, the per-process open-file limits were:</p>
+<pre><code>$ ulimit -Sn
+524288
+$ ulimit -Hn
+524288
+$ cat /proc/sys/fs/file-max
+9223372036854775807</code></pre>
+<p>Those numbers are high because this is a modern distro default, not a tuned server. <code>ulimit -Sn</code> is the soft limit (what actually stops a process today). <code>ulimit -Hn</code> is the hard ceiling a non-root process can raise its own soft limit up to. <code>/proc/sys/fs/file-max</code> is a different, system-wide number (section 4) &mdash; on this box the kernel reports the architecture's maximum representable value, effectively uncapped.</p>
+
+<h2>2. Reproducing EMFILE on purpose</h2>
+<p>To actually see the error, we lowered the limit for one throwaway subshell only (never the real session) and ran a script that opens files in a loop:</p>
+<pre><code>$ bash -c 'ulimit -n 50; ulimit -n; python3 /tmp/openfiles_test.py'
+50
+OPENED=47
+OSError: [Errno 24] Too many open files: '/tmp/ofd_test_47.txt'</code></pre>
+<p>With the soft limit set to 50, Python opened 47 files before the 48th call to <code>open()</code> raised. That "47, not 50" gap is real and expected: the process already had 3 descriptors in use for stdin, stdout and stderr, so only 47 slots were free for new files.</p>
+<p>Node's own built-in <code>fs</code> module hits the same wall with its own wording:</p>
+<pre><code>$ bash -c 'ulimit -n 50; node /tmp/openfiles_test.js'
+OPENED=30
+EMFILE: too many open files, open '/tmp/ofd_node_30.txt'</code></pre>
+<p>Node stopped sooner, at 30 instead of 47, under the identical 50-descriptor limit. Node's runtime (libuv) keeps its own internal descriptors open for things like the event loop and its thread pool, so fewer slots are left for application code before the same <code>EMFILE</code> condition hits.</p>
+
+<h2>3. The fix: raise the limit (and confirm it actually works)</h2>
+<p>Raising the limit in the same kind of subshell let the identical script run much further before hitting the (now higher) wall:</p>
+<pre><code>$ bash -c 'ulimit -n 4096; ulimit -n; python3 /tmp/openfiles_test.py'
+4096
+OPENED=4093
+OSError: [Errno 24] Too many open files: '/tmp/ofd_test_4093.txt'</code></pre>
+<p>Same script, same error type, but it now opened 4,093 files (again, 3 short of 4096) before failing &mdash; nearly 90&times; more than with the 50 limit. That confirms the ceiling moved because of <code>ulimit -n</code>, not because of anything else in the code. Our main shell's own limit was untouched the whole time:</p>
+<pre><code>$ ulimit -Sn
+524288</code></pre>
+<p>In real code, the fix is almost never "raise the limit and keep looping" &mdash; it's closing file descriptors (and sockets, which share the same fd table on Linux) as soon as you're done with them, using <code>with open(...)</code> in Python or <code>fs.close()</code>/streams in Node, and pooling connections instead of opening a new one per request. Raising the limit (below) buys headroom for a process that legitimately needs many concurrent descriptors, like a server handling thousands of sockets.</p>
+
+<h2>4. Per-process limit vs. system-wide fs.file-max</h2>
+<p>These are two different ceilings, and our test only exercised the first one:</p>
+<ul>
+<li><strong>Per-process limit (<code>ulimit -n</code>, <code>RLIMIT_NOFILE</code>).</strong> What section 2 measured. It caps how many descriptors one process can hold open, regardless of how much headroom the rest of the system has. Every one of our EMFILE/Errno 24 errors came from this limit, not from the system running out of anything globally.</li>
+<li><strong>System-wide ceiling (<code>/proc/sys/fs/file-max</code>).</strong> A kernel-wide cap on the total number of open file handles across every process on the machine combined. On this box it read <code>9223372036854775807</code> &mdash; effectively unbounded for any real workload. We only read this value; we did not change it, since it's a shared, persistent system setting.</li>
+</ul>
+<p>In practice, EMFILE in a single script or server process (what this guide reproduces) is almost always the per-process limit. The system-wide limit matters on a busy multi-process host (many services, containers or user sessions) where individual processes stay under their own <code>ulimit -n</code> but the sum across all of them approaches <code>fs.file-max</code>. You'd see that as open() failures scattered across unrelated processes, not one process failing in isolation like ours did.</p>
+
+<h2>5. Making the fix persistent (per the Linux docs, not measured)</h2>
+<p><code>ulimit -n 4096</code> as used above only lasts for that one shell/process. Per the Linux and systemd documentation, to make a higher limit stick:</p>
+<ul>
+<li><strong>Login shells / interactive users:</strong> add lines to <code>/etc/security/limits.conf</code> (requires the <code>pam_limits</code> module), for example <code>myuser soft nofile 4096</code> and <code>myuser hard nofile 65536</code>.</li>
+<li><strong>systemd services:</strong> set <code>LimitNOFILE=4096</code> (or higher) in the service's <code>[Service]</code> section, either in the unit file or an override via <code>systemctl edit</code>. This applies regardless of who the service runs as and doesn't need <code>pam_limits</code>.</li>
+<li><strong>Docker containers:</strong> the <code>--ulimit nofile=4096:65536</code> flag on <code>docker run</code>, or the equivalent <code>ulimits:</code> key in Compose.</li>
+</ul>
+<p>We did not edit any of these files on our test box &mdash; they're persistent, system-level changes, so treat the above as what the docs describe, not something we verified here. Whatever mechanism you use, confirm it worked the same way we did in section 3: run the real workload and watch the actual descriptor count it reaches before any error, don't just trust the configured number.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Errno 24 mean in Python?</summary><p>Errno 24 is EMFILE on Linux: the calling process has too many file descriptors open already. We reproduced it directly: with ulimit -n 50, Python&#x27;s open() raised OSError: [Errno 24] Too many open files after 47 successful opens.</p></details>
+<details><summary>Why did my script fail a few files before the exact ulimit number?</summary><p>A few descriptors are already in use for stdin, stdout and stderr (and, in Node, for internal runtime/event-loop handles) before your code opens anything. In our test, a limit of 50 let Python open 47 new files and Node only 30, under the identical limit.</p></details>
+<details><summary>Is EMFILE the same as running out of disk space or memory?</summary><p>No. EMFILE/Errno 24 is specifically about the count of open file descriptors hitting a limit, not disk space (ENOSPC) or memory. In our tests the disk had plenty of free space; the failure was purely the descriptor count.</p></details>
+<details><summary>Does raising fs.file-max fix EMFILE in my app?</summary><p>Usually not. fs.file-max is a system-wide ceiling across every process; our EMFILE errors came entirely from the much smaller per-process ulimit -n, which is what you normally need to raise. We only read fs.file-max on our box; we didn&#x27;t need to touch it to fix the test failure.</p></details>
+<details><summary>How do I raise the open-file limit for good, not just one shell?</summary><p>ulimit -n in a shell only lasts for that shell and its children, as our tests showed (the main shell&#x27;s limit of 524288 was unaffected by the subshell tests). Per the Linux docs, persistent changes go in /etc/security/limits.conf for login sessions or LimitNOFILE= in a systemd unit for services; we did not edit those files ourselves.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 on Debian GNU/Linux 13 (trixie) with Python 3.13.5 and Node.js 24.21.0. The persistent-fix section (limits.conf, systemd LimitNOFILE=) is per the Linux docs, not measured. PlainHeaders is our extension; Python and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

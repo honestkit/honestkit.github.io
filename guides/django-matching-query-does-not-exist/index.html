@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Django &quot;matching query does not exist&quot; (DoesNotExist), Tested</title>
+<meta name="description" content="Django DoesNotExist and MultipleObjectsReturned tested on 6.1.2: why .get() raises, catching Model.DoesNotExist, first(), get_or_create and get_object_or_404.">
+<link rel="canonical" href="https://honestkit.github.io/guides/django-matching-query-does-not-exist/">
+<meta property="og:title" content="Django &quot;matching query does not exist&quot; (DoesNotExist), Tested">
+<meta property="og:description" content="Django DoesNotExist and MultipleObjectsReturned tested on 6.1.2: why .get() raises, catching Model.DoesNotExist, first(), get_or_create and get_object_or_404.">
+<meta property="og:url" content="https://honestkit.github.io/guides/django-matching-query-does-not-exist/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I avoid 'matching query does not exist' in Django?", "acceptedAnswer": {"@type": "Answer", "text": "Catch Model.DoesNotExist, use .filter(...).first() which returns None, or get_object_or_404 in views."}}, {"@type": "Question", "name": "Does get_object_or_404 handle MultipleObjectsReturned?", "acceptedAnswer": {"@type": "Answer", "text": "No. In Django 6.1.2 only DoesNotExist becomes Http404; MultipleObjectsReturned propagates as a 500."}}, {"@type": "Question", "name": "Why does get_or_create raise MultipleObjectsReturned?", "acceptedAnswer": {"@type": "Answer", "text": "It calls get() first, so existing duplicate rows make it raise. Add a unique constraint after removing duplicates."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Django matching query does not exist (tested)</h1>
+<p class="lead"><code>Post matching query does not exist</code> is <code>Post.DoesNotExist</code>, raised when <code>.get()</code> finds no row; <code>get() returned more than one</code> is <code>MultipleObjectsReturned</code>. Catch the model's exception, use <code>.first()</code>, or <code>get_object_or_404</code> in views.</p>
+<h2 id="setup">Setup</h2>
+<p>One model, an in-memory SQLite table, and three rows: one <code>hello</code> and two <code>dup</code>. <code>common.py</code>:</p>
+<pre><code>import sys; sys.path.insert(0, &#x27;/w/proj&#x27;)
+import django
+from django.conf import settings
+settings.configure(INSTALLED_APPS=[&#x27;blog&#x27;],
+    DATABASES={&#x27;default&#x27;: {&#x27;ENGINE&#x27;: &#x27;django.db.backends.sqlite3&#x27;, &#x27;NAME&#x27;: &#x27;:memory:&#x27;}})
+django.setup()
+from django.db import connection
+from blog.models import Post
+with connection.schema_editor() as ed:
+    ed.create_model(Post)
+Post.objects.create(title=&#x27;hello&#x27;); Post.objects.create(title=&#x27;dup&#x27;); Post.objects.create(title=&#x27;dup&#x27;)</code></pre>
+<pre><code>from django.db import models
+class Post(models.Model):
+    title = models.CharField(max_length=100)</code></pre>
+<h2 id="repro">1. Reproduce both errors</h2>
+<pre><code>from common import *
+from django.core.exceptions import ObjectDoesNotExist
+for kw in [{&#x27;pk&#x27;: 99}, {&#x27;title&#x27;: &#x27;dup&#x27;}]:
+    try:
+        Post.objects.get(**kw)
+    except Exception as e:
+        print(kw, &#x27;-&gt;&#x27;, type(e).__qualname__ + &#x27;:&#x27;, e)
+        print(&#x27;   ObjectDoesNotExist subclass:&#x27;, isinstance(e, ObjectDoesNotExist))</code></pre>
+<p>Output:</p>
+<pre><code>{&#x27;pk&#x27;: 99} -&gt; Post.DoesNotExist: Post matching query does not exist.
+   ObjectDoesNotExist subclass: True
+{&#x27;title&#x27;: &#x27;dup&#x27;} -&gt; Post.MultipleObjectsReturned: get() returned more than one Post -- it returned 2!
+   ObjectDoesNotExist subclass: False</code></pre>
+<p><code>.get()</code> expects exactly one row. Zero rows raises <code>&lt;Model&gt;.DoesNotExist</code> ("matching query does not exist"); two or more raises <code>&lt;Model&gt;.MultipleObjectsReturned</code> with the count. Each model has its own subclasses; <code>DoesNotExist</code> also inherits from <code>django.core.exceptions.ObjectDoesNotExist</code>, which is handy for catching the error for any model.</p>
+<h2 id="fix">2. Fixes: catch it, or use first()</h2>
+<pre><code>from common import *
+# 1. catch the model-specific exception
+try:
+    p = Post.objects.get(pk=99)
+except Post.DoesNotExist:
+    p = None
+print(&#x27;caught:&#x27;, p)
+# 2. first() returns None instead of raising (and never raises MultipleObjectsReturned)
+print(&#x27;first():&#x27;, Post.objects.filter(pk=99).first(), Post.objects.filter(title=&#x27;dup&#x27;).first().pk)
+# 3. get_or_create on a non-unique field still raises when duplicates exist
+try:
+    Post.objects.get_or_create(title=&#x27;dup&#x27;)
+except Post.MultipleObjectsReturned as e:
+    print(&#x27;get_or_create:&#x27;, type(e).__qualname__ + &#x27;:&#x27;, e)</code></pre>
+<p>Output:</p>
+<pre><code>caught: None
+first(): None 2
+get_or_create: Post.MultipleObjectsReturned: get() returned more than one Post -- it returned 2!</code></pre>
+<ul>
+<li>Catch <code>Post.DoesNotExist</code> (not a bare <code>except</code>) when a missing row is expected.</li>
+<li><code>.filter(...).first()</code> returns <code>None</code> for no rows and the lowest-pk row when there are several; it never raises either error. Only use it when "any one of them" is really fine.</li>
+<li><code>get_or_create()</code> does a <code>get()</code> first, so it raises <code>MultipleObjectsReturned</code> if duplicates already exist. The lasting fix for duplicates is a <code>unique=True</code> field or a <code>UniqueConstraint</code>, after cleaning the existing rows.</li>
+</ul>
+<h2 id="views">3. In views: get_object_or_404</h2>
+<pre><code>from common import *
+from django.http import Http404
+from django.shortcuts import get_object_or_404
+for kw in [{&#x27;pk&#x27;: 99}, {&#x27;title&#x27;: &#x27;dup&#x27;}]:
+    try:
+        get_object_or_404(Post, **kw)
+    except Exception as e:
+        print(kw, &#x27;-&gt;&#x27;, type(e).__qualname__ + &#x27;:&#x27;, e)</code></pre>
+<p>Output:</p>
+<pre><code>{&#x27;pk&#x27;: 99} -&gt; Http404: No Post matches the given query.
+{&#x27;title&#x27;: &#x27;dup&#x27;} -&gt; Post.MultipleObjectsReturned: get() returned more than one Post -- it returned 2!</code></pre>
+<p><code>get_object_or_404</code> converts <code>DoesNotExist</code> into <code>Http404</code> (a 404 page, not a 500), but <code>MultipleObjectsReturned</code> passes through unchanged and becomes a 500 error. Look up by <code>pk</code> or a unique field in views.</p>
+<p>Related: <a href="/guides/django-noreversematch/">Django NoReverseMatch</a>, <a href="/guides/django-improperlyconfigured-settings-are-not-configured/">Django settings are not configured</a>, <a href="/guides/sqlalchemy-integrityerror-unique-constraint-failed/">SQLAlchemy IntegrityError UNIQUE constraint failed</a>.</p>
+
+<aside class="cta"><strong>Check that a missing object returns 404, not 500, from your Django app:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I avoid &#x27;matching query does not exist&#x27; in Django?</summary><p>Catch Model.DoesNotExist, use .filter(...).first() which returns None, or get_object_or_404 in views.</p></details>
+<details><summary>Does get_object_or_404 handle MultipleObjectsReturned?</summary><p>No. In Django 6.1.2 only DoesNotExist becomes Http404; MultipleObjectsReturned propagates as a 500.</p></details>
+<details><summary>Why does get_or_create raise MultipleObjectsReturned?</summary><p>It calls get() first, so existing duplicate rows make it raise. Add a unique constraint after removing duplicates.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Django 6.1.2 and Python 3.14.7 (python:3-alpine in Docker, SQLite in memory). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and Django are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

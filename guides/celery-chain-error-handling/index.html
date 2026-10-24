@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Celery chain error handling: on_error and link_error (tested)</title>
+<meta name="description" content="What happens when a task in a Celery chain fails: later tasks skipped, caller gets the original exception, where on_error must go, and eager mode.">
+<link rel="canonical" href="https://honestkit.github.io/guides/celery-chain-error-handling/">
+<meta property="og:title" content="Celery chain error handling: on_error and link_error (tested)">
+<meta property="og:description" content="What happens when a task in a Celery chain fails: later tasks skipped, caller gets the original exception, where on_error must go, and eager mode.">
+<meta property="og:url" content="https://honestkit.github.io/guides/celery-chain-error-handling/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I handle errors in a Celery chain?", "acceptedAnswer": {"@type": "Answer", "text": "Call .on_error(handler.s()) on the chain object. The handler runs with (request, exc, traceback) for the task that failed, and get() on the chain result raises the original exception."}}, {"@type": "Question", "name": "Do the remaining chain tasks run after a failure?", "acceptedAnswer": {"@type": "Answer", "text": "No. In the test the task after the failing one never ran, and its state was FAILURE, so get() does not hang."}}, {"@type": "Question", "name": "Why is my chain errback not called?", "acceptedAnswer": {"@type": "Answer", "text": "If on_error is attached only to the last signature, it is never called when an earlier task fails, because the last task never starts. Attach it to the chain."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Celery chain error handling (tested with a real worker)</h1>
+<p class="lead">When a task in a Celery chain fails, the remaining tasks are skipped and marked FAILURE, <code>result.get()</code> raises the original exception, and an errback attached to the chain, <code>chain(a.s(), b.s(), c.s()).on_error(handler.s())</code>, runs once with the failing task's request. An errback on only the last signature is never called.</p>
+<p>A chain runs tasks one after another, passing each result to the next. When one task in the middle fails, the rest of the chain never runs, the caller's <code>get()</code> raises the original exception, and an errback added with <code>.on_error()</code> on the <em>whole chain</em> is called once with the failing task's request. Measured with Celery 5.6.3 (kombu 5.6.2, redis-py 8.1.0), a real worker and Redis 7 as broker and result backend.</p>
+<h2 id="handling">1. Chain error handling with a real worker</h2>
+<pre><code>$ cat tasks.py
+from celery import Celery
+app = Celery(&quot;tasks&quot;, broker=&quot;redis://127.0.0.1:8964/0&quot;, backend=&quot;redis://127.0.0.1:8964/1&quot;)
+
+@app.task
+def add(x, y):
+    print(f&quot;add({x}, {y})&quot;)
+    return x + y
+
+@app.task
+def div(x, y):
+    print(f&quot;div({x}, {y})&quot;)
+    return x / y
+
+@app.task
+def on_error(request, exc, tb):
+    print(f&quot;errback: task {request.task} {request.id[:8]} failed with {exc!r}&quot;)
+$ celery -A tasks worker -c 1 --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ cat run_chain.py
+from celery import chain
+from tasks import add, div, on_error
+
+ok = chain(add.s(2, 2), div.s(2), add.s(10))()
+print(&quot;ok:&quot;, ok.get(timeout=10))
+
+bad = chain(add.s(2, 2), div.s(0), add.s(10)).on_error(on_error.s())()
+try:
+    bad.get(timeout=10)
+except Exception as e:
+    print(&quot;caller:&quot;, type(e).__name__, e)
+print(&quot;last task state:&quot;, bad.state)
+print(&quot;middle task state:&quot;, bad.parent.state)
+print(&quot;first task:&quot;, bad.parent.parent.state, bad.parent.parent.result)
+del ok, bad
+$ timeout 40 python run_chain.py
+ok: 12.0
+caller: ZeroDivisionError division by zero
+last task state: FAILURE
+middle task state: FAILURE
+first task: SUCCESS 4</code></pre>
+<p>The caller gets <code>ZeroDivisionError</code>, not a wrapper exception. The last task <code>add.s(10)</code> never ran, yet its state is FAILURE: Celery marks the remaining tasks of the chain as failed so that <code>get()</code> on the final result does not hang. The first task keeps its SUCCESS result (4), so you can still read partial progress through <code>.parent</code>. The worker log:</p>
+<pre><code>$ grep -aE &quot;add\(|div\(|errback|raised unexpected&quot; worker.log | cut -c1-200
+[2026-10-23 11:24:34,310: WARNING/ForkPoolWorker-1] add(2, 2)
+[2026-10-23 11:24:34,324: WARNING/ForkPoolWorker-1] div(4, 2)
+[2026-10-23 11:24:34,327: WARNING/ForkPoolWorker-1] add(2.0, 10)
+[2026-10-23 11:24:34,331: WARNING/ForkPoolWorker-1] add(2, 2)
+[2026-10-23 11:24:34,332: WARNING/ForkPoolWorker-1] div(4, 0)
+[2026-10-23 11:24:34,336: WARNING/ForkPoolWorker-1] errback: task tasks.div ce639419 failed with ZeroDivisionError(&#x27;division by zero&#x27;)
+[2026-10-23 11:24:34,336: ERROR/ForkPoolWorker-1] Task tasks.div[ce639419-ea9f-490f-969e-93d81f592a0d] raised unexpected: ZeroDivisionError(&#x27;division by zero&#x27;)</code></pre>
+<p>The errback ran once, for <code>tasks.div</code>, and received the real exception (unlike a chord errback, which gets a <code>ChordError</code>). <code>request.task</code> and <code>request.id</code> tell you which step failed.</p>
+<h2 id="placement">2. Errback on the last signature only: not called</h2>
+<pre><code>$ cat run2.py
+from celery import chain
+from tasks import add, div, on_error
+
+# errback attached only to the LAST signature
+r = chain(add.s(2, 2), div.s(0), add.s(10).on_error(on_error.s()))()
+try:
+    r.get(timeout=10)
+except Exception as e:
+    print(&quot;caller:&quot;, type(e).__name__, e)
+del r
+$ timeout 40 python run2.py
+caller: ZeroDivisionError division by zero
+$ grep -aE &quot;add\(|div\(|errback|raised unexpected&quot; &lt;(tail -n +53 worker.log) | cut -c1-200
+[2026-10-23 11:24:36,601: WARNING/ForkPoolWorker-1] add(2, 2)
+[2026-10-23 11:24:36,604: WARNING/ForkPoolWorker-1] div(4, 0)
+[2026-10-23 11:24:36,607: ERROR/ForkPoolWorker-1] Task tasks.div[39691d6f-2031-4cd1-b9c3-2b6a5954da17] raised unexpected: ZeroDivisionError(&#x27;division by zero&#x27;)</code></pre>
+<p>(The <code>tail -n +53</code> only skips the log lines from the first run.) With <code>on_error</code> attached to <code>add.s(10)</code> instead of the chain, nothing handles the failure in <code>div</code>: the last task never starts, so its errback never fires. Call <code>.on_error()</code> on the <code>chain(...)</code> object, which applies the errback to every task in it.</p>
+<h2 id="eager">3. Eager mode (tests): raised from the chain() call</h2>
+<pre><code>$ cat eager.py
+from celery import chain
+from tasks import app, add, div, on_error
+app.conf.task_always_eager = True
+
+try:
+    r = chain(add.s(2, 2), div.s(0), add.s(10)).on_error(on_error.s())()
+    print(&quot;got a result:&quot;, r.state)
+except Exception as e:
+    print(&quot;raised by the chain() call:&quot;, type(e).__name__, e)
+$ timeout 20 python eager.py 2&gt;&amp;1
+add(2, 2)
+div(4, 0)
+errback: task tasks.div fca79556 failed with ZeroDivisionError(&#x27;division by zero&#x27;)
+raised by the chain() call: ZeroDivisionError division by zero</code></pre>
+<p>With <code>task_always_eager = True</code> the errback does run, but the exception is raised straight out of the <code>chain(...)()</code> call instead of later from <code>get()</code>. Wrap the call itself in <code>try</code> (or <code>pytest.raises</code>) in eager-mode tests.</p>
+<p>Related: <a href="/guides/celery-chord-error-handling/">Celery chord error handling</a>, <a href="/guides/celery-link-error-errback-example/">Celery link_error errback example</a>, <a href="/guides/celery-maxretriesexceedederror/">Celery MaxRetriesExceededError</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I handle errors in a Celery chain?</summary><p>Call .on_error(handler.s()) on the chain object. The handler runs with (request, exc, traceback) for the task that failed, and get() on the chain result raises the original exception.</p></details>
+<details><summary>Do the remaining chain tasks run after a failure?</summary><p>No. In the test the task after the failing one never ran, and its state was FAILURE, so get() does not hang.</p></details>
+<details><summary>Why is my chain errback not called?</summary><p>If on_error is attached only to the last signature, it is never called when an earlier task fails, because the last task never starts. Attach it to the chain.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Celery 5.6.3, kombu 5.6.2 and redis-py 8.1.0 on Python 3.13.5, one worker (-c 1), Redis 7 (Docker) as broker and backend. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Celery and Redis are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

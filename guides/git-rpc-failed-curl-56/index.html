@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Git &quot;RPC failed curl 56&quot; / remote end hung up: Causes (Tested)</title>
+<meta name="description" content="We built a local git server and forced four real connection failures to show exactly what error text each produces, and what http.postBuffer changes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/git-rpc-failed-curl-56/">
+<meta property="og:title" content="Git &quot;RPC failed curl 56&quot; / remote end hung up: Causes (Tested)">
+<meta property="og:description" content="We built a local git server and forced four real connection failures to show exactly what error text each produces, and what http.postBuffer changes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/git-rpc-failed-curl-56/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does raising http.postBuffer fix curl 56?", "acceptedAnswer": {"@type": "Answer", "text": "Only sometimes. We measured that it changes one thing: requests under the new limit are sent with a plain Content-Length instead of Transfer-Encoding: chunked. That helps only if a proxy or antivirus on the path is mishandling chunked requests. If the reset happens on small, unchunked requests too, postBuffer will not change anything."}}, {"@type": "Question", "name": "Does git retry automatically after a connection reset?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, once. Our GIT_CURL_VERBOSE=1 trace showed git/curl detect the reset, log \"Connection died, retrying a fresh connect\", and reissue the exact same RPC over a new connection. The RPC failed error we see is from the second, final attempt."}}, {"@type": "Question", "name": "Why do I sometimes see curl 56 and sometimes curl 18 or curl 52 for what feels like the same problem?", "acceptedAnswer": {"@type": "Answer", "text": "The number reflects how the connection died, which we reproduced directly: curl 56 is a hard reset (RST), curl 52 is a graceful close before any response bytes arrive, and curl 18 is a graceful close partway through a response body that had already started. Same underlying flaky link, different failure point."}}, {"@type": "Question", "name": "Why did my clone just hang instead of showing an error?", "acceptedAnswer": {"@type": "Answer", "text": "Git has no built-in timeout for the RPC call. We confirmed a server that accepts the connection and sends nothing back makes git clone hang indefinitely with no error text, until something else (your terminal, a wrapper script, or the OS) kills it. Set http.lowSpeedLimit and http.lowSpeedTime so git gives up on its own with a curl 28 error."}}, {"@type": "Question", "name": "Is this a problem with my repository or my git version?", "acceptedAnswer": {"@type": "Answer", "text": "Almost never. We reproduced the exact same error strings with a perfectly healthy repo and a healthy git 2.47.3 client; the only variable was how we killed the TCP connection on the server side. Corrupt repos produce different errors (e.g. fsck failures), not curl 56."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>git RPC failed; curl 56 Connection reset by peer (tested)</h1>
+<p class="lead"><code>error: RPC failed; curl 56 Recv failure: Connection reset by peer</code> and <code>fatal: the remote end hung up unexpectedly</code> happen when a git push, clone or pull over HTTP(S) loses its TCP connection partway through. We built a local git smart-HTTP server, forced four different kinds of connection failure against it, and recorded the exact error text each one produces.</p><p>Short version: curl's error number tells you <em>how</em> the connection died, not why. A reverse proxy, firewall, antivirus, VPN or flaky Wi-Fi can all cause it; the fix is almost always on the network path between you and the server, not in git itself.</p>
+<h2>1. The error, and the four things we tested</h2>
+<p>The message is really two lines:</p>
+<pre><code>error: RPC failed; curl 56 Recv failure: Connection reset by peer
+fatal: the remote end hung up unexpectedly</code></pre>
+<p>"RPC" here means the smart-HTTP exchange git uses for push/clone/fetch (a POST to <code>/git-upload-pack</code> or <code>/git-receive-pack</code>). "curl 56" is libcurl's own error number (<code>CURLE_RECV_ERROR</code>): a read on the socket failed. The exact wording depends on <strong>how</strong> the connection died. We reproduced four distinct ways and recorded the exact text for each:</p>
+<table>
+<tr><th>What happened on the wire</th><th>Exact error git printed</th></tr>
+<tr><td>Server sends a TCP RST while git is sending/receiving the RPC body</td><td><code>error: RPC failed; curl 56 Recv failure: Connection reset by peer</code></td></tr>
+<tr><td>Server closes gracefully (FIN) before sending any response headers</td><td><code>error: RPC failed; curl 52 Empty reply from server</code></td></tr>
+<tr><td>Server closes gracefully (FIN) partway through a response body it had already started sending</td><td><code>error: RPC failed; curl 18 transfer closed with outstanding read data remaining</code></td></tr>
+<tr><td>Server never responds at all (hang), with a client-side low-speed timeout configured</td><td><code>error: RPC failed; curl 28 Operation too slow. Less than 1000 bytes/sec transferred the last 3 seconds</code></td></tr>
+</table>
+<p>In every case git also printed <code>fatal: the remote end hung up unexpectedly</code> as a second line, except the timeout case. So that second line alone does not tell you which of these happened; the curl number does.</p>
+
+<h2>2. Test setup</h2>
+<p>We ran <code>git http-backend</code> (git's own CGI smart-HTTP implementation) behind a ~130-line Node.js proxy on <code>127.0.0.1:8984</code>, serving real bare repos with a 5 MB file committed. For the failure cases, the proxy intercepted the POST to <code>git-upload-pack</code>/<code>git-receive-pack</code> and either:</p>
+<ul>
+<li>called Node's <code>socket.resetAndDestroy()</code> (sends an actual TCP RST, available since Node 18.3), or</li>
+<li>called <code>socket.end()</code> (a graceful FIN, no RST), or</li>
+<li>did nothing at all (simulating a server that hangs).</li>
+</ul>
+<p>A plain, non-broken clone against the same setup worked end to end, so the failures below are specifically caused by the connection, not a misconfigured test server.</p>
+
+<h2>3. Reproducing curl 56 (the RST case)</h2>
+<p>We read the client's request body for the upload-pack negotiation (177 bytes) then called <code>resetAndDestroy()</code> before writing any response. Full output:</p>
+<pre><code>$ git clone http://127.0.0.1:8984/repo.git dest
+Cloning into 'dest'...
+error: RPC failed; curl 56 Recv failure: Connection reset by peer
+fatal: the remote end hung up unexpectedly</code></pre>
+<p>With <code>GIT_CURL_VERBOSE=1</code> set, the verbose trace shows git/curl retrying once by itself before giving up:</p>
+<pre><code>== Info: Recv failure: Connection reset by peer
+== Info: Connection died, retrying a fresh connect (retry count: 1)
+== Info: shutting down connection #0
+== Info: Issue another request to this URL: '.../git-upload-pack'
+...
+== Info: upload completely sent off: 177 bytes
+== Info: Recv failure: Connection reset by peer
+error: RPC failed; curl 56 Recv failure: Connection reset by peer</code></pre>
+<p>So a single RST does not immediately fail the clone: git transparently retries the whole RPC once over a fresh connection. Only the second failure is fatal. This matches what admins observe: an intermittently flaky proxy can make pushes "usually" succeed on retry and fail outright only when it drops two connections in a row.</p>
+
+<h2>4. A truncated response looks different again</h2>
+<p>We let the real pack data start streaming to the client (over 24 KB written), then cut the connection mid-stream. With a hard RST:</p>
+<pre><code>error: RPC failed; curl 56 Recv failure: Connection reset by peer
+fetch-pack: unexpected disconnect while reading sideband packet
+fatal: protocol error: bad pack header</code></pre>
+<p>With a graceful FIN instead of an RST, at the same point in the stream:</p>
+<pre><code>error: RPC failed; curl 18 transfer closed with outstanding read data remaining
+fetch-pack: unexpected disconnect while reading sideband packet
+fatal: protocol error: bad pack header</code></pre>
+<p>Both add <code>fetch-pack: unexpected disconnect while reading sideband packet</code> and <code>fatal: protocol error: bad pack header</code> &mdash; lines that did not appear in section 3, where the connection died before any pack bytes arrived. If you see those two extra lines, the connection broke <em>during</em> the pack transfer, not during the initial request. (Per git's documentation, a truncated pack can also be reported as <code>fatal: early EOF</code> / <code>fatal: index-pack failed</code> in other code paths, e.g. on the receiving end of a push; we did not reproduce that exact string, only the sideband/bad-pack-header variant above.)</p>
+
+<h2>5. A hang is silent until something times out</h2>
+<p>We also tested a server that accepts the connection and then sends nothing back, ever. With no timeout configured, <code>git clone</code> against it simply hung &mdash; <code>timeout 6 git clone ...</code> had to kill it after 6 seconds, and git itself printed no error at all. Git has no built-in RPC timeout.</p>
+<p>Setting a client-side low-speed timeout changes that:</p>
+<pre><code>$ git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=3 clone http://127.0.0.1:8984/repo.git dest
+Cloning into 'dest'...
+error: RPC failed; curl 28 Operation too slow. Less than 1000 bytes/sec transferred the last 3 seconds
+fatal: the remote end hung up unexpectedly</code></pre>
+<p>This took almost exactly 3 seconds (we measured 4.0 s wall clock) &mdash; the <code>http.lowSpeedTime</code> value. Without <code>http.lowSpeedLimit</code>/<code>http.lowSpeedTime</code> set, a genuinely stuck connection can hang until the OS's own TCP keepalive/timeout kicks in, which on Linux defaults to much longer than a few seconds. If your pushes "just hang" rather than erroring, this is why, and setting these two config values turns a silent hang into a clear curl 28 error.</p>
+
+<h2>6. http.postBuffer: what it actually changes</h2>
+<p><code>git config --get http.postBuffer</code> prints nothing by default (unset); per git's docs the built-in default is 1 MiB. We verified what that default actually does by pushing a ~5 MB pack and inspecting the real request headers with <code>GIT_CURL_VERBOSE=1</code>:</p>
+<table>
+<tr><th>http.postBuffer</th><th>Request header we captured</th></tr>
+<tr><td>default (unset, 1 MiB)</td><td><code>Transfer-Encoding: chunked</code> (no Content-Length)</td></tr>
+<tr><td>20971520 (20 MB)</td><td><code>Content-Length: 5138338</code> (no chunked encoding)</td></tr>
+</table>
+<pre><code>$ git -c http.postBuffer=20971520 push origin master
+...
+=&gt; Send header: POST /repo.git/git-receive-pack HTTP/1.1
+=&gt; Send header: Content-Length: 5138338</code></pre>
+<p>So raising <code>http.postBuffer</code> above the size of your push does exactly one thing: it switches the request from chunked transfer encoding to a single buffered request with a normal <code>Content-Length</code>. It does not make git retry more, send faster, or change anything about how RSTs or timeouts are handled. It only helps if the actual problem is a proxy, antivirus or corporate firewall that mishandles or strips chunked HTTP/1.1 requests &mdash; which, per git's own documentation, is the only scenario it's meant for. If your RST or timeout happens on a plain unchunked request too, raising postBuffer will not fix it.</p>
+
+<h2>7. What to actually do about it</h2>
+<ul>
+<li><strong>If it fails consistently on one large push/clone, rarely on small ones:</strong> something in the path (corporate proxy, antivirus, old load balancer) is dropping long-lived or chunked HTTP connections. Try <code>git config http.postBuffer 157286400</code> (150 MB) to force a single buffered request, per git's docs. If that fixes it, the chunked-encoding path was the problem.</li>
+<li><strong>If it fails intermittently, including on small pushes:</strong> that's a flaky link, not an encoding issue. Git already retries once by itself (section 3); if that's not enough, shallow-clone (<code>--depth 1</code>) or split a huge push into smaller ones so each attempt has less to lose.</li>
+<li><strong>If it looks like a silent hang rather than an error:</strong> set <code>git config --global http.lowSpeedLimit 1000</code> and <code>http.lowSpeedTime 30</code> so a dead connection surfaces as curl 28 within 30 seconds instead of hanging indefinitely (section 5).</li>
+<li><strong>If you see "unexpected disconnect while reading sideband packet" / "bad pack header":</strong> the connection broke mid-transfer, not at the start (section 4). Check the server/proxy's own timeout settings for long-running requests &mdash; many reverse proxies cap request duration independent of data size.</li>
+<li><strong>Use <code>GIT_CURL_VERBOSE=1 git ...</code></strong> to see exactly which curl error number you get (56, 52, 18, 28, or something else) and whether it happens before or after the pack data starts. That number, per section 1's table, tells you which of these four situations you're actually in.</li>
+</ul>
+<p>If the server itself is returning a slow or failing HTTP response rather than dropping the connection, check what it actually sends with our <a href="/tools/http-headers/">HTTP headers tool</a>. For plain connection resets outside of git specifically, see <a href="/guides/err-connection-reset-econnreset/">ERR_CONNECTION_RESET / ECONNRESET</a>; for a server-side timeout to an upstream, see <a href="/guides/504-gateway-timeout/">504 Gateway Timeout</a>.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does raising http.postBuffer fix curl 56?</summary><p>Only sometimes. We measured that it changes one thing: requests under the new limit are sent with a plain Content-Length instead of Transfer-Encoding: chunked. That helps only if a proxy or antivirus on the path is mishandling chunked requests. If the reset happens on small, unchunked requests too, postBuffer will not change anything.</p></details>
+<details><summary>Does git retry automatically after a connection reset?</summary><p>Yes, once. Our GIT_CURL_VERBOSE=1 trace showed git/curl detect the reset, log &quot;Connection died, retrying a fresh connect&quot;, and reissue the exact same RPC over a new connection. The RPC failed error we see is from the second, final attempt.</p></details>
+<details><summary>Why do I sometimes see curl 56 and sometimes curl 18 or curl 52 for what feels like the same problem?</summary><p>The number reflects how the connection died, which we reproduced directly: curl 56 is a hard reset (RST), curl 52 is a graceful close before any response bytes arrive, and curl 18 is a graceful close partway through a response body that had already started. Same underlying flaky link, different failure point.</p></details>
+<details><summary>Why did my clone just hang instead of showing an error?</summary><p>Git has no built-in timeout for the RPC call. We confirmed a server that accepts the connection and sends nothing back makes git clone hang indefinitely with no error text, until something else (your terminal, a wrapper script, or the OS) kills it. Set http.lowSpeedLimit and http.lowSpeedTime so git gives up on its own with a curl 28 error.</p></details>
+<details><summary>Is this a problem with my repository or my git version?</summary><p>Almost never. We reproduced the exact same error strings with a perfectly healthy repo and a healthy git 2.47.3 client; the only variable was how we killed the TCP connection on the server side. Corrupt repos produce different errors (e.g. fsck failures), not curl 56.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with git 2.47.3 and Node.js 24.21.0 on Linux. We ran a real git smart-HTTP server (git http-backend as CGI behind a small Node proxy) on 127.0.0.1:8984 and pointed git clone/push at it, including versions that abort the TCP connection mid-request with a real RST (Node&#x27;s socket.resetAndDestroy()) or a graceful FIN. All error strings below are copy-pasted from real git output. The literal phrase &quot;fatal: early EOF&quot; is from git&#x27;s source/docs, not reproduced verbatim; our mid-response-truncation test produced a different, also-real message instead (section 4). PlainHeaders is our extension; git, curl and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

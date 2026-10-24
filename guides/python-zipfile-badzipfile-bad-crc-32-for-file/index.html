@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python zipfile BadZipFile: Bad CRC-32 for file - Tested Fix</title>
+<meta name="description" content="Measured in Python 3.13.5: one bad byte breaks one member, extractall leaves partial files, and 11 of 58 corruptions raise zlib.error instead.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-zipfile-badzipfile-bad-crc-32-for-file/">
+<meta property="og:title" content="Python zipfile BadZipFile: Bad CRC-32 for file - Tested Fix">
+<meta property="og:description" content="Measured in Python 3.13.5: one bad byte breaks one member, extractall leaves partial files, and 11 of 58 corruptions raise zlib.error instead.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-zipfile-badzipfile-bad-crc-32-for-file/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does BadZipFile: Bad CRC-32 for file mean?", "acceptedAnswer": {"@type": "Answer", "text": "The member's data doesn't match the checksum stored in the zip, so it was damaged after the zip was made. We measured one flipped byte causing it for one member while the other members still read fine."}}, {"@type": "Question", "name": "How do I fix Bad CRC-32 in Python zipfile?", "acceptedAnswer": {"@type": "Answer", "text": "Get a fresh copy of the file (re-download in binary mode and compare sizes or checksums). The data is wrong, so there's no flag to ignore it. The other members can still be read; testzip() names the first bad one."}}, {"@type": "Question", "name": "Why does my corrupt zip raise zlib.error instead of BadZipFile?", "acceptedAnswer": {"@type": "Answer", "text": "If the damaged deflate data can't be decompressed, zlib fails before the CRC check. We measured 11 of 58 single-byte corruptions raising zlib.error, which except zipfile.BadZipFile does not catch."}}, {"@type": "Question", "name": "Does zipfile.testzip() catch all corruption?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured it returning the bad member name for a CRC mismatch but raising zlib.error for a different corruption of the same file."}}, {"@type": "Question", "name": "Can a file saved in text mode cause Bad CRC-32?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We measured LF to CRLF translation producing a member that fails testzip(), and a bytes-to-str-to-bytes round trip producing 'Bad magic number for central directory'. Always write zips with 'wb'."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>zipfile BadZipFile: Bad CRC-32 for file (tested)</h1>
+<p class="lead"><code>zipfile.BadZipFile: Bad CRC-32 for file 'name'</code> means one member's bytes changed after the zip was made. We corrupted real archives to measure what still works, what gets written before the error, and the <code>zlib.error</code> that slips past <code>except BadZipFile</code>.</p>
+<h2 id="error">1. The exact error: one damaged member, the rest fine</h2>
+<pre><code>import os, tempfile, zipfile
+
+d = tempfile.mkdtemp()
+p = os.path.join(d, &quot;data.zip&quot;)
+with zipfile.ZipFile(p, &quot;w&quot;, zipfile.ZIP_STORED) as z:
+    z.writestr(&quot;a.txt&quot;, &quot;hello world\n&quot; * 1000)
+    z.writestr(&quot;b.txt&quot;, &quot;second file\n&quot; * 1000)
+
+raw = bytearray(open(p, &quot;rb&quot;).read())
+i = raw.find(b&quot;hello world&quot;)
+raw[i + 5000] ^= 0xFF                 # flip one byte inside a.txt&#x27;s data
+open(p, &quot;wb&quot;).write(raw)
+
+with zipfile.ZipFile(p) as z:          # opening works: the directory is intact
+    print(&quot;namelist:&quot;, z.namelist())
+    print(&quot;testzip():&quot;, z.testzip())   # first bad member, or None
+    try:
+        z.read(&quot;a.txt&quot;)
+    except zipfile.BadZipFile as e:
+        print(&quot;read a.txt -&gt; BadZipFile:&quot;, e)
+    print(&quot;read b.txt -&gt;&quot;, len(z.read(&quot;b.txt&quot;)), &quot;bytes OK&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>namelist: [&#x27;a.txt&#x27;, &#x27;b.txt&#x27;]
+testzip(): a.txt
+read a.txt -&gt; BadZipFile: Bad CRC-32 for file &#x27;a.txt&#x27;
+read b.txt -&gt; 12000 bytes OK</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> flipping a single byte inside one member's data leaves the archive's directory intact, so <code>ZipFile()</code> opens it and <code>namelist()</code> works. Only reading that member raises <code>zipfile.BadZipFile: Bad CRC-32 for file 'a.txt'</code>. The other member reads normally. <code>testzip()</code> returns the name of the first bad member (and <code>None</code> when all are good), so one corrupt entry does not mean the whole zip is lost.</p>
+
+<h2 id="zlib">2. Compressed members: often zlib.error instead of BadZipFile</h2>
+<pre><code>import collections, os, random, tempfile, zipfile
+
+d = tempfile.mkdtemp()
+p = os.path.join(d, &quot;data.zip&quot;)
+with zipfile.ZipFile(p, &quot;w&quot;, zipfile.ZIP_DEFLATED) as z:
+    z.writestr(&quot;a.txt&quot;, random.Random(7).randbytes(50_000).hex())
+good = open(p, &quot;rb&quot;).read()
+data_start, data_end = 30 + len(&quot;a.txt&quot;), good.find(b&quot;PK\x01\x02&quot;)
+
+seen = collections.Counter()
+for pos in range(data_start, data_end, 997):   # flip one byte at many places
+    raw = bytearray(good)
+    raw[pos] ^= 0xFF
+    open(p, &quot;wb&quot;).write(raw)
+    try:
+        with zipfile.ZipFile(p) as z:
+            z.read(&quot;a.txt&quot;)
+        seen[&quot;no error (!)&quot;] += 1
+    except Exception as e:
+        seen[f&quot;{type(e).__module__}.{type(e).__name__}: {str(e)[:62]}&quot;] += 1
+for k, v in seen.most_common():
+    print(f&quot;{v:3}  {k}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code> 47  zipfile.BadZipFile: Bad CRC-32 for file &#x27;a.txt&#x27;
+  9  zlib.error: Error -3 while decompressing data: invalid distance too far ba
+  2  zlib.error: Error -3 while decompressing data: invalid literal/length code</code></pre>
+<p><strong>Measured:</strong> we flipped one byte at 58 positions in a deflate-compressed member. 47 gave <code>Bad CRC-32</code>, but <strong>11 raised <code>zlib.error: Error -3 while decompressing data</code></strong>, which is not a <code>BadZipFile</code> subclass. So <code>except zipfile.BadZipFile</code> lets about one in six corruptions crash your program. Which one you get depends on where the damage lands: if the bytes still decompress, the CRC check catches it at the end; if they don't, zlib fails first.</p>
+
+<h2 id="partial">3. extractall() leaves a partial file behind</h2>
+<pre><code>import os, random, tempfile, zipfile
+
+d = tempfile.mkdtemp()
+p = os.path.join(d, &quot;data.zip&quot;)
+with zipfile.ZipFile(p, &quot;w&quot;, zipfile.ZIP_DEFLATED) as z:
+    z.writestr(&quot;a.txt&quot;, random.Random(7).randbytes(50_000).hex())
+raw = bytearray(open(p, &quot;rb&quot;).read())
+raw[len(raw) // 2] ^= 0xFF            # corrupt the compressed stream
+open(p, &quot;wb&quot;).write(raw)
+
+with zipfile.ZipFile(p) as z:
+    try:
+        z.read(&quot;a.txt&quot;)
+    except Exception as e:
+        print(f&quot;{type(e).__module__}.{type(e).__name__}: {e}&quot;)
+        print(&quot;is BadZipFile?&quot;, isinstance(e, zipfile.BadZipFile))
+    try:
+        z.extractall(os.path.join(d, &quot;out&quot;))
+    except Exception as e:
+        print(&quot;extractall:&quot;, type(e).__name__)
+    left = os.path.join(d, &quot;out&quot;, &quot;a.txt&quot;)
+    print(&quot;partial file left behind:&quot;, os.path.exists(left),
+          os.path.getsize(left) if os.path.exists(left) else &quot;&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>zipfile.BadZipFile: Bad CRC-32 for file &#x27;a.txt&#x27;
+is BadZipFile? True
+extractall: BadZipFile
+partial file left behind: True 65536</code></pre>
+<p><strong>Measured:</strong> <code>extractall()</code> raised <code>BadZipFile</code> but had already written 65,536 bytes of the 100,000-byte <code>a.txt</code> to disk. Anything that later picks up files from that folder sees a truncated file with no error. Extract to a temporary directory and move it into place only after extraction succeeds.</p>
+
+<h2 id="stream">4. Streaming reads: the CRC is checked only at the end</h2>
+<pre><code>import os, tempfile, zipfile
+
+d = tempfile.mkdtemp()
+p = os.path.join(d, &quot;data.zip&quot;)
+with zipfile.ZipFile(p, &quot;w&quot;, zipfile.ZIP_STORED) as z:
+    z.writestr(&quot;rows.csv&quot;, &quot;id,value\n&quot; + &quot;&quot;.join(f&quot;{i},{i*i}\n&quot; for i in range(5000)))
+raw = bytearray(open(p, &quot;rb&quot;).read())
+raw[raw.find(b&quot;4000,&quot;)] = ord(&quot;9&quot;)    # corrupt one digit near the end
+open(p, &quot;wb&quot;).write(raw)
+
+rows = 0
+with zipfile.ZipFile(p) as z, z.open(&quot;rows.csv&quot;) as f:
+    try:
+        for line in f:
+            rows += 1
+    except zipfile.BadZipFile as e:
+        print(f&quot;BadZipFile after {rows} rows already processed: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>BadZipFile after 4798 rows already processed: Bad CRC-32 for file &#x27;rows.csv&#x27;</code></pre>
+<p><strong>Measured:</strong> a corrupted digit at row 4000 of a stored CSV went unnoticed while we iterated <code>z.open()</code>; <code>BadZipFile</code> came only near the end of the member, after 4,798 rows (including the corrupted one) had already been processed. If you stream rows into a database, wrap the load in a transaction you can roll back, or run a verification pass first (section 6).</p>
+
+<h2 id="causes">5. Where the corruption comes from: text-mode saves and newline translation</h2>
+<pre><code>import io, os, random, tempfile, zipfile
+
+d = tempfile.mkdtemp()
+p = os.path.join(d, &quot;good.zip&quot;)
+with zipfile.ZipFile(p, &quot;w&quot;, zipfile.ZIP_DEFLATED) as z:
+    z.writestr(&quot;a.txt&quot;, random.Random(1).randbytes(30_000).hex())
+good = open(p, &quot;rb&quot;).read()
+
+# 1) saved via text: bytes -&gt; str -&gt; bytes (like writing response.text to a file)
+text_saved = good.decode(&quot;latin-1&quot;).encode(&quot;utf-8&quot;)
+# 2) newline translation (FTP ASCII mode, or Windows text-mode copy)
+crlf = good.replace(b&quot;\n&quot;, b&quot;\r\n&quot;)
+
+for label, blob in [(&quot;good&quot;, good), (&quot;saved as text (utf-8)&quot;, text_saved),
+                    (&quot;LF -&gt; CRLF translated&quot;, crlf)]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as z:
+            print(f&quot;{label:22} testzip -&gt; {z.testzip()}&quot;)
+    except Exception as e:
+        print(f&quot;{label:22} {type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>good                   testzip -&gt; None
+saved as text (utf-8)  BadZipFile: Bad magic number for central directory
+LF -&gt; CRLF translated  testzip -&gt; a.txt</code></pre>
+<p><strong>Measured:</strong> a zip that went through a <code>bytes &rarr; str &rarr; bytes</code> round trip (like <code>open(p, "w").write(response.text)</code>) fails before any CRC check with <code>Bad magic number for central directory</code>, because the shifted offsets break the directory. A zip whose <code>\n</code> bytes were turned into <code>\r\n</code> (FTP ASCII mode, a text-mode copy) still opens, but <code>testzip()</code> flags the member: that is the <code>Bad CRC-32</code> case. Save downloads with <code>"wb"</code> and <code>response.content</code> or <code>iter_content()</code>, and transfer zips in binary mode. Other real causes: a flaky disk or USB stick, and a download that was resumed with mismatched ranges.</p>
+
+<h2 id="fix">6. Verify a zip properly (catch zlib.error too)</h2>
+<pre><code>import os, random, tempfile, zipfile, zlib
+
+def verify_zip(path):
+    &quot;&quot;&quot;Return None if every member decompresses with a matching CRC, else the problem.&quot;&quot;&quot;
+    try:
+        with zipfile.ZipFile(path) as z:
+            for info in z.infolist():
+                try:
+                    with z.open(info) as f:
+                        while f.read(1 &lt;&lt; 20):
+                            pass
+                except (zipfile.BadZipFile, zlib.error, EOFError) as e:
+                    return f&quot;{info.filename}: {type(e).__module__}.{type(e).__name__}: {e}&quot;
+    except zipfile.BadZipFile as e:
+        return f&quot;archive: {e}&quot;
+    return None
+
+d = tempfile.mkdtemp()
+p = os.path.join(d, &quot;data.zip&quot;)
+with zipfile.ZipFile(p, &quot;w&quot;, zipfile.ZIP_DEFLATED) as z:
+    z.writestr(&quot;a.txt&quot;, random.Random(7).randbytes(50_000).hex())
+good = open(p, &quot;rb&quot;).read()
+
+for pos in (100, 10_065):            # one zlib.error case, one CRC case
+    raw = bytearray(good)
+    raw[pos] ^= 0xFF
+    open(p, &quot;wb&quot;).write(raw)
+    with zipfile.ZipFile(p) as z:
+        try:
+            print(f&quot;pos {pos}: testzip() -&gt; {z.testzip()}&quot;)
+        except Exception as e:
+            print(f&quot;pos {pos}: testzip() raised {type(e).__module__}.{type(e).__name__}&quot;)
+    print(f&quot;pos {pos}: verify_zip() -&gt; {verify_zip(p)}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>pos 100: testzip() raised zlib.error
+pos 100: verify_zip() -&gt; a.txt: zlib.error: Error -3 while decompressing data: invalid distance too far back
+pos 10065: testzip() -&gt; a.txt
+pos 10065: verify_zip() -&gt; a.txt: zipfile.BadZipFile: Bad CRC-32 for file &#x27;a.txt&#x27;</code></pre>
+<p><strong>Measured:</strong> <code>testzip()</code> returned the bad name for the CRC case but <strong>raised <code>zlib.error</code></strong> for the other, so it is not a safe check on its own. Reading every member in chunks and catching <code>(zipfile.BadZipFile, zlib.error, EOFError)</code> reports both cases as a value you can log. When a member is bad, the fix is a fresh copy of the file: re-download it and compare its size or published checksum. There is no option to skip the CRC check and the data would be wrong anyway. For zips that won't open at all (<code>File is not a zip file</code>), see our <a href="/guides/python-badzipfile-file-is-not-a-zip-file/">BadZipFile guide</a>.</p>
+
+<aside class="cta"><strong>Corrupt download? Check the Content-Length and Content-Type the server sent for it:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does BadZipFile: Bad CRC-32 for file mean?</summary><p>The member&#x27;s data doesn&#x27;t match the checksum stored in the zip, so it was damaged after the zip was made. We measured one flipped byte causing it for one member while the other members still read fine.</p></details>
+<details><summary>How do I fix Bad CRC-32 in Python zipfile?</summary><p>Get a fresh copy of the file (re-download in binary mode and compare sizes or checksums). The data is wrong, so there&#x27;s no flag to ignore it. The other members can still be read; testzip() names the first bad one.</p></details>
+<details><summary>Why does my corrupt zip raise zlib.error instead of BadZipFile?</summary><p>If the damaged deflate data can&#x27;t be decompressed, zlib fails before the CRC check. We measured 11 of 58 single-byte corruptions raising zlib.error, which except zipfile.BadZipFile does not catch.</p></details>
+<details><summary>Does zipfile.testzip() catch all corruption?</summary><p>No. We measured it returning the bad member name for a CRC mismatch but raising zlib.error for a different corruption of the same file.</p></details>
+<details><summary>Can a file saved in text mode cause Bad CRC-32?</summary><p>Yes. We measured LF to CRLF translation producing a member that fails testzip(), and a bytes-to-str-to-bytes round trip producing &#x27;Bad magic number for central directory&#x27;. Always write zips with &#x27;wb&#x27;.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 on Debian with Python 3.13.5&#x27;s built-in zipfile: single-byte corruption of stored and deflated members (58 positions), extractall() partial output, streaming reads, text-mode and CRLF-translated copies, and a verification function. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; Python&#x27;s zipfile is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

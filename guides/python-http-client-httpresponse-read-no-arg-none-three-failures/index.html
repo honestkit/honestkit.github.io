@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>http.client resp.read() on None: 3 Different Failures</title>
+<meta name="description" content="We measured Python 3.13.5: one transient None makes resp.read() raise TypeError, IncompleteRead, or return None, depending on the body&#x27;s framing.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-http-client-httpresponse-read-no-arg-none-three-failures/">
+<meta property="og:title" content="http.client resp.read() on None: 3 Different Failures">
+<meta property="og:description" content="We measured Python 3.13.5: one transient None makes resp.read() raise TypeError, IncompleteRead, or return None, depending on the body&#x27;s framing.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-http-client-httpresponse-read-no-arg-none-three-failures/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does urllib.request.urlopen() hit this too?", "acceptedAnswer": {"@type": "Answer", "text": "urlopen() returns an http.client.HTTPResponse for http and https URLs, so .read() on it runs the same code. With urlopen's default blocking sockets you won't see a None; it happens when the socket or the stream from makefile() is non-blocking, e.g. a custom connection class or an event-loop integration."}}, {"@type": "Question", "name": "Is the server sending a truncated body?", "acceptedAnswer": {"@type": "Answer", "text": "No. In all three repros the body is complete and correctly framed. IncompleteRead(0 bytes read) and the closed connection come from the client treating a transient None as end-of-data."}}, {"@type": "Question", "name": "Why TypeError instead of IncompleteRead for Content-Length?", "acceptedAnswer": {"@type": "Answer", "text": "_safe_read() calls len(data) on the result of self.fp.read() before its short-read check. When that result is None, len() raises TypeError first, so the IncompleteRead branch, and HTTPResponse.read()'s except IncompleteRead cleanup, never run."}}, {"@type": "Question", "name": "Can I catch the error and call read() again?", "acceptedAnswer": {"@type": "Answer", "text": "No. Once HTTPResponse has seen the None, the connection is closed or the response is in an inconsistent state, and the remaining body is not recoverable from that response object. Retry the whole request, or fix the stream below http.client as shown."}}, {"@type": "Question", "name": "Is this related to the other None/EOF findings?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- same family as json.load(), configparser.read_file(), http.server and others: a correctly-returned non-blocking None is treated as end-of-data one layer above io. This one is notable because a single call fails three different ways depending on response framing."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>http.client resp.read() on a Transient None: 3 Different Failures (tested)</h1>
+<p class="lead">A non-blocking raw stream signals "no data ready yet" by returning <code>None</code> -- distinct from the empty read that means real end-of-stream. We fed <code>http.client.HTTPResponse.read()</code> (no argument -- the call behind most <code>urlopen(url).read()</code> code) one such <code>None</code> before a valid body. With <code>Content-Length</code> it crashed with <code>TypeError: object of type 'NoneType' has no len()</code>; with chunked encoding it raised <code>IncompleteRead(0 bytes read)</code>; with no length it returned <code>None</code> and closed the connection. Three framings, three unrelated-looking errors, one cause.</p>
+<h2 id="repro1">1. One transient None, three framings, three different results</h2>
+<pre><code>import http.client, io
+
+class FlakyRaw(io.RawIOBase):
+    """Sends headers cleanly, then one transient None, then the body."""
+    def __init__(self, header_bytes, body_bytes):
+        self.header_bytes, self.body_bytes, self.stage = header_bytes, body_bytes, 0
+    def readable(self):
+        return True
+    def readinto(self, b):
+        if self.stage == 0:
+            n = len(self.header_bytes)
+            b[:n] = self.header_bytes
+            self.stage = 1
+            return n
+        if self.stage == 1:
+            self.stage = 2
+            return None            # transient: no data ready yet
+        if self.stage == 2:
+            n = len(self.body_bytes)
+            b[:n] = self.body_bytes
+            self.stage = 3
+            return n               # the real, complete body
+        return 0                   # real EOF after that
+
+class FakeSocket:
+    def __init__(self, raw):
+        self.raw = raw
+    def makefile(self, mode, *a, **kw):
+        return io.BufferedReader(self.raw)
+    def close(self):
+        pass
+    def sendall(self, data):
+        pass
+
+body = b"hello body"
+cases = [
+    ("Content-Length", b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n", body),
+    ("chunked", b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", b"a\r\nhello body\r\n0\r\n\r\n"),
+    ("no length", b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", body),
+]
+for framing, headers, wire_body in cases:
+    conn = http.client.HTTPConnection("example.com")
+    conn.sock = FakeSocket(FlakyRaw(headers, wire_body))
+    conn.request("GET", "/")
+    resp = conn.getresponse()
+    try:
+        data = resp.read()
+        print(f"{framing:15} returned {data!r}, connection closed: {resp.fp is None}")
+    except Exception as e:
+        print(f"{framing:15} {type(e).__name__}: {e}")</code></pre>
+<pre><code>Content-Length  TypeError: object of type 'NoneType' has no len()
+chunked         IncompleteRead: IncompleteRead(0 bytes read)
+no length       returned None, connection closed: True</code></pre>
+<p><strong>Measured:</strong> every body is valid and complete, one read away. The same <code>resp.read()</code> call crashed with a generic <code>TypeError</code>, raised <code>IncompleteRead</code> as if the server had cut the body short, or returned <code>None</code> -- which <code>read()</code> is documented never to return -- and closed the connection. Which one you get depends only on how the server framed the body.</p>
+
+<h2 id="why">2. Why each framing fails differently</h2>
+<table><thead><tr><th>Framing</th><th>Code path in http/client.py</th><th>What the None does</th></tr></thead><tbody>
+<tr><td><code>Content-Length</code></td><td><code>_safe_read(self.length)</code>: <code>data = self.fp.read(cursize)</code> then <code>if len(data) &gt;= amt</code></td><td><code>len(None)</code> raises <code>TypeError</code> before the short-read check that would raise <code>IncompleteRead</code></td></tr>
+<tr><td><code>Transfer-Encoding: chunked</code></td><td><code>_read_next_chunk_size()</code>: <code>line = self.fp.readline(...)</code> then <code>int(line, 16)</code></td><td><code>BufferedReader.readline()</code> collapses the None to <code>b''</code>; <code>int(b'', 16)</code> fails and is re-raised as <code>IncompleteRead(0 bytes read)</code></td></tr>
+<tr><td>no length (read until close)</td><td><code>s = self.fp.read()</code> then <code>self._close_conn()</code></td><td><code>BufferedReader.read()</code> returns the None as-is; <code>read()</code> closes the connection and hands you <code>None</code></td></tr>
+</tbody></table>
+<p>Only the chunked case produces an <code>http.client</code> exception, and it blames the server ("incomplete read"). The <code>Content-Length</code> case points at a <code>len()</code> call inside the standard library. The no-length case raises nothing, so the failure surfaces later, wherever your code first treats the <code>None</code> as bytes. In all three the connection is unusable afterwards, so the body cannot be re-read.</p>
+
+<h2 id="fix">3. The fix: stop the None below http.client</h2>
+<p>Append to the script above:</p>
+<pre><code>class RetryOnNone(io.RawIOBase):
+    """Wraps a non-blocking raw stream; turns None into 'wait and retry'."""
+    def __init__(self, raw):
+        self.raw = raw
+    def readable(self):
+        return True
+    def readinto(self, b):
+        while True:
+            n = self.raw.readinto(b)
+            if n is not None:
+                return n
+            # real code: wait for readability here (e.g. selectors) instead of spinning
+
+class FixedSocket(FakeSocket):
+    def makefile(self, mode, *a, **kw):
+        return io.BufferedReader(RetryOnNone(self.raw))
+
+for framing, headers, wire_body in cases:
+    conn = http.client.HTTPConnection("example.com")
+    conn.sock = FixedSocket(FlakyRaw(headers, wire_body))
+    conn.request("GET", "/")
+    print(f"{framing:15}", conn.getresponse().read())</code></pre>
+<pre><code>Content-Length  b'hello body'
+chunked         b'hello body'
+no length       b'hello body'</code></pre>
+<p><strong>Measured:</strong> same flaky streams, and all three framings return the full body. The retry has to live in the raw stream that <code>makefile()</code> hands to <code>http.client</code>; once a <code>None</code> reaches <code>HTTPResponse</code> the connection is already lost. Simpler: if you control the socket, keep it blocking (or use <code>settimeout()</code>), which never returns <code>None</code>.</p>
+<p>Related: <a href="/guides/python-http-client-httpresponse-read-none-unrecoverable-close/">HTTPResponse.read(amt) closes the connection on None</a> (the sized-read case) and <a href="/guides/python-xmlrpc-client-serverproxy-none-expaterror-no-element-found/">xmlrpc.client ServerProxy raising ExpatError on a valid reply</a>.</p>
+<aside class="cta"><strong>Reading a whole response with resp.read() over a non-blocking socket? One transient None fails three different ways depending on the server&#x27;s framing:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does urllib.request.urlopen() hit this too?</summary><p>urlopen() returns an http.client.HTTPResponse for http and https URLs, so .read() on it runs the same code. With urlopen&#x27;s default blocking sockets you won&#x27;t see a None; it happens when the socket or the stream from makefile() is non-blocking, e.g. a custom connection class or an event-loop integration.</p></details>
+<details><summary>Is the server sending a truncated body?</summary><p>No. In all three repros the body is complete and correctly framed. IncompleteRead(0 bytes read) and the closed connection come from the client treating a transient None as end-of-data.</p></details>
+<details><summary>Why TypeError instead of IncompleteRead for Content-Length?</summary><p>_safe_read() calls len(data) on the result of self.fp.read() before its short-read check. When that result is None, len() raises TypeError first, so the IncompleteRead branch, and HTTPResponse.read()&#x27;s except IncompleteRead cleanup, never run.</p></details>
+<details><summary>Can I catch the error and call read() again?</summary><p>No. Once HTTPResponse has seen the None, the connection is closed or the response is in an inconsistent state, and the remaining body is not recoverable from that response object. Retry the whole request, or fix the stream below http.client as shown.</p></details>
+<details><summary>Is this related to the other None/EOF findings?</summary><p>Yes -- same family as json.load(), configparser.read_file(), http.server and others: a correctly-returned non-blocking None is treated as end-of-data one layer above io. This one is notable because a single call fails three different ways depending on response framing.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in http.client.HTTPResponse.read() (no argument), reading a complete, valid body framed three ways -- Content-Length, Transfer-Encoding: chunked, and read-until-close -- through a custom non-blocking socket whose underlying stream returns None once before the body. PlainHeaders is our extension; Python&#x27;s http.client and io modules are built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

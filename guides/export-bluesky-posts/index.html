@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Export Bluesky Posts to CSV: Free Public API, No Login (Python Example)</title>
+<meta name="description" content="Download all posts of any public Bluesky profile as CSV with the free public API (no account, no app password): a tested Python script with likes, reposts, replies and links, reply threads, and a full account backup.">
+<link rel="canonical" href="https://honestkit.github.io/guides/export-bluesky-posts/">
+<meta property="og:title" content="Export Bluesky Posts to CSV: Free Public API, No Login (Python Example)">
+<meta property="og:description" content="Download all posts of any public Bluesky profile as CSV with the free public API (no account, no app password): a tested Python script with likes, reposts, replies and links, reply threads, and a full account backup.">
+<meta property="og:url" content="https://honestkit.github.io/guides/export-bluesky-posts/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Do I need a Bluesky account or app password to export posts?", "acceptedAnswer": {"@type": "Answer", "text": "Not for public profiles. public.api.bsky.app answers getAuthorFeed and getPostThread without logging in."}}, {"@type": "Question", "name": "Why do I get posts from other accounts in the export?", "acceptedAnswer": {"@type": "Answer", "text": "The author feed includes reposts and the pinned post, marked with a 'reason' key. Skip those items to keep only the profile's own posts."}}, {"@type": "Question", "name": "Is there a limit on how far back I can go?", "acceptedAnswer": {"@type": "Answer", "text": "Cursor paging reaches the profile's first post. Pause between requests on large profiles, as the API rate-limits heavy use."}}, {"@type": "Question", "name": "Can I export Bluesky search results?", "acceptedAnswer": {"@type": "Answer", "text": "Not through the public endpoint: in our test (2026-10-01) app.bsky.feed.searchPosts on public.api.bsky.app answered 403, while profile feeds and threads worked without logging in."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>How to export Bluesky posts to CSV (any public profile)</h1>
+<p class="lead">Bluesky's public API serves every public profile's posts as JSON, without logging in. Here is how to turn them into a spreadsheet.</p>
+<h2>1. One request</h2>
+<pre><code>curl "https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed?actor=bsky.app&amp;limit=100"</code></pre>
+<p><code>actor</code> is a handle (<code>bsky.app</code>, <code>nytimes.com</code>) or a DID. Each item in <code>feed</code> has a <code>post</code> with <code>record.text</code>, <code>record.createdAt</code>, <code>likeCount</code>, <code>repostCount</code>, <code>replyCount</code> and <code>quoteCount</code>. <code>limit</code> is at most 100; the response's <code>cursor</code> fetches the next page. <code>filter</code> can be <code>posts_with_replies</code>, <code>posts_no_replies</code> or <code>posts_with_media</code>.</p>
+<p><strong>Watch out:</strong> the feed also contains the profile's <em>reposts</em> of other people's posts and its pinned post. Those items carry a <code>reason</code> key. In our test the very first item was a repost of another account's post, so skip items with <code>reason</code> if you want only the profile's own posts, once each.</p>
+<h2>2. All posts to CSV (Python, standard library only)</h2>
+<pre><code>import csv, json, time, urllib.parse, urllib.request
+
+HANDLE = "bsky.app"
+API = "https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed"
+
+rows, cursor = [], None
+while True:
+    params = {"actor": HANDLE, "limit": 100, "filter": "posts_with_replies"}
+    if cursor:
+        params["cursor"] = cursor
+    data = json.load(urllib.request.urlopen(API + "?" + urllib.parse.urlencode(params)))
+    for item in data["feed"]:
+        if "reason" in item:  # a repost or the pinned post: skip
+            continue
+        p = item["post"]
+        rows.append({
+            "created_at": p["record"]["createdAt"],
+            "text": p["record"].get("text", ""),
+            "likes": p.get("likeCount", 0),
+            "reposts": p.get("repostCount", 0),
+            "replies": p.get("replyCount", 0),
+            "quotes": p.get("quoteCount", 0),
+            "is_reply": "reply" in p["record"],
+            "url": "https://bsky.app/profile/%s/post/%s" % (p["author"]["handle"], p["uri"].split("/")[-1]),
+        })
+    cursor = data.get("cursor")
+    if not cursor or not data["feed"]:
+        break
+    time.sleep(0.5)
+
+with open("posts.csv", "w", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=list(rows[0]))
+    w.writeheader()
+    w.writerows(rows)
+print(len(rows), "posts")</code></pre>
+<p>For @bsky.app this wrote 865 rows in about 12 seconds, the same number as the profile's post count. The CSV is UTF-8: in Excel, open it with Data → From Text/CSV so emoji and accents display correctly.</p>
+<h2>3. Replies to one post</h2>
+<pre><code>curl "https://public.api.bsky.app/xrpc/app.bsky.feed.getPostThread?uri=at://did:plc:z72i7hdynmk6r22z27h6tvur/app.bsky.feed.post/3mwolmfws5k2r&amp;depth=10"</code></pre>
+<p>The <code>uri</code> is the post's at:// address: the author's DID plus the last part of the bsky.app post link (resolve a handle to its DID with <code>com.atproto.identity.resolveHandle?handle=…</code>). <code>thread.replies</code> nests replies up to <code>depth</code> levels. Expect slightly fewer replies than <code>replyCount</code>: in our test 66 of 68 came back, as deleted or hidden replies are left out.</p>
+<h2>4. Your own full account backup</h2>
+<p>For an archive of your own account (posts, likes, follows), use Settings → Account → Export my data in the Bluesky app. It downloads a <code>.car</code> file, the raw repository format. The same file is public for any account: <code>com.atproto.sync.getRepo?did=…</code> on the account's PDS host. It is complete, but needs an AT Protocol library to read, so the CSV route above is easier for analysis.</p>
+<h2>Many profiles or threads, without code</h2>
+<p>Our <a href="/apify/bluesky-posts/">Bluesky Posts Scraper on Apify</a> takes handles, profile links or post links and returns one flat row per post (text, counts, links, media, reply/repost flags), with a date cutoff and optional reposts, as CSV, Excel or JSON. Billed per post.</p>
+<aside class="cta"><strong>Need it in bulk?</strong> <a href="/apify/bluesky-posts/">Bluesky Posts Scraper – Profiles &amp; Threads, No Login</a> (hosted, pay per result)</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Do I need a Bluesky account or app password to export posts?</summary><p>Not for public profiles. public.api.bsky.app answers getAuthorFeed and getPostThread without logging in.</p></details>
+<details><summary>Why do I get posts from other accounts in the export?</summary><p>The author feed includes reposts and the pinned post, marked with a &#x27;reason&#x27; key. Skip those items to keep only the profile&#x27;s own posts.</p></details>
+<details><summary>Is there a limit on how far back I can go?</summary><p>Cursor paging reaches the profile&#x27;s first post. Pause between requests on large profiles, as the API rate-limits heavy use.</p></details>
+<details><summary>Can I export Bluesky search results?</summary><p>Not through the public endpoint: in our test (2026-10-01) app.bsky.feed.searchPosts on public.api.bsky.app answered 403, while profile feeds and threads worked without logging in.</p></details>
+</section>
+<p class="note">Written with AI assistance. The Python export, the thread request and the repository download were run for @bsky.app on 2026-10-01 (865 rows, matching the profile&#x27;s post count). The Apify tool is ours; the APIs are free to call directly.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

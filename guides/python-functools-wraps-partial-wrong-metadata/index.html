@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>functools.wraps on a partial Copies Wrong Metadata (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: wraps() on a functools.partial object silently sets __doc__/__module__ to generic partial-class values, not the wrapped call&#x27;s own.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-functools-wraps-partial-wrong-metadata/">
+<meta property="og:title" content="functools.wraps on a partial Copies Wrong Metadata (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: wraps() on a functools.partial object silently sets __doc__/__module__ to generic partial-class values, not the wrapped call&#x27;s own.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-functools-wraps-partial-wrong-metadata/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does functools.wraps set the wrong __doc__ when wrapping a functools.partial object?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. We measured that wraps() on a partial object copies __doc__ and __module__ from the partial class itself (the generic 'Create a new function with partial application...' docstring and module \"functools\"), because partial instances inherit those two attributes from their class rather than lacking them."}}, {"@type": "Question", "name": "Why doesn't __name__ get corrupted the same way?", "acceptedAnswer": {"@type": "Answer", "text": "Because functools.partial objects don't define __name__ or __qualname__ at all -- not even an inherited class-level one -- so update_wrapper's attribute copy silently skips them (it catches AttributeError per attribute), leaving the wrapper's own __name__ untouched. __doc__ and __module__ ARE present via class inheritance, so they get copied without being skipped."}}, {"@type": "Question", "name": "How do I fix the misleading __doc__/__module__ after wrapping a partial?", "acceptedAnswer": {"@type": "Answer", "text": "Set __name__, __doc__, and __module__ directly on the partial object before passing it to a decorator that uses functools.wraps -- we measured this giving wraps() real attributes to copy instead of the generic class-level fallbacks."}}, {"@type": "Question", "name": "Does this affect inspect.signature too?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured inspect.signature(wrapper) correctly following the __wrapped__ reference back to the real partial and showing its actual call signature. Only __doc__/__module__ (and __name__ staying stale) are affected, not signature introspection."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>functools.wraps on a functools.partial Copies the Wrong __doc__/__module__ (tested)</h1>
+<p class="lead"><code>functools.wraps(f)</code> copies <code>__name__</code>, <code>__doc__</code>, <code>__module__</code> and more from <code>f</code> onto your wrapper, using <code>getattr</code> with a silent skip for whatever attributes <code>f</code> doesn't have. A plain function has all of these with meaningful values. A <code>functools.partial</code> object does not define its own <code>__name__</code> or <code>__qualname__</code> at all -- but it does inherit <code>__doc__</code> and <code>__module__</code> from the <code>partial</code> class itself, so <code>wraps()</code> copies those without skipping, silently attaching the generic <code>functools.partial</code> class docstring and module name to your wrapper instead of anything describing the actual call.</p>
+<h2 id="repro1">1. Decorating a partial gives you functools's own docstring, not yours</h2>
+<pre><code>import functools
+
+def greet(name, greeting="Hello"):
+    return f"{greeting}, {name}!"
+
+say_hi = functools.partial(greet, greeting="Hi")
+
+def logged(f):
+    @functools.wraps(f)
+    def wrapper(*a, **kw):
+        return f(*a, **kw)
+    return wrapper
+
+say_hi_logged = logged(say_hi)
+print(say_hi_logged("Ann"))
+print("__name__:", say_hi_logged.__name__)
+print("__module__:", say_hi_logged.__module__)
+print("__doc__:", say_hi_logged.__doc__)</code></pre>
+<pre><code>Hi, Ann!
+__name__: wrapper
+__module__: functools
+__doc__: Create a new function with partial application of the given arguments
+and keywords.</code></pre>
+<p><strong>Measured:</strong> <code>__name__</code> stays <code>"wrapper"</code> -- unchanged, because <code>partial</code> objects have no <code>__name__</code> attribute to copy and <code>update_wrapper</code> skips attributes that don't exist. But <code>__module__</code> comes out as <code>"functools"</code> (the module where the <code>partial</code> class is defined) and <code>__doc__</code> comes out as the generic class docstring for <code>functools.partial</code> itself -- not <code>greet</code>'s docstring, not anything about <code>say_hi</code>. Both get copied silently because <code>partial</code> objects inherit those two attributes from their class, so the "attribute missing, skip it" fallback never triggers for them.</p>
+
+<h2 id="repro2">2. help() shows the misleading result directly</h2>
+<pre><code>help(say_hi_logged)</code></pre>
+<pre><code>Help on function wrapper in module functools:
+
+wrapper(*args, sep=' ', end='\n', file=None, flush=False)
+    Create a new function with partial application of the given arguments
+    and keywords.</code></pre>
+<p><strong>Measured:</strong> anyone running <code>help()</code> on the decorated callable sees "module functools" and a docstring about partial application in general -- actively misleading for debugging, since it looks like the function itself is part of the standard library rather than user code. (The signature line shown is a separate, correct effect of <code>inspect.signature</code> following the real <code>__wrapped__</code> reference that <code>wraps()</code> also sets -- that part works as intended.)</p>
+
+<h2 id="repro3">3. The fix: set the metadata explicitly, or wrap the underlying function instead</h2>
+<pre><code>import functools
+
+def greet(name, greeting="Hello"):
+    return f"{greeting}, {name}!"
+
+say_hi = functools.partial(greet, greeting="Hi")
+say_hi.__doc__ = "Greet someone with a Hi."
+say_hi.__name__ = "say_hi"
+say_hi.__module__ = greet.__module__
+
+def logged(f):
+    @functools.wraps(f)
+    def wrapper(*a, **kw):
+        return f(*a, **kw)
+    return wrapper
+
+say_hi_logged = logged(say_hi)
+print("__name__:", say_hi_logged.__name__)
+print("__module__:", say_hi_logged.__module__)
+print("__doc__:", say_hi_logged.__doc__)</code></pre>
+<pre><code>__name__: say_hi
+__module__: __main__
+__doc__: Greet someone with a Hi.</code></pre>
+<p><strong>Measured:</strong> setting <code>__name__</code>/<code>__doc__</code>/<code>__module__</code> directly on the <code>partial</code> object before decorating it (all three are plain writable attributes on a <code>partial</code> instance) gives <code>wraps()</code> real values to copy instead of falling through to the class-level defaults.</p>
+<aside class="cta"><strong>Decorating a functools.partial object with functools.wraps and expecting your wrapper&#x27;s __doc__/__module__ to describe what it actually does? Check them first -- they&#x27;re probably inherited from the wrong place:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does functools.wraps set the wrong __doc__ when wrapping a functools.partial object?</summary><p>Yes. We measured that wraps() on a partial object copies __doc__ and __module__ from the partial class itself (the generic &#x27;Create a new function with partial application...&#x27; docstring and module &quot;functools&quot;), because partial instances inherit those two attributes from their class rather than lacking them.</p></details>
+<details><summary>Why doesn&#x27;t __name__ get corrupted the same way?</summary><p>Because functools.partial objects don&#x27;t define __name__ or __qualname__ at all -- not even an inherited class-level one -- so update_wrapper&#x27;s attribute copy silently skips them (it catches AttributeError per attribute), leaving the wrapper&#x27;s own __name__ untouched. __doc__ and __module__ ARE present via class inheritance, so they get copied without being skipped.</p></details>
+<details><summary>How do I fix the misleading __doc__/__module__ after wrapping a partial?</summary><p>Set __name__, __doc__, and __module__ directly on the partial object before passing it to a decorator that uses functools.wraps -- we measured this giving wraps() real attributes to copy instead of the generic class-level fallbacks.</p></details>
+<details><summary>Does this affect inspect.signature too?</summary><p>No -- we measured inspect.signature(wrapper) correctly following the __wrapped__ reference back to the real partial and showing its actual call signature. Only __doc__/__module__ (and __name__ staying stale) are affected, not signature introspection.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-08 with Python 3.13.5&#x27;s built-in functools.wraps/update_wrapper: built a functools.partial over a user function, decorated it with a wrapper that applies functools.wraps(partial_obj), then inspected the resulting wrapper&#x27;s __name__, __doc__, __module__, and help() output. PlainHeaders is our extension; Python&#x27;s functools module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

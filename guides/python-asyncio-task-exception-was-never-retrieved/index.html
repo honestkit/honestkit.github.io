@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python asyncio &quot;Task exception was never retrieved&quot;: Fix</title>
+<meta name="description" content="asyncio Task exception was never retrieved on Python 3.13: why the error is lost, done callbacks, gather, TaskGroup, and Task was destroyed but it is pending.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-asyncio-task-exception-was-never-retrieved/">
+<meta property="og:title" content="Python asyncio &quot;Task exception was never retrieved&quot;: Fix">
+<meta property="og:description" content="asyncio Task exception was never retrieved on Python 3.13: why the error is lost, done callbacks, gather, TaskGroup, and Task was destroyed but it is pending.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-asyncio-task-exception-was-never-retrieved/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Task exception was never retrieved mean?", "acceptedAnswer": {"@type": "Answer", "text": "A task raised an exception but was never awaited and its exception was never read; asyncio logs it when the task is garbage-collected. The error did not reach your code."}}, {"@type": "Question", "name": "How do I handle exceptions in asyncio.create_task?", "acceptedAnswer": {"@type": "Answer", "text": "Keep the task in a set and add a done callback that calls task.exception() (after checking task.cancelled()), or await it via gather or a TaskGroup."}}, {"@type": "Question", "name": "What does Task was destroyed but it is pending mean?", "acceptedAnswer": {"@type": "Answer", "text": "The loop was closed or the task garbage-collected while it was still running. asyncio.run() cancels leftover tasks first, so it does not print this."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>asyncio Task exception was never retrieved (tested)</h1>
+<p class="lead">asyncio prints <code>Task exception was never retrieved</code> when a task raised and nothing ever awaited it or read its exception, typically a fire-and-forget <code>create_task()</code>. The error is lost and the program carries on. Keep a reference and add a done callback, or use <code>gather</code> or <code>TaskGroup</code>.</p>
+<h2 id="repro">1. Reproduce "Task exception was never retrieved"</h2>
+<pre><code>import asyncio, gc
+async def fails():
+    raise ValueError(&quot;boom&quot;)
+async def main():
+    asyncio.create_task(fails())       # fire-and-forget: nobody awaits it
+    await asyncio.sleep(0.1)
+    print(&quot;main finished normally&quot;)
+asyncio.run(main())
+gc.collect()
+print(&quot;still running after asyncio.run(): the error did not propagate&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>Task exception was never retrieved
+future: &lt;Task finished name=&#x27;Task-2&#x27; coro=&lt;fails() done, defined at /tmp/te376/b1.py:2&gt; exception=ValueError(&#x27;boom&#x27;)&gt;
+Traceback (most recent call last):
+  File &quot;/tmp/te376/b1.py&quot;, line 3, in fails
+    raise ValueError(&quot;boom&quot;)
+ValueError: boom
+main finished normally
+still running after asyncio.run(): the error did not propagate</code></pre>
+<p>The task raised, but nobody awaited it or asked for its result, so the exception has nowhere to go. asyncio logs it when the finished Task object is <strong>garbage-collected</strong>, and here that happened <em>before</em> <code>main finished normally</code> was printed: the only reference to the task was the discarded return value of <code>create_task</code>. The program carries on as if nothing failed. This is a lost error, not just a noisy warning.</p>
+<h2 id="fix">2. Three ways to retrieve the exception</h2>
+<pre><code>import asyncio
+async def fails():
+    raise ValueError(&quot;boom&quot;)
+background = set()
+def report(t: asyncio.Task):
+    background.discard(t)
+    if not t.cancelled() and t.exception() is not None:
+        print(&quot;task failed:&quot;, repr(t.exception()))
+async def main():
+    t = asyncio.create_task(fails())
+    background.add(t)                  # keep a strong reference
+    t.add_done_callback(report)        # retrieve the exception
+    await asyncio.sleep(0.1)
+    # or: gather with return_exceptions=True
+    print(await asyncio.gather(fails(), asyncio.sleep(0, &quot;ok&quot;), return_exceptions=True))
+    # or: TaskGroup propagates the error to the caller
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(fails())
+    except* ValueError as eg:
+        print(&quot;TaskGroup raised:&quot;, repr(eg.exceptions[0]))
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>task failed: ValueError(&#x27;boom&#x27;)
+[ValueError(&#x27;boom&#x27;), &#x27;ok&#x27;]
+TaskGroup raised: ValueError(&#x27;boom&#x27;)</code></pre>
+<ul><li><strong>Fire-and-forget tasks</strong>: keep a strong reference (a set) and add a done callback that calls <code>t.exception()</code> and logs it. Calling <code>exception()</code> counts as retrieving it, so the warning goes away and you decide what to do with the error. Check <code>t.cancelled()</code> first: <code>exception()</code> raises <code>CancelledError</code> on a cancelled task.</li><li><strong><code>gather(..., return_exceptions=True)</code></strong>: exceptions come back as values in the result list.</li><li><strong><code>asyncio.TaskGroup</code></strong> (Python 3.11+): a failing child cancels the others and the error is raised from the <code>async with</code> block as an <code>ExceptionGroup</code>, caught here with <code>except*</code>.</li></ul>
+<h2 id="pending">3. The sibling warning: "Task was destroyed but it is pending!"</h2>
+<pre><code>import asyncio
+async def slow():
+    await asyncio.sleep(10)
+async def main():
+    asyncio.create_task(slow())
+loop = asyncio.new_event_loop()
+loop.run_until_complete(main())
+loop.close()                           # closes with slow() still pending</code></pre>
+<p>Output:</p>
+<pre><code>Task was destroyed but it is pending!
+task: &lt;Task pending name=&#x27;Task-2&#x27; coro=&lt;slow() done, defined at /tmp/te376/b3.py:2&gt; wait_for=&lt;Future pending cb=[Task.task_wakeup()]&gt;&gt;</code></pre>
+<pre><code>import asyncio
+async def slow():
+    await asyncio.sleep(10)
+async def main():
+    asyncio.create_task(slow())
+asyncio.run(main())                    # cancels leftover tasks before closing
+print(&quot;asyncio.run: no warning&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>asyncio.run: no warning</code></pre>
+<p>This one means the event loop was closed (or the task was garbage-collected) while the task was still running. With a manual <code>new_event_loop()</code> / <code>loop.close()</code> it appears; <code>asyncio.run()</code> cancels leftover tasks before closing the loop, so the same code under <code>asyncio.run</code> is silent, though the work in <code>slow()</code> was still cut short. Await or cancel your background tasks before shutdown, and keep a reference to them while they run.</p>
+<h2 id="checklist">Checklist</h2>
+<ul><li>Find the task in the message (<code>coro=&lt;fails() ...&gt;</code>) and its traceback: that is the real error.</li><li>Never drop the return value of <code>create_task</code>: keep it in a set and add a done callback that checks <code>exception()</code>.</li><li>Prefer <code>TaskGroup</code> or <code>gather</code> when the caller should see the failure.</li><li>Use <code>asyncio.run()</code> rather than managing the loop by hand, and await or cancel background tasks before exit.</li></ul>
+<p>Related: <a href="/guides/python-asyncio-runtimeerror-event-loop-is-closed/">asyncio RuntimeError: Event loop is closed</a>, <a href="/guides/python-asyncio-timeouterror-cancellederror/">asyncio TimeoutError and CancelledError</a>.</p>
+
+<aside class="cta"><strong>Debugging an async HTTP client? See the headers a URL really returns, right in the browser:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Task exception was never retrieved mean?</summary><p>A task raised an exception but was never awaited and its exception was never read; asyncio logs it when the task is garbage-collected. The error did not reach your code.</p></details>
+<details><summary>How do I handle exceptions in asyncio.create_task?</summary><p>Keep the task in a set and add a done callback that calls task.exception() (after checking task.cancelled()), or await it via gather or a TaskGroup.</p></details>
+<details><summary>What does Task was destroyed but it is pending mean?</summary><p>The loop was closed or the task garbage-collected while it was still running. asyncio.run() cancels leftover tasks first, so it does not print this.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Python 3.13.5 on Linux. Each block was run verbatim (python -u, stdout and stderr together) and the output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

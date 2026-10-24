@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>subprocess.run(shell=True) Silently Drops List Arguments</title>
+<meta name="description" content="We measured subprocess.run([...], shell=True) silently dropping every argument after the first — no error, exit code 0, just missing output.">
+<link rel="canonical" href="https://honestkit.github.io/guides/subprocess-shell-true-list-args-silently-dropped/">
+<meta property="og:title" content="subprocess.run(shell=True) Silently Drops List Arguments">
+<meta property="og:description" content="We measured subprocess.run([...], shell=True) silently dropping every argument after the first — no error, exit code 0, just missing output.">
+<meta property="og:url" content="https://honestkit.github.io/guides/subprocess-shell-true-list-args-silently-dropped/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does subprocess.run([...], shell=True) raise an error when extra list items are ignored?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured it returning exit code 0 with empty stderr. There's no error or warning; the arguments are just silently unavailable to the program being run."}}, {"@type": "Question", "name": "Where do the extra list items go when you use shell=True with a list?", "acceptedAnswer": {"@type": "Answer", "text": "We measured them becoming positional parameters ($0, $1, $2, ...) inside the shell command string itself, not arguments appended to the program \u2014 equivalent to running /bin/sh -c args[0] args[1] args[2] ..."}}, {"@type": "Question", "name": "Does the same list of arguments work correctly with shell=False?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we measured subprocess.run([\"echo\", \"hello\", \"world\"], shell=False) printing \"hello world\" correctly. The silent-drop behavior only happens when shell=True is combined with a list."}}, {"@type": "Question", "name": "Is this subprocess.run(shell=True) behavior documented?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 the Python docs state directly that with shell=True and a sequence, the first item is the command string and the rest become arguments to the shell itself, not the program. We confirmed this is still accurate in Python 3.13.5 on Linux."}}, {"@type": "Question", "name": "How do I safely run a command with arguments using subprocess?", "acceptedAnswer": {"@type": "Answer", "text": "We'd use a list of the program and its arguments with shell=False (the default), and only use shell=True with a single complete command string when shell features like pipes or globs are actually needed."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>subprocess shell=True Drops List Args (tested)</h1>
+<p class="lead"><code>subprocess.run(["echo", "hello", "world"], shell=True)</code> looks like it should print <code>hello world</code>. We measured what it actually prints: nothing but a blank line, with exit code <code>0</code> and empty <code>stderr</code> &mdash; no error at all.</p>
+<h2 id="repro1">1. A list of args with shell=True silently loses everything but the first item</h2>
+<pre><code>import subprocess
+
+r = subprocess.run(["echo", "hello", "world"], shell=True, capture_output=True, text=True)
+r.stdout
+'\n'
+r.returncode
+0
+r.stderr
+''</code></pre>
+<p><strong>Measured:</strong> <code>"hello"</code> and <code>"world"</code> vanish completely. No exception, no non-zero exit code, no stderr output &mdash; just a blank line, because bare <code>echo</code> with no arguments prints nothing but the newline.</p>
+
+<h2 id="repro2">2. Where the missing arguments actually went</h2>
+<pre><code>r = subprocess.run(["echo $0 $1 $2", "A", "B", "C"], shell=True, capture_output=True, text=True)
+r.stdout
+'A B C\n'</code></pre>
+<p><strong>Measured:</strong> the first list item becomes the shell command string, and every item after it becomes a positional parameter (<code>$0</code>, <code>$1</code>, <code>$2</code>, &hellip;) available <em>inside that shell command</em> &mdash; not extra arguments appended to the program being run. In the first repro, <code>"hello"</code> and <code>"world"</code> became <code>$0</code> and <code>$1</code> for the shell session, but the command string <code>"echo"</code> never references them, so they're silently discarded.</p>
+
+<h2 id="repro3">3. Why: shell=True only ever runs args[0]</h2>
+<p>Per the <a href="https://docs.python.org/3/library/subprocess.html#subprocess.Popen">Python subprocess docs</a>, this is explicitly documented: with <code>shell=True</code> and a sequence for <code>args</code>, "the first item specifies the command string, and any additional items will be treated as additional arguments to the <em>shell itself</em>" &mdash; equivalent to running <code>/bin/sh -c args[0] args[1] ...</code>. Our test confirms that's exactly what happens in 3.13.5 on Linux: it's not a bug, it's the documented contract, but it looks identical to the normal, safe list-of-arguments call that works correctly with <code>shell=False</code>.</p>
+
+<h2 id="repro4">4. Contrast: the same list works fine without shell=True</h2>
+<pre><code>r = subprocess.run(["echo", "hello", "world"], shell=False, capture_output=True, text=True)
+r.stdout
+'hello world\n'</code></pre>
+<p><strong>Measured:</strong> dropping <code>shell=True</code> (or just omitting it, since it defaults to <code>False</code>) makes the identical list behave as most people expect &mdash; every item becomes an argument to the program. The silent failure only happens when <code>shell=True</code> and a list are combined.</p>
+
+<h2 id="fix">5. What to actually do</h2>
+<p>Don't mix <code>shell=True</code> with a list of arguments. If you need <code>shell=True</code> (to use shell features like pipes, globs, or environment variable expansion), pass a single string containing the whole command. If you just want to run a program with arguments safely, use a list with <code>shell=False</code> (the default) &mdash; that avoids both this silent-drop footgun and shell-injection risk from unsanitized input.</p>
+
+<aside class="cta"><strong>Debugging a subprocess call that&#x27;s supposed to hit an API or local server? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does subprocess.run([...], shell=True) raise an error when extra list items are ignored?</summary><p>No — we measured it returning exit code 0 with empty stderr. There&#x27;s no error or warning; the arguments are just silently unavailable to the program being run.</p></details>
+<details><summary>Where do the extra list items go when you use shell=True with a list?</summary><p>We measured them becoming positional parameters ($0, $1, $2, ...) inside the shell command string itself, not arguments appended to the program — equivalent to running /bin/sh -c args[0] args[1] args[2] ...</p></details>
+<details><summary>Does the same list of arguments work correctly with shell=False?</summary><p>Yes — we measured subprocess.run([&quot;echo&quot;, &quot;hello&quot;, &quot;world&quot;], shell=False) printing &quot;hello world&quot; correctly. The silent-drop behavior only happens when shell=True is combined with a list.</p></details>
+<details><summary>Is this subprocess.run(shell=True) behavior documented?</summary><p>Yes — the Python docs state directly that with shell=True and a sequence, the first item is the command string and the rest become arguments to the shell itself, not the program. We confirmed this is still accurate in Python 3.13.5 on Linux.</p></details>
+<details><summary>How do I safely run a command with arguments using subprocess?</summary><p>We&#x27;d use a list of the program and its arguments with shell=False (the default), and only use shell=True with a single complete command string when shell features like pipes or globs are actually needed.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5 on Linux: called subprocess.run() with shell=True and a list of arguments the way you&#x27;d call it with shell=False, comparing stdout, stderr, and returncode against the string form and against shell=False, to see exactly what happens to the extra list items. PlainHeaders is our extension; Python&#x27;s subprocess module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

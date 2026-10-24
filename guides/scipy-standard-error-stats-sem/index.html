@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SciPy Standard Error: scipy.stats.sem vs np.std (Tested)</title>
+<meta name="description" content="Standard error in SciPy, tested: stats.sem uses ddof=1 (np.std does not), NaN handling, axis, a 95% CI, and linregress / curve_fit standard errors.">
+<link rel="canonical" href="https://honestkit.github.io/guides/scipy-standard-error-stats-sem/">
+<meta property="og:title" content="SciPy Standard Error: scipy.stats.sem vs np.std (Tested)">
+<meta property="og:description" content="Standard error in SciPy, tested: stats.sem uses ddof=1 (np.std does not), NaN handling, axis, a 95% CI, and linregress / curve_fit standard errors.">
+<meta property="og:url" content="https://honestkit.github.io/guides/scipy-standard-error-stats-sem/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I calculate standard error in SciPy?", "acceptedAnswer": {"@type": "Answer", "text": "scipy.stats.sem(x); it equals x.std(ddof=1) / sqrt(len(x))."}}, {"@type": "Question", "name": "Why does np.std / sqrt(n) differ from scipy.stats.sem?", "acceptedAnswer": {"@type": "Answer", "text": "np.std uses ddof=0 by default while scipy.stats.sem uses ddof=1; pass ddof=1 to np.std or ddof=0 to sem to make them match."}}, {"@type": "Question", "name": "How do I get the standard error of a regression slope in SciPy?", "acceptedAnswer": {"@type": "Answer", "text": "scipy.stats.linregress returns it as result.stderr, and the intercept's as result.intercept_stderr."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SciPy standard error: scipy.stats.sem, ddof, NaN and regression (tested)</h1>
+<p class="lead"><code>scipy.stats.sem(x)</code> returns the standard error of the mean, <code>x.std(ddof=1) / sqrt(n)</code>. If your own number is smaller, you used <code>np.std</code>, which defaults to <code>ddof=0</code>. Below: NaN, axis, confidence intervals, and standard errors of regression coefficients, all measured.</p>
+<h2 id="sem">1. scipy.stats.sem: ddof, NaN, axis</h2>
+<p><code>b1.py</code> compares <code>scipy.stats.sem</code> with the manual formula and shows the three things that change its result:</p>
+<pre><code>import numpy as np
+from scipy import stats
+
+x = np.array([4.1, 5.0, 3.8, 6.2, 5.5, 4.9])
+print(&quot;stats.sem(x)            &quot;, stats.sem(x))
+print(&quot;std(ddof=1)/sqrt(n)     &quot;, x.std(ddof=1) / np.sqrt(len(x)))
+print(&quot;np.std(x)/sqrt(n)       &quot;, np.std(x) / np.sqrt(len(x)), &quot;&lt;- ddof=0, smaller&quot;)
+print(&quot;stats.sem(x, ddof=0)    &quot;, stats.sem(x, ddof=0))
+
+y = np.array([4.1, np.nan, 3.8])
+print(&quot;sem with NaN            &quot;, stats.sem(y))
+print(&quot;nan_policy=&#x27;omit&#x27;       &quot;, stats.sem(y, nan_policy=&quot;omit&quot;))
+
+m = np.array([[1.0, 2.0, 3.0], [2.0, 4.0, 9.0]])
+print(&quot;2-D default axis=0      &quot;, stats.sem(m))
+print(&quot;axis=1                  &quot;, stats.sem(m, axis=1))
+print(&quot;axis=None               &quot;, stats.sem(m, axis=None))
+print(&quot;one value               &quot;, stats.sem([5.0]))</code></pre>
+<p>Output (SciPy 1.18.1, NumPy 2.5.4, Python 3.13.5):</p>
+<pre><code>stats.sem(x)             0.36094013046179535
+std(ddof=1)/sqrt(n)      0.36094013046179535
+np.std(x)/sqrt(n)        0.3294917522713047 &lt;- ddof=0, smaller
+stats.sem(x, ddof=0)     0.3294917522713047
+sem with NaN             nan
+nan_policy=&#x27;omit&#x27;        0.1499999999999999
+2-D default axis=0       [0.5 1.  3. ]
+axis=1                   [0.57735027 2.081666  ]
+axis=None                1.1761519176251567
+/tmp/se408/b1.py:18: SmallSampleWarning: One or more sample arguments is too small; all returned values will be NaN. See documentation for sample size requirements.
+  print(&quot;one value               &quot;, stats.sem([5.0]))
+one value                nan</code></pre>
+<ul><li><code>stats.sem(x)</code> is <code>x.std(ddof=1) / sqrt(n)</code>: it uses the <strong>sample</strong> standard deviation (<code>ddof=1</code>) by default.</li>
+<li><code>np.std</code> defaults to <code>ddof=0</code>, so <code>np.std(x)/np.sqrt(n)</code> gives a smaller number (0.329 vs 0.361 here). That mismatch is the usual reason a hand-computed standard error disagrees with SciPy, pandas or a spreadsheet.</li>
+<li>One NaN makes the result <code>nan</code>; <code>nan_policy="omit"</code> drops it.</li>
+<li>On a 2-D array the default is <code>axis=0</code> (one value per column); use <code>axis=1</code> per row or <code>axis=None</code> for all values.</li>
+<li>With a single value SciPy 1.18 returns <code>nan</code> and emits a <code>SmallSampleWarning</code>.</li></ul>
+<h2 id="more">2. pandas .sem(), a 95% confidence interval, and regression standard errors</h2>
+<pre><code>import numpy as np, pandas as pd
+from scipy import stats
+from scipy.optimize import curve_fit
+
+x = np.array([4.1, 5.0, 3.8, 6.2, 5.5, 4.9])
+print(&quot;pandas Series.sem()     &quot;, pd.Series(x).sem())
+print(&quot;pandas with NaN         &quot;, pd.Series([4.1, np.nan, 3.8]).sem(), &quot;&lt;- skips NaN&quot;)
+
+# 95% confidence interval for the mean from the SEM
+lo, hi = stats.t.interval(0.95, df=len(x) - 1, loc=x.mean(), scale=stats.sem(x))
+print(&quot;mean, 95% CI            &quot;, round(x.mean(), 3), (float(round(lo, 3)), float(round(hi, 3))))
+
+# standard error of a regression slope and intercept
+t = np.array([0, 1, 2, 3, 4, 5.0])
+y = np.array([1.1, 2.9, 5.2, 7.1, 8.8, 11.2])
+res = stats.linregress(t, y)
+print(&quot;linregress slope, stderr&quot;, round(res.slope, 4), round(res.stderr, 4))
+print(&quot;intercept, stderr       &quot;, round(res.intercept, 4), round(res.intercept_stderr, 4))
+
+# standard errors of curve_fit parameters
+popt, pcov = curve_fit(lambda t, a, b: a * t + b, t, y)
+print(&quot;curve_fit perr          &quot;, np.round(np.sqrt(np.diag(pcov)), 4))</code></pre>
+<p>Output:</p>
+<pre><code>pandas Series.sem()      0.36094013046179535
+pandas with NaN          0.1499999999999999 &lt;- skips NaN
+mean, 95% CI             4.917 (3.989, 5.844)
+linregress slope, stderr 2.0029 0.0439
+intercept, stderr        1.0429 0.1329
+curve_fit perr           [0.0439 0.1329]</code></pre>
+<ul><li><code>pandas.Series.sem()</code> matches <code>scipy.stats.sem</code> (also <code>ddof=1</code>) but skips NaN by default.</li>
+<li>For a confidence interval of the mean, pass the SEM as <code>scale</code> to <code>stats.t.interval</code> with <code>df=n-1</code>.</li>
+<li><code>stats.linregress</code> returns the slope's standard error as <code>stderr</code> and the intercept's as <code>intercept_stderr</code>.</li>
+<li>For <code>curve_fit</code>, the parameter standard errors are <code>np.sqrt(np.diag(pcov))</code>; for this straight line they match <code>linregress</code> exactly.</li></ul>
+<p>To plot these as error bars: <a href="/guides/matplotlib-errorbar-fmt-asymmetric-bar-chart/">matplotlib errorbar</a>, <a href="/guides/seaborn-errorbar-sd-ci-se-pi/">seaborn errorbar="se"</a>, <a href="/guides/plotly-error-bars-error-y/">plotly error_y</a>. Related: <a href="/guides/scipy-minimize-error-success-false/">scipy minimize errors</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I calculate standard error in SciPy?</summary><p>scipy.stats.sem(x); it equals x.std(ddof=1) / sqrt(len(x)).</p></details>
+<details><summary>Why does np.std / sqrt(n) differ from scipy.stats.sem?</summary><p>np.std uses ddof=0 by default while scipy.stats.sem uses ddof=1; pass ddof=1 to np.std or ddof=0 to sem to make them match.</p></details>
+<details><summary>How do I get the standard error of a regression slope in SciPy?</summary><p>scipy.stats.linregress returns it as result.stderr, and the intercept&#x27;s as result.intercept_stderr.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with SciPy 1.18.1, NumPy 2.5.4, pandas 3.1.0 and Python 3.13.5 on Linux. Scripts ran verbatim and the output was pasted unedited. PlainTables is our extension; SciPy is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

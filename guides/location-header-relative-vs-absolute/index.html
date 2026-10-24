@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Location Header: Relative URLs, 201 Created and Redirect Methods (Tested)</title>
+<meta name="description" content="Relative Location values like next, /next, ../x, //host/x and ?q=1 resolved the same in Chromium 153, curl 8.14.1 and Node 24 fetch on every 3xx code. Plus: POST becoming GET on 301/302/303, Location on 201 is never followed, and why fetch redirect: manual hides it.">
+<link rel="canonical" href="https://honestkit.github.io/guides/location-header-relative-vs-absolute/">
+<meta property="og:title" content="Location Header: Relative URLs, 201 Created and Redirect Methods (Tested)">
+<meta property="og:description" content="Relative Location values like next, /next, ../x, //host/x and ?q=1 resolved the same in Chromium 153, curl 8.14.1 and Node 24 fetch on every 3xx code. Plus: POST becoming GET on 301/302/303, Location on 201 is never followed, and why fetch redirect: manual hides it.">
+<meta property="og:url" content="https://honestkit.github.io/guides/location-header-relative-vs-absolute/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can the Location header be a relative URL?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. In Chromium 153, curl 8.14.1 -L and Node.js 24 fetch, Location values next, /next, ../x, //host/x and ?q=1 all resolved against the request URL, the same way on 301, 302, 303, 307 and 308."}}, {"@type": "Question", "name": "Why does Location: next go to the wrong path?", "acceptedAnswer": {"@type": "Answer", "text": "Without a leading slash it replaces only the last path segment: from /a/b/start it went to /a/b/next. Use /next for a path from the site root."}}, {"@type": "Question", "name": "Is Location followed on a 201 Created?", "acceptedAnswer": {"@type": "Answer", "text": "No. Chromium navigation, fetch() in Chromium and Node, and curl -L all stopped at the 201 and returned it. Read res.headers.get('location') and resolve it with new URL(loc, res.url)."}}, {"@type": "Question", "name": "Does a 302 redirect turn POST into GET?", "acceptedAnswer": {"@type": "Answer", "text": "Yes in practice: browsers, Node fetch and curl -L -d all re-requested with GET and no body after 301, 302 and 303. 307 and 308 kept POST and the body in every client."}}, {"@type": "Question", "name": "Why is the Location header null with fetch redirect: 'manual'?", "acceptedAnswer": {"@type": "Answer", "text": "In the browser, redirect: 'manual' returns an opaqueredirect response with status 0 and no readable headers, by design. Node.js fetch returns the real 3xx status and a readable Location."}}, {"@type": "Question", "name": "Is the URL fragment kept after a redirect?", "acceptedAnswer": {"@type": "Answer", "text": "In Chromium, yes if the Location has no fragment of its own: start#orig redirected to /next ended at /next#orig. A fragment in the Location replaces it. The fragment is never sent to the server."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Location header: relative vs absolute URLs (tested)</h1>
+<p class="lead">The <code>Location</code> response header tells the client where to go next (on a 3xx redirect) or where a new resource lives (on <code>201 Created</code>). A relative value is allowed and works: we sent seven kinds of relative <code>Location</code> on all five redirect codes and Chromium, curl and Node.js fetch all ended at the same URL. The differences that bite are elsewhere: method changes, <code>201</code>, and <code>redirect: 'manual'</code>.</p>
+<h2>1. Relative Location values: how they resolve</h2>
+<p>The request URL was <code>http://localhost:8981/a/b/start?...</code>. Each <code>Location</code> value resolves against that URL like a link in an HTML page at the same address. Results were identical for 301, 302, 303, 307 and 308, and identical in all three clients:</p>
+<table><thead><tr><th><code>Location:</code> sent</th><th>Final URL (Chromium 153, curl -L, Node fetch)</th></tr></thead><tbody>
+<tr><td><code>next</code></td><td><code>/a/b/next</code> (replaces the last path segment)</td></tr>
+<tr><td><code>/next</code></td><td><code>/next</code> (same scheme, host and port)</td></tr>
+<tr><td><code>../x</code></td><td><code>/a/x</code></td></tr>
+<tr><td><code>//127.0.0.1:8982/x</code></td><td><code>http://127.0.0.1:8982/x</code> (protocol-relative: a different host)</td></tr>
+<tr><td><code>?q=1</code></td><td><code>/a/b/start?q=1</code> (same path, query replaced)</td></tr>
+<tr><td><code>/a b</code> (raw space)</td><td><code>/a%20b</code>: all three percent-encoded it and followed</td></tr>
+<tr><td><code>/né</code> (raw UTF-8 bytes)</td><td><code>/n%C3%A9</code> in Chromium and Node; curl requested <code>/n%c3%a9</code> (lowercase hex)</td></tr>
+</tbody></table>
+<p>So "relative Location does not work" is almost never the client. The usual bugs are a missing leading slash (<code>next</code> from <code>/a/b/start</code> lands on <code>/a/b/next</code>, not <code>/next</code>), a <code>//</code> prefix that turns your path into a host name, or a proxy in front of the app that rewrites the host or scheme. Absolute URLs avoid the first two, but then the app must know its public scheme and host. Send percent-encoded values yourself rather than relying on clients to clean up spaces and non-ASCII: we saw them cope, but the header is meant to carry an encoded URI.</p>
+<p>Without <code>-L</code> curl just prints the raw value, which is the quickest check:</p>
+<pre><code>$ curl -si 'http://localhost:8981/a/b/start?code=302&amp;to=next' | head -2
+HTTP/1.1 302 Found
+Location: next</code></pre>
+<h2>2. Fragments</h2>
+<ul>
+<li><code>Location: /next#f</code>: Chromium ended at <code>/next#f</code>; curl reported <code>/next#f</code> as the effective URL; Node fetch's <code>res.url</code> was <code>/next</code> (fragment dropped). None of them sent the fragment to the server.</li>
+<li>Fragment inheritance: in Chromium, opening <code>start?...#orig</code> that redirects to <code>/next</code> ended at <code>/next#orig</code>. If the Location has its own fragment (<code>/next#new</code>) that one wins.</li>
+</ul>
+<h2>3. Which method arrives after the redirect</h2>
+<p>We sent <code>POST</code> with body <code>a=1</code> and logged what reached <code>/next</code>:</p>
+<table><thead><tr><th>Code</th><th>Chromium form submit and fetch()</th><th>Node fetch</th><th><code>curl -L -d a=1</code></th><th><code>curl -L -X POST -d a=1</code></th></tr></thead><tbody>
+<tr><td>301</td><td>GET, no body</td><td>GET, no body</td><td>GET, no body</td><td>POST, no body</td></tr>
+<tr><td>302</td><td>GET, no body</td><td>GET, no body</td><td>GET, no body</td><td>POST, no body</td></tr>
+<tr><td>303</td><td>GET, no body</td><td>GET, no body</td><td>GET, no body</td><td>POST, no body</td></tr>
+<tr><td>307</td><td>POST <code>a=1</code></td><td>POST <code>a=1</code></td><td>POST <code>a=1</code></td><td>POST <code>a=1</code></td></tr>
+<tr><td>308</td><td>POST <code>a=1</code></td><td>POST <code>a=1</code></td><td>POST <code>a=1</code></td><td>POST <code>a=1</code></td></tr>
+</tbody></table>
+<p>Use 303 after a successful form POST (post/redirect/get), and 307/308 when the method and body must be kept, for example when moving an API endpoint. With curl, <code>-X POST</code> forces the method name on every hop but the body is still dropped on 301-303; use <code>--post301 --post302 --post303</code> instead, which kept both POST and <code>a=1</code> in our test.</p>
+<h2>4. Location on 201 Created (and 200) is not followed</h2>
+<p>With <code>Location: /next</code> on a <code>200</code>, <code>201</code> or <code>202</code>, no client moved: Chromium page navigation stayed on the original URL, <code>fetch()</code> in Chromium and Node returned the 201 itself, and <code>curl -L</code> stopped at 201. On a <code>204</code> navigation Chromium aborted (<code>net::ERR_ABORTED</code>) and stayed on the previous page. For a <code>201</code>, <code>Location</code> is information for the client: the URL of the new resource. Read it and resolve it yourself:</p>
+<pre><code>const res = await fetch('/api/items', { method: 'POST', body });
+if (res.status === 201) {
+  const loc = res.headers.get('location');      // "/next": the raw, possibly relative value
+  const url = new URL(loc, res.url).href;        // resolve against the response URL
+}</code></pre>
+<p>In the browser, a cross-origin API must list it in <code>Access-Control-Expose-Headers: Location</code>, or <code>headers.get('location')</code> returns <code>null</code> (our test server exposed it).</p>
+<h2>5. Reading Location of a redirect from JavaScript</h2>
+<table><thead><tr><th>Call</th><th>Chromium 153</th><th>Node.js 24 fetch</th></tr></thead><tbody>
+<tr><td><code>fetch(u, { redirect: 'manual' })</code></td><td><code>type: "opaqueredirect"</code>, <code>status: 0</code>, <code>ok: false</code>, <code>headers.get('location')</code> = <code>null</code></td><td><code>type: "basic"</code>, real <code>status</code> (301/302/307), <code>headers.get('location')</code> = <code>"/next"</code></td></tr>
+<tr><td><code>fetch(u, { redirect: 'error' })</code></td><td>rejects: <code>TypeError: Failed to fetch</code></td><td>rejects: <code>fetch failed</code>, cause <code>unexpected redirect</code></td></tr>
+<tr><td>XMLHttpRequest</td><td>always follows; <code>status</code> 200, <code>responseURL</code> = final URL</td><td>n/a</td></tr>
+</tbody></table>
+<p>Page JavaScript cannot see where a redirect points, even same-origin and even with <code>Access-Control-Expose-Headers: Location</code>. If the frontend needs the target, have the API return <code>200</code> or <code>201</code> with the URL in the body or in a non-redirect <code>Location</code>. On the server (Node), <code>redirect: 'manual'</code> does give you the status and raw header. To see where any URL redirects without code, open it with the <a href="/tools/http-headers/">HTTP headers checker</a>; for multi-hop chains see <a href="/guides/check-redirect-chain/">how to check a redirect chain</a>, and for PHP's <code>header('Location: ...')</code> pitfalls see <a href="/guides/php-header-location-redirect-not-working/">PHP header Location redirect not working</a>.</p>
+<aside class="cta"><strong>See the Location header your server sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Can the Location header be a relative URL?</summary><p>Yes. In Chromium 153, curl 8.14.1 -L and Node.js 24 fetch, Location values next, /next, ../x, //host/x and ?q=1 all resolved against the request URL, the same way on 301, 302, 303, 307 and 308.</p></details>
+<details><summary>Why does Location: next go to the wrong path?</summary><p>Without a leading slash it replaces only the last path segment: from /a/b/start it went to /a/b/next. Use /next for a path from the site root.</p></details>
+<details><summary>Is Location followed on a 201 Created?</summary><p>No. Chromium navigation, fetch() in Chromium and Node, and curl -L all stopped at the 201 and returned it. Read res.headers.get(&#x27;location&#x27;) and resolve it with new URL(loc, res.url).</p></details>
+<details><summary>Does a 302 redirect turn POST into GET?</summary><p>Yes in practice: browsers, Node fetch and curl -L -d all re-requested with GET and no body after 301, 302 and 303. 307 and 308 kept POST and the body in every client.</p></details>
+<details><summary>Why is the Location header null with fetch redirect: &#x27;manual&#x27;?</summary><p>In the browser, redirect: &#x27;manual&#x27; returns an opaqueredirect response with status 0 and no readable headers, by design. Node.js fetch returns the real 3xx status and a readable Location.</p></details>
+<details><summary>Is the URL fragment kept after a redirect?</summary><p>In Chromium, yes if the Location has no fragment of its own: start#orig redirected to /next ended at /next#orig. A fragment in the Location replaces it. The fragment is never sent to the server.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 (plain http.createServer on localhost:8981-8982, built-in fetch as the client too), curl 8.14.1 (-L) and headless Chromium 153.0.8010.12 (Playwright). The server answered /a/b/start with 301, 302, 303, 307 or 308 and a chosen Location value; we recorded the final URL and the method and body each client arrived with. PlainHeaders is our extension; Node.js, curl and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

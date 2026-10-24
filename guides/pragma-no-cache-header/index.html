@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pragma: no-cache vs Cache-Control: What Chromium 153 Does (Tested)</title>
+<meta name="description" content="We tested Pragma: no-cache in Chromium 153 on 2026-10-02: as a response header it stopped caching even next to max-age=60. Hard reload and fetch(cache:&#x27;reload&#x27;) send Pragma plus Cache-Control: no-cache. curl just sends the header.">
+<link rel="canonical" href="https://honestkit.github.io/guides/pragma-no-cache-header/">
+<meta property="og:title" content="Pragma: no-cache vs Cache-Control: What Chromium 153 Does (Tested)">
+<meta property="og:description" content="We tested Pragma: no-cache in Chromium 153 on 2026-10-02: as a response header it stopped caching even next to max-age=60. Hard reload and fetch(cache:&#x27;reload&#x27;) send Pragma plus Cache-Control: no-cache. curl just sends the header.">
+<meta property="og:url" content="https://honestkit.github.io/guides/pragma-no-cache-header/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Pragma: no-cache do?", "acceptedAnswer": {"@type": "Answer", "text": "It is the HTTP/1.0 way to ask that a cached copy not be used without checking the server. In Chromium 153 we measured that a response with <code>Pragma: no-cache</code> was revalidated on every fetch, just like <code>Cache-Control: no-cache</code>."}}, {"@type": "Question", "name": "Does Pragma: no-cache override Cache-Control: max-age?", "acceptedAnswer": {"@type": "Answer", "text": "In Chromium 153, yes: a response with both <code>Cache-Control: max-age=60</code> and <code>Pragma: no-cache</code> hit the server 3 times out of 3 fetches. The older RFC 7234 said Cache-Control should win, so other caches may differ. Do not send both."}}, {"@type": "Question", "name": "Is the Pragma header deprecated?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. RFC 9111 marks Pragma as deprecated and says to use Cache-Control instead (from the RFC, not measured). Browsers still send it on hard reloads for old proxies."}}, {"@type": "Question", "name": "Why do my logs show Pragma: no-cache requests?", "acceptedAnswer": {"@type": "Answer", "text": "Chromium 153 sent <code>Pragma: no-cache</code> and <code>Cache-Control: no-cache</code> on a hard reload and on <code>fetch()</code> with <code>cache: 'reload'</code> or <code>'no-store'</code>. A normal reload sent only <code>Cache-Control: max-age=0</code>."}}, {"@type": "Question", "name": "Does curl -H 'Pragma: no-cache' bypass a cache?", "acceptedAnswer": {"@type": "Answer", "text": "Not on your machine: curl has no cache, so it just adds the header. A CDN or proxy in the path may or may not honour it; many ignore client cache headers by default."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Pragma: no-cache header (tested)</h1>
+<p class="lead"><code>Pragma: no-cache</code> is the HTTP/1.0 way to say "do not serve this from a cache without checking". <code>Cache-Control</code> replaced it in HTTP/1.1, and RFC 9111 now calls Pragma deprecated. It is still everywhere, so we measured what Chromium 153 actually does with it on responses and when it sends it on requests.</p>
+<h2>1. Response side: does Pragma alone stop caching? (measured)</h2>
+<p>A Node.js server returned each URL below. The page called <code>fetch(url)</code> three times in a row for each URL and the server counted requests. 1 hit means the browser reused its cached copy; 3 hits means it went back every time.</p>
+<table><thead><tr><th>Response headers</th><th>Server hits (of 3)</th><th>What happened</th></tr></thead><tbody>
+<tr><td><code>Cache-Control: max-age=60</code></td><td>1</td><td>Cached, as expected (control)</td></tr>
+<tr><td><code>Last-Modified</code> (10 days old), nothing else</td><td>1</td><td>Cached heuristically (control)</td></tr>
+<tr><td><code>Pragma: no-cache</code> + <code>Last-Modified</code></td><td>3</td><td>Revalidated every time: requests 2 and 3 carried <code>If-Modified-Since</code></td></tr>
+<tr><td><code>Pragma: no-cache</code> + <code>Expires</code> (1 hour ahead)</td><td>3</td><td>Not reused</td></tr>
+<tr><td><code>Pragma: no-cache</code> + <code>Cache-Control: max-age=60</code></td><td>3</td><td>Not reused: Pragma won over max-age</td></tr>
+</tbody></table>
+<p>So in Chromium 153, a response <code>Pragma: no-cache</code> behaves like <code>Cache-Control: no-cache</code>: the copy may be stored but must be revalidated before reuse. Our test server always answered 200, so you only see the saving of a 304 if your server supports conditional requests.</p>
+<p>The last row is the surprise. RFC 9111 (section 5.4) says Pragma is deprecated and RFC 7234 said caches should ignore it when <code>Cache-Control</code> is present (from the RFC, not measured). Chromium did not ignore it. Do not rely on either behaviour: if a response is cacheable, do not also send <code>Pragma: no-cache</code>, because some framework default may be quietly disabling your caching.</p>
+<pre><code># find it in your own responses
+curl -sI https://example.com/app.js | grep -iE '^(pragma|cache-control|expires)'</code></pre>
+
+<h2>2. Request side: when does Chromium send Pragma? (measured)</h2>
+<p>We logged the request headers Chromium 153 sent to the test server:</p>
+<table><thead><tr><th>Action</th><th><code>Pragma</code></th><th><code>Cache-Control</code></th></tr></thead><tbody>
+<tr><td>First page load / plain <code>fetch(url)</code></td><td>none</td><td>none</td></tr>
+<tr><td>Normal reload</td><td>none</td><td><code>max-age=0</code></td></tr>
+<tr><td>Hard reload (ignore cache)</td><td><code>no-cache</code></td><td><code>no-cache</code></td></tr>
+<tr><td><code>fetch(url, {cache: 'no-store'})</code></td><td><code>no-cache</code></td><td><code>no-cache</code></td></tr>
+<tr><td><code>fetch(url, {cache: 'reload'})</code></td><td><code>no-cache</code></td><td><code>no-cache</code></td></tr>
+<tr><td><code>fetch(url, {cache: 'no-cache'})</code></td><td>none</td><td><code>max-age=0</code></td></tr>
+</tbody></table>
+<p>Chromium sends both headers together whenever it wants an end-to-end fresh copy. The Pragma copy is for old HTTP/1.0 proxies that do not understand <code>Cache-Control</code>. Note that <code>fetch</code> mode <code>no-cache</code> sends <code>max-age=0</code>, not <code>no-cache</code>: the names do not match the headers.</p>
+<p>If your server or CDN logs show <code>Pragma: no-cache</code> on requests, it usually means a hard reload or a script using <code>cache: 'reload'</code> or <code>'no-store'</code>, not a misconfigured client.</p>
+
+<h2>3. curl: it is just a header (measured)</h2>
+<pre><code>curl -sv -o /dev/null -H 'Pragma: no-cache' http://127.0.0.1:8988/ 2&gt;&amp;1 | grep -i '^&gt; pragma'
+&gt; Pragma: no-cache</code></pre>
+<p>curl 8.14.1 has no HTTP cache, so the header changes nothing on the client side. It sent the header on both requests and got 200 both times; without <code>-H</code> curl sent no Pragma at all. The only effect is on whatever cache sits between you and the origin (a CDN or proxy), and many CDNs ignore request <code>Pragma</code> and request <code>Cache-Control</code> by default (from vendor docs, not measured).</p>
+
+<h2>4. Pragma vs Cache-Control (from the RFC, not measured)</h2>
+<table><thead><tr><th></th><th><code>Pragma: no-cache</code></th><th><code>Cache-Control</code></th></tr></thead><tbody>
+<tr><td>Defined in</td><td>HTTP/1.0; deprecated in RFC 9111</td><td>RFC 9111 (HTTP/1.1 and later)</td></tr>
+<tr><td>Values</td><td>Only <code>no-cache</code> is standard</td><td><code>no-cache</code>, <code>no-store</code>, <code>max-age</code>, <code>private</code>, <code>public</code> and more</td></tr>
+<tr><td>Meant for</td><td>Requests (the spec never defined its meaning on responses)</td><td>Requests and responses</td></tr>
+<tr><td>Chromium 153 on responses</td><td>Treated like <code>no-cache</code> (measured above)</td><td>Followed</td></tr>
+</tbody></table>
+<p>To stop caching, use the header that says what you mean. See <a href="/guides/cache-control-no-cache-vs-no-store/">no-cache vs no-store</a> (revalidate vs never store) and <a href="/guides/cache-control-private-vs-public/">private vs public</a> (browser only vs shared caches).</p>
+
+<h2>5. What to send</h2>
+<ul>
+<li><strong>Sensitive or never-cache response:</strong> <code>Cache-Control: no-store</code>. Adding <code>Pragma: no-cache</code> is harmless and only helps HTTP/1.0 caches, which are rare.</li>
+<li><strong>Always revalidate:</strong> <code>Cache-Control: no-cache</code> plus an <code>ETag</code> or <code>Last-Modified</code> so you get cheap 304s.</li>
+<li><strong>Cacheable response:</strong> make sure no <code>Pragma: no-cache</code> sneaks in. In our test it cancelled <code>max-age=60</code> completely.</li>
+</ul>
+<p>Paste a URL into the <a href="/tools/http-headers/">HTTP header checker</a> to see which of these your server actually sends.</p>
+<aside class="cta"><strong>Check whether your responses send Pragma, Cache-Control or both:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Pragma: no-cache do?</summary><p>It is the HTTP/1.0 way to ask that a cached copy not be used without checking the server. In Chromium 153 we measured that a response with &lt;code&gt;Pragma: no-cache&lt;/code&gt; was revalidated on every fetch, just like &lt;code&gt;Cache-Control: no-cache&lt;/code&gt;.</p></details>
+<details><summary>Does Pragma: no-cache override Cache-Control: max-age?</summary><p>In Chromium 153, yes: a response with both &lt;code&gt;Cache-Control: max-age=60&lt;/code&gt; and &lt;code&gt;Pragma: no-cache&lt;/code&gt; hit the server 3 times out of 3 fetches. The older RFC 7234 said Cache-Control should win, so other caches may differ. Do not send both.</p></details>
+<details><summary>Is the Pragma header deprecated?</summary><p>Yes. RFC 9111 marks Pragma as deprecated and says to use Cache-Control instead (from the RFC, not measured). Browsers still send it on hard reloads for old proxies.</p></details>
+<details><summary>Why do my logs show Pragma: no-cache requests?</summary><p>Chromium 153 sent &lt;code&gt;Pragma: no-cache&lt;/code&gt; and &lt;code&gt;Cache-Control: no-cache&lt;/code&gt; on a hard reload and on &lt;code&gt;fetch()&lt;/code&gt; with &lt;code&gt;cache: &#x27;reload&#x27;&lt;/code&gt; or &lt;code&gt;&#x27;no-store&#x27;&lt;/code&gt;. A normal reload sent only &lt;code&gt;Cache-Control: max-age=0&lt;/code&gt;.</p></details>
+<details><summary>Does curl -H &#x27;Pragma: no-cache&#x27; bypass a cache?</summary><p>Not on your machine: curl has no cache, so it just adds the header. A CDN or proxy in the path may or may not honour it; many ignore client cache headers by default.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright) against a Node.js test server on localhost:8987, counting server hits for 3 identical fetch() calls per URL and logging request headers for fetch() cache modes, a normal reload and a hard reload (DevTools Page.reload ignoreCache). curl 8.14.1 against a local python http.server on 127.0.0.1:8988. Pragma and Cache-Control semantics are quoted from RFC 9111 and RFC 7234, not measured. Firefox and Safari were not tested. PlainHeaders is our extension; curl, Node.js and Playwright are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

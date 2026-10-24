@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hashable isinstance() Stays True After hash=None (Tested)</title>
+<meta name="description" content="We measured Python 3.13.5: isinstance(x, Hashable) keeps returning True after __hash__ is set to None on the class, even though hash(x) now raises TypeError.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-collections-abc-hashable-isinstance-stale-cache/">
+<meta property="og:title" content="Hashable isinstance() Stays True After hash=None (Tested)">
+<meta property="og:description" content="We measured Python 3.13.5: isinstance(x, Hashable) keeps returning True after __hash__ is set to None on the class, even though hash(x) now raises TypeError.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-collections-abc-hashable-isinstance-stale-cache/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does isinstance(x, Hashable) stay True after I set __hash__ = None?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that ABCMeta caches the result of its subclass/instance checks keyed on the class. Hashable's check is satisfied once (the class has a usable __hash__), and that cached True is what later isinstance() calls return, even after the class's __hash__ is reassigned to None."}}, {"@type": "Question", "name": "Is this a bug in collections.abc.Hashable?", "acceptedAnswer": {"@type": "Answer", "text": "It's documented ABC caching behavior, not specific to Hashable -- ABCMeta caches isinstance/issubclass results for performance and the cache isn't designed to track later mutation of the classes it already evaluated. Hashable just makes the consequence easy to demonstrate because __hash__ = None has an immediate, checkable effect on hash()."}}, {"@type": "Question", "name": "How do I reliably check if an object is hashable right before using it as a dict key?", "acceptedAnswer": {"@type": "Answer", "text": "We measured that calling hash(x) directly inside a try/except TypeError is accurate at that exact moment, unlike isinstance(x, Hashable), which can report a cached answer from before any later mutation of the object's class."}}, {"@type": "Question", "name": "Does this only affect classes that change __hash__ at runtime?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- a class whose __hash__ is never reassigned after creation won't hit this, since there's no later mutation for the isinstance cache to miss. It specifically affects code that flips a class between hashable and unhashable (or vice versa) after other code has already run an isinstance/issubclass check against it."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>collections.abc.Hashable isinstance() Cache Goes Stale (Tested)</h1>
+<p class="lead"><code>collections.abc.Hashable</code> doesn't require subclassing -- its <code>__subclasshook__</code> checks whether a class defines a usable <code>__hash__</code>, so ordinary classes pass <code>isinstance(x, Hashable)</code> automatically. That check runs through <code>ABCMeta</code>'s C-level cache, which is keyed on the class and is not invalidated when the class is mutated afterward. Code that mutates a class's <code>__hash__</code> at runtime -- a common pattern for making a mutable object temporarily unhashable, e.g. during an in-place edit -- can leave <code>isinstance(x, Hashable)</code> reporting the old, pre-mutation answer.</p>
+<h2 id="repro1">1. A plain class passes isinstance(..., Hashable) by default</h2>
+<pre><code>from collections.abc import Hashable
+
+class Foo:
+    pass
+
+f = Foo()
+print(isinstance(f, Hashable))</code></pre>
+<pre><code>True</code></pre>
+<p><strong>Measured:</strong> <code>Foo</code> never subclasses <code>Hashable</code> or registers with it. <code>Hashable</code>'s <code>__subclasshook__</code> checks whether the class provides a real <code>__hash__</code> (every plain class inherits <code>object.__hash__</code>), and that's enough to pass the <code>isinstance</code> check.</p>
+
+<h2 id="repro2">2. Setting __hash__ = None makes the object genuinely unhashable</h2>
+<pre><code>Foo.__hash__ = None
+try:
+    hash(f)
+except TypeError as e:
+    print("hash() ->", e)</code></pre>
+<pre><code>hash() -> unhashable type: 'Foo'</code></pre>
+<p><strong>Measured:</strong> after this assignment, calling <code>hash(f)</code> on the exact same object raises <code>TypeError</code> immediately -- <code>Foo</code> is now unhashable, matching how setting <code>__hash__ = None</code> is documented to work for mutable types.</p>
+
+<h2 id="repro3">3. isinstance() against Hashable never re-checks</h2>
+<pre><code>print(isinstance(f, Hashable))</code></pre>
+<pre><code>True</code></pre>
+<p><strong>Measured:</strong> the same <code>isinstance(f, Hashable)</code> call that correctly returned <code>True</code> before the mutation still returns <code>True</code> afterward, on the same object, in the same process, with no other code running in between. A guard like <code>if isinstance(x, Hashable): d[x] = 1</code> written against this object will pass the check and then raise <code>TypeError</code> on the very next line.</p>
+
+<h2 id="repro4">4. The cached result survives even through unrelated ABC activity</h2>
+<pre><code>print(issubclass(Foo, Hashable))  # same stale answer via issubclass directly
+
+d = {}
+if isinstance(f, Hashable):
+    d[f] = 1  # raises despite the isinstance guard just above</code></pre>
+<pre><code>True
+Traceback (most recent call last):
+  ...
+TypeError: unhashable type: 'Foo'</code></pre>
+<p><strong>Measured:</strong> <code>issubclass(Foo, Hashable)</code> shows the same stale <code>True</code>, since <code>isinstance</code> is implemented in terms of it. The dict insert immediately after the passing guard raises <code>TypeError</code> -- the isinstance check gave no real protection because nothing re-validates the cached answer once the class itself is mutated.</p>
+<aside class="cta"><strong>Guarding a dict/set insert with isinstance(x, collections.abc.Hashable)? That check can keep saying True after something sets the object&#x27;s __hash__ to None -- the isinstance result gets cached and never re-checked:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does isinstance(x, Hashable) stay True after I set __hash__ = None?</summary><p>We measured that ABCMeta caches the result of its subclass/instance checks keyed on the class. Hashable&#x27;s check is satisfied once (the class has a usable __hash__), and that cached True is what later isinstance() calls return, even after the class&#x27;s __hash__ is reassigned to None.</p></details>
+<details><summary>Is this a bug in collections.abc.Hashable?</summary><p>It&#x27;s documented ABC caching behavior, not specific to Hashable -- ABCMeta caches isinstance/issubclass results for performance and the cache isn&#x27;t designed to track later mutation of the classes it already evaluated. Hashable just makes the consequence easy to demonstrate because __hash__ = None has an immediate, checkable effect on hash().</p></details>
+<details><summary>How do I reliably check if an object is hashable right before using it as a dict key?</summary><p>We measured that calling hash(x) directly inside a try/except TypeError is accurate at that exact moment, unlike isinstance(x, Hashable), which can report a cached answer from before any later mutation of the object&#x27;s class.</p></details>
+<details><summary>Does this only affect classes that change __hash__ at runtime?</summary><p>Yes -- a class whose __hash__ is never reassigned after creation won&#x27;t hit this, since there&#x27;s no later mutation for the isinstance cache to miss. It specifically affects code that flips a class between hashable and unhashable (or vice versa) after other code has already run an isinstance/issubclass check against it.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5&#x27;s built-in collections.abc.Hashable: created a plain class, confirmed isinstance(instance, Hashable) is True (it passes Hashable&#x27;s default __subclasshook__ by having a non-None __hash__), then set the class&#x27;s __hash__ to None afterward and re-ran the same isinstance() call on the same object. PlainHeaders is our extension; Python&#x27;s collections.abc module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

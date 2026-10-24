@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python shutil Error Handling: copy, move, copytree, rmtree</title>
+<meta name="description" content="What shutil.copy, copytree, move and rmtree raise, measured in Python 3.13: copytree finishes then raises one shutil.Error, and move raises shutil.Error.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-shutil-error-handling-copy-move-copytree-rmtree/">
+<meta property="og:title" content="Python shutil Error Handling: copy, move, copytree, rmtree">
+<meta property="og:description" content="What shutil.copy, copytree, move and rmtree raise, measured in Python 3.13: copytree finishes then raises one shutil.Error, and move raises shutil.Error.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-shutil-error-handling-copy-move-copytree-rmtree/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What exceptions does shutil.copy raise?", "acceptedAnswer": {"@type": "Answer", "text": "FileNotFoundError when the source or the destination folder is missing, SameFileError when copying a file onto itself, PermissionError for permission problems, and IsADirectoryError when the source is a directory."}}, {"@type": "Question", "name": "What is shutil.Error?", "acceptedAnswer": {"@type": "Answer", "text": "An OSError subclass raised by copytree (with a list of (src, dst, reason) tuples in args[0]) and by move when the destination already exists. SameFileError is a subclass of it."}}, {"@type": "Question", "name": "Does shutil.copytree stop at the first error?", "acceptedAnswer": {"@type": "Answer", "text": "No. It copies everything it can and then raises one shutil.Error listing every failure, leaving a partial copy behind."}}, {"@type": "Question", "name": "How do I make copytree work when the destination exists?", "acceptedAnswer": {"@type": "Answer", "text": "Pass dirs_exist_ok=True (Python 3.8+). Without it, copytree raises FileExistsError [Errno 17]."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python shutil error handling: copy, move, copytree, rmtree (tested)</h1>
+<p class="lead"><code>shutil</code> raises a mix of <code>FileNotFoundError</code>, <code>IsADirectoryError</code>, <code>FileExistsError</code>, <code>SameFileError</code> and its own <code>shutil.Error</code>, depending on the function and the problem. We triggered each one, measured how <code>copytree</code> reports a tree full of failures, and wrote a copy wrapper that says which path is wrong.</p>
+<h2 id="errors">1. What each shutil function raises, and when</h2>
+<p>We called <code>copy</code>, <code>copyfile</code>, <code>copytree</code>, <code>move</code> and <code>rmtree</code> with the inputs that usually go wrong:</p>
+<pre><code>import os, shutil, tempfile
+d = tempfile.mkdtemp(); os.chdir(d)
+open(&quot;a.txt&quot;, &quot;w&quot;).write(&quot;hi&quot;)
+os.mkdir(&quot;folder&quot;)
+
+def show(label, fn):
+    try:
+        fn(); print(f&quot;{label:34} OK&quot;)
+    except Exception as e:
+        print(f&quot;{label:34} {type(e).__name__}: {e}&quot;)
+
+show(&quot;copy: source missing&quot;,            lambda: shutil.copy(&quot;nope.txt&quot;, &quot;b.txt&quot;))
+show(&quot;copy: destination dir missing&quot;,   lambda: shutil.copy(&quot;a.txt&quot;, &quot;missing/b.txt&quot;))
+show(&quot;copy: file onto itself&quot;,          lambda: shutil.copy(&quot;a.txt&quot;, &quot;a.txt&quot;))
+show(&quot;copyfile: destination is a dir&quot;,  lambda: shutil.copyfile(&quot;a.txt&quot;, &quot;folder&quot;))
+show(&quot;copy: destination is a dir&quot;,      lambda: shutil.copy(&quot;a.txt&quot;, &quot;folder&quot;))
+show(&quot;copytree: destination exists&quot;,    lambda: shutil.copytree(&quot;folder&quot;, &quot;folder&quot;))
+show(&quot;copytree: source is a file&quot;,      lambda: shutil.copytree(&quot;a.txt&quot;, &quot;t2&quot;))
+show(&quot;move: source missing&quot;,            lambda: shutil.move(&quot;nope.txt&quot;, &quot;b.txt&quot;))
+show(&quot;move: same name already in dir&quot;,  lambda: (open(&quot;folder/a.txt&quot;,&quot;w&quot;).close(), shutil.move(&quot;a.txt&quot;, &quot;folder&quot;)))
+show(&quot;rmtree: not a directory&quot;,         lambda: shutil.rmtree(&quot;folder/a.txt&quot;))
+
+print()
+for c in [shutil.SameFileError, shutil.Error]:
+    print(c.__name__, &quot;-&gt;&quot;, &quot; &gt; &quot;.join(k.__name__ for k in c.__mro__[1:-2]))</code></pre>
+<p>Output:</p>
+<pre><code>copy: source missing               FileNotFoundError: [Errno 2] No such file or directory: &#x27;nope.txt&#x27;
+copy: destination dir missing      FileNotFoundError: [Errno 2] No such file or directory: &#x27;missing/b.txt&#x27;
+copy: file onto itself             SameFileError: &#x27;a.txt&#x27; and &#x27;a.txt&#x27; are the same file
+copyfile: destination is a dir     IsADirectoryError: [Errno 21] Is a directory: &#x27;folder&#x27;
+copy: destination is a dir         OK
+copytree: destination exists       FileExistsError: [Errno 17] File exists: &#x27;folder&#x27;
+copytree: source is a file         NotADirectoryError: [Errno 20] Not a directory: &#x27;a.txt&#x27;
+move: source missing               FileNotFoundError: [Errno 2] No such file or directory: &#x27;nope.txt&#x27;
+move: same name already in dir     Error: Destination path &#x27;folder/a.txt&#x27; already exists
+rmtree: not a directory            NotADirectoryError: [Errno 20] Not a directory: &#x27;folder/a.txt&#x27;
+
+SameFileError -&gt; Error &gt; OSError &gt; Exception
+Error -&gt; OSError &gt; Exception</code></pre>
+<p>What to take from this:</p>
+<ul>
+<li><strong>A missing source and a missing destination folder give the same error</strong>: <code>FileNotFoundError [Errno 2]</code>. Only <code>e.filename</code> tells you which path it was. <code>shutil.copy</code> does not create parent folders; call <code>os.makedirs(os.path.dirname(dst), exist_ok=True)</code> first.</li>
+<li><code>copy()</code> into a directory works (the file keeps its name), but <code>copyfile()</code> needs a full file path and raises <code>IsADirectoryError</code>.</li>
+<li><code>copytree()</code> refuses an existing destination with <code>FileExistsError</code>. Pass <code>dirs_exist_ok=True</code> (Python 3.8+) to merge into it.</li>
+<li><code>move()</code> onto a name that already exists in the target folder raises <code>shutil.Error</code>, not <code>FileExistsError</code>, so <code>except FileExistsError</code> misses it.</li>
+<li><code>shutil.Error</code> and <code>SameFileError</code> are both <code>OSError</code> subclasses, so <code>except OSError</code> catches everything shutil raises.</li>
+</ul>
+<h2 id="copytree">2. copytree keeps going and raises one shutil.Error at the end</h2>
+<p>When some files in a tree can't be copied, <code>copytree()</code> does not stop at the first one. It copies everything it can, then raises a single <code>shutil.Error</code> whose <code>args[0]</code> is a list of <code>(src, dst, reason)</code> tuples:</p>
+<pre><code>import os, shutil, tempfile
+d = tempfile.mkdtemp(); os.chdir(d)
+os.makedirs(&quot;src/sub&quot;)
+for name in [&quot;ok1.txt&quot;, &quot;secret.txt&quot;, &quot;sub/ok2.txt&quot;, &quot;sub/secret2.txt&quot;]:
+    open(f&quot;src/{name}&quot;, &quot;w&quot;).write(name)
+os.chmod(&quot;src/secret.txt&quot;, 0o000)
+os.chmod(&quot;src/sub/secret2.txt&quot;, 0o000)
+
+try:
+    shutil.copytree(&quot;src&quot;, &quot;dst&quot;)
+except shutil.Error as e:
+    errors = e.args[0]
+    print(f&quot;shutil.Error with {len(errors)} failures:&quot;)
+    for src, dst, why in errors:
+        print(&quot; &quot;, os.path.relpath(src, d), &quot;-&gt;&quot;, why)
+
+print(&quot;copied anyway:&quot;, sorted(os.path.relpath(os.path.join(r, f), &quot;dst&quot;)
+                              for r, _, fs in os.walk(&quot;dst&quot;) for f in fs))</code></pre>
+<p>Output:</p>
+<pre><code>shutil.Error with 2 failures:
+  src/secret.txt -&gt; [Errno 13] Permission denied: &#x27;src/secret.txt&#x27;
+  src/sub/secret2.txt -&gt; [Errno 13] Permission denied: &#x27;src/sub/secret2.txt&#x27;
+copied anyway: [&#x27;ok1.txt&#x27;, &#x27;sub/ok2.txt&#x27;]</code></pre>
+<p>Two consequences: the destination is left <strong>partially copied</strong> when the exception reaches you, and <code>str(e)</code> is one long list that is hard to read. Loop over <code>e.args[0]</code> to report each file, and delete or mark the incomplete destination if a half-copy is worse than none. For permission problems specifically, see our <a href="/guides/python-shutil-copy-move-permissionerror-errno-13/">shutil copy/move PermissionError guide</a> and <a href="/guides/python-shutil-rmtree-permissionerror-errno-13/">rmtree PermissionError guide</a>.</p>
+<h2 id="handler">3. A copy wrapper with useful error messages</h2>
+<p>Since the raw errors don't say which side is missing, a small wrapper can check and re-raise with a clear message, and treat "same file" as success:</p>
+<pre><code>import errno, os, shutil, tempfile
+
+def safe_copy(src, dst):
+    try:
+        return shutil.copy2(src, dst)
+    except shutil.SameFileError:
+        return dst                                # already there: nothing to do
+    except FileNotFoundError as e:
+        # tell apart &quot;source missing&quot; from &quot;destination folder missing&quot;
+        which = &quot;source&quot; if not os.path.exists(src) else &quot;destination folder&quot;
+        raise FileNotFoundError(errno.ENOENT, f&quot;{which} missing&quot;, e.filename) from e
+    except IsADirectoryError as e:
+        raise IsADirectoryError(errno.EISDIR, &quot;use copytree for directories&quot;, e.filename) from e
+
+d = tempfile.mkdtemp(); os.chdir(d)
+open(&quot;a.txt&quot;, &quot;w&quot;).write(&quot;hi&quot;); os.mkdir(&quot;dir&quot;)
+for args in [(&quot;a.txt&quot;, &quot;a.txt&quot;), (&quot;nope.txt&quot;, &quot;x.txt&quot;), (&quot;a.txt&quot;, &quot;missing/x.txt&quot;), (&quot;dir&quot;, &quot;y&quot;)]:
+    try:
+        print(args, &quot;-&gt;&quot;, safe_copy(*args))
+    except OSError as e:
+        print(args, &quot;-&gt;&quot;, type(e).__name__, e)</code></pre>
+<p>Output:</p>
+<pre><code>(&#x27;a.txt&#x27;, &#x27;a.txt&#x27;) -&gt; a.txt
+(&#x27;nope.txt&#x27;, &#x27;x.txt&#x27;) -&gt; FileNotFoundError [Errno 2] source missing: &#x27;nope.txt&#x27;
+(&#x27;a.txt&#x27;, &#x27;missing/x.txt&#x27;) -&gt; FileNotFoundError [Errno 2] destination folder missing: &#x27;missing/x.txt&#x27;
+(&#x27;dir&#x27;, &#x27;y&#x27;) -&gt; IsADirectoryError [Errno 21] use copytree for directories: &#x27;dir&#x27;</code></pre>
+<p>Catch <code>SameFileError</code> before anything else, because it is also a <code>shutil.Error</code> and an <code>OSError</code>. Checking <code>os.path.exists()</code> only <em>after</em> the copy fails, to explain the error, is safe. Checking it <em>before</em> copying is not a guarantee, because the file can disappear in between. The <code>from e</code> keeps the original traceback attached.</p>
+
+<aside class="cta"><strong>Copying downloaded files around? Check what a URL serves before you save it:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What exceptions does shutil.copy raise?</summary><p>FileNotFoundError when the source or the destination folder is missing, SameFileError when copying a file onto itself, PermissionError for permission problems, and IsADirectoryError when the source is a directory.</p></details>
+<details><summary>What is shutil.Error?</summary><p>An OSError subclass raised by copytree (with a list of (src, dst, reason) tuples in args[0]) and by move when the destination already exists. SameFileError is a subclass of it.</p></details>
+<details><summary>Does shutil.copytree stop at the first error?</summary><p>No. It copies everything it can and then raises one shutil.Error listing every failure, leaving a partial copy behind.</p></details>
+<details><summary>How do I make copytree work when the destination exists?</summary><p>Pass dirs_exist_ok=True (Python 3.8+). Without it, copytree raises FileExistsError [Errno 17].</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-22 on Debian with Python 3.13.5: shutil.copy, copyfile, copytree, move and rmtree with missing sources, missing destination folders, existing destinations, the same file, and unreadable (0o000) files inside a tree. Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

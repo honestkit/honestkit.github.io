@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python SSL: WRONG_VERSION_NUMBER wrong version number Fix</title>
+<meta name="description" content="Reproduced [SSL: WRONG_VERSION_NUMBER] in Python 3.13.5: https:// to a plain-HTTP port, or an https:// proxy URL for an HTTP proxy. Not a TLS version problem.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-ssl-wrong-version-number/">
+<meta property="og:title" content="Python SSL: WRONG_VERSION_NUMBER wrong version number Fix">
+<meta property="og:description" content="Reproduced [SSL: WRONG_VERSION_NUMBER] in Python 3.13.5: https:// to a plain-HTTP port, or an https:// proxy URL for an HTTP proxy. Not a TLS version problem.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-ssl-wrong-version-number/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does WRONG_VERSION_NUMBER mean I need a different TLS version?", "acceptedAnswer": {"@type": "Answer", "text": "Almost never. We reproduced it by sending a TLS handshake to a plain-HTTP server: OpenSSL read the server's 'HTTP/1.1 400' text as a TLS record. Changing ssl minimum/maximum versions doesn't help."}}, {"@type": "Question", "name": "Why does requests show it through a proxy?", "acceptedAnswer": {"@type": "Answer", "text": "If HTTPS_PROXY or proxies= says https://proxy:port, requests speaks TLS to the proxy. Most proxies expect plain HTTP and tunnel with CONNECT, so write the proxy as http://proxy:port. We measured both forms."}}, {"@type": "Question", "name": "I get it with smtplib. Why?", "acceptedAnswer": {"@type": "Answer", "text": "smtplib.SMTP_SSL expects TLS from the first byte (port 465). Port 587 starts in plain text: use smtplib.SMTP(host, 587) and call .starttls()."}}, {"@type": "Question", "name": "How do I tell if a port speaks HTTP or HTTPS?", "acceptedAnswer": {"@type": "Answer", "text": "Try curl -sv http://HOST:PORT/ -- if it answers, it's plain HTTP. openssl s_client -connect HOST:PORT -brief shows a TLS handshake if the port speaks TLS."}}, {"@type": "Question", "name": "Should I set verify=False?", "acceptedAnswer": {"@type": "Answer", "text": "No -- it doesn't help here (the failure is before certificate checks) and it removes protection you need. Fix the URL scheme or proxy setting instead."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python [SSL: WRONG_VERSION_NUMBER] wrong version number (tested)</h1>
+<p class="lead"><code>ssl.SSLError: [SSL: WRONG_VERSION_NUMBER] wrong version number</code> almost never means a TLS version mismatch. We reproduced it with urllib and requests: it happens when the client speaks TLS and the other side answers in <strong>plain HTTP</strong> -- an <code>https://</code> URL pointed at an HTTP-only port, or a proxy URL written as <code>https://</code> when the proxy itself speaks HTTP. OpenSSL reads the server's <code>HTTP/1.1</code> text as a TLS record and rejects its "version".</p>
+<h2 id="repro">1. Reproduce it: https:// to a port that speaks plain HTTP</h2>
+<pre><code>import socket, threading, time, ssl, urllib.request, requests
+
+PORT = 8963
+def serve():   # a plain-HTTP server (no TLS)
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", PORT))
+    srv.listen()
+    while True:
+        conn, _ = srv.accept()
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        conn.close()
+threading.Thread(target=serve, daemon=True).start()
+time.sleep(0.2)
+
+url = f"https://127.0.0.1:{PORT}/"          # https:// to a port that speaks plain HTTP
+try:
+    urllib.request.urlopen(url)
+except Exception as e:
+    print("urlopen  -&gt;", type(e).__name__ + ":", e)
+try:
+    requests.get(url)
+except Exception as e:
+    print("requests -&gt;", type(e).__name__ + ":", e)
+print("http://  -&gt;", requests.get(url.replace("https://", "http://")).status_code)
+print(ssl.OPENSSL_VERSION)
+
+# The proxy variant: proxy URL written with https:// for a proxy that speaks plain HTTP
+for proxy in ("https://127.0.0.1:8963", "http://127.0.0.1:8963"):
+    try:
+        requests.get("https://example.com/", proxies={"https": proxy}, timeout=5)
+    except Exception as e:
+        print(f"proxy {proxy:24} -&gt;", type(e).__name__ + ":", str(e)[-90:])</code></pre>
+<pre><code>urlopen  -&gt; URLError: &lt;urlopen error [SSL: WRONG_VERSION_NUMBER] wrong version number (_ssl.c:1029)&gt;
+requests -&gt; SSLError: HTTPSConnectionPool(host='127.0.0.1', port=8963): Max retries exceeded with url: / (Caused by SSLError(SSLError(1, '[SSL: WRONG_VERSION_NUMBER] wrong version number (_ssl.c:1029)')))
+http://  -&gt; 400
+OpenSSL 3.5.7 9 Jun 2026
+proxy https://127.0.0.1:8963   -&gt; ProxyError:  SSLError(SSLError(1, '[SSL: WRONG_VERSION_NUMBER] wrong version number (_ssl.c:1029)'))))
+proxy http://127.0.0.1:8963    -&gt; ProxyError: Error('Unable to connect to proxy', OSError('Tunnel connection failed: 400 Bad Request')))</code></pre>
+<p><strong>Measured:</strong> the client started a TLS handshake, the server answered with a plain-text <code>HTTP/1.1 400 ...</code> line, and OpenSSL tried to read those bytes as a TLS record header. <code>"HT"</code> is not a valid TLS version, hence <code>WRONG_VERSION_NUMBER</code>. The same URL with <code>http://</code> reached the server fine. Nothing is wrong with your TLS version settings or certificates.</p>
+
+<h2 id="causes">2. The usual causes</h2>
+<ul>
+<li><strong><code>https://</code> on a plain-HTTP port</strong>: a dev server on <code>:8000</code>/<code>:8080</code>/<code>:5000</code>, or <code>https://host:80</code>. Use <code>http://</code>, or put TLS in front of it.</li>
+<li><strong>A proxy URL written with <code>https://</code></strong>: most corporate and local proxies (Squid, Fiddler, mitmproxy's default) accept plain HTTP and tunnel HTTPS with <code>CONNECT</code>. Measured above: <code>proxies={"https": "https://127.0.0.1:8963"}</code> gives the same <code>WRONG_VERSION_NUMBER</code>; <code>http://127.0.0.1:8963</code> reaches the proxy (our stand-in then refuses the tunnel with 400; a real proxy would open it). Check <code>HTTPS_PROXY</code>/<code>https_proxy</code> in your environment -- requests and urllib read them automatically -- and write it as <code>http://proxy:port</code>.</li>
+<li><strong>Wrong port for the service</strong>: e.g. SMTP on 587 needs <code>smtplib.SMTP(...).starttls()</code>, not <code>SMTP_SSL</code> (which expects TLS from the first byte, port 465).</li>
+<li><strong>Something in the middle answering in plain text</strong>: a captive portal, a misconfigured load balancer listener, or a firewall returning an HTTP block page on 443.</li>
+</ul>
+
+<h2 id="check">3. Check what the port actually speaks</h2>
+<pre><code>curl -sv http://HOST:PORT/ -o /tmp/out    # answers? it's plain HTTP
+openssl s_client -connect HOST:PORT -brief &lt;/dev/null   # TLS servers print the protocol and cipher</code></pre>
+<p>If plain <code>http://</code> works, fix the URL or the proxy setting. If neither works, the service on that port is not HTTP at all.</p>
+<p>Related: <a href="/guides/err-ssl-protocol-error/">ERR_SSL_PROTOCOL_ERROR in Chrome</a>, the browser-side version of the same mismatch.</p>
+<aside class="cta"><strong>Check what a server actually answers with, header by header:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does WRONG_VERSION_NUMBER mean I need a different TLS version?</summary><p>Almost never. We reproduced it by sending a TLS handshake to a plain-HTTP server: OpenSSL read the server&#x27;s &#x27;HTTP/1.1 400&#x27; text as a TLS record. Changing ssl minimum/maximum versions doesn&#x27;t help.</p></details>
+<details><summary>Why does requests show it through a proxy?</summary><p>If HTTPS_PROXY or proxies= says https://proxy:port, requests speaks TLS to the proxy. Most proxies expect plain HTTP and tunnel with CONNECT, so write the proxy as http://proxy:port. We measured both forms.</p></details>
+<details><summary>I get it with smtplib. Why?</summary><p>smtplib.SMTP_SSL expects TLS from the first byte (port 465). Port 587 starts in plain text: use smtplib.SMTP(host, 587) and call .starttls().</p></details>
+<details><summary>How do I tell if a port speaks HTTP or HTTPS?</summary><p>Try curl -sv http://HOST:PORT/ -- if it answers, it&#x27;s plain HTTP. openssl s_client -connect HOST:PORT -brief shows a TLS handshake if the port speaks TLS.</p></details>
+<details><summary>Should I set verify=False?</summary><p>No -- it doesn&#x27;t help here (the failure is before certificate checks) and it removes protection you need. Fix the URL scheme or proxy setting instead.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 (OpenSSL 3.5.7), urllib.request and requests 2.32.3, connecting with https:// to a local plain-HTTP socket server, directly and through a proxies= setting. PlainHeaders is our extension; Python, requests and OpenSSL are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

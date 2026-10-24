@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLAlchemy StaleDataError: expected to update 1 row(s), 0 matched</title>
+<meta name="description" content="SQLAlchemy StaleDataError tested on 2.1.6: row deleted by another connection, DELETE only warns, version_id_col optimistic locking with reload and retry.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlalchemy-staledataerror-expected-to-update-1-rows-0-were-matched/">
+<meta property="og:title" content="SQLAlchemy StaleDataError: expected to update 1 row(s), 0 matched">
+<meta property="og:description" content="SQLAlchemy StaleDataError tested on 2.1.6: row deleted by another connection, DELETE only warns, version_id_col optimistic locking with reload and retry.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlalchemy-staledataerror-expected-to-update-1-rows-0-were-matched/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What causes StaleDataError in SQLAlchemy?", "acceptedAnswer": {"@type": "Answer", "text": "The UPDATE for an object matched 0 rows: the row was deleted or its primary key changed after the session loaded it, or with version_id_col another session committed a newer version."}}, {"@type": "Question", "name": "Does deleting an already-deleted row raise StaleDataError?", "acceptedAnswer": {"@type": "Answer", "text": "Not without a version column: SQLAlchemy 2.1.6 emits an SAWarning ('expected to delete 1 row(s); 0 were matched') and the commit succeeds."}}, {"@type": "Question", "name": "How do I handle StaleDataError with version_id_col?", "acceptedAnswer": {"@type": "Answer", "text": "Roll back, reload the row, re-apply the change (or report the conflict), and commit again."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLAlchemy StaleDataError: expected to update 1 row(s); 0 were matched (tested)</h1>
+<p class="lead"><code>sqlalchemy.orm.exc.StaleDataError: UPDATE statement on table 'users' expected to update 1 row(s); 0 were matched</code> means the row your session loaded is gone or changed (deleted, primary key changed, or a newer version) by the time it flushed. SQLAlchemy refuses to pretend the UPDATE happened.</p>
+<p>Blocks 1, 2 and 4 import this <code>common.py</code> (a SQLite file with one user):</p>
+<pre><code>import os
+from sqlalchemy import create_engine, String, text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
+class Base(DeclarativeBase): pass
+class User(Base):
+    __tablename__ = &quot;users&quot;
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+def fresh(path=&quot;/tmp/sd.db&quot;):
+    if os.path.exists(path): os.remove(path)
+    eng = create_engine(f&quot;sqlite:///{path}&quot;)
+    Base.metadata.create_all(eng)
+    with Session(eng) as s:
+        s.add(User(id=1, name=&quot;Ada&quot;)); s.commit()
+    return eng</code></pre>
+<h2 id="repro">1. The error: the row changed under you</h2>
+<pre><code>from common import *
+eng = fresh()
+s1 = Session(eng)
+u = s1.get(User, 1)             # loaded in session 1
+with eng.begin() as c:          # someone else deletes the row
+    c.execute(text(&quot;DELETE FROM users WHERE id = 1&quot;))
+u.name = &quot;Grace&quot;
+try:
+    s1.commit()
+except Exception as e:
+    print(f&quot;{type(e).__module__}.{type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>sqlalchemy.orm.exc.StaleDataError: UPDATE statement on table &#x27;users&#x27; expected to update 1 row(s); 0 were matched.</code></pre>
+<p>When the session flushes a change it runs <code>UPDATE users ... WHERE users.id = ?</code> and checks the row count. Here another connection deleted the row after session 1 loaded it, so the UPDATE matched 0 rows and SQLAlchemy raised <code>StaleDataError</code> instead of silently writing nothing. The same happens if something else changed the primary key, or a long-lived session holds an object whose row was removed by a bulk <code>delete()</code>, a cron job or another worker.</p>
+<h2 id="delete">2. DELETE only warns</h2>
+<pre><code>import warnings
+from common import *
+eng = fresh()
+s1 = Session(eng)
+u = s1.get(User, 1)
+with eng.begin() as c:
+    c.execute(text(&quot;DELETE FROM users WHERE id = 1&quot;))
+s1.delete(u)
+with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter(&quot;always&quot;)
+    s1.commit()
+    for x in w: print(f&quot;{x.category.__name__}: {x.message}&quot;)
+print(&quot;commit succeeded&quot;)
+s1.close(); eng.dispose()</code></pre>
+<p>Output:</p>
+<pre><code>SAWarning: DELETE statement on table &#x27;users&#x27; expected to delete 1 row(s); 0 were matched.  Please set confirm_deleted_rows=False within the mapper configuration to prevent this warning.
+commit succeeded</code></pre>
+<p>Deleting an already-deleted row is a <code>SAWarning</code>, not an error, and the commit succeeds. Without a version column, only UPDATEs raise.</p>
+<h2 id="version">3. Optimistic locking with version_id_col: catch, reload, retry</h2>
+<pre><code>from sqlalchemy import create_engine, String, Integer
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
+class Base(DeclarativeBase): pass
+class Doc(Base):
+    __tablename__ = &quot;docs&quot;
+    id: Mapped[int] = mapped_column(primary_key=True)
+    body: Mapped[str] = mapped_column(String(50))
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    __mapper_args__ = {&quot;version_id_col&quot;: version}
+eng = create_engine(&quot;sqlite:////tmp/sd3.db&quot;)
+Base.metadata.drop_all(eng); Base.metadata.create_all(eng)
+with Session(eng) as s: s.add(Doc(id=1, body=&quot;v1&quot;)); s.commit()
+a, b = Session(eng), Session(eng)
+da, db = a.get(Doc, 1), b.get(Doc, 1)
+print(&quot;both loaded version&quot;, da.version, db.version)
+da.body = &quot;edit by A&quot;; a.commit()
+print(&quot;A committed, version now&quot;, da.version)
+db.body = &quot;edit by B&quot;
+try:
+    b.commit()
+except Exception as e:
+    print(f&quot;{type(e).__name__}: {e}&quot;)
+    b.rollback()
+    db = b.get(Doc, 1)   # reload, then re-apply
+    print(&quot;reloaded:&quot;, db.body, &quot;version&quot;, db.version)
+    db.body = &quot;edit by B&quot;; b.commit()
+    print(&quot;retry ok, version&quot;, db.version)</code></pre>
+<p>Output:</p>
+<pre><code>both loaded version 1 1
+A committed, version now 2
+StaleDataError: UPDATE statement on table &#x27;docs&#x27; expected to update 1 row(s); 0 were matched.
+reloaded: edit by A version 2
+retry ok, version 3</code></pre>
+<p>With <code>version_id_col</code> the UPDATE also says <code>WHERE version = 1</code>. Two sessions loaded version 1; A committed first (version 2), so B's UPDATE matched 0 rows. Here <code>StaleDataError</code> is the feature working: it stops B from overwriting A's edit. Roll back, reload the current row, re-apply or show the user the conflict, then commit again.</p>
+<h2 id="check">4. Check the row still exists before writing</h2>
+<pre><code>from common import *
+eng = fresh()
+s1 = Session(eng)
+u = s1.get(User, 1)
+with eng.begin() as c:
+    c.execute(text(&quot;DELETE FROM users WHERE id = 1&quot;))
+# check before writing: refresh() fails if the row is gone
+try:
+    s1.refresh(u)
+except Exception as e:
+    print(f&quot;refresh: {type(e).__name__}: {e}&quot;)
+s1.rollback()
+print(&quot;s1.get after rollback:&quot;, s1.get(User, 1))</code></pre>
+<p>Output:</p>
+<pre><code>refresh: InvalidRequestError: Could not refresh instance &#x27;&lt;User at 0x7faec4762350&gt;&#x27;
+s1.get after rollback: None</code></pre>
+<p><code>refresh()</code> fails on a row that no longer exists, and after a rollback <code>get()</code> returns <code>None</code>. Short-lived sessions (one per request or job) make this rare: load, change and commit in one go instead of holding objects for minutes.</p>
+<h2 id="fix">Fixes in order</h2>
+<ul><li>Find who else writes to the row (another worker, raw SQL, a bulk <code>query.delete()</code>/<code>update()</code>, a trigger) and why your session still has it.</li><li>Use one short session per request or job, not a global session.</li><li>If concurrent edits are expected, add <code>version_id_col</code> and handle <code>StaleDataError</code> with rollback + reload + retry.</li><li>Do not "fix" it by catching and ignoring: your UPDATE did not happen.</li></ul>
+<p>Related: <a href="/guides/sqlalchemy-integrityerror-unique-constraint-failed/">SQLAlchemy IntegrityError</a> · <a href="/guides/sqlalchemy-detachedinstanceerror-not-bound-to-a-session/">DetachedInstanceError</a>.</p>
+
+<aside class="cta"><strong>Debugging a script that also calls web APIs? Check what headers a URL actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What causes StaleDataError in SQLAlchemy?</summary><p>The UPDATE for an object matched 0 rows: the row was deleted or its primary key changed after the session loaded it, or with version_id_col another session committed a newer version.</p></details>
+<details><summary>Does deleting an already-deleted row raise StaleDataError?</summary><p>Not without a version column: SQLAlchemy 2.1.6 emits an SAWarning (&#x27;expected to delete 1 row(s); 0 were matched&#x27;) and the commit succeeds.</p></details>
+<details><summary>How do I handle StaleDataError with version_id_col?</summary><p>Roll back, reload the row, re-apply the change (or report the conflict), and commit again.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with SQLAlchemy 2.1.6 and Python 3.14.7 (SQLite, python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Python and SQLAlchemy are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

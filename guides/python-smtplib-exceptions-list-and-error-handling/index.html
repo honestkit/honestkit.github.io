@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python smtplib Exceptions: Full List and Error Handling (Tested)</title>
+<meta name="description" content="Measured in Python 3.13.5: which smtplib exception each SMTP failure raises, why connection refused escapes except SMTPException, and partial recipient refusal.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-smtplib-exceptions-list-and-error-handling/">
+<meta property="og:title" content="Python smtplib Exceptions: Full List and Error Handling (Tested)">
+<meta property="og:description" content="Measured in Python 3.13.5: which smtplib exception each SMTP failure raises, why connection refused escapes except SMTPException, and partial recipient refusal.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-smtplib-exceptions-list-and-error-handling/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What exceptions can smtplib raise?", "acceptedAnswer": {"@type": "Answer", "text": "SMTPException subclasses (SMTPAuthenticationError, SMTPSenderRefused, SMTPRecipientsRefused, SMTPDataError, SMTPServerDisconnected, SMTPNotSupportedError, SMTPHeloError, SMTPConnectError), plus OSError subclasses that happen before SMTP starts: we measured ConnectionRefusedError, TimeoutError, socket.gaierror and ssl.SSLError."}}, {"@type": "Question", "name": "Why doesn't except smtplib.SMTPException catch connection refused?", "acceptedAnswer": {"@type": "Answer", "text": "Connection refused, connect timeouts and DNS failures are raised by the socket layer as plain OSError subclasses. We measured all three with SMTPException? False. Catch OSError, which also covers SMTPException."}}, {"@type": "Question", "name": "Does sendmail raise an error if one recipient is invalid?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured one of two recipients refused: no exception, and sendmail() returned {'typo@example.com': (550, ...)}. It raises SMTPRecipientsRefused only if all recipients are refused."}}, {"@type": "Question", "name": "How do I get the SMTP error code from an exception?", "acceptedAnswer": {"@type": "Answer", "text": "For SMTPResponseException subclasses use e.smtp_code and e.smtp_error (bytes). For SMTPRecipientsRefused use e.recipients, a dict of address to (code, message). We measured both."}}, {"@type": "Question", "name": "What does SMTPServerDisconnected: Connection unexpectedly closed mean?", "acceptedAnswer": {"@type": "Answer", "text": "The server closed the connection or didn't answer within the timeout. We measured both a hang-up and a silent server producing it (the timeout case ends in ': timed out')."}}, {"@type": "Question", "name": "Why do I get ssl.SSLError WRONG_VERSION_NUMBER with smtplib?", "acceptedAnswer": {"@type": "Answer", "text": "You used SMTP_SSL on a plain-text port. We measured it; use SMTP plus starttls() on 587, or SMTP_SSL on 465."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python smtplib exceptions: which error for which failure (tested)</h1>
+<p class="lead">smtplib has a dozen exception classes, and some of the most common failures raise none of them. We ran every case against a scripted SMTP server: auth, TLS, refused sender, recipients and message, dropped connections, timeouts and DNS. Below is what each one raises and a handler that tells retry from fix.</p>
+<h2 id="setup">0. The test server</h2>
+<p>To get real exceptions without a mail account, we used a small scripted SMTP server on localhost that answers each command with a reply we choose. Save it as <code>fake_smtp.py</code> next to the examples:</p>
+<pre><code># Tiny scripted SMTP server for tests: replies come from a dict you pass in.
+import socket, threading
+
+def serve(port, replies, drop_after=None):
+    srv = socket.create_server((&quot;127.0.0.1&quot;, port))
+    def run():
+        conn, _ = srv.accept()
+        f = conn.makefile(&quot;rwb&quot;)
+        f.write(b&quot;220 fake ready\r\n&quot;); f.flush()
+        n = 0
+        for line in f:
+            n += 1
+            if drop_after is not None and n &gt; drop_after:
+                break                                # hang up mid-session
+            cmd = line.split(b&quot; &quot;, 1)[0].split(b&quot;:&quot;)[0].strip().upper().decode(&quot;latin-1&quot;)
+            if cmd in (&quot;MAIL&quot;, &quot;RCPT&quot;):
+                cmd = line[:9].strip().upper().decode(&quot;latin-1&quot;).split(&quot;:&quot;)[0]
+            if cmd == &quot;DATA&quot;:
+                f.write(replies.get(&quot;DATA&quot;, b&quot;354 go&quot;) + b&quot;\r\n&quot;); f.flush()
+                for body in f:
+                    if body == b&quot;.\r\n&quot;:
+                        break
+                f.write(replies.get(&quot;END&quot;, b&quot;250 queued&quot;) + b&quot;\r\n&quot;); f.flush()
+                continue
+            if cmd == &quot;RCPT TO&quot; and replies.get(&quot;REFUSE&quot;) and replies[&quot;REFUSE&quot;] in line:
+                f.write(b&quot;550 5.1.1 No such user\r\n&quot;); f.flush()
+                continue
+            f.write(replies.get(cmd, b&quot;221 bye&quot; if cmd == &quot;QUIT&quot; else b&quot;250 ok&quot;) + b&quot;\r\n&quot;); f.flush()
+            if cmd == &quot;QUIT&quot;:
+                break
+        conn.close(); srv.close()
+    threading.Thread(target=run, daemon=True).start()</code></pre>
+
+<h2 id="list">1. Which exception each failure raises</h2>
+<pre><code>import smtplib, socket
+from fake_smtp import serve
+
+msg = &quot;Subject: hi\r\n\r\nhello&quot;
+def send(port, **kw):
+    try:
+        with smtplib.SMTP(&quot;127.0.0.1&quot;, port, timeout=3) as s:
+            if kw.get(&quot;login&quot;):
+                s.login(&quot;me&quot;, &quot;wrong-password&quot;)
+            if kw.get(&quot;tls&quot;):
+                s.starttls()
+            s.sendmail(&quot;me@example.com&quot;, [&quot;you@example.com&quot;], msg)
+        return &quot;sent&quot;
+    except Exception as e:
+        return (f&quot;{type(e).__module__}.{type(e).__name__}: {e} &quot;
+                f&quot;| SMTPException? {isinstance(e, smtplib.SMTPException)}&quot;)
+
+cases = [
+    (&quot;nothing listening&quot;,   None, {}),
+    (&quot;auth rejected&quot;,       {&quot;EHLO&quot;: b&quot;250-fake\r\n250 AUTH PLAIN LOGIN&quot;,
+                             &quot;AUTH&quot;: b&quot;535 5.7.8 Authentication failed&quot;}, {&quot;login&quot;: 1}),
+    (&quot;STARTTLS not offered&quot;, {&quot;EHLO&quot;: b&quot;250 fake&quot;}, {&quot;tls&quot;: 1}),
+    (&quot;sender refused&quot;,      {&quot;MAIL FROM&quot;: b&quot;553 5.7.1 Sender not allowed&quot;}, {}),
+    (&quot;recipient refused&quot;,   {&quot;RCPT TO&quot;: b&quot;550 5.1.1 No such user&quot;}, {}),
+    (&quot;message refused&quot;,     {&quot;END&quot;: b&quot;554 5.7.1 Message rejected as spam&quot;}, {}),
+    (&quot;server hangs up&quot;,     &quot;drop&quot;, {}),
+]
+for i, (label, replies, kw) in enumerate(cases):
+    port = 8964
+    if replies == &quot;drop&quot;:
+        serve(port, {}, drop_after=1)
+    elif replies is not None:
+        serve(port, replies)
+    print(f&quot;{label:21} -&gt; {send(port, **kw)}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>nothing listening     -&gt; builtins.ConnectionRefusedError: [Errno 111] Connection refused | SMTPException? False
+auth rejected         -&gt; smtplib.SMTPAuthenticationError: (535, b&#x27;5.7.8 Authentication failed&#x27;) | SMTPException? True
+STARTTLS not offered  -&gt; smtplib.SMTPNotSupportedError: STARTTLS extension not supported by server. | SMTPException? True
+sender refused        -&gt; smtplib.SMTPSenderRefused: (553, b&#x27;5.7.1 Sender not allowed&#x27;, &#x27;me@example.com&#x27;) | SMTPException? True
+recipient refused     -&gt; smtplib.SMTPRecipientsRefused: {&#x27;you@example.com&#x27;: (550, b&#x27;5.1.1 No such user&#x27;)} | SMTPException? True
+message refused       -&gt; smtplib.SMTPDataError: (554, b&#x27;5.7.1 Message rejected as spam&#x27;) | SMTPException? True
+server hangs up       -&gt; smtplib.SMTPServerDisconnected: Connection unexpectedly closed | SMTPException? True</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> each SMTP reply maps to its own class: <code>535</code> on AUTH &rarr; <code>SMTPAuthenticationError</code>, a server without STARTTLS &rarr; <code>SMTPNotSupportedError</code>, a refused MAIL FROM &rarr; <code>SMTPSenderRefused</code>, a refused RCPT TO &rarr; <code>SMTPRecipientsRefused</code>, a rejection after the message body &rarr; <code>SMTPDataError</code>, a dropped connection &rarr; <code>SMTPServerDisconnected</code>. But <strong>nothing listening on the port raises the built-in <code>ConnectionRefusedError</code></strong>, which is not an <code>SMTPException</code>.</p>
+
+<h2 id="connect">2. Connection errors are not SMTPException</h2>
+<pre><code>import smtplib
+
+for host, port in [(&quot;127.0.0.1&quot;, 8967),            # nothing listening
+                   (&quot;10.255.255.1&quot;, 587),          # unroutable: no reply at all
+                   (&quot;no-such-host.invalid&quot;, 587)]: # DNS failure
+    try:
+        smtplib.SMTP(host, port, timeout=2)
+    except Exception as e:
+        print(f&quot;{host:21} {type(e).__module__}.{type(e).__name__}: {e} &quot;
+              f&quot;| SMTPException? {isinstance(e, smtplib.SMTPException)}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>127.0.0.1             builtins.ConnectionRefusedError: [Errno 111] Connection refused | SMTPException? False
+10.255.255.1          builtins.TimeoutError: timed out | SMTPException? False
+no-such-host.invalid  socket.gaierror: [Errno -2] Name or service not known | SMTPException? False</code></pre>
+<p><strong>Measured:</strong> connection refused, a connect timeout (an unroutable address) and a DNS failure all happen before any SMTP is spoken, so they are plain <code>OSError</code> subclasses: <code>ConnectionRefusedError</code>, <code>TimeoutError</code>, <code>socket.gaierror</code>. <code>except smtplib.SMTPException</code> misses all three. You can catch everything with one <code>except OSError</code>, because <code>SMTPException</code> itself subclasses <code>OSError</code>.</p>
+
+<h2 id="timeout">3. Timeouts after connecting, and the SSL/port mismatch</h2>
+<pre><code>import smtplib, socket, ssl, threading, time
+from fake_smtp import serve
+
+# 1) server accepts the connection but never sends its 220 greeting
+silent = socket.create_server((&quot;127.0.0.1&quot;, 8965))
+t0 = time.monotonic()
+try:
+    smtplib.SMTP(&quot;127.0.0.1&quot;, 8965, timeout=2)
+except Exception as e:
+    print(f&quot;silent server: {type(e).__module__}.{type(e).__name__}: {e} &quot;
+          f&quot;after {time.monotonic() - t0:.1f}s | SMTPException? {isinstance(e, smtplib.SMTPException)}&quot;)
+silent.close()
+
+# 2) SMTP_SSL (port 465 style) against a plain-text server (port 587 style)
+serve(8964, {})
+try:
+    smtplib.SMTP_SSL(&quot;127.0.0.1&quot;, 8964, timeout=3)
+except Exception as e:
+    print(f&quot;SMTP_SSL on plain port: {type(e).__module__}.{type(e).__name__}: {e} &quot;
+          f&quot;| OSError? {isinstance(e, OSError)}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>silent server: smtplib.SMTPServerDisconnected: Connection unexpectedly closed: timed out after 2.0s | SMTPException? True
+SMTP_SSL on plain port: ssl.SSLError: [SSL: WRONG_VERSION_NUMBER] wrong version number (_ssl.c:1029) | OSError? True</code></pre>
+<p><strong>Measured:</strong> once the TCP connection exists, a server that never answers gives <code>SMTPServerDisconnected: Connection unexpectedly closed: timed out</code> after the 2-second timeout, not <code>TimeoutError</code>. We got the same message when the server greeted us and then went silent at EHLO. Using <code>SMTP_SSL</code> (for port 465) against a plain server (port 587 or 25) gives <code>ssl.SSLError: [SSL: WRONG_VERSION_NUMBER]</code>; the fix is <code>SMTP</code> + <code>starttls()</code> on 587, or <code>SMTP_SSL</code> on 465. For a custom socket that returns <code>None</code> mid-reply, see our <a href="/guides/python-smtplib-getreply-none-smtpserverdisconnected/">getreply guide</a>.</p>
+
+<h2 id="partial">4. The trap: some recipients refused is NOT an exception</h2>
+<pre><code>import smtplib
+from fake_smtp import serve
+
+serve(8964, {&quot;REFUSE&quot;: b&quot;typo@example.com&quot;})
+with smtplib.SMTP(&quot;127.0.0.1&quot;, 8964, timeout=3) as s:
+    refused = s.sendmail(&quot;me@example.com&quot;,
+                         [&quot;you@example.com&quot;, &quot;typo@example.com&quot;],
+                         &quot;Subject: hi\r\n\r\nhello&quot;)
+print(&quot;no exception; sendmail returned:&quot;, refused)
+
+serve(8964, {&quot;REFUSE&quot;: b&quot;@example.com&quot;})            # every recipient refused
+try:
+    with smtplib.SMTP(&quot;127.0.0.1&quot;, 8964, timeout=3) as s:
+        s.sendmail(&quot;me@example.com&quot;, [&quot;a@example.com&quot;, &quot;b@example.com&quot;], &quot;hi&quot;)
+except smtplib.SMTPRecipientsRefused as e:
+    print(&quot;all refused -&gt; SMTPRecipientsRefused&quot;)
+    for addr, (code, text) in e.recipients.items():
+        print(f&quot;   {addr}: {code} {text.decode()}&quot;)
+
+serve(8964, {&quot;MAIL FROM&quot;: b&quot;553 5.7.1 Sender not allowed&quot;})
+try:
+    with smtplib.SMTP(&quot;127.0.0.1&quot;, 8964, timeout=3) as s:
+        s.sendmail(&quot;me@example.com&quot;, [&quot;a@example.com&quot;], &quot;hi&quot;)
+except smtplib.SMTPResponseException as e:     # base of Sender/Data/Auth errors
+    print(f&quot;{type(e).__name__}: smtp_code={e.smtp_code} smtp_error={e.smtp_error!r}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>no exception; sendmail returned: {&#x27;typo@example.com&#x27;: (550, b&#x27;5.1.1 No such user&#x27;)}
+all refused -&gt; SMTPRecipientsRefused
+   a@example.com: 550 5.1.1 No such user
+   b@example.com: 550 5.1.1 No such user
+SMTPSenderRefused: smtp_code=553 smtp_error=b&#x27;5.7.1 Sender not allowed&#x27;</code></pre>
+<p><strong>Measured:</strong> when the server refuses one of two recipients, <code>sendmail()</code> <strong>raises nothing</strong>: the message goes to the good address and the refused one only appears in the returned dict. Only when <em>every</em> recipient is refused do you get <code>SMTPRecipientsRefused</code>, whose <code>.recipients</code> maps each address to its <code>(code, message)</code>. <code>send_message()</code> behaves the same way. Classes that carry one server reply (<code>SMTPSenderRefused</code>, <code>SMTPDataError</code>, <code>SMTPAuthenticationError</code>, <code>SMTPHeloError</code>, <code>SMTPConnectError</code>) subclass <code>SMTPResponseException</code> and expose <code>.smtp_code</code> and <code>.smtp_error</code> (bytes); <code>SMTPRecipientsRefused</code> and <code>SMTPNotSupportedError</code> do not.</p>
+
+<h2 id="handler">5. A handler that sorts retry vs fix vs reject</h2>
+<pre><code>import smtplib, socket, ssl
+from fake_smtp import serve
+
+def send_mail(host, port, sender, rcpts, msg):
+    &quot;&quot;&quot;Send; return a short status a caller can log or retry on.&quot;&quot;&quot;
+    try:
+        with smtplib.SMTP(host, port, timeout=10) as s:
+            refused = s.sendmail(sender, rcpts, msg)
+        return f&quot;sent, refused={refused}&quot; if refused else &quot;sent&quot;
+    except smtplib.SMTPAuthenticationError as e:
+        return f&quot;FIX CONFIG: login rejected {e.smtp_code}&quot;
+    except smtplib.SMTPRecipientsRefused as e:
+        return f&quot;BAD ADDRESSES: {sorted(e.recipients)}&quot;
+    except smtplib.SMTPResponseException as e:     # sender/data/other coded replies
+        kind = &quot;RETRY LATER&quot; if 400 &lt;= e.smtp_code &lt; 500 else &quot;REJECTED&quot;
+        return f&quot;{kind}: {e.smtp_code} {e.smtp_error.decode(errors=&#x27;replace&#x27;)}&quot;
+    except (smtplib.SMTPServerDisconnected, TimeoutError, ConnectionError) as e:
+        return f&quot;RETRY LATER: {type(e).__name__}&quot;
+    except (socket.gaierror, ssl.SSLError, smtplib.SMTPException) as e:
+        return f&quot;FIX CONFIG: {type(e).__name__}: {e}&quot;
+
+msg = &quot;Subject: hi\r\n\r\nhello&quot;
+print(send_mail(&quot;127.0.0.1&quot;, 8967, &quot;me@example.com&quot;, [&quot;a@example.com&quot;], msg))
+serve(8964, {&quot;END&quot;: b&quot;451 4.7.1 Greylisted, try again later&quot;})
+print(send_mail(&quot;127.0.0.1&quot;, 8964, &quot;me@example.com&quot;, [&quot;a@example.com&quot;], msg))
+serve(8964, {&quot;END&quot;: b&quot;554 5.7.1 Message rejected as spam&quot;})
+print(send_mail(&quot;127.0.0.1&quot;, 8964, &quot;me@example.com&quot;, [&quot;a@example.com&quot;], msg))
+serve(8964, {&quot;REFUSE&quot;: b&quot;@example.com&quot;})
+print(send_mail(&quot;127.0.0.1&quot;, 8964, &quot;me@example.com&quot;, [&quot;a@example.com&quot;], msg))
+serve(8964, {&quot;REFUSE&quot;: b&quot;typo@&quot;})
+print(send_mail(&quot;127.0.0.1&quot;, 8964, &quot;me@example.com&quot;, [&quot;a@example.com&quot;, &quot;typo@example.com&quot;], msg))</code></pre>
+<p>Output:</p>
+<pre><code>RETRY LATER: ConnectionRefusedError
+RETRY LATER: 451 4.7.1 Greylisted, try again later
+REJECTED: 554 5.7.1 Message rejected as spam
+BAD ADDRESSES: [&#x27;a@example.com&#x27;]
+sent, refused={&#x27;typo@example.com&#x27;: (550, b&#x27;5.1.1 No such user&#x27;)}</code></pre>
+<p><strong>Measured:</strong> the handler checks the returned dict and splits failures by what you should do next. 4xx codes (here a greylisting <code>451</code>) are temporary, so retry later with backoff. 5xx codes are permanent, so don't retry the same message. Connection problems are retryable; DNS, TLS and login failures need a config fix. Order matters: <code>SMTPAuthenticationError</code> must come before <code>SMTPResponseException</code>, its base class.</p>
+
+<aside class="cta"><strong>Debugging a web app that sends mail? Check the real status and headers its endpoints return:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What exceptions can smtplib raise?</summary><p>SMTPException subclasses (SMTPAuthenticationError, SMTPSenderRefused, SMTPRecipientsRefused, SMTPDataError, SMTPServerDisconnected, SMTPNotSupportedError, SMTPHeloError, SMTPConnectError), plus OSError subclasses that happen before SMTP starts: we measured ConnectionRefusedError, TimeoutError, socket.gaierror and ssl.SSLError.</p></details>
+<details><summary>Why doesn&#x27;t except smtplib.SMTPException catch connection refused?</summary><p>Connection refused, connect timeouts and DNS failures are raised by the socket layer as plain OSError subclasses. We measured all three with SMTPException? False. Catch OSError, which also covers SMTPException.</p></details>
+<details><summary>Does sendmail raise an error if one recipient is invalid?</summary><p>No. We measured one of two recipients refused: no exception, and sendmail() returned {&#x27;typo@example.com&#x27;: (550, ...)}. It raises SMTPRecipientsRefused only if all recipients are refused.</p></details>
+<details><summary>How do I get the SMTP error code from an exception?</summary><p>For SMTPResponseException subclasses use e.smtp_code and e.smtp_error (bytes). For SMTPRecipientsRefused use e.recipients, a dict of address to (code, message). We measured both.</p></details>
+<details><summary>What does SMTPServerDisconnected: Connection unexpectedly closed mean?</summary><p>The server closed the connection or didn&#x27;t answer within the timeout. We measured both a hang-up and a silent server producing it (the timeout case ends in &#x27;: timed out&#x27;).</p></details>
+<details><summary>Why do I get ssl.SSLError WRONG_VERSION_NUMBER with smtplib?</summary><p>You used SMTP_SSL on a plain-text port. We measured it; use SMTP plus starttls() on 587, or SMTP_SSL on 465.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 on Debian with Python 3.13.5&#x27;s smtplib against a scripted SMTP server on localhost (code shown): auth, STARTTLS, sender, recipient and data refusals, hang-ups, silent servers, SMTP_SSL on a plain port, connection refused, an unroutable address and a DNS failure. Every block was run verbatim and its output pasted from that run. No real mail server was contacted. PlainHeaders is our extension; Python&#x27;s smtplib is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>openpyxl &quot;ValueError: Cannot convert ... to Excel&quot;: Fixes</title>
+<meta name="description" content="openpyxl Cannot convert to Excel tested on 3.1.5: lists, dicts, UUIDs and arrays fail at assignment; timezone datetimes fail only at save(); pandas to_excel.">
+<link rel="canonical" href="https://honestkit.github.io/guides/openpyxl-valueerror-cannot-convert-to-excel/">
+<meta property="og:title" content="openpyxl &quot;ValueError: Cannot convert ... to Excel&quot;: Fixes">
+<meta property="og:description" content="openpyxl Cannot convert to Excel tested on 3.1.5: lists, dicts, UUIDs and arrays fail at assignment; timezone datetimes fail only at save(); pandas to_excel.">
+<meta property="og:url" content="https://honestkit.github.io/guides/openpyxl-valueerror-cannot-convert-to-excel/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Cannot convert to Excel mean in openpyxl?", "acceptedAnswer": {"@type": "Answer", "text": "A cell was given a value openpyxl can't store, such as a list, dict, set, NumPy array or UUID. Convert it to a string or number first."}}, {"@type": "Question", "name": "How do I fix Excel does not support timezones in datetimes?", "acceptedAnswer": {"@type": "Answer", "text": "Remove tzinfo before saving: d.replace(tzinfo=None) after converting to the zone you want, or df['col'].dt.tz_localize(None) in pandas."}}, {"@type": "Question", "name": "Can openpyxl write numpy values?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. In openpyxl 3.1.5 NumPy scalars like np.float64 and np.int64 are accepted; whole NumPy arrays are not."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>openpyxl ValueError: Cannot convert to Excel (tested)</h1>
+<p class="lead">openpyxl raises <code>ValueError: Cannot convert [1, 2] to Excel</code> when a cell is given something that isn't a single number, string, bool or date: a list, dict, NumPy array or UUID. Timezone-aware datetimes are different: they are accepted, then fail with a <code>TypeError</code> at <code>save()</code>.</p>
+<h2 id="types">1. Which values openpyxl refuses</h2>
+<pre><code>import datetime as dt, decimal, uuid
+import numpy as np
+from openpyxl import Workbook
+ws = Workbook().active
+values = {
+    &quot;list&quot;: [1, 2], &quot;dict&quot;: {&quot;a&quot;: 1}, &quot;tuple&quot;: (1, 2), &quot;set&quot;: {1},
+    &quot;uuid&quot;: uuid.uuid4(), &quot;numpy float64&quot;: np.float64(1.5), &quot;numpy int64&quot;: np.int64(3),
+    &quot;numpy array&quot;: np.array([1, 2]), &quot;Decimal&quot;: decimal.Decimal(&quot;1.10&quot;),
+    &quot;tz-aware datetime&quot;: dt.datetime(2026, 10, 23, 6, 0, tzinfo=dt.timezone.utc),
+}
+for name, v in values.items():
+    try:
+        ws[&quot;A1&quot;] = v
+        print(f&quot;{name:18} ok -&gt; stored {ws[&#x27;A1&#x27;].value!r}&quot;)
+    except Exception as e:
+        print(f&quot;{name:18} {type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>list               ValueError: Cannot convert [1, 2] to Excel
+dict               ValueError: Cannot convert {&#x27;a&#x27;: 1} to Excel
+tuple              ValueError: Cannot convert (1, 2) to Excel
+set                ValueError: Cannot convert {1} to Excel
+uuid               ValueError: Cannot convert UUID(&#x27;e3b3233f-93e6-4359-bd00-ab65b1947cb1&#x27;) to Excel
+numpy float64      ok -&gt; stored np.float64(1.5)
+numpy int64        ok -&gt; stored np.int64(3)
+numpy array        ValueError: Cannot convert array([1, 2]) to Excel
+Decimal            ok -&gt; stored Decimal(&#x27;1.10&#x27;)
+tz-aware datetime  ok -&gt; stored datetime.datetime(2026, 10, 23, 6, 0, tzinfo=datetime.timezone.utc)</code></pre>
+<p>A cell holds one scalar: a number, string, bool, date/time or <code>None</code>. Containers (list, tuple, dict, set, NumPy arrays) and arbitrary objects such as <code>UUID</code> raise <code>ValueError: Cannot convert ... to Excel</code> <strong>at assignment</strong> (or on <code>ws.append</code>), and the message prints the offending value, which is your best clue to which column it came from. NumPy scalars and <code>Decimal</code> are accepted.</p>
+<p>Fix it by converting before writing: <code>", ".join(tags)</code> or <code>json.dumps(obj)</code> for containers, <code>str(u)</code> for UUIDs. If the value came out of a DataFrame, look for an object column holding lists, e.g. after a <code>groupby().agg(list)</code> or a JSON column.</p>
+<h2 id="tz">2. Timezones: accepted at assignment, rejected at save</h2>
+<pre><code>import datetime as dt, io
+from openpyxl import Workbook, load_workbook
+wb = Workbook(); ws = wb.active
+ws[&quot;A1&quot;] = dt.datetime(2026, 10, 23, 6, 0, tzinfo=dt.timezone(dt.timedelta(hours=2)))
+buf = io.BytesIO()
+try:
+    wb.save(buf)
+    print(&quot;saved; read back:&quot;, repr(load_workbook(buf).active[&quot;A1&quot;].value))
+except Exception as e:
+    print(type(e).__name__, e)</code></pre>
+<p>Output:</p>
+<pre><code>TypeError Excel does not support timezones in datetimes. The tzinfo in the datetime/time object must be set to None.</code></pre>
+<p>The timezone-aware datetime in block 1 was stored without complaint. The error only appears at <code>wb.save()</code>, as a <strong>TypeError</strong>, not a ValueError, so a try/except around the cell assignment never sees it. Excel has no timezone concept: convert to the zone you want shown, then drop the tzinfo, e.g. <code>d.astimezone(dt.timezone.utc).replace(tzinfo=None)</code>.</p>
+<h2 id="pandas">3. The same errors from pandas to_excel</h2>
+<pre><code>import io
+import pandas as pd
+df = pd.DataFrame({&quot;when&quot;: pd.to_datetime([&quot;2026-10-23 06:00&quot;]).tz_localize(&quot;UTC&quot;),
+                   &quot;tags&quot;: [[&quot;a&quot;, &quot;b&quot;]]})
+try:
+    df.to_excel(io.BytesIO(), index=False)
+except Exception as e:
+    print(type(e).__name__, e)
+df[&quot;when&quot;] = df[&quot;when&quot;].dt.tz_localize(None)       # drop tz, keep UTC wall time
+df[&quot;tags&quot;] = df[&quot;tags&quot;].map(&quot;, &quot;.join)             # list -&gt; text
+df.to_excel(io.BytesIO(), index=False)
+print(&quot;written after fix:&quot;, df.to_dict(&quot;records&quot;))</code></pre>
+<p>Output:</p>
+<pre><code>ValueError Excel does not support datetimes with timezones. Please ensure that datetimes are timezone unaware before writing to Excel.
+written after fix: [{&#x27;when&#x27;: Timestamp(&#x27;2026-10-23 06:00:00&#x27;), &#x27;tags&#x27;: &#x27;a, b&#x27;}]</code></pre>
+<p><code>DataFrame.to_excel</code> checks timezones itself and raises its own <code>ValueError</code> ("Excel does not support datetimes with timezones"). Strip the zone with <code>.dt.tz_localize(None)</code> (keeps the wall-clock time) or <code>.dt.tz_convert("Europe/Paris").dt.tz_localize(None)</code> to show local time, and flatten list columns to text.</p>
+<h2 id="checklist">Checklist</h2>
+<ul><li>Read the value in the message: <code>Cannot convert [1, 2]</code> means a list reached a cell.</li><li>Flatten containers to strings (<code>join</code> / <code>json.dumps</code>), <code>str()</code> UUIDs and custom objects.</li><li>Timezone-aware datetimes: remove <code>tzinfo</code> before saving; the openpyxl error appears at <code>save()</code>, not at assignment.</li><li>pandas: <code>df.select_dtypes("datetimetz")</code> lists the tz-aware columns to fix.</li></ul>
+<p>Related: <a href="/guides/openpyxl-illegalcharactererror-cannot-be-used-in-worksheets/">openpyxl IllegalCharacterError</a>, <a href="/guides/openpyxl-invalidfileexception-does-not-support-file-format/">openpyxl InvalidFileException</a>.</p>
+
+<aside class="cta"><strong>Need a web table in Excel without writing code? Copy it straight from the page:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Cannot convert to Excel mean in openpyxl?</summary><p>A cell was given a value openpyxl can&#x27;t store, such as a list, dict, set, NumPy array or UUID. Convert it to a string or number first.</p></details>
+<details><summary>How do I fix Excel does not support timezones in datetimes?</summary><p>Remove tzinfo before saving: d.replace(tzinfo=None) after converting to the zone you want, or df[&#x27;col&#x27;].dt.tz_localize(None) in pandas.</p></details>
+<details><summary>Can openpyxl write numpy values?</summary><p>Yes. In openpyxl 3.1.5 NumPy scalars like np.float64 and np.int64 are accepted; whole NumPy arrays are not.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with openpyxl 3.1.5, pandas 3.1.0, NumPy 2.5.4 and Python 3.14.7 (python:3-alpine in Docker). Each block was run verbatim and the output pasted unedited (the UUID is random per run). PlainTables is our extension; Python and openpyxl are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

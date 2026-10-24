@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TypeError: unhashable type: &#x27;dict&#x27; in Python (Tested Fix)</title>
+<meta name="description" content="TypeError: unhashable type: &#x27;dict&#x27; from set(), dict keys or lru_cache. Tested fixes: dedupe a list of dicts with tuple(sorted(items)) or json.dumps.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-typeerror-unhashable-type-dict/">
+<meta property="og:title" content="TypeError: unhashable type: &#x27;dict&#x27; in Python (Tested Fix)">
+<meta property="og:description" content="TypeError: unhashable type: &#x27;dict&#x27; from set(), dict keys or lru_cache. Tested fixes: dedupe a list of dicts with tuple(sorted(items)) or json.dumps.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-typeerror-unhashable-type-dict/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is a dict unhashable in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Dicts are mutable, so their hash could change; Python refuses to hash them. Sets, dict keys and lru_cache all need hashable values."}}, {"@type": "Question", "name": "How do I remove duplicate dicts from a list?", "acceptedAnswer": {"@type": "Answer", "text": "Track a hashable key such as tuple(sorted(d.items())), or json.dumps(d, sort_keys=True) for nested values, in a set while you loop."}}, {"@type": "Question", "name": "How do I use a dict with lru_cache?", "acceptedAnswer": {"@type": "Answer", "text": "Pass frozenset(d.items()) or a tuple instead of the dict; lru_cache hashes every argument."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>TypeError: unhashable type: &#x27;dict&#x27; (tested fix)</h1>
+<p class="lead"><code>TypeError: unhashable type: 'dict'</code> means a dict was used as a set member, a dict key, or a cached function argument. Dicts are mutable, so they cannot be hashed. We reproduced each case and tested the fixes on Python 3.13.</p>
+<h2 id="cause">1. Cause: a dict used where a hashable value is needed</h2>
+<pre><code>rows = [{&quot;id&quot;: 1, &quot;tag&quot;: &quot;a&quot;}, {&quot;id&quot;: 1, &quot;tag&quot;: &quot;a&quot;}, {&quot;id&quot;: 2, &quot;tag&quot;: &quot;b&quot;}]
+for label, fn in [(&quot;set(rows)&quot;, lambda: set(rows)),
+                  (&quot;{row: 1}&quot;, lambda: {rows[0]: 1}),
+                  (&quot;row in set()&quot;, lambda: rows[0] in set()),
+                  (&quot;dict.fromkeys(rows)&quot;, lambda: dict.fromkeys(rows))]:
+    try:
+        fn()
+    except TypeError as e:
+        print(f&quot;{label:20} -&gt; TypeError: {e}&quot;)
+print(&quot;row in list:&quot;, rows[0] in rows)   # lists compare with ==, no hashing</code></pre>
+<p>Output:</p>
+<pre><code>set(rows)            -&gt; TypeError: unhashable type: &#x27;dict&#x27;
+{row: 1}             -&gt; TypeError: unhashable type: &#x27;dict&#x27;
+row in set()         -&gt; TypeError: unhashable type: &#x27;dict&#x27;
+dict.fromkeys(rows)  -&gt; TypeError: unhashable type: &#x27;dict&#x27;
+row in list: True</code></pre>
+<p>Set members, dict keys and <code>x in some_set</code> lookups all hash the value, and a dict is mutable, so it has no hash. The usual trigger is a list of dicts from JSON or a database (an API response, <code>csv.DictReader</code> rows) passed to <code>set()</code> to deduplicate it. Membership in a <em>list</em> works because lists compare with <code>==</code> and never hash.</p>
+<h2 id="fix">2. Fix: deduplicate on a hashable key</h2>
+<pre><code>import json
+rows = [{&quot;id&quot;: 1, &quot;tag&quot;: &quot;a&quot;}, {&quot;tag&quot;: &quot;a&quot;, &quot;id&quot;: 1}, {&quot;id&quot;: 2, &quot;tag&quot;: &quot;b&quot;}]
+# Fix 1: dedupe on a hashable key built from the dict, keeping order
+seen, unique = set(), []
+for r in rows:
+    k = tuple(sorted(r.items()))
+    if k not in seen:
+        seen.add(k); unique.append(r)
+print(unique)
+# Fix 2: nested values (lists/dicts inside) -&gt; use a canonical JSON string
+nested = [{&quot;id&quot;: 1, &quot;tags&quot;: [&quot;x&quot;]}, {&quot;tags&quot;: [&quot;x&quot;], &quot;id&quot;: 1}]
+print(len({json.dumps(r, sort_keys=True) for r in nested}))
+try:
+    {tuple(sorted(r.items())) for r in nested}
+except TypeError as e:
+    print(&quot;tuple(items) with a list inside -&gt; TypeError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>[{&#x27;id&#x27;: 1, &#x27;tag&#x27;: &#x27;a&#x27;}, {&#x27;id&#x27;: 2, &#x27;tag&#x27;: &#x27;b&#x27;}]
+1
+tuple(items) with a list inside -&gt; TypeError: unhashable type: &#x27;list&#x27;</code></pre>
+<p><code>tuple(sorted(d.items()))</code> is hashable and ignores key order, so the first two rows count as the same row. It only works when every value is itself hashable; with a list or dict inside, it fails with <a href="/guides/python-typeerror-unhashable-type-list/">unhashable type: 'list'</a>. For nested data, <code>json.dumps(d, sort_keys=True)</code> gives a canonical string key.</p>
+<h2 id="cache">3. lru_cache and other caches with dict arguments</h2>
+<pre><code>from functools import lru_cache
+@lru_cache
+def price(opts):
+    return len(opts)
+try:
+    price({&quot;size&quot;: &quot;L&quot;})
+except TypeError as e:
+    print(&quot;lru_cache -&gt;&quot;, f&quot;TypeError: {e}&quot;)
+print(&quot;frozenset fix:&quot;, price(frozenset({&quot;size&quot;: &quot;L&quot;}.items())))</code></pre>
+<p>Output:</p>
+<pre><code>lru_cache -&gt; TypeError: unhashable type: &#x27;dict&#x27;
+frozenset fix: 1</code></pre>
+<p><code>functools.lru_cache</code> builds its cache key by hashing the arguments, so passing a dict raises the same error. Pass a <code>frozenset(d.items())</code> or a tuple instead (and rebuild the dict inside the function if needed).</p>
+<p>Related: <a href="/guides/python-typeerror-unhashable-type-list/">unhashable type: 'list'</a> (all causes) · <a href="/guides/python-keyerror/">KeyError</a>.</p>
+
+<aside class="cta"><strong>Deduplicating JSON rows from an API? Check what headers the endpoint actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is a dict unhashable in Python?</summary><p>Dicts are mutable, so their hash could change; Python refuses to hash them. Sets, dict keys and lru_cache all need hashable values.</p></details>
+<details><summary>How do I remove duplicate dicts from a list?</summary><p>Track a hashable key such as tuple(sorted(d.items())), or json.dumps(d, sort_keys=True) for nested values, in a set while you loop.</p></details>
+<details><summary>How do I use a dict with lru_cache?</summary><p>Pass frozenset(d.items()) or a tuple instead of the dict; lru_cache hashes every argument.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Python 3.13.5 on Debian: set(), dict keys, set membership and dict.fromkeys with dicts, two dedupe fixes, and functools.lru_cache with a dict argument. Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

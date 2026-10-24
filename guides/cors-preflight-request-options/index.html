@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CORS Preflight Request: When the Browser Sends OPTIONS (Tested)</title>
+<meta name="description" content="We counted OPTIONS hits from Chromium 153 for 23 request types: which trigger a CORS preflight, what the OPTIONS carries, and how long it is cached.">
+<link rel="canonical" href="https://honestkit.github.io/guides/cors-preflight-request-options/">
+<meta property="og:title" content="CORS Preflight Request: When the Browser Sends OPTIONS (Tested)">
+<meta property="og:description" content="We counted OPTIONS hits from Chromium 153 for 23 request types: which trigger a CORS preflight, what the OPTIONS carries, and how long it is cached.">
+<meta property="og:url" content="https://honestkit.github.io/guides/cors-preflight-request-options/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does my GET request send an OPTIONS first?", "acceptedAnswer": {"@type": "Answer", "text": "Because it is cross-origin and has a non-safelisted header, usually Authorization or a custom X- header. In Chromium 153 a plain GET had no preflight, but GET with Authorization or X-Custom did. Accept: application/json alone did not."}}, {"@type": "Question", "name": "Does Content-Type: application/json trigger a preflight?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Only text/plain, application/x-www-form-urlencoded and multipart/form-data are simple. A JSON POST was preflighted in our test, even when the type came from a Blob and no header was set by hand."}}, {"@type": "Question", "name": "Are cookies sent with the preflight?", "acceptedAnswer": {"@type": "Answer", "text": "No. Even with credentials: 'include', Chromium sent the OPTIONS without a Cookie header. The real request after it carried the cookie. Do not require auth on OPTIONS."}}, {"@type": "Question", "name": "How long does the browser cache a preflight?", "acceptedAnswer": {"@type": "Answer", "text": "Without Access-Control-Max-Age, 5 seconds in Chromium 153 (cached at 4.8 s, re-sent at 5.3 s). A set value is used as given; 0 turns caching off. Chromium caps it at 7200 s per its source, not measured. The cache is per full URL."}}, {"@type": "Question", "name": "What status should the OPTIONS response have?", "acceptedAnswer": {"@type": "Answer", "text": "Any 2xx. 200 and 204 both worked. 404 and 500 with correct CORS headers were blocked with \"It does not have HTTP ok status.\""}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>CORS preflight request (OPTIONS), tested</h1>
+<p class="lead">A <strong>preflight request</strong> is an <code>OPTIONS</code> request the browser sends before a cross-origin request that is not "simple". It asks the server: may this origin use this method and these headers? Only if the answer is yes does the real request go out. We ran 23 kinds of <code>fetch</code> and XHR calls in Chromium 153 and counted what reached the server.</p>
+<h2>1. Our test setup</h2>
+<p>The page was served from <code>http://localhost:8992</code>. The API ran on <code>http://localhost:8993</code>. Different port means a different origin, so every call was cross-origin. A cookie <code>sid=abc</code> was set for <code>localhost</code>.</p>
+<p>The API logged method, <code>Access-Control-Request-*</code> headers and <code>Cookie</code> for each request. Its OPTIONS answer allowed everything: it echoed the <code>Origin</code>, set <code>Access-Control-Allow-Credentials: true</code>, allowed <code>GET, POST, PUT, DELETE, PATCH</code> and echoed the requested headers. So every request below succeeded, and we only counted preflights.</p>
+
+<h2>2. Which requests trigger a preflight</h2>
+<table>
+<tr><th>Request (cross-origin)</th><th>Preflight?</th><th>OPTIONS asked for</th></tr>
+<tr><td><code>fetch(u)</code> plain GET</td><td>No</td><td>-</td></tr>
+<tr><td>HEAD</td><td>No</td><td>-</td></tr>
+<tr><td>POST, <code>Content-Type: text/plain</code></td><td>No</td><td>-</td></tr>
+<tr><td>POST, <code>text/plain; charset=utf-8</code></td><td>No</td><td>-</td></tr>
+<tr><td>POST with a string body (browser sets <code>text/plain;charset=UTF-8</code>)</td><td>No</td><td>-</td></tr>
+<tr><td>POST <code>URLSearchParams</code> (<code>application/x-www-form-urlencoded</code>)</td><td>No</td><td>-</td></tr>
+<tr><td>POST <code>FormData</code> (<code>multipart/form-data</code>)</td><td>No</td><td>-</td></tr>
+<tr><td>POST, <code>Content-Type: application/json</code></td><td><strong>Yes</strong></td><td>method POST, headers <code>content-type</code></td></tr>
+<tr><td>POST a <code>Blob</code> of type <code>application/json</code>, no header set</td><td><strong>Yes</strong></td><td>method POST, headers <code>content-type</code></td></tr>
+<tr><td>GET with <code>X-Custom: 1</code></td><td><strong>Yes</strong></td><td>headers <code>x-custom</code></td></tr>
+<tr><td>GET with <code>Authorization: Bearer ...</code></td><td><strong>Yes</strong></td><td>headers <code>authorization</code></td></tr>
+<tr><td>GET with <code>Accept: application/json</code></td><td>No</td><td>-</td></tr>
+<tr><td>GET with <code>Range: bytes=0-10</code></td><td>No</td><td>-</td></tr>
+<tr><td>GET with <code>Range: bytes=0-10,20-30</code></td><td><strong>Yes</strong></td><td>headers <code>range</code></td></tr>
+<tr><td>PUT</td><td><strong>Yes</strong></td><td>method PUT</td></tr>
+<tr><td>DELETE</td><td><strong>Yes</strong></td><td>method DELETE</td></tr>
+<tr><td>PATCH</td><td><strong>Yes</strong></td><td>method PATCH</td></tr>
+<tr><td>GET with <code>credentials: 'include'</code></td><td>No</td><td>- (cookie sent on the GET)</td></tr>
+<tr><td>PUT with <code>credentials: 'include'</code></td><td><strong>Yes</strong></td><td>method PUT (no cookie on OPTIONS)</td></tr>
+<tr><td>POST with a <code>ReadableStream</code> body (<code>duplex: 'half'</code>)</td><td><strong>Yes</strong></td><td>method POST</td></tr>
+<tr><td>XHR POST with an <code>xhr.upload.onprogress</code> listener</td><td><strong>Yes</strong></td><td>method POST</td></tr>
+<tr><td>Same XHR POST, no upload listener</td><td>No</td><td>-</td></tr>
+<tr><td>Same-origin PUT with JSON and <code>X-Custom</code></td><td>No</td><td>- (same origin never preflights)</td></tr>
+</table>
+<p>The rule that fits every row: a request is "simple" only if the method is GET, HEAD or POST, every header you add is on the safelist (<code>Accept</code>, <code>Accept-Language</code>, <code>Content-Language</code>, <code>Content-Type</code> and a single-range <code>Range</code>), and <code>Content-Type</code> is one of <code>text/plain</code>, <code>application/x-www-form-urlencoded</code> or <code>multipart/form-data</code>. Anything else is preflighted. Credentials alone do not cause a preflight.</p>
+<p>Two surprises. A JSON <code>Blob</code> triggers a preflight even if you never set a header, because the browser copies the Blob type into <code>Content-Type</code>. And an XHR upload progress listener alone turns a simple POST into a preflighted one.</p>
+<p>The streaming body did get its preflight, but then the request failed with <code>TypeError: Failed to fetch</code> and the console showed <code>net::ERR_ALPN_NEGOTIATION_FAILED</code>. Chromium only sends streaming uploads over HTTP/2 or later, and our test API spoke plain HTTP/1.1.</p>
+
+<h2>3. What the OPTIONS request carries</h2>
+<pre><code>OPTIONS /api HTTP/1.1
+Origin: http://localhost:8992
+Access-Control-Request-Method: PUT
+Access-Control-Request-Headers: authorization,content-type,x-alpha,x-zeta
+Accept: */*
+Sec-Fetch-Mode: cors</code></pre>
+<ul>
+<li><code>Access-Control-Request-Method</code> was always there, even for POST.</li>
+<li><code>Access-Control-Request-Headers</code> was only there when there were non-safelisted headers. Chromium sent the names <strong>lowercase, sorted, comma-separated with no spaces</strong>. We set <code>X-Zeta</code>, <code>Content-Type</code>, <code>X-Alpha</code>, <code>Authorization</code> in that order and got <code>authorization,content-type,x-alpha,x-zeta</code>.</li>
+<li><strong>No cookies, ever.</strong> Even with <code>credentials: 'include'</code>, the OPTIONS had no <code>Cookie</code> header. The real PUT that followed had <code>sid=abc</code>. So never put auth checks on OPTIONS. A preflight with an <code>Authorization</code> header does not carry the token either. It only lists the header name.</li>
+<li>No request body.</li>
+</ul>
+<p>The <code>Origin</code> header is explained in <a href="/guides/origin-header/">Origin header</a>. <code>Sec-Fetch-Mode: cors</code> is covered in <a href="/guides/sec-fetch-site-mode-dest-headers/">Sec-Fetch-Site, Mode and Dest</a>.</p>
+
+<h2>4. What the server must answer</h2>
+<p>The preflight answer needs a 2xx status and the right <code>Access-Control-Allow-*</code> headers. We tried other statuses with the same headers:</p>
+<table>
+<tr><th>OPTIONS answer</th><th>Result</th></tr>
+<tr><td>204 + allow headers</td><td>Real request sent</td></tr>
+<tr><td>200 + allow headers</td><td>Real request sent</td></tr>
+<tr><td>404 + allow headers</td><td>Blocked: "Response to preflight request doesn't pass access control check: It does not have HTTP ok status."</td></tr>
+<tr><td>500 + allow headers</td><td>Blocked, same message</td></tr>
+<tr><td>404, no CORS headers</td><td>Blocked: "Response to preflight request doesn't pass access control check: No 'Access-Control-Allow-Origin' header is present on the requested resource."</td></tr>
+</table>
+<p>In every blocked case the real request never reached the server, and <code>fetch</code> threw <code>TypeError: Failed to fetch</code>. The full text is in the console. All CORS console messages are listed in <a href="/guides/cors-error-messages-explained/">CORS error messages explained</a>.</p>
+<p>A minimal Node handler:</p>
+<pre><code>if (req.method === 'OPTIONS') {
+  res.writeHead(204, {
+    'Access-Control-Allow-Origin': req.headers.origin,   // check it against a list first
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '600',
+    'Vary': 'Origin',
+  });
+  return res.end();
+}</code></pre>
+<p>Never echo any origin blindly. See <a href="/guides/cors-allow-multiple-origins/">CORS: allow multiple origins</a> for an allowlist. The header details are in <a href="/guides/access-control-allow-methods/">Access-Control-Allow-Methods</a>, <a href="/guides/access-control-allow-headers/">Access-Control-Allow-Headers</a> and <a href="/guides/access-control-allow-credentials/">Access-Control-Allow-Credentials</a>.</p>
+
+<h2>5. Preflight caching and Access-Control-Max-Age</h2>
+<p>We sent the same JSON PUT twice to the same URL, with a pause between, and counted OPTIONS hits.</p>
+<table>
+<tr><th>Access-Control-Max-Age</th><th>Pause</th><th>Second call preflighted?</th></tr>
+<tr><td>not set</td><td>4.0 s</td><td>No (cached)</td></tr>
+<tr><td>not set</td><td>4.8 s</td><td>No (cached)</td></tr>
+<tr><td>not set</td><td>5.3 s</td><td>Yes</td></tr>
+<tr><td>not set</td><td>6.0 s</td><td>Yes</td></tr>
+<tr><td>0</td><td>0.2 s</td><td>Yes, every time</td></tr>
+<tr><td>-1</td><td>0.2 s</td><td>Yes</td></tr>
+<tr><td>10</td><td>9 s</td><td>No (cached)</td></tr>
+<tr><td>10</td><td>11 s</td><td>Yes</td></tr>
+<tr><td>60</td><td>8 s total</td><td>No (cached)</td></tr>
+</table>
+<p>So without the header Chromium caches a preflight for <strong>5 seconds</strong>. A set value is honoured. <code>0</code> disables the cache. Per the Chromium source and MDN docs (not measured, it would take hours), Chromium caps the value at <strong>7200 seconds</strong> (2 hours). Firefox's cap is 86400 per its docs.</p>
+<p>The cache is narrow. With Max-Age 60 we saw:</p>
+<ul>
+<li>Same URL again: no preflight.</li>
+<li>Different path (<code>/c-y</code>): new preflight.</li>
+<li>Same path with a query string (<code>/c-x?q=1</code>): new preflight. The cache key is the full URL.</li>
+<li>Same URL, a header not in the cached list (<code>X-B</code> after <code>X-A</code>): new preflight.</li>
+</ul>
+<p>For APIs with many URLs (<code>/items/1</code>, <code>/items/2</code>...) the cache helps little. Each new URL costs one extra round trip. More on this in <a href="/guides/access-control-max-age/">Access-Control-Max-Age</a>.</p>
+
+<h2>6. How to avoid a preflight</h2>
+<ul>
+<li><strong>Serve the API from the same origin</strong>, for example behind a <code>/api/</code> path on the same host. Same-origin requests never preflight (we saw a same-origin PUT with JSON and a custom header go straight through).</li>
+<li>For simple reads, use plain GET with no custom headers. Put tokens in a cookie instead of an <code>Authorization</code> header if your design allows it (see <a href="/guides/samesite-cookie-lax-strict-none/">SameSite cookies</a>).</li>
+<li>Sending JSON as <code>text/plain</code> avoids the preflight, but only do it if the server parses it on purpose. It also skips the protection that a preflight gives against cross-site form-style POSTs, so the server must check <code>Origin</code> or a CSRF token.</li>
+<li>Otherwise, set <code>Access-Control-Max-Age</code> so repeat calls to the same URL skip the OPTIONS.</li>
+</ul>
+<p>Check what your OPTIONS endpoint really returns with the <a href="/tools/http-headers/">HTTP headers checker</a> or the <a href="/plainheaders/">PlainHeaders extension</a>.</p>
+<aside class="cta"><strong>See the CORS headers your server really sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does my GET request send an OPTIONS first?</summary><p>Because it is cross-origin and has a non-safelisted header, usually Authorization or a custom X- header. In Chromium 153 a plain GET had no preflight, but GET with Authorization or X-Custom did. Accept: application/json alone did not.</p></details>
+<details><summary>Does Content-Type: application/json trigger a preflight?</summary><p>Yes. Only text/plain, application/x-www-form-urlencoded and multipart/form-data are simple. A JSON POST was preflighted in our test, even when the type came from a Blob and no header was set by hand.</p></details>
+<details><summary>Are cookies sent with the preflight?</summary><p>No. Even with credentials: &#x27;include&#x27;, Chromium sent the OPTIONS without a Cookie header. The real request after it carried the cookie. Do not require auth on OPTIONS.</p></details>
+<details><summary>How long does the browser cache a preflight?</summary><p>Without Access-Control-Max-Age, 5 seconds in Chromium 153 (cached at 4.8 s, re-sent at 5.3 s). A set value is used as given; 0 turns caching off. Chromium caps it at 7200 s per its source, not measured. The cache is per full URL.</p></details>
+<details><summary>What status should the OPTIONS response have?</summary><p>Any 2xx. 200 and 204 both worked. 404 and 500 with correct CORS headers were blocked with &quot;It does not have HTTP ok status.&quot;</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright) and Node.js 24. The page ran on http://localhost:8992 and the API on http://localhost:8993. A Node server logged every request, so each OPTIONS hit was counted server-side. Items marked as from the docs were not measured. PlainHeaders is our extension; Chromium, Playwright and Node.js are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

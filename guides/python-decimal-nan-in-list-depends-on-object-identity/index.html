@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>decimal: NaN in list Depends on Identity, Not Equality</title>
+<meta name="description" content="We measured Python 3.13.5: Decimal(&#x27;NaN&#x27;) in [that_same_object] is True, but a second, equal-looking Decimal(&#x27;NaN&#x27;) in the same list is False.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-decimal-nan-in-list-depends-on-object-identity/">
+<meta property="og:title" content="decimal: NaN in list Depends on Identity, Not Equality">
+<meta property="og:description" content="We measured Python 3.13.5: Decimal(&#x27;NaN&#x27;) in [that_same_object] is True, but a second, equal-looking Decimal(&#x27;NaN&#x27;) in the same list is False.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-decimal-nan-in-list-depends-on-object-identity/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Decimal('NaN') in a list sometimes return True and sometimes False?", "acceptedAnswer": {"@type": "Answer", "text": "Because Python's in operator checks object identity (is) before falling back to equality (==), and NaN values are never == to anything, including themselves. We measured the exact same NaN object already in a list returning True for in, while a separately-constructed but value-equal NaN returned False against that same list."}}, {"@type": "Question", "name": "Does list.count() work correctly for Decimal NaN values?", "acceptedAnswer": {"@type": "Answer", "text": "Not by value -- we measured count() returning 1 for the exact NaN object stored in the list and 0 for a second, independently-created NaN, even though both print identically as Decimal('NaN'). count() relies on the same identity-or-equality check as the in operator."}}, {"@type": "Question", "name": "How do I check if a list already contains a NaN value?", "acceptedAnswer": {"@type": "Answer", "text": "Use .is_nan() explicitly, e.g. any(x.is_nan() for x in my_list), rather than in or count(). We confirmed those membership tests only match the literal NaN object already present, not any value that happens to also be NaN."}}, {"@type": "Question", "name": "Is this NaN membership behavior specific to Python's decimal module?", "acceptedAnswer": {"@type": "Answer", "text": "No -- it follows from Python's general rule that in checks is before ==, combined with IEEE 754's rule that NaN never equals anything. The same pattern applies to float('nan') in a list. We tested it here specifically against decimal.Decimal('NaN')."}}, {"@type": "Question", "name": "Does list.index() raise an error for a NaN that looks like it's in the list?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, measurably -- we confirmed data.index(nan2) raises ValueError even when data contains a different NaN object (nan1) that prints identically, because index() can't find an object that's neither identical nor equal to nan2."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>decimal: NaN List Membership Depends on Object Identity, Not Value (tested)</h1>
+<p class="lead"><code>Decimal('NaN')</code> never equals another <code>NaN</code>, including itself by value -- that's standard IEEE 754 behavior, inherited by <code>decimal</code>. We measured what that means for Python's <code>in</code> operator, <code>list.count()</code>, and <code>list.index()</code>, which look like they test for value equality but don't always.</p>
+<h2 id="repro1">1. Two NaN Decimals are never == to each other, as expected</h2>
+<pre><code>from decimal import Decimal
+
+nan1 = Decimal("NaN")
+nan2 = Decimal("NaN")
+print(nan1 == nan2)
+print(nan1 is nan2)</code></pre>
+<pre><code>False
+False</code></pre>
+<p><strong>Measured:</strong> two separately-constructed <code>NaN</code> values are neither <code>==</code> nor the same object -- unsurprising, this is the documented IEEE 754 rule that NaN compares unequal to everything, including another NaN.</p>
+
+<h2 id="repro2">2. But "nan1 in [nan1]" is True anyway -- the in operator checks identity first</h2>
+<pre><code>from decimal import Decimal
+
+nan1 = Decimal("NaN")
+nan2 = Decimal("NaN")
+
+print("nan1 in [nan1]:", nan1 in [nan1])
+print("nan2 in [nan1]:", nan2 in [nan1])</code></pre>
+<pre><code>nan1 in [nan1]: True
+nan2 in [nan1]: False
+</code></pre>
+<p><strong>Measured:</strong> <code>nan1 in [nan1]</code> is <code>True</code> even though <code>nan1 == nan1</code> is <code>False</code> -- Python's <code>in</code> operator checks <code>is</code> (object identity) before falling back to <code>==</code>, and short-circuits to a match on identity alone. A second, value-equal <code>NaN</code> object (<code>nan2</code>) checked against the exact same list is <code>False</code>, because it's neither identical nor equal to what's already there. The result of the exact same-looking membership check silently depends on whether it's literally the same object in memory, not on its value -- the opposite of what <code>in</code> normally means for everything else.</p>
+
+<h2 id="repro3">3. count() and index() inherit the same inconsistency</h2>
+<pre><code>from decimal import Decimal
+
+nan1 = Decimal("NaN")
+nan2 = Decimal("NaN")
+data = [Decimal("1"), nan1]
+
+print("count(nan1):", data.count(nan1))
+print("count(nan2):", data.count(nan2))
+print("index(nan1):", data.index(nan1))
+try:
+    data.index(nan2)
+except Exception as e:
+    print("index(nan2) ->", type(e).__name__, e)</code></pre>
+<pre><code>count(nan1): 1
+count(nan2): 0
+index(nan1): 1
+index(nan2) -> ValueError Decimal('NaN') is not in list</code></pre>
+<p><strong>Measured:</strong> <code>list.count()</code> and <code>list.index()</code> use the same identity-then-equality check as <code>in</code>, so they report <code>1</code>/found for the exact stored <code>NaN</code> object and <code>0</code>/not-found for an equal-looking one. A "have we already recorded this NaN value" check built on <code>in</code> or <code>count()</code> will only ever say yes for the literal object already in the collection -- reinserting a value that parsed to <code>NaN</code> from a different source (a new <code>Decimal('NaN')</code>, a fresh row from a file) will never match, no matter how many NaNs are already present. If NaN values need deduplication or detection, check with <code>.is_nan()</code> explicitly rather than membership tests.</p>
+<aside class="cta"><strong>Checking whether a Decimal(&#x27;NaN&#x27;) is already in a list with the in operator? Check whether it&#x27;s the same object first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Decimal(&#x27;NaN&#x27;) in a list sometimes return True and sometimes False?</summary><p>Because Python&#x27;s in operator checks object identity (is) before falling back to equality (==), and NaN values are never == to anything, including themselves. We measured the exact same NaN object already in a list returning True for in, while a separately-constructed but value-equal NaN returned False against that same list.</p></details>
+<details><summary>Does list.count() work correctly for Decimal NaN values?</summary><p>Not by value -- we measured count() returning 1 for the exact NaN object stored in the list and 0 for a second, independently-created NaN, even though both print identically as Decimal(&#x27;NaN&#x27;). count() relies on the same identity-or-equality check as the in operator.</p></details>
+<details><summary>How do I check if a list already contains a NaN value?</summary><p>Use .is_nan() explicitly, e.g. any(x.is_nan() for x in my_list), rather than in or count(). We confirmed those membership tests only match the literal NaN object already present, not any value that happens to also be NaN.</p></details>
+<details><summary>Is this NaN membership behavior specific to Python&#x27;s decimal module?</summary><p>No -- it follows from Python&#x27;s general rule that in checks is before ==, combined with IEEE 754&#x27;s rule that NaN never equals anything. The same pattern applies to float(&#x27;nan&#x27;) in a list. We tested it here specifically against decimal.Decimal(&#x27;NaN&#x27;).</p></details>
+<details><summary>Does list.index() raise an error for a NaN that looks like it&#x27;s in the list?</summary><p>Yes, measurably -- we confirmed data.index(nan2) raises ValueError even when data contains a different NaN object (nan1) that prints identically, because index() can&#x27;t find an object that&#x27;s neither identical nor equal to nan2.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in decimal module: created two separate Decimal(&#x27;NaN&#x27;) instances, confirmed they aren&#x27;t == or is equal to each other, then checked list membership, count(), and index() for each against a list containing only the first instance. PlainHeaders is our extension; Python&#x27;s decimal module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

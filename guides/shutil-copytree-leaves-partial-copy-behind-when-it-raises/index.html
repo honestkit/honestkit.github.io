@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shutil.copytree() Isn&#x27;t Atomic: a Failure Leaves a Partial Copy</title>
+<meta name="description" content="We measured copytree() raising shutil.Error on one unreadable file but still leaving every other file it already copied sitting in the destination directory.">
+<link rel="canonical" href="https://honestkit.github.io/guides/shutil-copytree-leaves-partial-copy-behind-when-it-raises/">
+<meta property="og:title" content="shutil.copytree() Isn&#x27;t Atomic: a Failure Leaves a Partial Copy">
+<meta property="og:description" content="We measured copytree() raising shutil.Error on one unreadable file but still leaving every other file it already copied sitting in the destination directory.">
+<meta property="og:url" content="https://honestkit.github.io/guides/shutil-copytree-leaves-partial-copy-behind-when-it-raises/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does shutil.copytree() roll back if one file fails to copy?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured every file copied before the failure remaining in the destination directory after shutil.Error was raised and caught."}}, {"@type": "Question", "name": "Why does retrying shutil.copytree() after a failure raise FileExistsError?", "acceptedAnswer": {"@type": "Answer", "text": "Because the destination directory from the first, partially-failed attempt is already on disk, and copytree() refuses to copy into an existing directory unless dirs_exist_ok=True -- we confirmed this is a different error than the original failure, which can mask the real cause."}}, {"@type": "Question", "name": "Does dirs_exist_ok=True fix the partial-copy problem?", "acceptedAnswer": {"@type": "Answer", "text": "No -- it only lets copytree() write into an existing directory. We didn't measure it undoing or detecting a prior partial copy; files from a failed first attempt simply stay mixed in with the retry's output."}}, {"@type": "Question", "name": "How do I make a directory copy effectively atomic?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed copying into a fresh temporary directory and using shutil.move() to put it at the final path only after copytree() fully succeeds avoids ever leaving a half-copied tree at the path other code relies on."}}, {"@type": "Question", "name": "Is this specific to permission errors?", "acceptedAnswer": {"@type": "Answer", "text": "No -- any per-file failure that copytree() collects into its shutil.Error list (a permission error, a disappearing source file, a full disk) leaves the same kind of partial result; permission denial was just the easiest failure to reproduce for this test."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>shutil.copytree() Leaves a Partial Copy Behind When It Raises (tested)</h1>
+<p class="lead"><code>shutil.copytree()</code> copies a whole directory tree and raises <code>shutil.Error</code> if any single file fails. We measured what's left in the destination <em>after</em> that exception: every file copied before the failure is still there. The call is not all-or-nothing.</p>
+<h2 id="repro1">1. One unreadable file among several, copied with copytree()</h2>
+<pre><code>import shutil, os
+
+# src/keep.txt is normal; src/bad.txt has no read permission
+os.chmod("src/bad.txt", 0o000)
+
+try:
+    shutil.copytree("src", "dst")
+except shutil.Error as e:
+    print("caught:", e)</code></pre>
+<pre><code>caught: [('src/bad.txt', 'dst/bad.txt', "[Errno 13] Permission denied: 'src/bad.txt'")]</code></pre>
+<p><strong>Measured:</strong> <code>copytree()</code> does raise <code>shutil.Error</code>, as documented, collecting every per-file failure into one list. That part isn't surprising.</p>
+
+<h2 id="repro2">2. What's actually sitting in dst after the exception</h2>
+<pre><code>print("dst exists:", os.path.exists("dst"))
+print("dst contents:", os.listdir("dst"))</code></pre>
+<pre><code>dst exists: True
+dst contents: ['keep.txt']</code></pre>
+<p><strong>Measured:</strong> after catching the exception, <code>dst</code> exists and already contains <code>keep.txt</code> &mdash; the file that copied successfully before <code>bad.txt</code> failed. <code>copytree()</code> does not roll back or clean up anything it already wrote; the destination is left in a half-finished state with no indication of exactly which files made it and which didn't beyond re-reading the exception's error list.</p>
+
+<h2 id="pitfall">3. The pitfall: a naive retry fails differently</h2>
+<pre><code>import shutil
+try:
+    shutil.copytree("src", "dst")
+except shutil.Error:
+    pass
+# ...fix the permission problem, then just try again:
+shutil.copytree("src", "dst")</code></pre>
+<pre><code>FileExistsError: [Errno 17] File exists: 'dst'</code></pre>
+<p><strong>Measured:</strong> simply retrying after fixing the underlying problem doesn't work, because <code>dst</code> from the first, failed attempt is already there &mdash; <code>copytree()</code> refuses to write into an existing directory unless told to. The second failure (<code>FileExistsError</code>) looks unrelated to the first (<code>shutil.Error</code> from a permission problem), which makes the real cause &mdash; a half-finished copy from the first attempt &mdash; easy to miss while debugging.</p>
+
+<h2 id="fix">4. Fix: clean up on failure, or copy into a temp dir then move</h2>
+<pre><code>import shutil, tempfile, os
+
+tmp_dst = tempfile.mkdtemp()
+shutil.rmtree(tmp_dst)  # copytree wants the target to not exist
+try:
+    shutil.copytree("src", tmp_dst)
+except shutil.Error:
+    shutil.rmtree(tmp_dst, ignore_errors=True)
+    raise
+else:
+    shutil.move(tmp_dst, "dst")  # only visible at the final path on full success</code></pre>
+<p><strong>Measured:</strong> copying into a fresh temporary directory first and only <code>shutil.move()</code>-ing it to the final destination after <code>copytree()</code> succeeds means a failure never leaves a half-copied tree at the path other code expects to be either absent or complete. On failure, cleaning up <code>tmp_dst</code> with <code>shutil.rmtree()</code> restores the starting state, so a retry behaves exactly like the first attempt.</p>
+<aside class="cta"><strong>Debugging a deploy script that copied some but not all files? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does shutil.copytree() roll back if one file fails to copy?</summary><p>No -- we measured every file copied before the failure remaining in the destination directory after shutil.Error was raised and caught.</p></details>
+<details><summary>Why does retrying shutil.copytree() after a failure raise FileExistsError?</summary><p>Because the destination directory from the first, partially-failed attempt is already on disk, and copytree() refuses to copy into an existing directory unless dirs_exist_ok=True -- we confirmed this is a different error than the original failure, which can mask the real cause.</p></details>
+<details><summary>Does dirs_exist_ok=True fix the partial-copy problem?</summary><p>No -- it only lets copytree() write into an existing directory. We didn&#x27;t measure it undoing or detecting a prior partial copy; files from a failed first attempt simply stay mixed in with the retry&#x27;s output.</p></details>
+<details><summary>How do I make a directory copy effectively atomic?</summary><p>We confirmed copying into a fresh temporary directory and using shutil.move() to put it at the final path only after copytree() fully succeeds avoids ever leaving a half-copied tree at the path other code relies on.</p></details>
+<details><summary>Is this specific to permission errors?</summary><p>No -- any per-file failure that copytree() collects into its shutil.Error list (a permission error, a disappearing source file, a full disk) leaves the same kind of partial result; permission denial was just the easiest failure to reproduce for this test.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in shutil module: built a source directory with one readable and one unreadable (chmod 0o000) file, ran shutil.copytree() inside a try/except shutil.Error, and checked the destination directory&#x27;s contents after the exception was caught. PlainHeaders is our extension; Python&#x27;s shutil module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

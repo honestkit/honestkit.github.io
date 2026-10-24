@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLAlchemy IntegrityError: UNIQUE constraint failed (Tested)</title>
+<meta name="description" content="SQLAlchemy IntegrityError tested on 2.1.6: why the next commit raises PendingRollbackError, rollback(), ON CONFLICT DO NOTHING, begin_nested savepoints.">
+<link rel="canonical" href="https://honestkit.github.io/guides/sqlalchemy-integrityerror-unique-constraint-failed/">
+<meta property="og:title" content="SQLAlchemy IntegrityError: UNIQUE constraint failed (Tested)">
+<meta property="og:description" content="SQLAlchemy IntegrityError tested on 2.1.6: why the next commit raises PendingRollbackError, rollback(), ON CONFLICT DO NOTHING, begin_nested savepoints.">
+<meta property="og:url" content="https://honestkit.github.io/guides/sqlalchemy-integrityerror-unique-constraint-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "How do I catch IntegrityError in SQLAlchemy?", "acceptedAnswer": {"@type": "Answer", "text": "from sqlalchemy.exc import IntegrityError; wrap the commit in try/except IntegrityError and call session.rollback() in the except block."}}, {"@type": "Question", "name": "What is PendingRollbackError?", "acceptedAnswer": {"@type": "Answer", "text": "The session's transaction failed earlier (for example on an IntegrityError) and was never rolled back. Call session.rollback() before using the session again."}}, {"@type": "Question", "name": "How do I insert and ignore duplicates?", "acceptedAnswer": {"@type": "Answer", "text": "insert(Model).values(...).on_conflict_do_nothing(index_elements=[...]) from sqlalchemy.dialects.sqlite or .postgresql, or wrap each insert in session.begin_nested()."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>SQLAlchemy IntegrityError: UNIQUE constraint failed (tested)</h1>
+<p class="lead"><code>sqlalchemy.exc.IntegrityError: (sqlite3.IntegrityError) UNIQUE constraint failed</code> means an insert or update broke a database constraint. After catching it you must call <code>session.rollback()</code>, or every later commit raises <code>PendingRollbackError</code>. To skip expected duplicates, use <code>on_conflict_do_nothing()</code> or a <code>begin_nested()</code> savepoint.</p>
+<p>Every block imports this <code>common.py</code> (an in-memory SQLite database with a unique <code>email</code> column):</p>
+<pre><code>from sqlalchemy import create_engine, String
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
+
+class Base(DeclarativeBase): pass
+class User(Base):
+    __tablename__ = &quot;users&quot;
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String, unique=True)
+
+engine = create_engine(&quot;sqlite://&quot;)
+Base.metadata.create_all(engine)</code></pre>
+<h2 id="test">1. The error</h2>
+<pre><code>from common import *
+with Session(engine) as s:
+    s.add(User(email=&quot;a@example.com&quot;)); s.commit()
+    s.add(User(email=&quot;a@example.com&quot;)); s.commit()</code></pre>
+<p>Output (last lines; the full traceback has 28 SQLAlchemy frames above them):</p>
+<pre><code>    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+sqlalchemy.exc.IntegrityError: (sqlite3.IntegrityError) UNIQUE constraint failed: users.email
+[SQL: INSERT INTO users (email) VALUES (?)]
+[parameters: (&#x27;a@example.com&#x27;,)]
+(Background on this error at: https://sqlalche.me/e/21/gkpj)</code></pre>
+<p>SQLAlchemy wraps the driver's exception: the part in parentheses (<code>sqlite3.IntegrityError</code>, or <code>psycopg.errors.UniqueViolation</code> on PostgreSQL) is the real database error, and the <code>[SQL: ...]</code> and <code>[parameters: ...]</code> lines show the exact row that broke the constraint. Other IntegrityErrors are the same pattern: <code>NOT NULL constraint failed</code> and <code>FOREIGN KEY constraint failed</code>.</p>
+<h2 id="pending">2. Catching it is not enough: PendingRollbackError</h2>
+<pre><code>from common import *
+from sqlalchemy.exc import IntegrityError
+with Session(engine) as s:
+    s.add(User(email=&quot;a@example.com&quot;)); s.commit()
+    try:
+        s.add(User(email=&quot;a@example.com&quot;)); s.commit()
+    except IntegrityError as e:
+        print(&quot;caught:&quot;, e.orig)
+    s.add(User(email=&quot;b@example.com&quot;))          # carry on with the same session...
+    try:
+        s.commit()
+    except Exception as e:
+        print(type(e).__name__ + &quot;:&quot;, str(e)[:205])</code></pre>
+<p>Output:</p>
+<pre><code>caught: UNIQUE constraint failed: users.email
+PendingRollbackError: This Session&#x27;s transaction has been rolled back due to a previous exception during flush. To begin a new transaction with this Session, first issue Session.rollback(). Original exception was: (sqlite3.Inte</code></pre>
+<p>After a failed flush, the session's transaction is dead. Every later <code>commit()</code>, query or flush raises <code>PendingRollbackError</code> until you call <code>rollback()</code>. This is the usual cause of "everything fails after one duplicate" in web apps that share a session.</p>
+<h2 id="fix">3. Fix: roll back in the except block</h2>
+<pre><code>from common import *
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+with Session(engine) as s:
+    s.add(User(email=&quot;a@example.com&quot;)); s.commit()
+    try:
+        s.add(User(email=&quot;a@example.com&quot;)); s.commit()
+    except IntegrityError as e:
+        s.rollback()                              # required before the session is usable again
+        print(&quot;duplicate:&quot;, e.orig)
+    s.add(User(email=&quot;b@example.com&quot;)); s.commit()
+    print(s.scalars(select(User.email)).all())</code></pre>
+<p>Output:</p>
+<pre><code>duplicate: UNIQUE constraint failed: users.email
+[&#x27;a@example.com&#x27;, &#x27;b@example.com&#x27;]</code></pre>
+<p><code>e.orig</code> is the underlying driver exception, handy for logging or for checking which constraint failed. Note that <code>rollback()</code> discards <em>everything</em> not yet committed in that session, not just the bad row.</p>
+<h2 id="upsert">4. Avoid the error: INSERT ... ON CONFLICT DO NOTHING</h2>
+<pre><code>from common import *
+from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert       # postgresql has the same API
+with Session(engine) as s:
+    for email in [&quot;a@example.com&quot;, &quot;a@example.com&quot;, &quot;c@example.com&quot;]:
+        s.execute(insert(User).values(email=email).on_conflict_do_nothing(index_elements=[&quot;email&quot;]))
+    s.commit()
+    print(s.scalars(select(User.email)).all())</code></pre>
+<p>Output:</p>
+<pre><code>[&#x27;a@example.com&#x27;, &#x27;c@example.com&#x27;]</code></pre>
+<p>If duplicates are expected, let the database skip them. <code>sqlalchemy.dialects.postgresql.insert</code> has the same <code>on_conflict_do_nothing</code> / <code>on_conflict_do_update</code> methods; MySQL uses <code>on_duplicate_key_update</code>.</p>
+<h2 id="savepoint">5. Keep the rest of the transaction: begin_nested()</h2>
+<pre><code>from common import *
+from sqlalchemy.exc import IntegrityError
+with Session(engine) as s:
+    s.add(User(email=&quot;a@example.com&quot;)); s.commit()
+    try:
+        with s.begin_nested():                     # SAVEPOINT: only this part is undone
+            s.add(User(email=&quot;a@example.com&quot;))
+    except IntegrityError:
+        print(&quot;skipped duplicate&quot;)
+    s.add(User(email=&quot;d@example.com&quot;)); s.commit()
+    print(s.query(User.email).order_by(User.id).all())</code></pre>
+<p>Output:</p>
+<pre><code>skipped duplicate
+[(&#x27;a@example.com&#x27;,), (&#x27;d@example.com&#x27;,)]</code></pre>
+<p>A SAVEPOINT (<code>session.begin_nested()</code>) undoes only the failed insert, and the session stays usable without a full <code>rollback()</code>. Use it when you insert many rows in one transaction and want to skip the bad ones.</p>
+<p>Related: <a href="/guides/sqlite-unique-constraint-failed/">SQLite UNIQUE constraint failed</a> · <a href="/guides/sqlite-database-is-locked/">SQLite database is locked</a> · <a href="/guides/sqlite3-operationalerror-near-syntax-error/">sqlite3 OperationalError: near syntax error</a>.</p>
+
+<aside class="cta"><strong>Collecting data from web tables? Copy them as CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>How do I catch IntegrityError in SQLAlchemy?</summary><p>from sqlalchemy.exc import IntegrityError; wrap the commit in try/except IntegrityError and call session.rollback() in the except block.</p></details>
+<details><summary>What is PendingRollbackError?</summary><p>The session&#x27;s transaction failed earlier (for example on an IntegrityError) and was never rolled back. Call session.rollback() before using the session again.</p></details>
+<details><summary>How do I insert and ignore duplicates?</summary><p>insert(Model).values(...).on_conflict_do_nothing(index_elements=[...]) from sqlalchemy.dialects.sqlite or .postgresql, or wrap each insert in session.begin_nested().</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with SQLAlchemy 2.1.6 and Python 3.14.7 (python:3-alpine in Docker), SQLite in-memory database. Each block was run verbatim and the output pasted unedited (block 1 shows the last 5 lines of the traceback). PlainTables is our extension; Python and SQLAlchemy are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

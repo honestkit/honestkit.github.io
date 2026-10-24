@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx AsyncClient connection pool: Limits and PoolTimeout</title>
+<meta name="description" content="Reuse one httpx AsyncClient (20 requests: 1 connection vs 20). Default pool 100 connections, 20 keep-alive, 5s expiry; max_connections and PoolTimeout tested.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-asyncclient-connection-pool-limits/">
+<meta property="og:title" content="httpx AsyncClient connection pool: Limits and PoolTimeout">
+<meta property="og:description" content="Reuse one httpx AsyncClient (20 requests: 1 connection vs 20). Default pool 100 connections, 20 keep-alive, 5s expiry; max_connections and PoolTimeout tested.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-asyncclient-connection-pool-limits/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the default connection pool size of httpx AsyncClient?", "acceptedAnswer": {"@type": "Answer", "text": "In httpx 0.28.1: max_connections=100, max_keepalive_connections=20, keepalive_expiry=5.0 seconds."}}, {"@type": "Question", "name": "Should I create a new httpx client per request?", "acceptedAnswer": {"@type": "Answer", "text": "No. Each new client opens a new connection; one shared client reused 1 connection for 20 requests in the test."}}, {"@type": "Question", "name": "What causes httpx.PoolTimeout?", "acceptedAnswer": {"@type": "Answer", "text": "All max_connections connections were busy for longer than the pool timeout. Increase max_connections, limit concurrency, or close streamed responses."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx AsyncClient connection pool and Limits (tested)</h1>
+<p class="lead">Create one <code>httpx.AsyncClient</code> and reuse it: 20 requests used 1 TCP connection instead of 20. The default pool allows 100 connections and 20 idle keep-alive ones; set <code>limits=httpx.Limits(max_connections=...)</code> to cap concurrency.</p>
+<p>An <code>httpx.AsyncClient</code> (or <code>Client</code>) owns a connection pool. Reuse one client for many requests and size the pool with <code>httpx.Limits</code>. Measured with httpx 0.28.1 on Python 3.13.5 against a local HTTP/1.1 <code>http.server</code> (<code>srv.py</code>) that records each client TCP port; <code>/slow</code> sleeps 1 second.</p>
+<h2 id="reuse">1. Reuse one AsyncClient</h2>
+<pre><code>import asyncio, httpx
+import srv
+base = srv.start()
+
+async def new_client_each_time():
+    for _ in range(20):
+        async with httpx.AsyncClient() as client:
+            await client.get(base + &quot;/&quot;)
+
+async def one_shared_client():
+    async with httpx.AsyncClient() as client:
+        for _ in range(20):
+            await client.get(base + &quot;/&quot;)
+
+for f in (new_client_each_time, one_shared_client):
+    srv.PORTS.clear()
+    asyncio.run(f())
+    print(f&quot;{f.__name__}: 20 requests, {len(srv.PORTS)} TCP connections&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>new_client_each_time: 20 requests, 20 TCP connections
+one_shared_client: 20 requests, 1 TCP connections</code></pre>
+<p>A new client per request opens (and closes) a new TCP connection, plus a TLS handshake on HTTPS. Create one client at startup (for example in a FastAPI lifespan) and close it at shutdown.</p>
+<h2 id="defaults">2. httpx asyncclient connection pool defaults</h2>
+<pre><code>import httpx
+c = httpx.AsyncClient()
+pool = c._transport._pool
+print(&quot;max_connections:&quot;, pool._max_connections)
+print(&quot;max_keepalive_connections:&quot;, pool._max_keepalive_connections)
+print(&quot;keepalive_expiry:&quot;, pool._keepalive_expiry)
+print(httpx.Limits())</code></pre>
+<p>Output:</p>
+<pre><code>max_connections: 100
+max_keepalive_connections: 20
+keepalive_expiry: 5.0
+Limits(max_connections=None, max_keepalive_connections=None, keepalive_expiry=5.0)</code></pre>
+<p>A client created without <code>limits=</code> allows 100 connections, keeps up to 20 idle ones alive, and drops idle ones after 5 seconds. A bare <code>httpx.Limits()</code> means <strong>no limit</strong> (<code>None</code>), not the client default. (The pool attributes printed here are private, shown only to read the effective values.)</p>
+<h2 id="limits">3. max_connections caps concurrency</h2>
+<pre><code>import asyncio, time, httpx
+import srv
+base = srv.start()
+
+async def run(limits):
+    async with httpx.AsyncClient(limits=limits, timeout=30) as client:
+        srv.PORTS.clear(); t = time.perf_counter()
+        await asyncio.gather(*(client.get(base + &quot;/slow&quot;) for _ in range(10)))
+        print(f&quot;{limits}: 10 x 1s requests in {time.perf_counter()-t:.1f}s, {len(srv.PORTS)} connections&quot;)
+
+asyncio.run(run(httpx.Limits(max_connections=100)))
+asyncio.run(run(httpx.Limits(max_connections=2)))</code></pre>
+<p>Output:</p>
+<pre><code>Limits(max_connections=100, max_keepalive_connections=None, keepalive_expiry=5.0): 10 x 1s requests in 1.0s, 10 connections
+Limits(max_connections=2, max_keepalive_connections=None, keepalive_expiry=5.0): 10 x 1s requests in 5.2s, 2 connections</code></pre>
+<p>With <code>max_connections=2</code>, ten concurrent 1-second requests ran two at a time (5.2s). Extra requests wait for a free connection instead of failing, as long as the pool timeout allows.</p>
+<h2 id="pooltimeout">4. PoolTimeout</h2>
+<pre><code>import asyncio, httpx
+import srv
+base = srv.start()
+
+async def main():
+    limits = httpx.Limits(max_connections=2)
+    async with httpx.AsyncClient(limits=limits, timeout=httpx.Timeout(5.0, pool=0.5)) as client:
+        try:
+            await asyncio.gather(*(client.get(base + &quot;/slow&quot;) for _ in range(5)))
+        except httpx.PoolTimeout as e:
+            print(&quot;raised&quot;, type(e).__name__, &quot;after waiting 0.5s for a free connection&quot;)
+
+asyncio.run(main())</code></pre>
+<p>Output:</p>
+<pre><code>raised PoolTimeout after waiting 0.5s for a free connection</code></pre>
+<p><code>httpx.PoolTimeout</code> means a request waited longer than the <code>pool</code> timeout for a connection. Raise <code>max_connections</code>, lower concurrency with an <code>asyncio.Semaphore</code>, or allow a longer <code>pool</code> timeout. Also check that streamed responses are closed, because an open stream keeps its connection.</p>
+<p>Related: <a href="/guides/httpx-timeout-default-readtimeout/">httpx timeout</a>, <a href="/guides/httpx-stream-response-iter-bytes/">httpx stream</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests differences</a>, <a href="/guides/aiohttp-unclosed-client-session/">aiohttp unclosed client session</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the default connection pool size of httpx AsyncClient?</summary><p>In httpx 0.28.1: max_connections=100, max_keepalive_connections=20, keepalive_expiry=5.0 seconds.</p></details>
+<details><summary>Should I create a new httpx client per request?</summary><p>No. Each new client opens a new connection; one shared client reused 1 connection for 20 requests in the test.</p></details>
+<details><summary>What causes httpx.PoolTimeout?</summary><p>All max_connections connections were busy for longer than the pool timeout. Increase max_connections, limit concurrency, or close streamed responses.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5 against a local HTTP/1.1 http.server that records client connections. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

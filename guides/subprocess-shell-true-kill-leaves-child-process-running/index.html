@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>subprocess.Popen(shell=True) .kill() Leaves the Real Child Alive</title>
+<meta name="description" content="We measured proc.kill() on a shell=True Popen only killing the /bin/sh wrapper — the actual command it ran kept running as an orphan process afterward.">
+<link rel="canonical" href="https://honestkit.github.io/guides/subprocess-shell-true-kill-leaves-child-process-running/">
+<meta property="og:title" content="subprocess.Popen(shell=True) .kill() Leaves the Real Child Alive">
+<meta property="og:description" content="We measured proc.kill() on a shell=True Popen only killing the /bin/sh wrapper — the actual command it ran kept running as an orphan process afterward.">
+<meta property="og:url" content="https://honestkit.github.io/guides/subprocess-shell-true-kill-leaves-child-process-running/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does subprocess.Popen(shell=True).kill() stop the command I actually ran?", "acceptedAnswer": {"@type": "Answer", "text": "Not necessarily \u2014 we measured proc.kill() terminating only the /bin/sh wrapper process. The real command the shell forked (e.g. sleep 8) kept running afterward as an orphan, untouched."}}, {"@type": "Question", "name": "Why does shell=True create two processes for one command?", "acceptedAnswer": {"@type": "Answer", "text": "Because Popen(cmd, shell=True) runs /bin/sh -c cmd \u2014 the shell itself is proc.pid, and it then forks the actual program as its own child with a separate pid, which we confirmed by finding it via pgrep -P."}}, {"@type": "Question", "name": "Does subprocess.run(..., shell=True, timeout=N) kill the real command on timeout?", "acceptedAnswer": {"@type": "Answer", "text": "We didn't measure this case directly, but it shares the exact same mechanism as .kill() \u2014 the timeout kills the pid subprocess tracks (the shell), not any children the shell forked, so the same orphaning risk applies, especially for shell pipelines."}}, {"@type": "Question", "name": "How do I make sure killing a shell=True subprocess kills everything it started?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed that passing start_new_session=True to Popen, then calling os.killpg(os.getpgid(proc.pid), signal.SIGKILL) instead of proc.kill(), terminates the shell and all its child processes together."}}, {"@type": "Question", "name": "Does this orphan problem happen without shell=True?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 without shell=True, Popen's pid is the actual program you launched (no intermediate shell process), so .kill() directly terminates it. The gap only exists because shell=True inserts a shell process in between."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>subprocess shell=True kill() Leaves Child Running (tested)</h1>
+<p class="lead">Calling <code>.kill()</code> on a <code>subprocess.Popen(..., shell=True)</code> object looks like it stops the command you launched. We measured what it actually stops: only the intermediate shell process. The real program the shell started keeps running, orphaned, with nothing left tracking it.</p>
+<h2 id="repro1">1. shell=True creates two processes, not one</h2>
+<pre><code>import subprocess, time
+
+proc = subprocess.Popen("sleep 8", shell=True)
+print("shell wrapper pid:", proc.pid)
+
+children = subprocess.run(["pgrep", "-P", str(proc.pid)], capture_output=True, text=True).stdout.split()
+print("children of shell pid:", children)</code></pre>
+<pre><code>shell wrapper pid: 2940024
+children of shell pid: ['2940025']</code></pre>
+<p><strong>Measured:</strong> <code>proc.pid</code> is the pid of <code>/bin/sh -c "sleep 8"</code>, not of <code>sleep</code> itself. The shell parses the command and forks <code>sleep</code> as its own child process with a different pid, exactly as the subprocess docs describe for the <code>shell=True</code> equivalence to <code>Popen(["/bin/sh", "-c", cmd])</code>.</p>
+
+<h2 id="repro2">2. proc.kill() only kills the shell; the real command survives</h2>
+<pre><code>proc.kill()
+proc.wait()
+print("shell wrapper returncode:", proc.returncode)
+time.sleep(0.3)
+
+import os
+print("child still alive:", os.path.exists(f"/proc/{children[0]}"))</code></pre>
+<pre><code>shell wrapper returncode: -9
+child still alive: True</code></pre>
+<p><strong>Measured:</strong> <code>proc.kill()</code> reports success &mdash; the returncode is <code>-9</code> (killed by <code>SIGKILL</code>), with no error or warning. But that only terminated the shell wrapper process. The <code>sleep 8</code> process it had already forked is now an orphan (reparented to init), completely untouched, and keeps running for its full 8 seconds with nothing left in your program referencing it.</p>
+
+<h2 id="repro3">3. Why: kill() signals one pid, not a process tree</h2>
+<p>Per the <a href="https://docs.python.org/3/library/subprocess.html#subprocess.Popen.kill">subprocess docs</a>, <code>Popen.kill()</code>/<code>.terminate()</code> send a signal to exactly the pid stored in <code>proc.pid</code> &mdash; they have no concept of child processes. This also means <code>subprocess.run(..., shell=True, timeout=N)</code>'s automatic timeout-kill has the identical gap: it kills the shell on timeout, not whatever the shell was running, so a command like <code>"long_running_tool | grep x"</code> can keep its real work going in the background indefinitely after Python has already moved on, thinking the timeout cleaned it up.</p>
+
+<h2 id="fix">4. Fix: put the shell in its own process group and kill the group</h2>
+<pre><code>import os, signal, subprocess
+
+proc = subprocess.Popen("sleep 8", shell=True, start_new_session=True)
+children = subprocess.run(["pgrep", "-P", str(proc.pid)], capture_output=True, text=True).stdout.split()
+
+os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+proc.wait()
+print("child still alive:", os.path.exists(f"/proc/{children[0]}"))
+False</code></pre>
+<p><strong>Measured:</strong> <code>start_new_session=True</code> makes the shell (and anything it forks) its own process group leader. Sending the kill signal to the whole group with <code>os.killpg(os.getpgid(proc.pid), signal.SIGKILL)</code> instead of <code>proc.kill()</code> terminates both the shell and the real command together &mdash; confirmed the child pid was gone immediately after. Do this for any <code>shell=True</code> process you might need to kill or time out, especially pipelines (<code>cmd1 | cmd2</code>) where the shell forks multiple children at once.</p>
+
+<aside class="cta"><strong>Debugging a timed-out subprocess call that&#x27;s supposed to hit an API or local server? Check the real headers and status behind the request:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does subprocess.Popen(shell=True).kill() stop the command I actually ran?</summary><p>Not necessarily — we measured proc.kill() terminating only the /bin/sh wrapper process. The real command the shell forked (e.g. sleep 8) kept running afterward as an orphan, untouched.</p></details>
+<details><summary>Why does shell=True create two processes for one command?</summary><p>Because Popen(cmd, shell=True) runs /bin/sh -c cmd — the shell itself is proc.pid, and it then forks the actual program as its own child with a separate pid, which we confirmed by finding it via pgrep -P.</p></details>
+<details><summary>Does subprocess.run(..., shell=True, timeout=N) kill the real command on timeout?</summary><p>We didn&#x27;t measure this case directly, but it shares the exact same mechanism as .kill() — the timeout kills the pid subprocess tracks (the shell), not any children the shell forked, so the same orphaning risk applies, especially for shell pipelines.</p></details>
+<details><summary>How do I make sure killing a shell=True subprocess kills everything it started?</summary><p>We confirmed that passing start_new_session=True to Popen, then calling os.killpg(os.getpgid(proc.pid), signal.SIGKILL) instead of proc.kill(), terminates the shell and all its child processes together.</p></details>
+<details><summary>Does this orphan problem happen without shell=True?</summary><p>No — without shell=True, Popen&#x27;s pid is the actual program you launched (no intermediate shell process), so .kill() directly terminates it. The gap only exists because shell=True inserts a shell process in between.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Python 3.13.5&#x27;s built-in subprocess module on Linux: launched Popen(&#x27;sleep 8&#x27;, shell=True), found the real child pid with pgrep -P, called proc.kill(), then checked /proc/&lt;pid&gt; for both the shell wrapper and its child. PlainHeaders is our extension; Python&#x27;s subprocess module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

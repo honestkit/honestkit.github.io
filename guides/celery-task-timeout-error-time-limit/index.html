@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Celery task timeout error: time_limit vs soft_time_limit</title>
+<meta name="description" content="Celery TimeLimitExceeded vs SoftTimeLimitExceeded, measured: hard limit kills the process, soft limit lets you clean up, and -P solo ignores both.">
+<link rel="canonical" href="https://honestkit.github.io/guides/celery-task-timeout-error-time-limit/">
+<meta property="og:title" content="Celery task timeout error: time_limit vs soft_time_limit">
+<meta property="og:description" content="Celery TimeLimitExceeded vs SoftTimeLimitExceeded, measured: hard limit kills the process, soft limit lets you clean up, and -P solo ignores both.">
+<meta property="og:url" content="https://honestkit.github.io/guides/celery-task-timeout-error-time-limit/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the difference between time_limit and soft_time_limit in Celery?", "acceptedAnswer": {"@type": "Answer", "text": "soft_time_limit raises SoftTimeLimitExceeded inside the task so it can clean up; time_limit kills the process and the task fails with TimeLimitExceeded."}}, {"@type": "Question", "name": "Why is my Celery time_limit not working?", "acceptedAnswer": {"@type": "Answer", "text": "The solo pool (-P solo) does not enforce time limits; in our test the task ran past both limits and succeeded."}}, {"@type": "Question", "name": "Does AsyncResult.get(timeout=) stop the task?", "acceptedAnswer": {"@type": "Answer", "text": "No. It raises celery.exceptions.TimeoutError in the caller; the task keeps running on the worker."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Celery task timeout: time_limit and soft_time_limit (tested)</h1>
+<p class="lead">Set <code>@app.task(soft_time_limit=60, time_limit=90)</code>: the soft limit raises <code>SoftTimeLimitExceeded</code> inside the task, the hard limit kills it with <code>TimeLimitExceeded</code>. Both are ignored with <code>-P solo</code>; run the default prefork pool.</p>
+<p>Celery has two per-task limits: <code>soft_time_limit</code> raises <code>SoftTimeLimitExceeded</code> inside the task so it can clean up, and <code>time_limit</code> (hard) kills the process running the task and fails it with <code>TimeLimitExceeded</code>. They are enforced by the prefork pool (the default).</p>
+<h2 id="prefork">1. Hard and soft time limits with the prefork pool</h2>
+<pre><code>$ cat tasks.py
+import time
+from celery import Celery
+from celery.exceptions import SoftTimeLimitExceeded
+app = Celery(&quot;tasks&quot;, broker=&quot;redis://127.0.0.1:8964/0&quot;, backend=&quot;redis://127.0.0.1:8964/1&quot;)
+
+@app.task(time_limit=2)
+def slow():
+    time.sleep(10)
+
+@app.task(soft_time_limit=1, time_limit=5)
+def slow_soft():
+    try:
+        time.sleep(10)
+    except SoftTimeLimitExceeded:
+        return &quot;cleaned up&quot;
+$ celery -A tasks worker -c 1 --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ cat run.py
+import time
+from tasks import slow, slow_soft
+for t in (slow, slow_soft):
+    t0 = time.time()
+    try:
+        print(t.name, &quot;-&gt;&quot;, t.delay().get(timeout=20), f&quot;({time.time()-t0:.0f}s)&quot;)
+    except Exception as e:
+        print(t.name, &quot;-&gt;&quot;, type(e).__name__, e, f&quot;({time.time()-t0:.0f}s)&quot;)
+$ timeout 60 python run.py
+tasks.slow -&gt; TimeLimitExceeded TimeLimitExceeded(2,) (2s)
+tasks.slow_soft -&gt; cleaned up (1s)</code></pre>
+<pre><code>$ grep -E &quot;ERROR|WARNING|succeeded&quot; worker.log | cut -c1-200
+[2026-10-23 11:00:02,602: ERROR/MainProcess] Task handler raised error: TimeLimitExceeded(2)
+[2026-10-23 11:00:02,602: ERROR/MainProcess] Hard time limit (2s) exceeded for tasks.slow[9516fbc7-4263-400d-82aa-873f4c047dee]
+[2026-10-23 11:00:02,709: ERROR/MainProcess] Process &#x27;ForkPoolWorker-1&#x27; pid:3012968 exited with &#x27;signal 9 (SIGKILL)&#x27;
+[2026-10-23 11:00:03,783: WARNING/MainProcess] Soft time limit (1s) exceeded for tasks.slow_soft[e188cdea-0f12-4ba6-a058-dae7eb169b79]
+[2026-10-23 11:00:03,792: INFO/ForkPoolWorker-2] Task tasks.slow_soft[e188cdea-0f12-4ba6-a058-dae7eb169b79] succeeded in 1.0103442892432213s: &#x27;cleaned up&#x27;</code></pre>
+<p><code>slow</code> failed after 2 s with <code>TimeLimitExceeded(2,)</code> and its process was replaced (SIGKILL). <code>slow_soft</code> caught <code>SoftTimeLimitExceeded</code> after 1 s and returned normally, so the task succeeded. If you do not catch the soft limit exception, the task fails with it.</p>
+<h2 id="solo">2. With -P solo the limits are silently ignored</h2>
+<pre><code>$ cat tasks.py
+import time
+from celery import Celery
+from celery.exceptions import SoftTimeLimitExceeded
+app = Celery(&quot;tasks&quot;, broker=&quot;redis://127.0.0.1:8964/0&quot;, backend=&quot;redis://127.0.0.1:8964/1&quot;)
+
+@app.task(time_limit=2)
+def slow():
+    time.sleep(10)
+
+@app.task(soft_time_limit=1, time_limit=5)
+def slow_soft():
+    try:
+        time.sleep(10)
+    except SoftTimeLimitExceeded:
+        return &quot;cleaned up&quot;
+$ celery -A tasks worker -P solo --loglevel=INFO &gt; worker.log 2&gt;&amp;1 &amp;
+$ cat run.py
+import time
+from tasks import slow, slow_soft
+for t in (slow, slow_soft):
+    t0 = time.time()
+    try:
+        print(t.name, &quot;-&gt;&quot;, t.delay().get(timeout=20), f&quot;({time.time()-t0:.0f}s)&quot;)
+    except Exception as e:
+        print(t.name, &quot;-&gt;&quot;, type(e).__name__, e, f&quot;({time.time()-t0:.0f}s)&quot;)
+$ timeout 60 python run.py
+tasks.slow -&gt; None (10s)
+tasks.slow_soft -&gt; None (10s)</code></pre>
+<p>The same tasks under <code>-P solo</code> both ran the full 10 seconds and succeeded; the worker log had no time limit message at all. If your limits "do nothing", check the pool (<code>-P solo</code>, and Windows setups that need it). Use the default prefork pool, or put timeouts inside the task (for example a <code>timeout=</code> on the network call that hangs).</p>
+<h2 id="caller">Timeouts on the caller side</h2><p><code>result.get(timeout=20)</code> only stops <em>waiting</em>: it raises <code>celery.exceptions.TimeoutError</code> in the caller and the task keeps running on the worker. Global defaults are <code>task_time_limit</code> and <code>task_soft_time_limit</code>.</p>
+<p>Related: <a href="/guides/celery-chord-error-handling/">Celery chord error handling</a>, <a href="/guides/celery-maxretriesexceedederror/">Celery MaxRetriesExceededError</a>, <a href="/guides/celery-link-error-errback-example/">Celery link_error errback</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the difference between time_limit and soft_time_limit in Celery?</summary><p>soft_time_limit raises SoftTimeLimitExceeded inside the task so it can clean up; time_limit kills the process and the task fails with TimeLimitExceeded.</p></details>
+<details><summary>Why is my Celery time_limit not working?</summary><p>The solo pool (-P solo) does not enforce time limits; in our test the task ran past both limits and succeeded.</p></details>
+<details><summary>Does AsyncResult.get(timeout=) stop the task?</summary><p>No. It raises celery.exceptions.TimeoutError in the caller; the task keeps running on the worker.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Celery 5.6.3 (kombu 5.6.2, redis-py 8.1.0) on Python 3.13.5, Redis 7 (Docker) as broker and backend. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; Celery and Redis are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jupyter &quot;Error Starting Kernel&quot;: 3 Causes and Fixes (Tested)</title>
+<meta name="description" content="Jupyter &quot;Error Starting Kernel&quot; / 500 Unhandled error: a deleted env, no ipykernel, or a broken kernel.json. All three reproduced, with a checker script.">
+<link rel="canonical" href="https://honestkit.github.io/guides/jupyter-error-starting-kernel/">
+<meta property="og:title" content="Jupyter &quot;Error Starting Kernel&quot;: 3 Causes and Fixes (Tested)">
+<meta property="og:description" content="Jupyter &quot;Error Starting Kernel&quot; / 500 Unhandled error: a deleted env, no ipykernel, or a broken kernel.json. All three reproduced, with a checker script.">
+<meta property="og:url" content="https://honestkit.github.io/guides/jupyter-error-starting-kernel/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does Jupyter say \"Error Starting Kernel\"?", "acceptedAnswer": {"@type": "Answer", "text": "The server could not launch the command in the kernel's kernel.json, most often because that Python interpreter (a deleted venv or conda env) no longer exists. The 500 response only says \"Unhandled error\"; the server log shows FileNotFoundError with the path."}}, {"@type": "Question", "name": "Why is my Jupyter kernel stuck on starting and then dies?", "acceptedAnswer": {"@type": "Answer", "text": "The interpreter exists but has no ipykernel: it exits with \"No module named ipykernel_launcher\", Jupyter restarts it 5 times, then gives up (about 18 seconds in our test). Install ipykernel into that interpreter."}}, {"@type": "Question", "name": "How do I find which kernel is broken?", "acceptedAnswer": {"@type": "Answer", "text": "Run jupyter kernelspec list and check each argv path in kernel.json exists and can import ipykernel, or use the check script in this guide."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Jupyter &quot;Error Starting Kernel&quot; (500 Unhandled error): three causes, tested</h1>
+<p class="lead"><code>Error Starting Kernel</code> in Jupyter usually means the interpreter in the kernel's <code>kernel.json</code> is gone, lacks ipykernel, or the spec file is broken. The server answers <code>500 Unhandled error</code> and only its log says why. All three cases are reproduced below, plus a script that checks every kernelspec.</p>
+<h2 id="repro">1. Reproduce: four kernelspecs, three ways to fail</h2>
+<p><code>run.py</code> writes four kernel specs (a working one, one pointing at a deleted virtualenv, one pointing at a Python without ipykernel, one with broken <code>kernel.json</code>), starts a Jupyter server, and asks it to start each kernel through the same REST call the notebook UI uses when you pick a kernel:</p>
+<pre><code>import json, os, subprocess, sys, time, urllib.request, urllib.error
+# kernelspecs that fail in three different ways, plus one that works
+D = &#x27;/tmp/ks412&#x27;
+def spec(name, argv):
+    os.makedirs(f&#x27;{D}/data/kernels/{name}&#x27;, exist_ok=True)
+    json.dump({&#x27;argv&#x27;: argv, &#x27;display_name&#x27;: name, &#x27;language&#x27;: &#x27;python&#x27;},
+              open(f&#x27;{D}/data/kernels/{name}/kernel.json&#x27;, &#x27;w&#x27;))
+CF = [&#x27;-m&#x27;, &#x27;ipykernel_launcher&#x27;, &#x27;-f&#x27;, &#x27;{connection_file}&#x27;]
+spec(&#x27;good&#x27;, [sys.executable] + CF)
+spec(&#x27;deleted-venv&#x27;, [&#x27;/tmp/ks412/oldenv/bin/python&#x27;] + CF)   # path that no longer exists
+spec(&#x27;no-ipykernel&#x27;, [&#x27;/usr/bin/python3&#x27;] + CF)                  # interpreter without ipykernel
+spec(&#x27;bad-json&#x27;, [sys.executable] + CF)
+open(f&#x27;{D}/data/kernels/bad-json/kernel.json&#x27;, &#x27;w&#x27;).write(&#x27;{&quot;argv&quot;: [,]}&#x27;)
+os.makedirs(f&#x27;{D}/root&#x27;, exist_ok=True)
+env = dict(os.environ, JUPYTER_DATA_DIR=f&#x27;{D}/data&#x27;, JUPYTER_RUNTIME_DIR=f&#x27;{D}/rt&#x27;, JUPYTER_CONFIG_DIR=f&#x27;{D}/cfg&#x27;,
+           JUPYTER_PATH=f&#x27;{D}/data&#x27;)
+srv = subprocess.Popen([sys.executable, &#x27;-m&#x27;, &#x27;jupyter_server&#x27;, &#x27;--port=8963&#x27;, &#x27;--no-browser&#x27;,
+                        &#x27;--IdentityProvider.token=abc123&#x27;, f&#x27;--ServerApp.root_dir={D}/root&#x27;],
+                       env=env, stdout=subprocess.DEVNULL, stderr=open(f&#x27;{D}/server.log&#x27;, &#x27;w&#x27;))
+B = &#x27;http://127.0.0.1:8963&#x27;
+H = {&#x27;Authorization&#x27;: &#x27;token abc123&#x27;, &#x27;Content-Type&#x27;: &#x27;application/json&#x27;}
+for _ in range(100):
+    try: urllib.request.urlopen(B + &#x27;/api&#x27;, timeout=1); break
+    except Exception: time.sleep(0.2)
+
+def call(method, path, body=None):
+    req = urllib.request.Request(B + path, method=method, headers=H,
+                                 data=json.dumps(body).encode() if body is not None else None)
+    try:
+        r = urllib.request.urlopen(req, timeout=30); return r.status, json.loads(r.read() or b&#x27;null&#x27;)
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b&#x27;null&#x27;)
+
+st, specs = call(&#x27;GET&#x27;, &#x27;/api/kernelspecs&#x27;)
+print(&#x27;kernelspecs listed:&#x27;, sorted(specs[&#x27;kernelspecs&#x27;]))
+for name in [&#x27;good&#x27;, &#x27;deleted-venv&#x27;, &#x27;no-ipykernel&#x27;, &#x27;bad-json&#x27;]:
+    st, body = call(&#x27;POST&#x27;, &#x27;/api/kernels&#x27;, {&#x27;name&#x27;: name})
+    msg = body.get(&#x27;message&#x27;) if isinstance(body, dict) else body
+    print(f&#x27;POST /api/kernels {name!r}: {st}&#x27;, (msg or &#x27;&#x27;)[:110] if st != 201 else &#x27;id=&#x27; + body[&#x27;id&#x27;][:8] + &#x27; state=&#x27; + body[&#x27;execution_state&#x27;])
+    if st == 201:
+        last = None
+        for t in range(25):
+            st2, k = call(&#x27;GET&#x27;, &#x27;/api/kernels/&#x27; + body[&#x27;id&#x27;])
+            cur = f&#x27;GET {st2} &#x27; + (k[&#x27;execution_state&#x27;] if st2 == 200 else k.get(&#x27;message&#x27;, &#x27;&#x27;))
+            if cur != last: print(f&#x27;   after {t:&gt;2}s: {cur}&#x27;); last = cur
+            if name == &#x27;good&#x27; and t == 5: break
+            time.sleep(1)
+srv.terminate()
+try: srv.wait(timeout=5)
+except subprocess.TimeoutExpired: srv.kill(); srv.wait()
+print(&#x27;--- server log:&#x27;)
+for line in open(f&#x27;{D}/server.log&#x27;):
+    if any(w in line for w in (&#x27;Error loading&#x27;, &#x27;Failed to run&#x27;, &#x27;Errno 2&#x27;, &#x27;No module&#x27;, &#x27;Restarter&#x27;, &#x27;restart&#x27;, &#x27;dead&#x27;, &#x27;500 POST&#x27;, &#x27;Expecting value&#x27;)):
+        print(line.rstrip()[:150].replace(line[3:27], &#x27;TIME &#x27;) if line.startswith(&#x27;[&#x27;) else line.rstrip()[:150])</code></pre>
+<p>Output (jupyter_server 2.21.1, jupyter_client 8.10.0, ipykernel 7.4.0, Python 3.13 on Linux):</p>
+<pre><code>kernelspecs listed: [&#x27;deleted-venv&#x27;, &#x27;good&#x27;, &#x27;no-ipykernel&#x27;, &#x27;python3&#x27;]
+POST /api/kernels &#x27;good&#x27;: 201 id=fd3141f0 state=starting
+   after  0s: GET 200 starting
+POST /api/kernels &#x27;deleted-venv&#x27;: 500 Unhandled error
+POST /api/kernels &#x27;no-ipykernel&#x27;: 201 id=cc8d1bbd state=starting
+   after  0s: GET 200 starting
+   after 18s: GET 404 Kernel does not exist: cc8d1bbd-bdcc-489c-926e-875be586e604
+POST /api/kernels &#x27;bad-json&#x27;: 500 Unhandled error
+--- server log:
+[W TIME ServerApp] Error loading kernelspec &#x27;bad-json&#x27;
+        raise JSONDecodeError(&quot;Expecting value&quot;, s, err.value) from None
+    json.decoder.JSONDecodeError: Expecting value: line 1 column 11 (char 10)
+[E TIME ServerApp] Failed to run command:
+[E TIME ServerApp] [Errno 2] No such file or directory: &#x27;/tmp/ks412/oldenv/bin/python&#x27;
+    FileNotFoundError: [Errno 2] No such file or directory: &#x27;/tmp/ks412/oldenv/bin/python&#x27;
+[E TIME ServerApp] [Errno 2] No such file or directory: &#x27;/tmp/ks412/oldenv/bin/python&#x27;
+    FileNotFoundError: [Errno 2] No such file or directory: &#x27;/tmp/ks412/oldenv/bin/python&#x27;
+    FileNotFoundError: [Errno 2] No such file or directory: &#x27;/tmp/ks412/oldenv/bin/python&#x27;
+[E TIME ServerApp] 500 POST /api/kernels (929623700111435bb2c724150e86199d@127.0.0.1) 14.51ms referer=None
+/usr/bin/python3: No module named ipykernel_launcher
+[I TIME ServerApp] AsyncIOLoopKernelRestarter: restarting kernel (1/5), new random ports
+/usr/bin/python3: No module named ipykernel_launcher
+[I TIME ServerApp] AsyncIOLoopKernelRestarter: restarting kernel (2/5), new random ports
+/usr/bin/python3: No module named ipykernel_launcher
+[I TIME ServerApp] AsyncIOLoopKernelRestarter: restarting kernel (3/5), new random ports
+/usr/bin/python3: No module named ipykernel_launcher
+[I TIME ServerApp] AsyncIOLoopKernelRestarter: restarting kernel (4/5), new random ports
+/usr/bin/python3: No module named ipykernel_launcher
+[I TIME ServerApp] AsyncIOLoopKernelRestarter: restarting kernel (5/5), new random ports
+/usr/bin/python3: No module named ipykernel_launcher
+[W TIME ServerApp] AsyncIOLoopKernelRestarter: restart failed
+[E TIME ServerApp] Expecting value: line 1 column 11 (char 10)
+        raise JSONDecodeError(&quot;Expecting value&quot;, s, err.value) from None
+    json.decoder.JSONDecodeError: Expecting value: line 1 column 11 (char 10)
+[E TIME ServerApp] Expecting value: line 1 column 11 (char 10)
+        raise JSONDecodeError(&quot;Expecting value&quot;, s, err.value) from None
+    json.decoder.JSONDecodeError: Expecting value: line 1 column 11 (char 10)
+        raise JSONDecodeError(&quot;Expecting value&quot;, s, err.value) from None
+    json.decoder.JSONDecodeError: Expecting value: line 1 column 11 (char 10)
+[E TIME ServerApp] 500 POST /api/kernels (b1c6d42326eb4947b23dcd2feac0cc1d@127.0.0.1) 10.23ms referer=None</code></pre>
+<h2 id="meaning">2. Which failure you have</h2>
+<ul><li><b>Interpreter path no longer exists</b> (<code>deleted-venv</code>): the start request fails at once with <b>500</b> and the body says only <code>Unhandled error</code>; this is the failure a notebook UI reports as "Error Starting Kernel". The real cause is in the server log: <code>Failed to run command</code> plus <code>FileNotFoundError: [Errno 2] No such file or directory</code> with the <code>python</code> path from <code>kernel.json</code>. Typical after deleting or moving a venv/conda env that was registered with <code>ipykernel install</code>.</li>
+<li><b>Interpreter has no ipykernel</b> (<code>no-ipykernel</code>): the start request <i>succeeds</i> (201, state <code>starting</code>), the process exits with <code>No module named ipykernel_launcher</code>, the restarter tries 5 times, logs <code>restart failed</code>, and about 18 seconds later the kernel no longer exists (404). So in a notebook the kernel never becomes ready and then disappears.</li>
+<li><b>Broken kernel.json</b> (<code>bad-json</code>): the spec is silently missing from <code>GET /api/kernelspecs</code> (only a warning <code>Error loading kernelspec 'bad-json'</code> in the log), and starting it by name gives the same 500 <code>Unhandled error</code> with a <code>JSONDecodeError</code> in the log.</li></ul>
+<p>So for "Error Starting Kernel" with no details, the browser can't tell you more: read the terminal where <code>jupyter lab</code> / <code>jupyter notebook</code> runs, or its log.</p>
+<h2 id="check">3. Check every kernelspec at once</h2>
+<p><code>check.py</code> loads each spec the way Jupyter does, then checks the interpreter exists and can import ipykernel. A bare <code>python</code> in <code>argv</code> is fine: jupyter_client replaces it with the server's own interpreter (<code>sys.executable</code>):</p>
+<pre><code># check every kernelspec Jupyter can see: does argv[0] exist, and can it import ipykernel?
+import os, subprocess, sys
+from jupyter_client.kernelspec import KernelSpecManager
+ksm = KernelSpecManager()
+for name, path in sorted(ksm.find_kernel_specs().items()):
+    try:
+        argv = ksm.get_kernel_spec(name).argv
+    except Exception as e:
+        print(f&#x27;{name:13} BROKEN kernel.json: {type(e).__name__}: {e}&#x27;); continue
+    exe = argv[0]
+    if exe in (&#x27;python&#x27;, &#x27;python3&#x27;, f&#x27;python{sys.version_info[0]}.{sys.version_info[1]}&#x27;):
+        exe = sys.executable   # jupyter_client swaps a bare &#x27;python&#x27; for the server&#x27;s own interpreter
+    if not os.path.exists(exe):
+        print(f&#x27;{name:13} MISSING interpreter {exe}&#x27;); continue
+    r = subprocess.run([exe, &#x27;-c&#x27;, &#x27;import ipykernel; print(ipykernel.__version__)&#x27;], capture_output=True, text=True)
+    print(f&#x27;{name:13}&#x27;, f&#x27;OK ipykernel {r.stdout.strip()}&#x27; if r.returncode == 0 else f&#x27;NO ipykernel in {exe}&#x27;)</code></pre>
+<pre><code>bad-json      BROKEN kernel.json: JSONDecodeError: Expecting value: line 1 column 11 (char 10)
+deleted-venv  MISSING interpreter /tmp/ks412/oldenv/bin/python
+good          OK ipykernel 7.4.0
+no-ipykernel  NO ipykernel in /usr/bin/python3
+python3       OK ipykernel 7.4.0</code></pre>
+<h2 id="fix">4. Fix</h2>
+<pre><code>jupyter kernelspec remove -y deleted-venv      # the env is gone: drop its spec
+/usr/bin/python3 -m ipykernel --version        # this interpreter has no ipykernel
+jupyter kernelspec list 2&gt;/dev/null            # (stderr still warns about bad-json)</code></pre>
+<pre><code>Removed /tmp/ks412/data/kernels/deleted-venv
+/usr/bin/python3: No module named ipykernel
+Available kernels:
+  bad-json        /tmp/ks412/data/kernels/bad-json
+  good            /tmp/ks412/data/kernels/good
+  no-ipykernel    /tmp/ks412/data/kernels/no-ipykernel
+  python3         /tmp/jn408/ve/share/jupyter/kernels/python3</code></pre>
+<ul><li><b>Missing interpreter</b>: <code>jupyter kernelspec remove -y NAME</code>, then recreate the env and register it again from inside it: <code>python -m pip install ipykernel</code> and <code>python -m ipykernel install --user --name NAME</code>.</li>
+<li><b>No ipykernel</b>: install it into the interpreter the spec points at (<code>/path/to/python -m pip install ipykernel</code>), not into whatever <code>pip</code> is first on PATH.</li>
+<li><b>Broken kernel.json</b>: note that <code>jupyter kernelspec list</code> still lists it (with a traceback on stderr) even though the server hides it; fix the JSON or remove the directory.</li></ul>
+<p>Related: <a href="/guides/jupyter-notebook-kernel-not-found-nosuchkernel/">Jupyter kernel not found (NoSuchKernel)</a>, <a href="/guides/jupyter-notebook-kernel-keeps-dying-deadkernelerror/">Jupyter kernel keeps dying</a>, <a href="/guides/jupyter-error-403-forbidden-xsrf-argument-missing/">Jupyter 403 Forbidden</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does Jupyter say &quot;Error Starting Kernel&quot;?</summary><p>The server could not launch the command in the kernel&#x27;s kernel.json, most often because that Python interpreter (a deleted venv or conda env) no longer exists. The 500 response only says &quot;Unhandled error&quot;; the server log shows FileNotFoundError with the path.</p></details>
+<details><summary>Why is my Jupyter kernel stuck on starting and then dies?</summary><p>The interpreter exists but has no ipykernel: it exits with &quot;No module named ipykernel_launcher&quot;, Jupyter restarts it 5 times, then gives up (about 18 seconds in our test). Install ipykernel into that interpreter.</p></details>
+<details><summary>How do I find which kernel is broken?</summary><p>Run jupyter kernelspec list and check each argv path in kernel.json exists and can import ipykernel, or use the check script in this guide.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with jupyter_server 2.21.1, jupyter_client 8.10.0, ipykernel 7.4.0 and Python 3.13 on Linux. The scripts ran verbatim and the output was pasted unedited. PlainTables is our extension; Jupyter is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

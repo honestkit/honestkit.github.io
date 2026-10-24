@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cannot Connect to the Docker Daemon: Causes and Fixes</title>
+<meta name="description" content="We pointed Docker&#x27;s CLI at a wrong socket and an unreachable TCP port and captured the exact error text for each, next to the normal working case for contrast.">
+<link rel="canonical" href="https://honestkit.github.io/guides/docker-cannot-connect-to-daemon/">
+<meta property="og:title" content="Cannot Connect to the Docker Daemon: Causes and Fixes">
+<meta property="og:description" content="We pointed Docker&#x27;s CLI at a wrong socket and an unreachable TCP port and captured the exact error text for each, next to the normal working case for contrast.">
+<meta property="og:url" content="https://honestkit.github.io/guides/docker-cannot-connect-to-daemon/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What's the fastest way to check if the problem is the daemon or my command?", "acceptedAnswer": {"@type": "Answer", "text": "Run docker context ls to see the endpoint the CLI is using, then try docker version. The client block (versions, plugins) always prints even when the daemon is unreachable; if the Server block is replaced by an error, the client never reached the daemon at all."}}, {"@type": "Question", "name": "Why does the error wording differ between a missing socket and a dead TCP port?", "acceptedAnswer": {"@type": "Answer", "text": "We measured both on the same Docker 29.8.1 CLI. A missing Unix socket file gives a longer 'failed to connect to the docker API ...: dial unix ...: no such file or directory' message. An unreachable TCP port gives the shorter, older 'Cannot connect to the Docker daemon at <host>. Is the docker daemon running?' phrasing. Both mean the same underlying thing: the connection attempt failed before any API call."}}, {"@type": "Question", "name": "Do I need sudo to run docker commands?", "acceptedAnswer": {"@type": "Answer", "text": "No, not if your user is in the docker group. On this box the account is a member of docker (confirmed with groups) and every docker ps/info/version command above worked without sudo. Routinely using sudo docker instead of fixing group membership just masks the real permission setup."}}, {"@type": "Question", "name": "What does the permission-denied version of this error look like?", "acceptedAnswer": {"@type": "Answer", "text": "Per Docker's documentation (not measured on this box, since our account already has docker group access), it reads along the lines of 'Got permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock' \u2014 distinct from the 'no such file' and 'connection refused' variants we measured."}}, {"@type": "Question", "name": "Does restarting Docker always fix this?", "acceptedAnswer": {"@type": "Answer", "text": "Only if the daemon genuinely isn't running. In our tests the daemon was running the whole time; the failures came from pointing the client at a wrong socket path or a wrong TCP port with DOCKER_HOST. Check docker context ls and your DOCKER_HOST variable before restarting anything."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Cannot Connect to the Docker Daemon (tested)</h1>
+<p class="lead"><code>Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?</code> means the Docker CLI could not reach the daemon over the socket or host it was told to use. It almost always means the daemon isn't running, the socket path is wrong, or you don't have permission to use it. We reproduced the main causes by deliberately pointing a working Docker install at the wrong place, and compared that with the normal, working connection.</p>
+<h2>1. What this error means</h2>
+<p>The <code>docker</code> command you type is only a client. It does no work itself; it sends your request to the Docker daemon (<code>dockerd</code>) over a socket, normally the Unix socket <code>/var/run/docker.sock</code>, or sometimes over TCP. When the client can't open that connection at all, it prints a "cannot connect" style error and exits before it ever reaches the daemon's API.</p>
+<p>That is different from an error the daemon itself returns (for example a bad image name). This error happens on the client side, before authentication or any API call is even attempted.</p>
+
+<h2>2. Our test setup</h2>
+<p>We did not stop or break the real daemon. Instead we set the <code>DOCKER_HOST</code> environment variable to point the CLI somewhere wrong, which makes the client fail to connect exactly as it would if the real daemon were down or misconfigured, without touching the working daemon at all.</p>
+<pre><code>$ docker context ls
+NAME        DESCRIPTION                               DOCKER ENDPOINT               ERROR
+default *   Current DOCKER_HOST based configuration   unix:///var/run/docker.sock
+
+$ DOCKER_HOST=unix:///tmp/nonexistent.sock docker ps
+$ DOCKER_HOST=tcp://127.0.0.1:1 docker ps</code></pre>
+<p>The first command confirms the real, working socket path on this box. The next two are the broken cases we measured.</p>
+
+<h2>3. Results: wrong socket path vs. wrong TCP port</h2>
+<table>
+<tr><th>Case</th><th>Command</th><th>Exact error text</th><th>Exit code</th></tr>
+<tr><td>Nonexistent Unix socket</td><td><code>DOCKER_HOST=unix:///tmp/nonexistent.sock docker ps</code></td><td>"failed to connect to the docker API at unix:///tmp/nonexistent.sock; check if the path is correct and if the daemon is running: dial unix /tmp/nonexistent.sock: connect: no such file or directory"</td><td>1</td></tr>
+<tr><td>Unreachable TCP port (connection refused)</td><td><code>DOCKER_HOST=tcp://127.0.0.1:1 docker ps</code></td><td>"Cannot connect to the Docker daemon at tcp://127.0.0.1:1. Is the docker daemon running?"</td><td>1</td></tr>
+<tr><td>Normal, working socket</td><td><code>docker ps</code></td><td>Container table printed normally, no error</td><td>0</td></tr>
+</table>
+<p>Both broken cases fail client-side, in well under 20 ms &mdash; there is no timeout to wait out, because the connection attempt itself fails immediately (no such file, or connection refused). The exact wording differs by failure type: a missing Unix socket file produces a newer, more detailed "failed to connect to the docker API" message naming the path and the underlying dial error, while a TCP connection refusal produces the older, shorter "Cannot connect to the Docker daemon at &lt;host&gt;. Is the docker daemon running?" phrasing. Both still mean the same thing: the client never reached a daemon.</p>
+<p>We saw this same split in <code>docker info</code> and <code>docker version</code> too: the client-side block of output (version, plugins) always prints first, then the daemon connection error replaces the Server section.</p>
+<pre><code>$ DOCKER_HOST=unix:///tmp/nonexistent.sock docker version
+Client: Docker Engine - Community
+ Version:           29.8.1
+ ...
+failed to connect to the docker API at unix:///tmp/nonexistent.sock; check if
+the path is correct and if the daemon is running: dial unix
+/tmp/nonexistent.sock: connect: no such file or directory</code></pre>
+
+<h2>4. The normal, working case (for contrast)</h2>
+<p>With <code>DOCKER_HOST</code> unset, the same CLI against the real socket just works, which confirms the broken cases above are genuine connection failures and not a typo in the command:</p>
+<pre><code>$ docker version --format '{{.Server.Version}}'
+29.8.1
+$ docker ps
+CONTAINER ID   IMAGE                     COMMAND              STATUS
+81a7dcb0bf0b   curlimages/curl:latest    "/watchdog.sh"       Up 4 days
+...</code></pre>
+<p>Server and client were both Docker 29.8.1, API 1.56, on this box.</p>
+
+<h2>5. Common causes</h2>
+<ul>
+<li><strong>The daemon isn't running.</strong> A fresh install, a crashed daemon, or a machine that hasn't finished booting Docker Desktop all look like this from the client's side.</li>
+<li><strong>Wrong <code>DOCKER_HOST</code>.</strong> A leftover environment variable, a typo'd socket path, or an SSH session that lost a forwarded Docker socket all point the client at nothing. This is exactly what we reproduced above.</li>
+<li><strong>Permission denied on the socket.</strong> The Unix socket is normally owned by <code>root:docker</code>. A user who isn't in the <code>docker</code> group can see the socket exists but can't open it. Per Docker's docs, this produces a message like "Got permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock" rather than "no such file" &mdash; we did not measure this ourselves, since the account on this box is already a member of the <code>docker</code> group (confirmed with <code>groups</code>), so every command above worked without <code>sudo</code>.</li>
+<li><strong>Docker Desktop / VM not started.</strong> On macOS and Windows the daemon runs inside a VM; if that VM isn't up, the socket the CLI expects simply isn't there yet.</li>
+<li><strong>Rootless or remote context pointed at the wrong place.</strong> Switching <code>docker context</code> or using a remote TCP/SSH host that isn't reachable reproduces our TCP case: connection refused, "Is the docker daemon running?".</li>
+</ul>
+
+<h2>6. How to fix it</h2>
+<ul>
+<li>Check the daemon is actually running: <code>systemctl status docker</code> (Linux) or open Docker Desktop and wait for it to report "running".</li>
+<li>Check which host the client is using: <code>docker context ls</code> shows the current endpoint; an unexpected one often means a stray <code>DOCKER_HOST</code> in your shell profile. <code>echo $DOCKER_HOST</code> and unset it if it's wrong.</li>
+<li>Check the socket file exists and is a socket: <code>ls -la /var/run/docker.sock</code>. "No such file or directory" matches our nonexistent-socket test above and means the daemon never created it.</li>
+<li>If it's a permission error, add your user to the <code>docker</code> group (<code>sudo usermod -aG docker $USER</code>, then log out and back in) rather than routinely using <code>sudo docker</code>.</li>
+<li>For a remote or TCP host, confirm the port is actually listening and reachable (firewall, SSH tunnel, correct port) &mdash; "connection refused" matches our TCP test and means nothing is listening there.</li>
+</ul>
+<p>If the daemon connects fine but a specific build or compose run fails afterward, see <a href="/guides/docker-build-failed/">Docker build failed</a> or <a href="/guides/docker-compose-up-error/">docker compose up error</a>. For the exact "Is the docker daemon running?" phrasing on an overlapping search, see <a href="/guides/docker-cannot-connect-to-the-docker-daemon/">Cannot connect to the Docker daemon</a>.</p>
+<aside class="cta"><strong>Check the status and headers your server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What&#x27;s the fastest way to check if the problem is the daemon or my command?</summary><p>Run docker context ls to see the endpoint the CLI is using, then try docker version. The client block (versions, plugins) always prints even when the daemon is unreachable; if the Server block is replaced by an error, the client never reached the daemon at all.</p></details>
+<details><summary>Why does the error wording differ between a missing socket and a dead TCP port?</summary><p>We measured both on the same Docker 29.8.1 CLI. A missing Unix socket file gives a longer &#x27;failed to connect to the docker API ...: dial unix ...: no such file or directory&#x27; message. An unreachable TCP port gives the shorter, older &#x27;Cannot connect to the Docker daemon at &lt;host&gt;. Is the docker daemon running?&#x27; phrasing. Both mean the same underlying thing: the connection attempt failed before any API call.</p></details>
+<details><summary>Do I need sudo to run docker commands?</summary><p>No, not if your user is in the docker group. On this box the account is a member of docker (confirmed with groups) and every docker ps/info/version command above worked without sudo. Routinely using sudo docker instead of fixing group membership just masks the real permission setup.</p></details>
+<details><summary>What does the permission-denied version of this error look like?</summary><p>Per Docker&#x27;s documentation (not measured on this box, since our account already has docker group access), it reads along the lines of &#x27;Got permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock&#x27; — distinct from the &#x27;no such file&#x27; and &#x27;connection refused&#x27; variants we measured.</p></details>
+<details><summary>Does restarting Docker always fix this?</summary><p>Only if the daemon genuinely isn&#x27;t running. In our tests the daemon was running the whole time; the failures came from pointing the client at a wrong socket path or a wrong TCP port with DOCKER_HOST. Check docker context ls and your DOCKER_HOST variable before restarting anything.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Docker 29.8.1 (client and server, API 1.56) on Linux, using the real docker CLI pointed at a deliberately wrong DOCKER_HOST (a nonexistent unix socket, then an unreachable TCP port). The real daemon and its socket were never touched. The docker-group permission-denied message is from Docker&#x27;s docs, not measured on this box (this account is already in the docker group). PlainHeaders is our extension; the Docker CLI is free and open source.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terraform: Backend Configuration Changed — Fixed (Tested)</title>
+<meta name="description" content="We changed a Terraform backend path and measured the fix: -reconfigure alone still prompts; -migrate-state -force-copy is the non-interactive way to keep state.">
+<link rel="canonical" href="https://honestkit.github.io/guides/terraform-backend-configuration-changed/">
+<meta property="og:title" content="Terraform: Backend Configuration Changed — Fixed (Tested)">
+<meta property="og:description" content="We changed a Terraform backend path and measured the fix: -reconfigure alone still prompts; -migrate-state -force-copy is the non-interactive way to keep state.">
+<meta property="og:url" content="https://honestkit.github.io/guides/terraform-backend-configuration-changed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does 'Backend configuration changed' mean in Terraform?", "acceptedAnswer": {"@type": "Answer", "text": "The backend block in your .tf files (path, bucket, region, or any other backend-specific argument) no longer matches what Terraform initialized with last. We reproduced it by changing only a local backend's path attribute and running plan without reinitializing."}}, {"@type": "Question", "name": "Does terraform init -reconfigure skip the state-copy question?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured that it still prompts interactively if pre-existing state is found at the old location. It also isn't just a reset switch: pairing it with -input=false doesn't suppress the prompt, it hard-errors instead, telling you to remove that flag."}}, {"@type": "Question", "name": "What's the non-interactive way to change a backend in CI without losing state?", "acceptedAnswer": {"@type": "Answer", "text": "terraform init -migrate-state -force-copy \u2014 we confirmed this runs with no prompt and exit code 0, and that terraform state list afterward still shows the pre-existing resources, copied to the new backend location."}}, {"@type": "Question", "name": "Is there a way to discard old state and start completely fresh at the new backend?", "acceptedAnswer": {"@type": "Answer", "text": "Yes \u2014 we confirmed terraform init -reconfigure, answered 'no' at the interactive copy prompt, initializes the new backend with empty state and leaves the old backend's state file untouched on disk. There's no flag to do this non-interactively, by design, since it's a destructive choice."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Terraform: Backend configuration changed (tested)</h1>
+<p class="lead">Editing the <code>backend</code> block in your Terraform config &mdash; a new path, a new bucket, even a new region &mdash; without reinitializing gives this error on the next plan or apply. We changed a local backend's path attribute and measured exactly what each fix flag does to existing state.</p>
+<h2 id="repro">1. The exact error</h2>
+<p>We had state tracked under a local backend, then edited only the <code>path</code> in the backend block:</p>
+<pre><code>terraform {
+  backend "local" {
+    path = "other.tfstate"   # was "terraform.tfstate"
+  }
+}</code></pre>
+<p>Running <code>terraform plan</code> without reinitializing gave, verbatim:</p>
+<pre><code>Error: Backend initialization required, please run "terraform init"
+
+Reason: Backend configuration block has changed
+
+The "backend" is the interface that Terraform uses to store state,
+perform operations, etc. If this message is showing up, it means that the
+Terraform configuration you're using is using a custom configuration for
+the Terraform backend.
+
+Changes to backend configurations require reinitialization. This allows
+Terraform to set up the new configuration, copy existing state, etc. Please
+run "terraform init" with either the "-reconfigure" or "-migrate-state" flags to
+use the current configuration.</code></pre>
+
+<h2 id="reconfigure">2. -reconfigure still prompts if old state exists &mdash; it doesn't silently discard</h2>
+<p>We expected <code>-reconfigure</code> to just swap in the new config with no questions. It didn't: with pre-existing state found under the old path, it asked the same interactive question <code>-migrate-state</code> does:</p>
+<pre><code>$ terraform init -reconfigure
+Initializing the backend...
+Do you want to copy existing state to the new backend?
+  ...
+  Enter a value:</code></pre>
+<p>We also tried pairing it with <code>-input=false</code>, expecting that to suppress the prompt and proceed. Instead it hard-errors:</p>
+<pre><code>$ terraform init -reconfigure -input=false
+Error: Can't ask approval for state migration when interactive input is disabled.
+
+Please remove the "-input=false" option and try again.</code></pre>
+<p><strong>Why this matters for CI:</strong> if your pipeline runs <code>init</code> non-interactively and a teammate changed the backend path, <code>-reconfigure -input=false</code> is not a safe no-op &mdash; it fails the build rather than silently losing state, which is the right failure mode, but it means you can't just bolt `-input=false` onto everything and assume it's handled.</p>
+
+<h2 id="fix">3. The actual non-interactive fix: -migrate-state -force-copy</h2>
+<p>We confirmed the one combination that both avoids the prompt <em>and</em> preserves existing state:</p>
+<pre><code>terraform init -migrate-state -force-copy</code></pre>
+<p>This ran cleanly with exit code 0 and no prompt, and <code>terraform state list</code> afterward still showed the resource &mdash; the state was copied to the new backend location automatically. <code>-force-copy</code> is documented as "equivalent to answering yes to all confirmation prompts," and that's exactly what we measured: it's the only flag combination here that is both script-safe and state-preserving.</p>
+<p>If you genuinely want to abandon old state and start empty at the new location (rare, but sometimes correct for throwaway environments), <code>-reconfigure</code> answered interactively with "no" does that &mdash; just don't expect it to skip the question on its own.</p>
+
+<aside class="cta"><strong>Debugging infra that talks to an API? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does &#x27;Backend configuration changed&#x27; mean in Terraform?</summary><p>The backend block in your .tf files (path, bucket, region, or any other backend-specific argument) no longer matches what Terraform initialized with last. We reproduced it by changing only a local backend&#x27;s path attribute and running plan without reinitializing.</p></details>
+<details><summary>Does terraform init -reconfigure skip the state-copy question?</summary><p>No — we measured that it still prompts interactively if pre-existing state is found at the old location. It also isn&#x27;t just a reset switch: pairing it with -input=false doesn&#x27;t suppress the prompt, it hard-errors instead, telling you to remove that flag.</p></details>
+<details><summary>What&#x27;s the non-interactive way to change a backend in CI without losing state?</summary><p>terraform init -migrate-state -force-copy — we confirmed this runs with no prompt and exit code 0, and that terraform state list afterward still shows the pre-existing resources, copied to the new backend location.</p></details>
+<details><summary>Is there a way to discard old state and start completely fresh at the new backend?</summary><p>Yes — we confirmed terraform init -reconfigure, answered &#x27;no&#x27; at the interactive copy prompt, initializes the new backend with empty state and leaves the old backend&#x27;s state file untouched on disk. There&#x27;s no flag to do this non-interactively, by design, since it&#x27;s a destructive choice.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Terraform v1.16.5 on Linux, changing a local backend&#x27;s path attribute and re-running init with -reconfigure, -migrate-state and -force-copy in combination. Every message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Terraform is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hashlib: new() Is Case-Insensitive, Except for blake2b/blake2s</title>
+<meta name="description" content="We measured Python 3.13.5: hashlib.new(&#x27;SHA256&#x27;) and hashlib.new(&#x27;sha3-256&#x27;) work fine, but hashlib.new(&#x27;BLAKE2B&#x27;) raises unsupported hash type.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-hashlib-new-case-insensitive-except-blake2b-blake2s/">
+<meta property="og:title" content="hashlib: new() Is Case-Insensitive, Except for blake2b/blake2s">
+<meta property="og:description" content="We measured Python 3.13.5: hashlib.new(&#x27;SHA256&#x27;) and hashlib.new(&#x27;sha3-256&#x27;) work fine, but hashlib.new(&#x27;BLAKE2B&#x27;) raises unsupported hash type.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-hashlib-new-case-insensitive-except-blake2b-blake2s/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is hashlib.new() case-insensitive for all algorithm names in Python?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured hashlib.new() accepting SHA256, sha3-256, and SHA3-256 interchangeably with their lowercase/underscore forms, but hashlib.new('BLAKE2B') raised ValueError while hashlib.new('blake2b') worked fine."}}, {"@type": "Question", "name": "Why does hashlib.new('BLAKE2B') raise an error in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Because blake2b/blake2s are dispatched to their own dedicated constructors inside hashlib rather than going through OpenSSL's case-insensitive name lookup that backs algorithms like sha256 and sha3-256 -- we confirmed the exact-case match requirement by testing both forms directly."}}, {"@type": "Question", "name": "Does hashlib.new() accept both hyphens and underscores in algorithm names?", "acceptedAnswer": {"@type": "Answer", "text": "For OpenSSL-backed algorithms, yes -- we measured sha3-256, sha3_256, and SHA3-256 all resolving to the same algorithm object with hashlib.new(). This does not extend to blake2b/blake2s, which only match their exact lowercase name."}}, {"@type": "Question", "name": "How do I safely pass a hashlib algorithm name from user input or config?", "acceptedAnswer": {"@type": "Answer", "text": "Lowercase it before calling hashlib.new() -- we confirmed name.lower() works correctly for every algorithm we tested, including blake2b/blake2s, removing the case-sensitivity inconsistency entirely."}}, {"@type": "Question", "name": "Can I avoid hashlib.new()'s case-sensitivity inconsistency for blake2b?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- call hashlib.blake2b() directly instead of going through hashlib.new('blake2b') if you already know which algorithm you need; we confirmed both produce an identical hash object when the name case is correct."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>hashlib: new() Is Case-Insensitive, Except for blake2b/blake2s (tested)</h1>
+<p class="lead"><code>hashlib.new(name)</code> looks like it should treat an algorithm name the same regardless of case or whether you use a hyphen or underscore -- and for most algorithms, it does. We measured whether that leniency is universal, the kind of thing that matters if an algorithm name is read from a config file, environment variable, or API parameter rather than hardcoded.</p>
+<h2 id="repro1">1. Most algorithm names are case- and separator-insensitive</h2>
+<pre><code>import hashlib
+
+for name in ("sha256", "SHA256", "sha3-256", "SHA3-256", "sha3_256"):
+    h = hashlib.new(name, b"x")
+    print(name, "->", h.name)</code></pre>
+<pre><code>sha256 -> sha256
+SHA256 -> sha256
+sha3-256 -> sha3_256
+SHA3-256 -> sha3_256
+sha3_256 -> sha3_256</code></pre>
+<p><strong>Measured:</strong> <code>hashlib.new()</code> accepts <code>sha256</code>/<code>SHA256</code> and <code>sha3-256</code>/<code>SHA3-256</code>/<code>sha3_256</code> interchangeably, normalizing all of them to the same underlying algorithm. This leniency comes from OpenSSL's name lookup, which most of hashlib's named constructors are backed by.</p>
+
+<h2 id="repro2">2. blake2b/blake2s break that pattern -- they're case-sensitive</h2>
+<pre><code>import hashlib
+
+print(hashlib.new("blake2b", b"x").name)
+try:
+    hashlib.new("BLAKE2B", b"x")
+except Exception as e:
+    print("BLAKE2B ->", type(e).__name__, e)</code></pre>
+<pre><code>blake2b
+BLAKE2B -> ValueError: unsupported hash type BLAKE2B</code></pre>
+<p><strong>Measured:</strong> lowercase <code>blake2b</code> works fine, but uppercase <code>BLAKE2B</code> raises <code>ValueError: unsupported hash type</code>. Unlike the OpenSSL-backed algorithms, <code>blake2b</code>/<code>blake2s</code> have their own dedicated constructors in <code>hashlib</code> (<code>hashlib.blake2b</code>/<code>hashlib.blake2s</code>) and the generic <code>new()</code> dispatch for them does an exact string match rather than going through OpenSSL's case-insensitive name table. If an algorithm name arrives from outside your program -- a config value, an environment variable, a value copied from documentation that happens to use a different case -- most algorithms tolerate the mismatch silently, but blake2b/blake2s do not.</p>
+
+<h2 id="repro3">3. The fix: normalize to lowercase, or call the dedicated constructor directly</h2>
+<pre><code>import hashlib
+
+name = "BLAKE2B"
+h = hashlib.new(name.lower(), b"x")
+print(h.name)
+
+# or, if you know it's blake2, skip new() entirely:
+h2 = hashlib.blake2b(b"x")
+print(h2.name)</code></pre>
+<pre><code>blake2b
+blake2b</code></pre>
+<p><strong>Measured:</strong> lowercasing the name before calling <code>hashlib.new()</code> works for every algorithm including blake2b/blake2s, and is the safer default if the name comes from outside your code -- don't rely on <code>new()</code>'s case tolerance being universal just because it holds for the common SHA family.</p>
+<aside class="cta"><strong>Building a hashlib algorithm name from a config file or user input? Check blake2b/blake2s case first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is hashlib.new() case-insensitive for all algorithm names in Python?</summary><p>No -- we measured hashlib.new() accepting SHA256, sha3-256, and SHA3-256 interchangeably with their lowercase/underscore forms, but hashlib.new(&#x27;BLAKE2B&#x27;) raised ValueError while hashlib.new(&#x27;blake2b&#x27;) worked fine.</p></details>
+<details><summary>Why does hashlib.new(&#x27;BLAKE2B&#x27;) raise an error in Python?</summary><p>Because blake2b/blake2s are dispatched to their own dedicated constructors inside hashlib rather than going through OpenSSL&#x27;s case-insensitive name lookup that backs algorithms like sha256 and sha3-256 -- we confirmed the exact-case match requirement by testing both forms directly.</p></details>
+<details><summary>Does hashlib.new() accept both hyphens and underscores in algorithm names?</summary><p>For OpenSSL-backed algorithms, yes -- we measured sha3-256, sha3_256, and SHA3-256 all resolving to the same algorithm object with hashlib.new(). This does not extend to blake2b/blake2s, which only match their exact lowercase name.</p></details>
+<details><summary>How do I safely pass a hashlib algorithm name from user input or config?</summary><p>Lowercase it before calling hashlib.new() -- we confirmed name.lower() works correctly for every algorithm we tested, including blake2b/blake2s, removing the case-sensitivity inconsistency entirely.</p></details>
+<details><summary>Can I avoid hashlib.new()&#x27;s case-sensitivity inconsistency for blake2b?</summary><p>Yes -- call hashlib.blake2b() directly instead of going through hashlib.new(&#x27;blake2b&#x27;) if you already know which algorithm you need; we confirmed both produce an identical hash object when the name case is correct.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in hashlib module: called hashlib.new() with several algorithm names in varying case and with hyphens vs underscores (sha256, SHA256, sha3-256, SHA3-256, sha3_256) and compared against blake2b in both lowercase and uppercase. PlainHeaders is our extension; Python&#x27;s hashlib module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

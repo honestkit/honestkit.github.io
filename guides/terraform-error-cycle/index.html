@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terraform: &#x27;Error: Cycle&#x27; — Fixed (Tested)</title>
+<meta name="description" content="We made two Terraform resources reference each other and reproduced &#x27;Error: Cycle&#x27;, then measured the fix and that validate catches it too.">
+<link rel="canonical" href="https://honestkit.github.io/guides/terraform-error-cycle/">
+<meta property="og:title" content="Terraform: &#x27;Error: Cycle&#x27; — Fixed (Tested)">
+<meta property="og:description" content="We made two Terraform resources reference each other and reproduced &#x27;Error: Cycle&#x27;, then measured the fix and that validate catches it too.">
+<meta property="og:url" content="https://honestkit.github.io/guides/terraform-error-cycle/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does Terraform's 'Error: Cycle' mean?", "acceptedAnswer": {"@type": "Answer", "text": "Two or more resources (or data sources, or modules) reference each other's attributes, so Terraform's dependency graph has no valid order to create or update them in. We reproduced it directly with two local_file resources whose content attributes each pointed at the other."}}, {"@type": "Question", "name": "Does the error only ever show two resources?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 it lists every resource in the cycle. We tested a three-resource cycle (a depends on c, c on b, b on a) and the error listed all three node names, not just the first two it found."}}, {"@type": "Question", "name": "Can terraform plan or apply run anyway, ignoring the cycle?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we found no flag that bypasses this check. The only fix we confirmed working is removing the circular reference from the configuration itself, so at least one side no longer depends on the other."}}, {"@type": "Question", "name": "Do I need to run plan or apply to catch a dependency cycle?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we measured that terraform validate reports the identical 'Error: Cycle' message, without contacting any provider or touching real state, since a cycle is detectable purely from the reference graph in your .tf files. It's the fastest check to run in CI."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Terraform: Error: Cycle (tested)</h1>
+<p class="lead"><code>Error: Cycle</code> means two or more resources (or data sources/modules) reference each other's attributes, so Terraform can't find a valid order to create or update them in. We built a genuine two-resource cycle on Terraform v1.16.5 and measured the exact output and fix.</p>
+<h2 id="repro">1. The exact error, from a real circular reference</h2>
+<p>We defined two <code>local_file</code> resources whose <code>content</code> each read the other's <code>content</code>:</p>
+<pre><code>resource "local_file" "a" {
+  filename = "${path.module}/a.txt"
+  content  = local_file.b.content
+}
+
+resource "local_file" "b" {
+  filename = "${path.module}/b.txt"
+  content  = local_file.a.content
+}</code></pre>
+<p><code>terraform plan</code> gave, verbatim, with no other output before or after it:</p>
+<pre><code>Error: Cycle:
+  local_file.a
+  local_file.b</code></pre>
+<p><strong>Why:</strong> Terraform builds a dependency graph from every reference between resources, then walks it to decide create/update order. A cycle means there's no valid starting point &mdash; <code>a</code> needs <code>b</code>'s value to be known first, but <code>b</code> needs <code>a</code>'s, so neither can go first. Terraform refuses rather than guess at an order.</p>
+<p>We also tried a three-resource cycle (<code>a</code> &rarr; <code>c</code> &rarr; <code>b</code> &rarr; <code>a</code>); the error lists every node in the cycle, not just two:</p>
+<pre><code>Error: Cycle:
+  local_file.a
+  local_file.c
+  local_file.b</code></pre>
+
+<h2 id="validate">2. terraform validate catches it too, with zero provider calls</h2>
+<p>We confirmed <code>terraform validate</code> reports the identical error, before any plan or provider interaction:</p>
+<pre><code>$ terraform validate
+Error: Cycle:
+  local_file.a
+  local_file.b</code></pre>
+<p>This is because a dependency cycle is a property of the configuration's reference graph alone &mdash; Terraform can detect it from the <code>.tf</code> files themselves, without talking to any provider or touching real state. If you want the fastest possible check in CI, <code>terraform validate</code> finds this before a slower <code>plan</code> would.</p>
+
+<h2 id="fix">3. The fix: break the cycle</h2>
+<p>We confirmed the fix is to remove the circular reference &mdash; have at most one side depend on the other, with the rest coming from a literal, variable, or a third resource neither one is part of:</p>
+<pre><code>resource "local_file" "a" {
+  filename = "${path.module}/a.txt"
+  content  = "hello from a"
+}
+
+resource "local_file" "b" {
+  filename = "${path.module}/b.txt"
+  content  = local_file.a.content
+}</code></pre>
+<p>With the cycle broken, <code>terraform plan</code> ran cleanly and showed the normal <code>Plan: 2 to add, 0 to change, 0 to destroy.</code> summary. There's no flag or setting to allow a cycle through &mdash; it has to be removed from the configuration.</p>
+
+<aside class="cta"><strong>Debugging infra that talks to an API? Check the real headers and status it actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does Terraform&#x27;s &#x27;Error: Cycle&#x27; mean?</summary><p>Two or more resources (or data sources, or modules) reference each other&#x27;s attributes, so Terraform&#x27;s dependency graph has no valid order to create or update them in. We reproduced it directly with two local_file resources whose content attributes each pointed at the other.</p></details>
+<details><summary>Does the error only ever show two resources?</summary><p>No — it lists every resource in the cycle. We tested a three-resource cycle (a depends on c, c on b, b on a) and the error listed all three node names, not just the first two it found.</p></details>
+<details><summary>Can terraform plan or apply run anyway, ignoring the cycle?</summary><p>No — we found no flag that bypasses this check. The only fix we confirmed working is removing the circular reference from the configuration itself, so at least one side no longer depends on the other.</p></details>
+<details><summary>Do I need to run plan or apply to catch a dependency cycle?</summary><p>No — we measured that terraform validate reports the identical &#x27;Error: Cycle&#x27; message, without contacting any provider or touching real state, since a cycle is detectable purely from the reference graph in your .tf files. It&#x27;s the fastest check to run in CI.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with Terraform v1.16.5 on Linux, local backend, using hashicorp/local 2.5.1 resources whose content attributes reference each other. Every message below is copy-pasted output, not paraphrased. PlainHeaders is our extension; Terraform is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

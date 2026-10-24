@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>array.frombytes() Silently Skips array&#x27;s Overflow Check</title>
+<meta name="description" content="We measured Python 3.13.5: append()/extend()/fromlist() raise OverflowError on out-of-range ints, but frombytes() silently wraps the value instead.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-array-frombytes-skips-overflow-validation/">
+<meta property="og:title" content="array.frombytes() Silently Skips array&#x27;s Overflow Check">
+<meta property="og:description" content="We measured Python 3.13.5: append()/extend()/fromlist() raise OverflowError on out-of-range ints, but frombytes() silently wraps the value instead.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-array-frombytes-skips-overflow-validation/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does array.array validate integer ranges the same way for every method?", "acceptedAnswer": {"@type": "Answer", "text": "No -- we measured append(), extend(), fromlist(), and the list-based constructor all raising OverflowError on an out-of-range int like 200 for a signed-byte ('b') array, while frombytes() and the bytes-based constructor accepted the same value with no error at all."}}, {"@type": "Question", "name": "What happens when you load an out-of-range byte value with array.frombytes()?", "acceptedAnswer": {"@type": "Answer", "text": "It's silently reinterpreted via two's-complement wraparound, not rejected -- we measured byte value 200 becoming -56 once loaded into a signed-byte ('b') array through frombytes(), with no exception raised."}}, {"@type": "Question", "name": "Why does array.array('b', bytes([200])) not raise OverflowError like array.array('b', [200]) does?", "acceptedAnswer": {"@type": "Answer", "text": "Because the bytes constructor and frombytes() just reinterpret raw bytes according to the type code's binary layout -- there's no Python int being range-checked, so the normal OverflowError path never runs. We measured both forms taking 200 silently, one via two's-complement decoding."}}, {"@type": "Question", "name": "Is it safe to use array.frombytes() on untrusted binary data?", "acceptedAnswer": {"@type": "Answer", "text": "Not for catching out-of-range values -- we measured it accepting any byte pattern without validation, unlike append()/extend()/fromlist(), which reject values that don't fit the array's type code. Validate the source or type code choice separately if that matters."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>array: frombytes() Skips the Overflow Validation Every Other Entry Point Enforces (tested)</h1>
+<p class="lead"><code>array.array('b', ...)</code> is supposed to only ever hold values that fit the type code's range -- for <code>'b'</code> (signed byte) that's -128 to 127. We measured whether that guarantee actually holds across every way you can put data into an array, including the byte-oriented ones.</p>
+<h2 id="repro1">1. Every integer-based entry point rejects an out-of-range value</h2>
+<pre><code>import array
+
+a = array.array('b')  # signed byte: -128..127
+
+try:
+    a.append(200)
+except OverflowError as e:
+    print("append:", e)
+
+try:
+    a.extend([200])
+except OverflowError as e:
+    print("extend:", e)
+
+try:
+    a.fromlist([200])
+except OverflowError as e:
+    print("fromlist:", e)
+
+try:
+    array.array('b', [200])
+except OverflowError as e:
+    print("constructor from list:", e)</code></pre>
+<pre><code>append: signed char is greater than maximum
+extend: signed char is greater than maximum
+fromlist: signed char is greater than maximum
+constructor from list: signed char is greater than maximum</code></pre>
+<p><strong>Measured:</strong> all four ways of handing <code>array</code> a Python <code>int</code> -- <code>append()</code>, <code>extend()</code>, <code>fromlist()</code>, and building the array directly from a list -- raise the same <code>OverflowError</code> the moment a value is outside the type code's range. 200 doesn't fit in a signed byte, and none of these let it through.</p>
+
+<h2 id="repro2">2. frombytes() and the bytes constructor take the same 200 with no error</h2>
+<pre><code>import array
+
+b = array.array('b', bytes([200]))
+print(b, b[0])
+
+c = array.array('b', [1, 2, 3])
+c.frombytes(bytes([200]))
+print(c)</code></pre>
+<pre><code>array('b', [-56]) -56
+array('b', [1, 2, 3, -56])</code></pre>
+<p><strong>Measured:</strong> both the bytes constructor and the <code>frombytes()</code> method accept the same byte value <code>200</code> with no exception at all. There's no range check here because there's nothing to check against -- a raw byte is just reinterpreted as whatever the type code says, so <code>200</code> (which doesn't fit as a non-negative signed byte) silently becomes its two's-complement equivalent, <code>-56</code>.</p>
+
+<h2 id="repro3">3. The same raw byte means a different value depending on the type code -- also with no warning</h2>
+<pre><code>import array
+
+signed = array.array('b', bytes([200]))
+unsigned = array.array('B', bytes([200]))
+
+print("signed 'b':  ", signed[0])
+print("unsigned 'B':", unsigned[0])</code></pre>
+<pre><code>signed 'b':   -56
+unsigned 'B': 200</code></pre>
+<p><strong>Measured:</strong> the exact same input byte, <code>200</code>, decodes to <code>-56</code> under the signed type code and <code>200</code> under the unsigned one -- both calls succeed, neither raises, and nothing signals that the interpretation depends entirely on which type code you picked. If you load untrusted or corrupted binary data with <code>frombytes()</code> expecting the same safety net <code>append()</code> gives you, there isn't one: bad data just becomes a different, silently wrong number.</p>
+<aside class="cta"><strong>Loading an array.array from raw bytes (frombytes, or the bytes constructor) instead of a list of ints? Check the values first -- range validation doesn&#x27;t apply:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does array.array validate integer ranges the same way for every method?</summary><p>No -- we measured append(), extend(), fromlist(), and the list-based constructor all raising OverflowError on an out-of-range int like 200 for a signed-byte (&#x27;b&#x27;) array, while frombytes() and the bytes-based constructor accepted the same value with no error at all.</p></details>
+<details><summary>What happens when you load an out-of-range byte value with array.frombytes()?</summary><p>It&#x27;s silently reinterpreted via two&#x27;s-complement wraparound, not rejected -- we measured byte value 200 becoming -56 once loaded into a signed-byte (&#x27;b&#x27;) array through frombytes(), with no exception raised.</p></details>
+<details><summary>Why does array.array(&#x27;b&#x27;, bytes([200])) not raise OverflowError like array.array(&#x27;b&#x27;, [200]) does?</summary><p>Because the bytes constructor and frombytes() just reinterpret raw bytes according to the type code&#x27;s binary layout -- there&#x27;s no Python int being range-checked, so the normal OverflowError path never runs. We measured both forms taking 200 silently, one via two&#x27;s-complement decoding.</p></details>
+<details><summary>Is it safe to use array.frombytes() on untrusted binary data?</summary><p>Not for catching out-of-range values -- we measured it accepting any byte pattern without validation, unlike append()/extend()/fromlist(), which reject values that don&#x27;t fit the array&#x27;s type code. Validate the source or type code choice separately if that matters.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in array module: compared range validation across append(), extend(), fromlist(), the iterable constructor, frombytes(), and the bytes constructor on a signed-byte (&#x27;b&#x27;) array. PlainHeaders is our extension; Python&#x27;s array module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

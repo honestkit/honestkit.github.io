@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python pathlib mkdir Exceptions: parents, exist_ok, Tested</title>
+<meta name="description" content="We measured pathlib mkdir errors: FileNotFoundError without parents, FileExistsError even with exist_ok when a file has the name, NotADirectoryError.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-pathlib-mkdir-exceptions-parents-exist-ok/">
+<meta property="og:title" content="Python pathlib mkdir Exceptions: parents, exist_ok, Tested">
+<meta property="og:description" content="We measured pathlib mkdir errors: FileNotFoundError without parents, FileExistsError even with exist_ok when a file has the name, NotADirectoryError.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-pathlib-mkdir-exceptions-parents-exist-ok/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does pathlib mkdir raise FileNotFoundError?", "acceptedAnswer": {"@type": "Answer", "text": "A parent directory is missing. We measured Path('out/2026/10/report').mkdir() failing on Python 3.13.5 and succeeding with parents=True."}}, {"@type": "Question", "name": "Why does mkdir(exist_ok=True) still raise FileExistsError?", "acceptedAnswer": {"@type": "Answer", "text": "A regular file has that name; exist_ok only ignores an existing directory. We measured it raising even with parents=True."}}, {"@type": "Question", "name": "What does mkdir(parents=True, exist_ok=True) do?", "acceptedAnswer": {"@type": "Answer", "text": "Creates the directory and any missing parents, and does nothing if it already exists as a directory, like mkdir -p. We measured it succeeding on a second run."}}, {"@type": "Question", "name": "Why does mkdir raise NotADirectoryError?", "acceptedAnswer": {"@type": "Answer", "text": "A file sits where a parent directory should be. We measured Path('data.txt/sub').mkdir(parents=True, exist_ok=True) raising errno 20."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Python pathlib mkdir exceptions (tested)</h1>
+<p class="lead"><code>Path.mkdir()</code> can raise four different exceptions, and <code>exist_ok=True</code> doesn't silence all of them. We measured each one on Python 3.13.5.</p>
+<h2 id="flags">1. parents and exist_ok</h2>
+<pre><code>from pathlib import Path
+import shutil
+shutil.rmtree(&quot;out&quot;, ignore_errors=True)
+p = Path(&quot;out/2026/10/report&quot;)
+for kwargs in [{}, {&quot;parents&quot;: True}, {&quot;parents&quot;: True}, {&quot;parents&quot;: True, &quot;exist_ok&quot;: True}]:
+    try:
+        p.mkdir(**kwargs)
+        print(f&quot;mkdir({kwargs}) -&gt; created&quot;)
+    except OSError as e:
+        print(f&quot;mkdir({kwargs}) -&gt; {type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>mkdir({}) -&gt; FileNotFoundError: [Errno 2] No such file or directory: &#x27;out/2026/10/report&#x27;
+mkdir({&#x27;parents&#x27;: True}) -&gt; created
+mkdir({&#x27;parents&#x27;: True}) -&gt; FileExistsError: [Errno 17] File exists: &#x27;out/2026/10/report&#x27;
+mkdir({&#x27;parents&#x27;: True, &#x27;exist_ok&#x27;: True}) -&gt; created</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> without <code>parents=True</code>, a missing parent directory is a <code>FileNotFoundError</code> naming the full path, even though only the parents are missing. Without <code>exist_ok=True</code>, running the script a second time is a <code>FileExistsError</code>. <code>mkdir(parents=True, exist_ok=True)</code> is the "make sure it exists" call, like <code>mkdir -p</code>.</p>
+
+<h2 id="file">2. exist_ok=True doesn't cover an existing file</h2>
+<pre><code>from pathlib import Path
+Path(&quot;data.txt&quot;).write_text(&quot;x&quot;)
+for kwargs in [{&quot;exist_ok&quot;: True}, {&quot;parents&quot;: True, &quot;exist_ok&quot;: True}]:
+    try:
+        Path(&quot;data.txt&quot;).mkdir(**kwargs)
+    except OSError as e:
+        print(f&quot;existing FILE, mkdir({kwargs}) -&gt; {type(e).__name__}: {e}&quot;)
+try:
+    Path(&quot;data.txt/sub&quot;).mkdir(parents=True, exist_ok=True)
+except OSError as e:
+    print(f&quot;file in the parent path -&gt; {type(e).__name__}: {e}&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>existing FILE, mkdir({&#x27;exist_ok&#x27;: True}) -&gt; FileExistsError: [Errno 17] File exists: &#x27;data.txt&#x27;
+existing FILE, mkdir({&#x27;parents&#x27;: True, &#x27;exist_ok&#x27;: True}) -&gt; FileExistsError: [Errno 17] File exists: &#x27;data.txt&#x27;
+file in the parent path -&gt; NotADirectoryError: [Errno 20] Not a directory: &#x27;data.txt/sub&#x27;</code></pre>
+<p><strong>Measured:</strong> <code>exist_ok</code> only ignores an existing <em>directory</em>. If a regular file has that name, you still get <code>FileExistsError</code>, and a file somewhere in the parent path gives <code>NotADirectoryError</code>. Look for a file (often an empty one created by an earlier bug) with the directory's name. More in our <a href="/guides/python-fileexistserror-errno-17-file-exists/">FileExistsError guide</a>.</p>
+
+<h2 id="permission">3. No write permission on the parent</h2>
+<pre><code>import os
+from pathlib import Path
+Path(&quot;locked&quot;).mkdir(exist_ok=True)
+os.chmod(&quot;locked&quot;, 0o555)                     # read-only directory
+try:
+    Path(&quot;locked/new&quot;).mkdir(exist_ok=True)
+except OSError as e:
+    print(f&quot;{type(e).__name__}: {e}&quot;)
+finally:
+    os.chmod(&quot;locked&quot;, 0o755)</code></pre>
+<p>Output:</p>
+<pre><code>PermissionError: [Errno 13] Permission denied: &#x27;locked/new&#x27;</code></pre>
+<p><strong>Measured:</strong> creating a directory needs write permission on its parent; <code>exist_ok</code> doesn't change that. Create it somewhere you own, or fix the parent's permissions. (This test ran as a normal user; root ignores the mode.)</p>
+
+<aside class="cta"><strong>Saving downloads into new folders? Check the file headers the server sends first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does pathlib mkdir raise FileNotFoundError?</summary><p>A parent directory is missing. We measured Path(&#x27;out/2026/10/report&#x27;).mkdir() failing on Python 3.13.5 and succeeding with parents=True.</p></details>
+<details><summary>Why does mkdir(exist_ok=True) still raise FileExistsError?</summary><p>A regular file has that name; exist_ok only ignores an existing directory. We measured it raising even with parents=True.</p></details>
+<details><summary>What does mkdir(parents=True, exist_ok=True) do?</summary><p>Creates the directory and any missing parents, and does nothing if it already exists as a directory, like mkdir -p. We measured it succeeding on a second run.</p></details>
+<details><summary>Why does mkdir raise NotADirectoryError?</summary><p>A file sits where a parent directory should be. We measured Path(&#x27;data.txt/sub&#x27;).mkdir(parents=True, exist_ok=True) raising errno 20.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux as a normal user: Path.mkdir with each parents/exist_ok combination, over an existing file and through a file in the path, and in a 0o555 directory. Every block was run verbatim and its output pasted from that run. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

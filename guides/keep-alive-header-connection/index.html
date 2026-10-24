@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connection: keep-alive and Keep-Alive Header: Timeouts, Reuse (Tested)</title>
+<meta name="description" content="Node.js 24 sends Keep-Alive: timeout=5 but closed idle sockets at 6.0 s. requests.get opened 5 connections for 5 calls; a Session opened 1. A keep-alive pool that outlived the server&#x27;s timeout threw ECONNRESET, reproduced here.">
+<link rel="canonical" href="https://honestkit.github.io/guides/keep-alive-header-connection/">
+<meta property="og:title" content="Connection: keep-alive and Keep-Alive Header: Timeouts, Reuse (Tested)">
+<meta property="og:description" content="Node.js 24 sends Keep-Alive: timeout=5 but closed idle sockets at 6.0 s. requests.get opened 5 connections for 5 calls; a Session opened 1. A keep-alive pool that outlived the server&#x27;s timeout threw ECONNRESET, reproduced here.">
+<meta property="og:url" content="https://honestkit.github.io/guides/keep-alive-header-connection/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Do I need to send Connection: keep-alive in HTTP/1.1?", "acceptedAnswer": {"@type": "Answer", "text": "No. HTTP/1.1 connections are persistent by default. curl 8.14.1 sends no Connection header and still reused one connection for 5 URLs in one command. The header mainly matters for HTTP/1.0, where Node.js 24 answered with Connection: close."}}, {"@type": "Question", "name": "What does Keep-Alive: timeout=5 mean?", "acceptedAnswer": {"@type": "Answer", "text": "It is the server's hint that it will close an idle connection after about 5 seconds. Node.js 24.21.0 sends it from server.keepAliveTimeout (5000 ms by default) but actually closed the idle socket after 6,007 ms because of its 1 s keepAliveTimeoutBuffer."}}, {"@type": "Question", "name": "Why does requests.get not reuse connections?", "acceptedAnswer": {"@type": "Answer", "text": "Each requests.get() call creates and closes its own session. Five calls opened 5 TCP connections in our test; five calls on one requests.Session() opened 1."}}, {"@type": "Question", "name": "Why do I get ECONNRESET or socket hang up on keep-alive connections?", "acceptedAnswer": {"@type": "Answer", "text": "The client reused a pooled socket at the moment the server was closing it. We reproduced it with a Node.js keep-alive agent and a 2 s server timeout: waits of 1,998 to 2,000 ms gave ECONNRESET. Make the client's idle timeout shorter than the server's, for example http.Agent({ keepAlive: true, timeout: 30000 }), or raise server.keepAliveTimeout above your load balancer's idle timeout."}}, {"@type": "Question", "name": "Can I use Connection: keep-alive with HTTP/2?", "acceptedAnswer": {"@type": "Answer", "text": "No. RFC 9113 forbids connection-specific headers. Node.js 24 http2 threw ERR_HTTP2_INVALID_CONNECTION_HEADERS when we set connection or keep-alive, and curl did not send them over HTTP/2."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Connection: keep-alive and the Keep-Alive header (tested)</h1>
+<p class="lead">In HTTP/1.1 every connection is persistent by default: after a response, the TCP socket stays open for the next request unless one side sends <code>Connection: close</code>. <code>Connection: keep-alive</code> mostly matters for HTTP/1.0. <code>Keep-Alive: timeout=5</code> is only a hint about how long the server will keep an idle socket. We measured what Node.js, curl and Python actually send, how many connections they open, when an idle socket really closes, and how to reproduce the ECONNRESET you get when a client reuses a socket the server is closing.</p>
+<h2>1. What Node.js sends by default</h2>
+<p>A plain <code>http.createServer((req, res) =&gt; res.end('ok\n'))</code> on Node.js 24.21.0, requested with curl:</p>
+<pre><code>HTTP/1.1 200 OK
+Date: Fri, 02 Oct 2026 02:07:38 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+Content-Length: 3</code></pre>
+<p>When the request had <code>Connection: close</code> (<code>curl -H "Connection: close"</code>) or was HTTP/1.0 (<code>curl --http1.0</code>), the response said <code>Connection: close</code>, had no <code>Keep-Alive</code> header, and the server closed the socket right after it. The server's defaults, read from the server object:</p>
+<table><thead><tr><th>Property</th><th>Default in Node.js 24.21.0</th></tr></thead><tbody>
+<tr><td><code>server.keepAliveTimeout</code></td><td>5000 ms</td></tr>
+<tr><td><code>server.keepAliveTimeoutBuffer</code></td><td>1000 ms</td></tr>
+<tr><td><code>server.headersTimeout</code></td><td>60000 ms</td></tr>
+<tr><td><code>server.requestTimeout</code></td><td>300000 ms</td></tr>
+<tr><td><code>server.timeout</code></td><td>0 (off)</td></tr>
+<tr><td><code>server.maxRequestsPerSocket</code></td><td>0 (unlimited)</td></tr>
+</tbody></table>
+<h2>2. When an idle socket really closes</h2>
+<p>We sent one request over a raw TCP socket, then timed how long it took the server to close the idle connection:</p>
+<table><thead><tr><th><code>keepAliveTimeout</code></th><th>Header sent</th><th>Server closed the idle socket after</th></tr></thead><tbody>
+<tr><td>5000 (default)</td><td><code>Keep-Alive: timeout=5</code></td><td>6,007 ms</td></tr>
+<tr><td>2000</td><td><code>Keep-Alive: timeout=2</code></td><td>3,005 ms</td></tr>
+<tr><td>500</td><td><code>Keep-Alive: timeout=0</code></td><td>not timed (clients never reused it, see section 4)</td></tr>
+<tr><td>0</td><td>no <code>Keep-Alive</code> header, still <code>Connection: keep-alive</code></td><td>never: still open after 12 s</td></tr>
+</tbody></table>
+<p>Node.js advertises <code>keepAliveTimeout</code> but waits an extra <code>keepAliveTimeoutBuffer</code> (1 s) before it closes. That gives clients a margin. Two traps: a value under 1000 ms is rounded down to <code>timeout=0</code> in the header, and <code>keepAliveTimeout = 0</code> turns idle closing off entirely.</p>
+<p><code>headersTimeout</code> is a different thing. It limits how long a client can take to send the request headers. With <code>http.createServer({ headersTimeout: 3000, connectionsCheckingInterval: 500 })</code>, a client that sent half a request got <code>HTTP/1.1 408 Request Timeout</code> after 3,008 ms. With the defaults (60 s, checked every 30 s by default), a half-sent request was still open after 8 s, as expected. For limits on header size, see <a href="/guides/http-header-size-limit/">HTTP header size limits</a>.</p>
+<h2>3. Which clients reuse connections</h2>
+<p>Each client made 5 sequential requests to the same Node.js server. We counted new TCP connections with <code>server.on('connection')</code>:</p>
+<table><thead><tr><th>Client</th><th>Sends <code>Connection:</code></th><th>Connections for 5 requests</th></tr></thead><tbody>
+<tr><td>curl 8.14.1, 5 URLs in one command (<code>http://host/[1-5]</code>)</td><td>(none)</td><td><strong>1</strong></td></tr>
+<tr><td>curl 8.14.1, 5 separate commands</td><td>(none)</td><td>5</td></tr>
+<tr><td>curl with <code>-H "Connection: close"</code>, 2 URLs</td><td>close</td><td>2 (one per URL)</td></tr>
+<tr><td>Node.js <code>fetch()</code></td><td>keep-alive</td><td>2 (requests alternated between the two)</td></tr>
+<tr><td>Node.js <code>http.get</code> (global agent)</td><td>keep-alive</td><td><strong>1</strong></td></tr>
+<tr><td>Node.js <code>new http.Agent()</code></td><td>close</td><td>5</td></tr>
+<tr><td>Node.js <code>new http.Agent({ keepAlive: true })</code></td><td>keep-alive</td><td><strong>1</strong></td></tr>
+<tr><td>Node.js <code>agent: false</code></td><td>close</td><td>5</td></tr>
+<tr><td>Python <code>requests.get()</code> x5</td><td>keep-alive</td><td>5</td></tr>
+<tr><td>Python <code>requests.Session().get()</code> x5</td><td>keep-alive</td><td><strong>1</strong></td></tr>
+<tr><td>Python <code>urllib.request.urlopen</code></td><td>close</td><td>5</td></tr>
+</tbody></table>
+<p>What this means:</p>
+<ul>
+<li>Reuse lives inside one process and one connection pool. Five curl commands always open five connections, whatever the headers say. <code>curl -v</code> prints <code>Re-using existing http: connection with host 127.0.0.1</code> for the second and later URLs in one command.</li>
+<li><code>requests.get()</code> sends <code>Connection: keep-alive</code> but creates and discards a new pool on every call, so nothing is reused. Use a <code>requests.Session()</code>.</li>
+<li>In Node.js 24, <code>http.globalAgent.keepAlive</code> is <code>true</code> (options: <code>keepAlive: true, scheduling: 'lifo', timeout: 5000</code>). A <code>new http.Agent()</code> you create yourself still defaults to <code>keepAlive: false</code>.</li>
+<li><code>fetch()</code> back-to-back opened a second socket because the first was not yet back in the pool. With 50 ms between requests, 4 of 5 used the same socket.</li>
+</ul>
+<h2>4. How long each client keeps an idle socket</h2>
+<p>We sent a request, waited, then sent another, against the default Node.js server (<code>Keep-Alive: timeout=5</code>, real close at 6 s) unless noted:</p>
+<table><thead><tr><th>Client</th><th>Reused after</th><th>New connection after</th></tr></thead><tbody>
+<tr><td><code>fetch()</code></td><td>2.9 s</td><td>3.1 s (hint minus about 2 s)</td></tr>
+<tr><td><code>http.globalAgent</code> (has <code>timeout: 5000</code>), tested against a <code>timeout=2</code> server</td><td>0.9 s</td><td>1.1 s (hint minus 1 s)</td></tr>
+<tr><td><code>new http.Agent({ keepAlive: true })</code>, no <code>timeout</code></td><td>5.9 s</td><td>6.1 s (only after the server closed it)</td></tr>
+<tr><td><code>new http.Agent({ keepAlive: true, timeout: 30000 })</code></td><td>3.9 s</td><td>4.1 s</td></tr>
+</tbody></table>
+<p>So <code>fetch</code> and agents with a <code>timeout</code> read the <code>Keep-Alive: timeout=N</code> hint and drop the socket early. A keep-alive agent <strong>without</strong> <code>timeout</code> ignored the hint and kept the socket until the server's FIN arrived. Against a server sending <code>timeout=0</code>, <code>fetch</code> and the keep-alive agent opened a new connection for every request, even 100 ms apart.</p>
+<h2>5. Reproducing the ECONNRESET race</h2>
+<p>This is the classic keep-alive bug: the client sends a request on a pooled socket at the same moment the server closes it. The server resets the connection and the client gets <code>ECONNRESET</code> or "socket hang up". We set the server to <code>keepAliveTimeout = 2000</code> and <code>keepAliveTimeoutBuffer = 0</code>, used <code>new http.Agent({ keepAlive: true })</code>, and waited 1,985 to 2,015 ms (1 ms steps) between two requests:</p>
+<table><thead><tr><th>Wait</th><th>Result</th></tr></thead><tbody>
+<tr><td>1,985 to 1,997 ms</td><td>reused (13 of 13)</td></tr>
+<tr><td>1,998 to 2,000 ms</td><td><strong>ECONNRESET</strong> (3 of 3)</td></tr>
+<tr><td>2,001 to 2,015 ms</td><td>new connection (15 of 15)</td></tr>
+</tbody></table>
+<p>With the default 1 s buffer the window just moved to 2,997 to 3,001 ms (5 resets in 31 tries). The buffer only helps clients that read the hint, and this agent did not. The same sweep with <code>new http.Agent({ keepAlive: true, timeout: 1500 })</code> gave 21 of 21 new connections and no errors. Rare in a test, but at thousands of requests per second with the right idle gaps, it shows up as occasional 502s or resets.</p>
+<p>The fix is always the same: <strong>the client must give up an idle socket before the server does.</strong></p>
+<ul>
+<li>Node.js clients: give custom agents a <code>timeout</code>, for example <code>new http.Agent({ keepAlive: true, timeout: 30000 })</code>. Measured above: it then follows the server's hint.</li>
+<li>Node.js behind a load balancer or proxy: the proxy is the client. Set <code>server.keepAliveTimeout</code> longer than the proxy's idle timeout. From the docs, not measured: the AWS Application Load Balancer idle timeout defaults to 60 s, so a common setting is <code>server.keepAliveTimeout = 65000</code>. Older advice is to set <code>headersTimeout</code> above <code>keepAliveTimeout</code> too.</li>
+<li>From the docs, not measured: nginx <code>keepalive_timeout</code> defaults to 75 s for clients. For upstream keep-alive, nginx needs <code>keepalive</code> in the <code>upstream</code> block, <code>proxy_http_version 1.1;</code> and <code>proxy_set_header Connection "";</code>, and its <code>keepalive_timeout</code> there (default 60 s) should be shorter than your app's.</li>
+<li>Retry idempotent requests (GET, PUT, DELETE) once on <code>ECONNRESET</code>.</li>
+</ul>
+<h2>6. HTTP/2 and HTTP/3 forbid these headers</h2>
+<p>RFC 9113 says HTTP/2 must not use connection-specific headers (<code>Connection</code>, <code>Keep-Alive</code>, <code>Transfer-Encoding</code>, <code>Upgrade</code>, <code>Proxy-Connection</code>). One connection carries many streams, so there is nothing to keep alive per request. In Node.js 24.21.0 <code>http2</code>:</p>
+<ul>
+<li><code>stream.respond({ ':status': 200, connection: 'keep-alive' })</code> threw <code>ERR_HTTP2_INVALID_CONNECTION_HEADERS</code>: <code>HTTP/1 Connection specific headers are forbidden: "connection"</code>. The same happened with <code>keep-alive</code> and on the client side with <code>session.request()</code>.</li>
+<li>The compatibility API <code>res.setHeader('Connection', 'keep-alive')</code> did not throw. It printed <code>UnsupportedWarning: The provided connection header is not valid, the value will be dropped</code>, and the response had no such header.</li>
+<li><code>curl --http2-prior-knowledge -H "Connection: keep-alive"</code> still shows the header in the <code>-v</code> output, but it is not in the HTTP/2 frames curl logs, and the server did not receive it.</li>
+</ul>
+<p>If a tool shows <code>Connection: keep-alive</code> on an HTTP/2 response, it is showing HTTP/1.1 headers or making them up. Related: <a href="/guides/transfer-encoding-chunked-vs-content-length/">Transfer-Encoding: chunked vs Content-Length</a>, which is also gone in HTTP/2.</p>
+<h2>7. Checklist</h2>
+<ol>
+<li>Check the response: <code>curl -sI http://host/</code> shows <code>Connection</code> and <code>Keep-Alive</code>. <code>curl -v url1 url2</code> shows whether the second request said <code>Re-using existing</code>.</li>
+<li>In Python use a <code>requests.Session()</code>. In Node.js use the global agent, <code>fetch</code>, or an agent with <code>keepAlive: true</code> and a <code>timeout</code>.</li>
+<li>Make every client idle timeout shorter than the server's: browser and app to load balancer, load balancer to app.</li>
+<li>Leave the Node.js <code>keepAliveTimeout</code> above 1000 ms so the header is not <code>timeout=0</code>, and never 0 on a public server.</li>
+<li>Do not set <code>Connection</code> or <code>Keep-Alive</code> on HTTP/2 responses.</li>
+</ol>
+<aside class="cta"><strong>See the Connection and Keep-Alive headers your server actually returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Do I need to send Connection: keep-alive in HTTP/1.1?</summary><p>No. HTTP/1.1 connections are persistent by default. curl 8.14.1 sends no Connection header and still reused one connection for 5 URLs in one command. The header mainly matters for HTTP/1.0, where Node.js 24 answered with Connection: close.</p></details>
+<details><summary>What does Keep-Alive: timeout=5 mean?</summary><p>It is the server&#x27;s hint that it will close an idle connection after about 5 seconds. Node.js 24.21.0 sends it from server.keepAliveTimeout (5000 ms by default) but actually closed the idle socket after 6,007 ms because of its 1 s keepAliveTimeoutBuffer.</p></details>
+<details><summary>Why does requests.get not reuse connections?</summary><p>Each requests.get() call creates and closes its own session. Five calls opened 5 TCP connections in our test; five calls on one requests.Session() opened 1.</p></details>
+<details><summary>Why do I get ECONNRESET or socket hang up on keep-alive connections?</summary><p>The client reused a pooled socket at the moment the server was closing it. We reproduced it with a Node.js keep-alive agent and a 2 s server timeout: waits of 1,998 to 2,000 ms gave ECONNRESET. Make the client&#x27;s idle timeout shorter than the server&#x27;s, for example http.Agent({ keepAlive: true, timeout: 30000 }), or raise server.keepAliveTimeout above your load balancer&#x27;s idle timeout.</p></details>
+<details><summary>Can I use Connection: keep-alive with HTTP/2?</summary><p>No. RFC 9113 forbids connection-specific headers. Node.js 24 http2 threw ERR_HTTP2_INVALID_CONNECTION_HEADERS when we set connection or keep-alive, and curl did not send them over HTTP/2.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0 (http.createServer and http2 on localhost:8987-8988, built-in fetch, http.Agent), curl 8.14.1, Python 3.13.5 with requests 2.32.3 and urllib. We counted connections with the server&#x27;s &#x27;connection&#x27; event and timed idle closes with a raw TCP client. nginx and cloud load balancer timeouts are quoted from their documentation, not measured. PlainHeaders is our extension; Node.js, curl and Python are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

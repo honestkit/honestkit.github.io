@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ModuleNotFoundError: No module named &#x27;distutils&#x27; (Fix)</title>
+<meta name="description" content="No module named &#x27;distutils&#x27;: it was removed in Python 3.12. Tested on 3.11, 3.13 and 3.14: the setuptools shim, and what to replace each call with.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-modulenotfounderror-no-module-named-distutils/">
+<meta property="og:title" content="ModuleNotFoundError: No module named &#x27;distutils&#x27; (Fix)">
+<meta property="og:description" content="No module named &#x27;distutils&#x27;: it was removed in Python 3.12. Tested on 3.11, 3.13 and 3.14: the setuptools shim, and what to replace each call with.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-modulenotfounderror-no-module-named-distutils/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why is there no module named distutils?", "acceptedAnswer": {"@type": "Answer", "text": "distutils was removed from the standard library in Python 3.12 (PEP 632). It still exists on 3.11 and older."}}, {"@type": "Question", "name": "How do I fix No module named distutils?", "acceptedAnswer": {"@type": "Answer", "text": "pip install setuptools: it provides a distutils shim. Long term, replace LooseVersion with packaging.version.Version and find_executable with shutil.which."}}, {"@type": "Question", "name": "Can I pip install distutils?", "acceptedAnswer": {"@type": "Answer", "text": "Do not look for a distutils package on PyPI. On 3.12+, installing setuptools is the supported way to get the distutils module back."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ModuleNotFoundError: No module named &#x27;distutils&#x27; (tested fix)</h1>
+<p class="lead"><code>ModuleNotFoundError: No module named 'distutils'</code> means the code (or a package pip is building) runs on Python 3.12 or newer, where <code>distutils</code> no longer exists. We ran the import and both fixes on 3.11, 3.13 and 3.14.</p>
+<h2 id="cause">1. Cause: distutils was removed in Python 3.12</h2>
+<pre><code>import sys
+print(sys.version.split()[0])
+try:
+    from distutils.version import LooseVersion
+    print(&quot;distutils OK:&quot;, LooseVersion(&quot;1.10&quot;) &gt; LooseVersion(&quot;1.9&quot;))
+except ModuleNotFoundError as e:
+    print(f&quot;ModuleNotFoundError: {e}&quot;)</code></pre>
+<p>Output on Python 3.13.5 (python:3-alpine with 3.14.7 says the same):</p>
+<pre><code>3.13.5
+ModuleNotFoundError: No module named &#x27;distutils&#x27;</code></pre>
+<p>Output on the official python:3.11-alpine image:</p>
+<pre><code>/w/b1.py:5: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+  print(&quot;distutils OK:&quot;, LooseVersion(&quot;1.10&quot;) &gt; LooseVersion(&quot;1.9&quot;))
+3.11.17
+distutils OK: True</code></pre>
+<p><code>distutils</code> was deprecated by PEP 632 and deleted from the standard library in Python 3.12. Code that imports it, or an old package whose <code>setup.py</code> imports it while pip builds it from source, works on 3.11 and fails on 3.12+. Check <code>python3 --version</code> where it fails: a new Docker base image or CI runner is the usual trigger.</p>
+<h2 id="setuptools">2. Quick fix: install setuptools (it ships a distutils shim)</h2>
+<p>We ran this script in a fresh python:3-alpine container (Python 3.14.7, which has no setuptools preinstalled):</p>
+<pre><code>python -c &quot;import setuptools&quot; 2&gt;&amp;1 | tail -1
+pip install -q --disable-pip-version-check --root-user-action=ignore setuptools 2&gt;&amp;1 | tail -1
+pip show setuptools 2&gt;/dev/null | grep -E &#x27;^(Name|Version)&#x27;
+python -c &quot;import distutils, sys; print(sys.version.split()[0], distutils.__file__)&quot;
+python -c &quot;from distutils.version import LooseVersion; print(LooseVersion(&#x27;1.10&#x27;) &gt; LooseVersion(&#x27;1.9&#x27;))&quot; 2&gt;&amp;1</code></pre>
+<p>Output:</p>
+<pre><code>ModuleNotFoundError: No module named &#x27;setuptools&#x27;
+Name: setuptools
+Version: 84.2.1
+3.14.7 /usr/local/lib/python3.14/site-packages/setuptools/_distutils/__init__.py
+&lt;string&gt;:1: DeprecationWarning: distutils Version classes are deprecated. Use packaging.version instead.
+True</code></pre>
+<p>After <code>pip install setuptools</code>, <code>import distutils</code> resolves to <code>setuptools/_distutils</code>, so legacy imports work again. Note that Python 3.12+ images and venvs no longer include setuptools by default, which is why the error appears on a clean install. If the error comes from pip building an old package, upgrading that package to a release with wheels for your Python is often the better fix.</p>
+<h2 id="replace">3. Proper fix: replace the distutils calls</h2>
+<pre><code>from packaging.version import Version
+print(Version(&quot;1.10&quot;) &gt; Version(&quot;1.9&quot;))
+print(Version(&quot;2.0.0rc1&quot;) &lt; Version(&quot;2.0.0&quot;))
+import shutil, sysconfig
+print(shutil.which(&quot;sh&quot;))                        # was distutils.spawn.find_executable
+print(sysconfig.get_paths()[&quot;purelib&quot;])         # was distutils.sysconfig.get_python_lib()</code></pre>
+<p>Output (Python 3.14.7, after <code>pip install packaging</code>):</p>
+<pre><code>True
+True
+/bin/sh
+/usr/local/lib/python3.14/site-packages</code></pre>
+<p>The common replacements: <code>distutils.version.LooseVersion</code>/<code>StrictVersion</code> → <code>packaging.version.Version</code>; <code>distutils.spawn.find_executable</code> → <code>shutil.which</code>; <code>distutils.sysconfig.get_python_lib()</code> → <code>sysconfig.get_paths()["purelib"]</code>; <code>distutils.util.strtobool</code> has no direct replacement, so write a small function.</p>
+<p>Related: <a href="/guides/python-modulenotfounderror-vs-importerror/">ModuleNotFoundError vs ImportError</a> · <a href="/guides/python-nameerror-name-np-is-not-defined/">name 'np' is not defined</a>.</p>
+
+<aside class="cta"><strong>Debugging a script that also calls web APIs? Check what headers a URL actually sends:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why is there no module named distutils?</summary><p>distutils was removed from the standard library in Python 3.12 (PEP 632). It still exists on 3.11 and older.</p></details>
+<details><summary>How do I fix No module named distutils?</summary><p>pip install setuptools: it provides a distutils shim. Long term, replace LooseVersion with packaging.version.Version and find_executable with shutil.which.</p></details>
+<details><summary>Can I pip install distutils?</summary><p>Do not look for a distutils package on PyPI. On 3.12+, installing setuptools is the supported way to get the distutils module back.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-22 with Python 3.13.5 on Debian and the official python:3.11-alpine (3.11.17) and python:3-alpine (3.14.7) images: importing distutils, pip install setuptools 84.2.1 as a shim, and packaging/shutil/sysconfig replacements. Every block was run verbatim and its output pasted unedited. PlainHeaders is our extension; Python, setuptools and packaging are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

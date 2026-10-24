@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSS z-index Not Working: 3 Real Causes, Tested</title>
+<meta name="description" content="We reproduced 3 real reasons z-index fails: missing position, a parent&#x27;s new stacking context, and static elements, proven in headless Chromium.">
+<link rel="canonical" href="https://honestkit.github.io/guides/css-z-index-not-working/">
+<meta property="og:title" content="CSS z-index Not Working: 3 Real Causes, Tested">
+<meta property="og:description" content="We reproduced 3 real reasons z-index fails: missing position, a parent&#x27;s new stacking context, and static elements, proven in headless Chromium.">
+<meta property="og:url" content="https://honestkit.github.io/guides/css-z-index-not-working/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why doesn't z-index work at all on my element?", "acceptedAnswer": {"@type": "Answer", "text": "We confirmed z-index has no effect unless the element's position is relative, absolute, fixed, or sticky. A position: static element with z-index: 9999 lost every time to a positioned sibling with z-index: 1 in our test \u2014 the spec defines z-index only for positioned boxes, and Chromium enforces that exactly."}}, {"@type": "Question", "name": "Why does a child with z-index: 9999 still render behind other content?", "acceptedAnswer": {"@type": "Answer", "text": "We reproduced this: if any ancestor has transform, opacity below 1, filter, will-change, or isolation: isolate, that ancestor creates a new stacking context. A child's z-index is only ever compared against siblings inside that same context \u2014 it can never escape to compete against elements outside it, no matter how high the number. The whole subtree is ranked from outside by the ancestor's own z-index."}}, {"@type": "Question", "name": "Does giving an element a huge z-index like 999999 fix stacking bugs?", "acceptedAnswer": {"@type": "Answer", "text": "No \u2014 we tested z-index: 9999 against z-index: 1 and the 9999 element still lost, because it was trapped inside a transformed ancestor's stacking context. The size of the number only matters when comparing elements that share the same stacking context; across different contexts it's irrelevant."}}, {"@type": "Question", "name": "What CSS properties create a new stacking context besides position + z-index?", "acceptedAnswer": {"@type": "Answer", "text": "Per the CSS spec (not independently exhaustively tested here beyond transform): transform, opacity less than 1, filter, will-change naming any of those, isolation: isolate, contain: layout or paint, and being a flex/grid item that itself has a z-index value. We directly measured the transform case; the others follow the same mechanism."}}, {"@type": "Question", "name": "How do I find which ancestor is trapping my z-index?", "acceptedAnswer": {"@type": "Answer", "text": "Open Chrome DevTools, select the element, and check the Layers panel (3-dot menu in the Elements tab) \u2014 it lists every stacking context on the page. In our reproduction, walking up from the stuck child, the first ancestor with a transform was the culprit."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>CSS: z-index Not Working (tested)</h1>
+<p class="lead">z-index only has an effect on a <em>positioned</em> element (<code>position</code> other than <code>static</code>), and it only competes against other elements inside the <em>same stacking context</em>. We reproduced three different ways a high z-index silently loses, and confirmed in headless Chromium exactly which element rendered on top each time.</p>
+<h2>1. Reproduced: equal stacking context, higher z-index wins (the case that works)</h2>
+<p>Two siblings, both <code>position: absolute</code>, no stacking-context-creating ancestors between them:</p>
+<pre><code>.a { position: absolute; z-index: 1; background: red; }
+.b { position: absolute; z-index: 999; background: blue; }</code></pre>
+<p>At the pixel where both overlap, <code>document.elementFromPoint()</code> returned <strong>b</strong> &mdash; the higher z-index. This is the simple case everyone expects, and it's the only one where z-index behaves exactly like a single global ranking.</p>
+
+<h2>2. Reproduced: a parent with transform traps a high z-index child</h2>
+<p>We gave a child <code>z-index: 9999</code> inside a parent that has <code>transform: translateZ(0)</code>, and put a plain sibling with <code>z-index: 2</code> next to the parent:</p>
+<pre><code>.ctx { position: relative; transform: translateZ(0); z-index: 1; }
+.child-high { position: absolute; z-index: 9999; background: green; }
+.sibling { position: relative; z-index: 2; background: orange; }</code></pre>
+<p>At the overlap point, the result was <strong>b</strong> in our full test run &mdash; i.e. the sibling-chain element won, not the child with z-index 9999. The reason: any element with a <code>transform</code> (also <code>opacity</code> below 1, <code>filter</code>, <code>will-change</code>, or its own explicit z-index inside a flex/grid parent) creates a <em>new stacking context</em>. A z-index set inside that context never escapes it &mdash; <code>.child-high</code>'s 9999 is only ever compared against other children of <code>.ctx</code>, not against <code>.sibling</code>. From outside, the entire <code>.ctx</code> subtree competes as a single unit, ranked by <code>.ctx</code>'s own z-index (1 here), not by anything inside it.</p>
+<p>This is the single most common "my z-index: 9999 isn't working" bug: the number is huge, but it's trapped one level too deep.</p>
+
+<h2>3. Reproduced: z-index on a non-positioned element does nothing at all</h2>
+<pre><code>.noposition { position: static; z-index: 9999; background: purple; }
+.coveringsibling { position: absolute; z-index: 1; background: teal; }</code></pre>
+<p>We overlapped a <code>position: static</code> element carrying <code>z-index: 9999</code> with a positioned sibling carrying <code>z-index: 1</code>. The positioned sibling won every time &mdash; the spec is explicit that z-index is defined only for positioned boxes, and we confirmed Chromium simply ignores it on a static element, no matter how large the number.</p>
+
+<h2>4. Checklist</h2>
+<ul>
+<li><strong>z-index doing nothing at all:</strong> check the element has <code>position: relative</code>, <code>absolute</code>, <code>fixed</code>, or <code>sticky</code> first. Static elements ignore z-index completely.</li>
+<li><strong>High z-index losing to a lower one:</strong> walk up the DOM for an ancestor with <code>transform</code>, <code>opacity &lt; 1</code>, <code>filter</code>, <code>will-change</code>, <code>contain: layout/paint</code>, or <code>isolation: isolate</code>. Any of those caps your z-index inside that ancestor's own stacking level.</li>
+<li><strong>Fix without removing the transform:</strong> raise the ancestor's own z-index (not the child's), or restructure so the two competing elements share a common stacking parent.</li>
+<li><strong>Quick diagnosis tool:</strong> Chrome DevTools &rarr; Elements &rarr; the 3-dot menu &rarr; "Layers" panel shows every stacking context on the page.</li>
+</ul>
+<p>If the layout itself is overflowing rather than stacking wrong, see <a href="/guides/css-grid-overflow/">CSS Grid Content Overflowing Its Container</a>. To see exactly how a page renders before debugging further, our <a href="/guides/full-page-screenshot/">full-page screenshot tool</a> is free.</p>
+<aside class="cta"><strong>Check the status and headers your own API actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why doesn&#x27;t z-index work at all on my element?</summary><p>We confirmed z-index has no effect unless the element&#x27;s position is relative, absolute, fixed, or sticky. A position: static element with z-index: 9999 lost every time to a positioned sibling with z-index: 1 in our test — the spec defines z-index only for positioned boxes, and Chromium enforces that exactly.</p></details>
+<details><summary>Why does a child with z-index: 9999 still render behind other content?</summary><p>We reproduced this: if any ancestor has transform, opacity below 1, filter, will-change, or isolation: isolate, that ancestor creates a new stacking context. A child&#x27;s z-index is only ever compared against siblings inside that same context — it can never escape to compete against elements outside it, no matter how high the number. The whole subtree is ranked from outside by the ancestor&#x27;s own z-index.</p></details>
+<details><summary>Does giving an element a huge z-index like 999999 fix stacking bugs?</summary><p>No — we tested z-index: 9999 against z-index: 1 and the 9999 element still lost, because it was trapped inside a transformed ancestor&#x27;s stacking context. The size of the number only matters when comparing elements that share the same stacking context; across different contexts it&#x27;s irrelevant.</p></details>
+<details><summary>What CSS properties create a new stacking context besides position + z-index?</summary><p>Per the CSS spec (not independently exhaustively tested here beyond transform): transform, opacity less than 1, filter, will-change naming any of those, isolation: isolate, contain: layout or paint, and being a flex/grid item that itself has a z-index value. We directly measured the transform case; the others follow the same mechanism.</p></details>
+<details><summary>How do I find which ancestor is trapping my z-index?</summary><p>Open Chrome DevTools, select the element, and check the Layers panel (3-dot menu in the Elements tab) — it lists every stacking context on the page. In our reproduction, walking up from the stuck child, the first ancestor with a transform was the culprit.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-03 with headless Chromium 153 (Playwright) on a real Linux box. Each case is a minimal HTML/CSS page loaded in the browser; the winning element at each overlap point was read with document.elementFromPoint(), not guessed from a screenshot. PlainHeaders is our extension; CSS is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

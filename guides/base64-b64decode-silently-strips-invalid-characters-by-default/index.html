@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>base64.b64decode() Silently Strips Invalid Characters by Default</title>
+<meta name="description" content="We measured Python 3.13.5: base64.b64decode() ignores injected non-base64 characters and decodes fine, unless you pass validate=True.">
+<link rel="canonical" href="https://honestkit.github.io/guides/base64-b64decode-silently-strips-invalid-characters-by-default/">
+<meta property="og:title" content="base64.b64decode() Silently Strips Invalid Characters by Default">
+<meta property="og:description" content="We measured Python 3.13.5: base64.b64decode() ignores injected non-base64 characters and decodes fine, unless you pass validate=True.">
+<meta property="og:url" content="https://honestkit.github.io/guides/base64-b64decode-silently-strips-invalid-characters-by-default/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does base64.b64decode() validate its input by default?", "acceptedAnswer": {"@type": "Answer", "text": "Partially -- we measured this: it raises binascii.Error for incorrect padding (wrong length), but silently discards any character outside the base64 alphabet instead of raising, unless you pass validate=True."}}, {"@type": "Question", "name": "How do I make Python's base64 decoder reject invalid characters?", "acceptedAnswer": {"@type": "Answer", "text": "Pass validate=True to base64.b64decode(). We confirmed the exact same corrupted input that decodes silently with the default settings raises binascii.Error('Only base64 data is allowed') once validate=True is set."}}, {"@type": "Question", "name": "Can corrupted or tampered base64 data decode successfully in Python?", "acceptedAnswer": {"@type": "Answer", "text": "Yes -- we measured this directly: splicing extra, invalid characters into a valid base64 string and decoding it with the default settings returned the correct original bytes with no error at all, since the invalid characters were just dropped before decoding."}}, {"@type": "Question", "name": "Why does base64.b64decode() raise an error for missing padding but not for invalid characters?", "acceptedAnswer": {"@type": "Answer", "text": "These are different checks implemented separately: padding length is always validated, but character-set validation is optional and off by default. We confirmed both behaviors on the same input by toggling only the validate argument."}}, {"@type": "Question", "name": "Should I always pass validate=True when decoding base64 from external input?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, for anything not produced by your own code -- we confirmed the default (validate=False) will silently accept and decode input that's been corrupted or tampered with, which can hide a real problem with the data's source or integrity."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>base64.b64decode() Silently Strips Invalid Characters by Default (tested)</h1>
+<p class="lead"><code>base64.b64decode()</code> looks like it should reject malformed input. We measured what happens when a base64 string has extra, invalid characters injected into it -- the default call doesn't just tolerate them, it silently discards them and returns a result as if nothing was wrong.</p>
+<h2 id="repro1">1. Injected invalid characters are silently discarded, not rejected</h2>
+<pre><code>import base64
+
+good = base64.b64encode(b"hello world").decode()
+corrupted = good[:4] + "!!!!" + good[4:]
+print(corrupted)
+print(base64.b64decode(corrupted))</code></pre>
+<pre><code>aGVs!!!!bG8gd29ybGQ=
+b'hello world'</code></pre>
+<p><strong>Measured:</strong> four extra <code>!</code> characters, which are not part of the base64 alphabet, were spliced into the middle of a valid encoded string. <code>base64.b64decode()</code> still returns the exact correct original bytes -- it simply throws away any character that isn't valid base64 before decoding, with no error, no warning, and no way to tell from the return value that the input was ever tampered with.</p>
+
+<h2 id="repro2">2. validate=True makes it reject the same input</h2>
+<pre><code>import base64
+
+corrupted = "aGVs!!!!bG8gd29ybGQ="
+print(base64.b64decode(corrupted, validate=True))</code></pre>
+<pre><code>Traceback (most recent call last):
+  ...
+binascii.Error: Only base64 data is allowed</code></pre>
+<p><strong>Measured:</strong> the exact same corrupted string raises <code>binascii.Error</code> once <code>validate=True</code> is passed. This single keyword argument is the entire difference between silently accepting tampered or corrupted input and correctly rejecting it. <code>validate</code> defaults to <code>False</code>, so every call site that doesn't explicitly opt in is exposed to this -- a realistic risk anywhere base64 arrives from outside your program: URL parameters, custom headers, or a token that's been partially mangled by an intermediary.</p>
+
+<h2 id="repro3">3. Missing padding is the one thing that does raise, by default</h2>
+<pre><code>import base64
+
+good = base64.b64encode(b"hello world").decode()
+nopad = good.rstrip("=")
+print(base64.b64decode(nopad))</code></pre>
+<pre><code>Traceback (most recent call last):
+  ...
+binascii.Error: Incorrect padding</code></pre>
+<p><strong>Measured:</strong> removing the trailing <code>=</code> padding raises <code>binascii.Error: Incorrect padding</code> even with the default <code>validate=False</code>. So the function already fails loud on one class of malformed input (wrong length/padding) but silently tolerates another, arguably worse, class (wrong characters) unless you explicitly pass <code>validate=True</code>. If you're decoding anything that didn't originate from your own <code>b64encode()</code> call, pass <code>validate=True</code> and handle the resulting <code>binascii.Error</code>.</p>
+<aside class="cta"><strong>Decoding a base64 value from a header or token? Check the raw header bytes first:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Does base64.b64decode() validate its input by default?</summary><p>Partially -- we measured this: it raises binascii.Error for incorrect padding (wrong length), but silently discards any character outside the base64 alphabet instead of raising, unless you pass validate=True.</p></details>
+<details><summary>How do I make Python&#x27;s base64 decoder reject invalid characters?</summary><p>Pass validate=True to base64.b64decode(). We confirmed the exact same corrupted input that decodes silently with the default settings raises binascii.Error(&#x27;Only base64 data is allowed&#x27;) once validate=True is set.</p></details>
+<details><summary>Can corrupted or tampered base64 data decode successfully in Python?</summary><p>Yes -- we measured this directly: splicing extra, invalid characters into a valid base64 string and decoding it with the default settings returned the correct original bytes with no error at all, since the invalid characters were just dropped before decoding.</p></details>
+<details><summary>Why does base64.b64decode() raise an error for missing padding but not for invalid characters?</summary><p>These are different checks implemented separately: padding length is always validated, but character-set validation is optional and off by default. We confirmed both behaviors on the same input by toggling only the validate argument.</p></details>
+<details><summary>Should I always pass validate=True when decoding base64 from external input?</summary><p>Yes, for anything not produced by your own code -- we confirmed the default (validate=False) will silently accept and decode input that&#x27;s been corrupted or tampered with, which can hide a real problem with the data&#x27;s source or integrity.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-04 with Python 3.13.5&#x27;s built-in base64 module: encoded a known string, inserted invalid (non-base64-alphabet) characters into the middle of it, then decoded with base64.b64decode()&#x27;s default validate=False versus validate=True, and separately measured what happens with missing padding. PlainHeaders is our extension; Python&#x27;s base64 module is built in.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

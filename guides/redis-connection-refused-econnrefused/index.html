@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redis Connection Refused (ECONNREFUSED): Causes and Fixes</title>
+<meta name="description" content="ECONNREFUSED means nothing is listening on that port. We tested ioredis, node-redis and redis-cli on a closed port and a container we stopped and restarted.">
+<link rel="canonical" href="https://honestkit.github.io/guides/redis-connection-refused-econnrefused/">
+<meta property="og:title" content="Redis Connection Refused (ECONNREFUSED): Causes and Fixes">
+<meta property="og:description" content="ECONNREFUSED means nothing is listening on that port. We tested ioredis, node-redis and redis-cli on a closed port and a container we stopped and restarted.">
+<meta property="og:url" content="https://honestkit.github.io/guides/redis-connection-refused-econnrefused/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does ECONNREFUSED mean for Redis specifically?", "acceptedAnswer": {"@type": "Answer", "text": "Nothing answered on that host and port. The OS sent back a TCP reset instead of completing the handshake. We measured this by pointing ioredis, node-redis and redis-cli at a closed port: all three got ECONNREFUSED, none got a Redis-level reply, because Redis never saw the request."}}, {"@type": "Question", "name": "Will my Node app crash when Redis is unreachable?", "acceptedAnswer": {"@type": "Answer", "text": "Only if you have no 'error' listener on the client. With one attached, we measured that both ioredis and node-redis just keep emitting 'error' events and retrying in the background by default; they don't throw or exit the process."}}, {"@type": "Question", "name": "Does ioredis reconnect automatically when Redis comes back?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, by default, with no code required. In our live test we stopped a running Redis container mid-session and restarted it 4 seconds later; ioredis kept retrying with growing delays and reconnected on its own about 3 seconds after the new container started listening."}}, {"@type": "Question", "name": "Is NOAUTH the same problem as connection refused?", "acceptedAnswer": {"@type": "Answer", "text": "No. We measured NOAUTH by setting a password on a live container and connecting without one: the TCP connection succeeded and Redis replied with 'NOAUTH Authentication required.' That means the network path is fine; the fix is credentials, not anything related to ECONNREFUSED."}}, {"@type": "Question", "name": "Redis is definitely running \u2014 why do I still get ECONNREFUSED?", "acceptedAnswer": {"@type": "Answer", "text": "The most common reasons we didn't have to simulate: wrong port (6379 vs a custom one), the app and Redis sitting in different Docker networks, or Redis bound to 127.0.0.1 while the client connects from elsewhere. Run redis-cli -h HOST -p PORT ping from the same place your app runs to isolate it."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>Redis Connection Refused (ECONNREFUSED) (tested)</h1>
+<p class="lead"><code>ECONNREFUSED</code> means the TCP connection itself was rejected: either nothing is listening on that host and port, or a firewall actively refused it. It happens before Redis ever sees a command, so it is different from an auth error. We measured three clients (<code>ioredis</code>, <code>redis</code>, <code>redis-cli</code>) against a closed port and against a real Redis container we stopped and restarted mid-test.</p>
+<h2>1. What ECONNREFUSED means</h2>
+<p><code>ECONNREFUSED</code> is an operating-system level TCP error, not a Redis error. The kernel on the target host received a SYN packet for a port with no process listening on it, and answered with a reset instead of a handshake. Redis never ran, Redis crashed, Redis is listening on a different port, or something else (a stale container, a reused port) is in the way.</p>
+<p>This is distinct from an authentication failure. If Redis is up and listening but rejects your command, you get a Redis-level reply like <code>NOAUTH</code>, not a connection error. We measured both, see section 5.</p>
+
+<h2>2. Our test setup</h2>
+<p>We ran a real Redis 7.4.11 container (<code>redis:7-alpine</code>) via <code>docker run --name forever-redistest -p 6380:6379 redis:7-alpine</code> for the happy path and the live-reconnect test. For the closed-port tests we pointed clients at port 6381, which nothing was listening on.</p>
+<pre><code>$ docker run --rm -d --name forever-redistest -p 6380:6379 redis:7-alpine
+$ docker exec forever-redistest redis-cli ping
+PONG</code></pre>
+<p>Happy path confirmed first: ioredis against the live container fired <code>connect</code> then <code>ready</code>, and <code>PING</code> returned <code>PONG</code>.</p>
+
+<h2>3. The exact errors, three clients, same closed port</h2>
+<table>
+<tr><th>Client</th><th>Error code</th><th>Exact message</th><th>What happens without custom handling</th></tr>
+<tr><td>ioredis 6.0.0</td><td>ECONNREFUSED</td><td><code>connect ECONNREFUSED 127.0.0.1:6381</code></td><td>Emits a repeated <code>'error'</code> event, auto-retries forever by default. Does not throw or crash the process.</td></tr>
+<tr><td>node-redis 6.3.0 (<code>redis</code> package)</td><td>ECONNREFUSED</td><td><code>connect ECONNREFUSED 127.0.0.1:6381</code></td><td>Same: repeated <code>'error'</code> events, built-in auto-retry, <code>client.connect()</code>'s promise stays pending while it keeps trying. No crash.</td></tr>
+<tr><td>redis-cli (bundled in redis:7-alpine)</td><td>n/a (CLI text)</td><td><code>Could not connect to Redis at 127.0.0.1:6381: Connection refused</code></td><td>Prints the message, exits with code 1. One attempt, no retry.</td></tr>
+</table>
+<p>Both Node clients behave the same way under default settings: an unhandled <code>'error'</code> listener would otherwise crash the process on the first attempt, but once you attach <code>.on('error', ...)</code>, the client just keeps retrying in the background and never throws. We counted the retries for ioredis with no custom <code>retryStrategy</code>: 6 error events in 3 seconds, with growing gaps (<code>4ms, 161ms, 410ms, 693ms, 1157ms, 2148ms</code> after the first). That matches ioredis's documented default <code>retryStrategy</code> of <code>Math.min(times * 50, 2000)</code> ms between attempts, retried indefinitely unless you return <code>null</code> from your own strategy or call <code>.disconnect()</code>.</p>
+
+<h2>4. Live test: stop the container, watch the client, restart it</h2>
+<p>We connected ioredis to the real container on port 6380, pinged it every 500 ms, then ran <code>docker stop forever-redistest</code> mid-loop, waited 4 seconds, then started a fresh container on the same port, with no code changes or reconnect call in between.</p>
+<pre><code>[+2521ms] ping #5 -&gt; PONG
+[+3029ms] event:close
+[+3030ms] event:reconnecting, delay= 150
+[+3183ms] event:error ECONNREFUSED "connect ECONNREFUSED 127.0.0.1:6380"
+...
+[+6855ms] event:reconnecting, delay= 3292
+[+10150ms] event:connect
+[+10153ms] event:ready
+[+10154ms] ping #6 -&gt; PONG</code></pre>
+<p>The moment the container stopped, ioredis fired <code>close</code>, then kept retrying with growing delays (150ms, 281ms, 347ms, 424ms, 814ms, 1795ms, 3292ms between tries). As soon as the new container was listening again, the very next retry succeeded: <code>connect</code> and <code>ready</code> fired and <code>PING</code> started returning <code>PONG</code> again, about 3.1 seconds after the container came back. We wrote zero reconnect logic; ioredis's default behaviour recovered on its own.</p>
+
+<h2>5. NOAUTH is a different error, not ECONNREFUSED</h2>
+<p>We set <code>requirepass</code> on the live container (<code>redis-cli config set requirepass testpass123</code>) and connected without credentials, to confirm this is a different failure mode than a refused connection.</p>
+<table>
+<tr><th>Client</th><th>Result</th></tr>
+<tr><td>redis-cli</td><td><code>NOAUTH Authentication required.</code> (exit 0 for the PING attempt itself; the reply is the error)</td></tr>
+<tr><td>ioredis</td><td>Rejects with a <code>ReplyError</code>: <code>NOAUTH HELLO must be called with the client already authenticated, otherwise the HELLO &lt;proto&gt; AUTH &lt;user&gt; &lt;pass&gt; option can be used to authenticate the client and select the RESP protocol version at the same time</code></td></tr>
+</table>
+<p>The TCP connection succeeded in both cases; Redis answered immediately with a Redis-protocol error, not a refused socket. If you see <code>NOAUTH</code> or <code>WRONGPASS</code>, the network path is fine and the fix is credentials (<code>requirepass</code> / <code>-a</code> / the client's <code>password</code> option), not anything in this guide.</p>
+
+<h2>6. Common real causes of ECONNREFUSED</h2>
+<ul>
+<li><strong>Redis isn't running yet, or crashed.</strong> Our closed-port test (section 3) is exactly this case: nothing listening, instant refusal.</li>
+<li><strong>Wrong port.</strong> Default is 6379; a custom <code>port</code> in redis.conf, a Docker <code>-p</code> remap (like our 6380), or a typo in the client config all produce the same ECONNREFUSED if the client points at the wrong number.</li>
+<li><strong>App and Redis are in different Docker networks or hosts.</strong> A container on one Docker network can't reach a Redis container on another unless they share a network or Redis is published on the host. Per Docker's networking docs, not separately measured here: this usually also shows as ECONNREFUSED (if something else is listening on that port/host inside the app's network) or ETIMEDOUT/no route (if nothing answers at all) — see <a href="/guides/err-connection-timed-out-etimedout/">ETIMEDOUT</a> for that variant.</li>
+<li><strong>Redis bound to 127.0.0.1 only.</strong> If <code>bind 127.0.0.1</code> is set and a client connects from another machine or container, the OS refuses the connection the same way as a closed port, because nothing is listening on the external interface. Per the Redis docs, not separately measured here.</li>
+<li><strong>Container stopped or restarting.</strong> Our live test (section 4) reproduced this directly: during the stop/restart window every attempt got ECONNREFUSED, then succeeded the instant the new process was listening.</li>
+</ul>
+
+<h2>7. How to handle it</h2>
+<ul>
+<li>Always attach an <code>'error'</code> listener. Both ioredis and node-redis will crash the process with an unhandled error on the very first failed attempt if you don't, even though they retry fine once you do.</li>
+<li>Let the client's built-in retry do its job for transient drops (our test shows ioredis recovers alone). Only write custom reconnect code if you need to cap attempts or change the backoff.</li>
+<li>Confirm host and port independently: <code>redis-cli -h HOST -p PORT ping</code> from the same network/container the app runs in. Its one-shot "Could not connect ... Connection refused" is the fastest way to confirm the problem is the socket, not your app's Redis client code.</li>
+<li>If you get <code>NOAUTH</code>/<code>WRONGPASS</code> instead, the network is fine (section 5); fix credentials, not connectivity.</li>
+<li>In Docker, check both containers are on the same network (<code>docker network inspect</code>) and that the port is actually published if the client lives outside the Redis container's network.</li>
+</ul>
+<p>If the connection succeeds but then drops repeatedly, see <a href="/guides/err-connection-reset-econnreset/">ECONNRESET</a>. For the general cross-language version of this error, see <a href="/guides/err-connection-refused-econnrefused/">ECONNREFUSED</a>.</p>
+<aside class="cta"><strong>Check the status and headers your API actually returns when its cache backend is down:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does ECONNREFUSED mean for Redis specifically?</summary><p>Nothing answered on that host and port. The OS sent back a TCP reset instead of completing the handshake. We measured this by pointing ioredis, node-redis and redis-cli at a closed port: all three got ECONNREFUSED, none got a Redis-level reply, because Redis never saw the request.</p></details>
+<details><summary>Will my Node app crash when Redis is unreachable?</summary><p>Only if you have no &#x27;error&#x27; listener on the client. With one attached, we measured that both ioredis and node-redis just keep emitting &#x27;error&#x27; events and retrying in the background by default; they don&#x27;t throw or exit the process.</p></details>
+<details><summary>Does ioredis reconnect automatically when Redis comes back?</summary><p>Yes, by default, with no code required. In our live test we stopped a running Redis container mid-session and restarted it 4 seconds later; ioredis kept retrying with growing delays and reconnected on its own about 3 seconds after the new container started listening.</p></details>
+<details><summary>Is NOAUTH the same problem as connection refused?</summary><p>No. We measured NOAUTH by setting a password on a live container and connecting without one: the TCP connection succeeded and Redis replied with &#x27;NOAUTH Authentication required.&#x27; That means the network path is fine; the fix is credentials, not anything related to ECONNREFUSED.</p></details>
+<details><summary>Redis is definitely running — why do I still get ECONNREFUSED?</summary><p>The most common reasons we didn&#x27;t have to simulate: wrong port (6379 vs a custom one), the app and Redis sitting in different Docker networks, or Redis bound to 127.0.0.1 while the client connects from elsewhere. Run redis-cli -h HOST -p PORT ping from the same place your app runs to isolate it.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with Node.js 24.21.0, ioredis 6.0.0, node-redis (the &quot;redis&quot; package) 6.3.0, against a throwaway Redis 7.4.11 (redis:7-alpine, official image) container run via Docker. redis-cli is the one bundled in that same image. The &quot;different Docker network&quot; cause in section 6 is reasoned from how Docker networking works, not separately measured. PlainHeaders is our extension; curl, Node.js, Docker and redis-cli are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

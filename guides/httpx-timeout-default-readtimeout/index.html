@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx timeout default (5s): ReadTimeout, PoolTimeout (tested)</title>
+<meta name="description" content="httpx times out after 5 seconds by default. How to raise or disable it with timeout= / httpx.Timeout, and what ReadTimeout, PoolTimeout, ConnectTimeout mean.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-timeout-default-readtimeout/">
+<meta property="og:title" content="httpx timeout default (5s): ReadTimeout, PoolTimeout (tested)">
+<meta property="og:description" content="httpx times out after 5 seconds by default. How to raise or disable it with timeout= / httpx.Timeout, and what ReadTimeout, PoolTimeout, ConnectTimeout mean.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-timeout-default-readtimeout/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What is the default timeout in httpx?", "acceptedAnswer": {"@type": "Answer", "text": "5 seconds for each of connect, read, write and pool: httpx.Client().timeout printed Timeout(timeout=5.0), and a 7-second endpoint raised ReadTimeout after 5.0 s."}}, {"@type": "Question", "name": "How do I disable the httpx timeout?", "acceptedAnswer": {"@type": "Answer", "text": "Pass timeout=None to the request or the Client. The request can then wait forever, so a large explicit value is usually safer."}}, {"@type": "Question", "name": "What does httpx PoolTimeout mean?", "acceptedAnswer": {"@type": "Answer", "text": "All connections allowed by Limits(max_connections=...) were busy for longer than the pool timeout. Raise max_connections or the pool timeout."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx timeout: the 5 s default, ReadTimeout, PoolTimeout and fixes (tested)</h1>
+<p class="lead">httpx's default timeout is 5 seconds (connect, read, write and pool each). A slower endpoint raises <code>httpx.ReadTimeout</code>; pass <code>timeout=30.0</code> (or <code>httpx.Timeout(5.0, read=30.0)</code>) to the request or the Client, and catch <code>httpx.TimeoutException</code>.</p>
+<p>httpx has a <strong>5-second default timeout</strong> on every request (requests has none), split into four parts: connect, read, write and pool. Measured with httpx 0.28.1 on Python 3.13.5 against a local <code>http.server</code> whose path is the number of seconds to wait before answering (<code>/7</code> = 7 s).</p>
+<h2 id="default">1. The default: ReadTimeout after 5 seconds</h2>
+<pre><code>import httpx, time
+from srv import start
+base = start()
+
+print(httpx.Client().timeout)
+t = time.monotonic()
+try:
+    httpx.get(base + &quot;/7&quot;)          # server takes 7 s to answer
+except httpx.TimeoutException as e:
+    print(type(e).__name__, f&quot;after {time.monotonic() - t:.1f}s:&quot;, e)
+    print(&quot;TimeoutException subclass:&quot;, isinstance(e, httpx.TimeoutException))</code></pre>
+<p>Output:</p>
+<pre><code>Timeout(timeout=5.0)
+ReadTimeout after 5.0s: timed out
+TimeoutException subclass: True</code></pre>
+<p>A slow endpoint that works in a browser or with requests fails in httpx with <code>httpx.ReadTimeout: timed out</code> after exactly 5 seconds. All four timeout errors (<code>ConnectTimeout</code>, <code>ReadTimeout</code>, <code>WriteTimeout</code>, <code>PoolTimeout</code>) subclass <code>httpx.TimeoutException</code>, so catch that to handle them together.</p>
+<h2 id="fix">2. Raising or disabling the timeout</h2>
+<pre><code>import httpx, time
+from srv import start
+base = start()
+
+for timeout in (10.0, None, httpx.Timeout(2.0, read=8.0)):
+    t = time.monotonic()
+    r = httpx.get(base + &quot;/6&quot;, timeout=timeout)
+    print(repr(timeout), &quot;-&gt;&quot;, r.status_code, f&quot;{time.monotonic() - t:.1f}s&quot;)
+
+print(httpx.Timeout(10.0, connect=2.0))
+try:
+    httpx.Timeout(connect=2.0)
+except ValueError as e:
+    print(&quot;ValueError:&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>10.0 -&gt; 200 6.0s
+None -&gt; 200 6.0s
+Timeout(connect=2.0, read=8.0, write=2.0, pool=2.0) -&gt; 200 6.0s
+Timeout(connect=2.0, read=10.0, write=10.0, pool=10.0)
+ValueError: httpx.Timeout must either include a default, or set all four parameters explicitly.</code></pre>
+<p>Pass <code>timeout=</code> per request or on <code>httpx.Client(timeout=...)</code> / <code>AsyncClient</code>. A float sets all four parts; <code>None</code> disables the timeout entirely (the call can then hang forever, so prefer a large number); <code>httpx.Timeout(default, read=...)</code> sets one part and uses the default for the rest. <code>httpx.Timeout(connect=2.0)</code> alone is a <code>ValueError</code>: give a default or all four values.</p>
+<h2 id="pool">3. PoolTimeout: waiting for a free connection</h2>
+<pre><code>import httpx, threading, time
+from srv import start
+base = start()
+
+client = httpx.Client(timeout=httpx.Timeout(5.0, pool=1.0),
+                      limits=httpx.Limits(max_connections=1))
+threading.Thread(target=client.get, args=(base + &quot;/3&quot;,)).start()
+time.sleep(0.2)
+t = time.monotonic()
+try:
+    client.get(base + &quot;/0&quot;)
+except httpx.PoolTimeout as e:
+    print(type(e).__name__, f&quot;after {time.monotonic() - t:.1f}s&quot;, &quot;| is TimeoutException:&quot;, isinstance(e, httpx.TimeoutException))</code></pre>
+<p>Output:</p>
+<pre><code>PoolTimeout after 1.0s | is TimeoutException: True</code></pre>
+<p>With <code>Limits(max_connections=1)</code> and one request in flight, the second request waited for a connection and raised <code>PoolTimeout</code> after the 1 s pool timeout. Seen under concurrency (many tasks sharing one <code>AsyncClient</code>), it means raise <code>max_connections</code> (a Client defaults to 100) or the <code>pool</code> timeout, not the read timeout.</p>
+<h2 id="connect">4. ConnectTimeout: the host never answers</h2>
+<pre><code>import httpx, time
+t = time.monotonic()
+try:
+    httpx.get(&quot;http://10.255.255.1/&quot;, timeout=1.0)   # unroutable address
+except httpx.TimeoutException as e:
+    print(type(e).__name__, f&quot;after {time.monotonic() - t:.1f}s&quot;)</code></pre>
+<p>Output:</p>
+<pre><code>ConnectTimeout after 1.0s</code></pre>
+<p>An address that drops packets gives <code>ConnectTimeout</code> after the connect timeout. A host that is up with nothing listening on the port fails fast with <code>httpx.ConnectError</code> (connection refused) instead, which is not a <code>TimeoutException</code>.</p>
+<p>Related: <a href="/guides/httpx-follow-redirects/">httpx follow redirects</a>, <a href="/guides/python-requests-readtimeout-read-timed-out/">requests ReadTimeout</a>, <a href="/guides/python-requests-connectionerror-max-retries/">requests ConnectionError max retries</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What is the default timeout in httpx?</summary><p>5 seconds for each of connect, read, write and pool: httpx.Client().timeout printed Timeout(timeout=5.0), and a 7-second endpoint raised ReadTimeout after 5.0 s.</p></details>
+<details><summary>How do I disable the httpx timeout?</summary><p>Pass timeout=None to the request or the Client. The request can then wait forever, so a large explicit value is usually safer.</p></details>
+<details><summary>What does httpx PoolTimeout mean?</summary><p>All connections allowed by Limits(max_connections=...) were busy for longer than the pool timeout. Raise max_connections or the pool timeout.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5 against a local http.server (and an unroutable address for the connect timeout). Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

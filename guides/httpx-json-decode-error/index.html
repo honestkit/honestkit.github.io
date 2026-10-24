@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>httpx JSON decode error: why response.json() fails (tested)</title>
+<meta name="description" content="httpx r.json() raises json.JSONDecodeError (not httpx.HTTPError) on empty 204 bodies, HTML error pages and NDJSON. Causes, a safe helper, streaming lines.">
+<link rel="canonical" href="https://honestkit.github.io/guides/httpx-json-decode-error/">
+<meta property="og:title" content="httpx JSON decode error: why response.json() fails (tested)">
+<meta property="og:description" content="httpx r.json() raises json.JSONDecodeError (not httpx.HTTPError) on empty 204 bodies, HTML error pages and NDJSON. Causes, a safe helper, streaming lines.">
+<meta property="og:url" content="https://honestkit.github.io/guides/httpx-json-decode-error/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What exception does httpx response.json() raise?", "acceptedAnswer": {"@type": "Answer", "text": "json.JSONDecodeError from the standard library, a subclass of ValueError. It is not an httpx.HTTPError."}}, {"@type": "Question", "name": "Why does httpx json() say Expecting value: line 1 column 1 (char 0)?", "acceptedAnswer": {"@type": "Answer", "text": "The body is empty (e.g. 204) or not JSON at all (e.g. an HTML error page). Inspect r.status_code and r.text."}}, {"@type": "Question", "name": "Does httpx check the Content-Type before json()?", "acceptedAnswer": {"@type": "Answer", "text": "No. In the test it parsed a text/plain body as JSON."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>httpx JSON decode error: response.json() fails (tested)</h1>
+<p class="lead"><code>r.json()</code> raises <code>json.JSONDecodeError</code> when the body is empty, an HTML error page, or several JSON lines. Check <code>r.status_code</code> and <code>r.text[:200]</code>; catch <code>json.JSONDecodeError</code> (or <code>ValueError</code>), not <code>httpx.HTTPError</code>.</p>
+<p><code>response.json()</code> in httpx parses the body with the standard <code>json</code> module, so a body that is not JSON raises <code>json.JSONDecodeError</code> (a <code>ValueError</code>), not an httpx exception. Measured with httpx 0.28.1 on Python 3.13.5; <code>srv</code> is a local http.server returning the bodies named by each path.</p>
+<h2 id="error">1. The three usual causes</h2>
+<pre><code>import json, httpx, srv
+url = srv.start()
+for path in [&quot;/empty&quot;, &quot;/html&quot;, &quot;/ndjson&quot;]:
+    r = httpx.get(url + path)
+    try:
+        r.json()
+    except json.JSONDecodeError as e:
+        print(f&quot;{path}: {r.status_code} {type(e).__module__}.{type(e).__name__}: {e}&quot;)
+print(&quot;is it an httpx exception?&quot;, issubclass(json.JSONDecodeError, httpx.HTTPError))</code></pre>
+<p>Output:</p>
+<pre><code>/empty: 204 json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+/html: 502 json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+/ndjson: 200 json.decoder.JSONDecodeError: Extra data: line 2 column 1 (char 9)
+is it an httpx exception? False</code></pre>
+<p>An empty body (204, or an empty 200) and an HTML error page both give <code>Expecting value: line 1 column 1 (char 0)</code>; print <code>r.status_code</code> and <code>r.text[:200]</code> to see which. Newline-delimited JSON gives <code>Extra data</code>. <code>except httpx.HTTPError</code> does not catch any of them.</p>
+<h2 id="ctype">2. Content-Type is not checked</h2>
+<pre><code>import httpx, srv
+url = srv.start()
+r = httpx.get(url + &quot;/ok&quot;)
+print(r.headers[&quot;content-type&quot;], &quot;-&gt;&quot;, r.json())
+r = httpx.get(url + &quot;/bom&quot;)
+print(&quot;UTF-8 BOM -&gt;&quot;, r.json())</code></pre>
+<p>Output:</p>
+<pre><code>text/plain -&gt; {&#x27;id&#x27;: 1}
+UTF-8 BOM -&gt; {&#x27;id&#x27;: 1}</code></pre>
+<p><code>r.json()</code> parsed a <code>text/plain</code> body without complaint, and handled a UTF-8 byte-order mark. So the error is always about the bytes, never the header.</p>
+<h2 id="safe">3. A safe get_json helper</h2>
+<pre><code>import json, httpx, srv
+url = srv.start()
+
+def get_json(client, path):
+    r = client.get(path)
+    r.raise_for_status()
+    if r.status_code == 204 or not r.content:
+        return None
+    if &quot;json&quot; not in r.headers.get(&quot;content-type&quot;, &quot;&quot;):
+        raise ValueError(f&quot;expected JSON, got {r.headers.get(&#x27;content-type&#x27;)}: {r.text[:60]!r}&quot;)
+    return r.json()
+
+with httpx.Client(base_url=url) as c:
+    print(&quot;/empty -&gt;&quot;, get_json(c, &quot;/empty&quot;))
+    try:
+        get_json(c, &quot;/html&quot;)
+    except httpx.HTTPStatusError as e:
+        print(&quot;/html -&gt;&quot;, e.response.status_code, e.response.text[:40])</code></pre>
+<p>Output:</p>
+<pre><code>/empty -&gt; None
+/html -&gt; 502 &lt;html&gt;&lt;body&gt;Bad Gateway&lt;/body&gt;&lt;/html&gt;</code></pre>
+<p>Check the status first (<code>raise_for_status()</code> turns the 502 HTML page into an <code>HTTPStatusError</code> with the body attached), return <code>None</code> for empty bodies, and fail with a readable message if the server sent something other than JSON.</p>
+<h2 id="ndjson">4. Streaming NDJSON / JSON lines</h2>
+<pre><code>import json, httpx, srv
+url = srv.start()
+with httpx.Client() as c:
+    with c.stream(&quot;GET&quot;, url + &quot;/ndjson&quot;) as r:
+        for line in r.iter_lines():
+            if line:
+                print(json.loads(line))</code></pre>
+<p>Output:</p>
+<pre><code>{&#x27;a&#x27;: 1}
+{&#x27;a&#x27;: 2}</code></pre>
+<p>For one JSON object per line, decode each line yourself with <code>iter_lines()</code> instead of calling <code>r.json()</code> on the whole body.</p>
+<p>Related: <a href="/guides/python-jsondecodeerror-expecting-value-line-1-column-1-char-0/">JSONDecodeError: Expecting value line 1 column 1</a>, <a href="/guides/json-decode-error-extra-data/">JSONDecodeError: Extra data</a>, <a href="/guides/httpx-raise-for-status-httpstatuserror/">httpx raise_for_status</a>, <a href="/guides/httpx-stream-response-iter-bytes/">httpx streaming</a>, <a href="/guides/httpx-vs-requests-differences/">httpx vs requests differences</a>.</p>
+
+<aside class="cta"><strong>Check the status code and headers a URL returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What exception does httpx response.json() raise?</summary><p>json.JSONDecodeError from the standard library, a subclass of ValueError. It is not an httpx.HTTPError.</p></details>
+<details><summary>Why does httpx json() say Expecting value: line 1 column 1 (char 0)?</summary><p>The body is empty (e.g. 204) or not JSON at all (e.g. an HTML error page). Inspect r.status_code and r.text.</p></details>
+<details><summary>Does httpx check the Content-Type before json()?</summary><p>No. In the test it parsed a text/plain body as JSON.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with httpx 0.28.1 on Python 3.13.5 against a local http.server. Each block was run verbatim and the output pasted unedited. PlainHeaders is our extension; httpx is free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

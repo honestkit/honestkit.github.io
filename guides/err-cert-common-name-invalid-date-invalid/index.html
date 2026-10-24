@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ERR_CERT_COMMON_NAME_INVALID and ERR_CERT_DATE_INVALID (Tested)</title>
+<meta name="description" content="We served 9 test certificates to Chromium, curl, Node fetch and Python. Exact error per client, why CN-only certs fail, wildcard traps, and openssl checks.">
+<link rel="canonical" href="https://honestkit.github.io/guides/err-cert-common-name-invalid-date-invalid/">
+<meta property="og:title" content="ERR_CERT_COMMON_NAME_INVALID and ERR_CERT_DATE_INVALID (Tested)">
+<meta property="og:description" content="We served 9 test certificates to Chromium, curl, Node fetch and Python. Exact error per client, why CN-only certs fail, wildcard traps, and openssl checks.">
+<meta property="og:url" content="https://honestkit.github.io/guides/err-cert-common-name-invalid-date-invalid/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why does curl work but Chrome shows ERR_CERT_COMMON_NAME_INVALID?", "acceptedAnswer": {"@type": "Answer", "text": "Most likely the certificate has no Subject Alternative Name. In our test curl, Node and Python accepted a CN-only certificate because they fall back to the Common Name. Chromium 153 ignored the CN and failed. Run openssl x509 -noout -ext subjectAltName; if it prints 'No extensions in certificate', reissue with a SAN."}}, {"@type": "Question", "name": "Does a wildcard certificate cover the bare domain?", "acceptedAnswer": {"@type": "Answer", "text": "No. A certificate for *.example.test failed for example.test and for a.b.example.test in all four clients we tested. It only worked for a.example.test. Add example.test as a separate SAN entry."}}, {"@type": "Question", "name": "What is the difference between ERR_CERT_DATE_INVALID and CERT_HAS_EXPIRED?", "acceptedAnswer": {"@type": "Answer", "text": "They are the same problem in different clients. Chromium shows ERR_CERT_DATE_INVALID for both expired and not-yet-valid certificates. Node reports CERT_HAS_EXPIRED or CERT_NOT_YET_VALID, and curl says 'certificate has expired' or 'certificate is not yet valid'."}}, {"@type": "Question", "name": "Can I use an IP address with a certificate made for a host name?", "acceptedAnswer": {"@type": "Answer", "text": "No. A certificate with only DNS:localhost failed for https://127.0.0.1 in every client, while it worked for https://localhost. The SAN needs an IP Address entry for that exact IP."}}, {"@type": "Question", "name": "Does Chrome reject certificates valid for more than 398 days?", "acceptedAnswer": {"@type": "Answer", "text": "Per the CA/Browser Forum and Chrome docs (not measured), that limit applies to certificates from public CAs. An 825-day certificate from our own private root loaded fine in Chromium 153, curl, Node and Python."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>NET::ERR_CERT_COMMON_NAME_INVALID and ERR_CERT_DATE_INVALID (tested)</h1>
+<p class="lead"><code>NET::ERR_CERT_COMMON_NAME_INVALID</code> means the certificate is not valid for the name in the address bar. <code>NET::ERR_CERT_DATE_INVALID</code> means it is expired or not valid yet. We built each broken certificate from a private test root, made every client trust that root, and recorded the exact error each one gave.</p>
+<h2>1. What the two errors mean</h2>
+<p>Chromium checks two things about the server certificate besides who signed it. First, the host name (or IP) you typed must be listed in the certificate's <strong>Subject Alternative Name</strong> (SAN). If not, you get <code>NET::ERR_CERT_COMMON_NAME_INVALID</code>. The name is old: Chromium no longer looks at the Common Name at all. Second, the current time must be between <code>notBefore</code> and <code>notAfter</code>. If not, you get <code>NET::ERR_CERT_DATE_INVALID</code>, for both expired and not-yet-valid certificates.</p>
+<p>If the root is not trusted, Chromium reports <code>NET::ERR_CERT_AUTHORITY_INVALID</code> instead. We saw exactly that when we ran the same test without the temporary trust store. See <a href="/guides/err-cert-authority-invalid/">ERR_CERT_AUTHORITY_INVALID</a> for that case.</p>
+
+<h2>2. Our test setup</h2>
+<p>We made one private root CA and signed a leaf certificate for each case with <code>openssl x509 -req</code>. A Node.js HTTPS server on 127.0.0.1 served one certificate at a time. Chromium trusted the root through a temporary NSS database (<code>certutil -A -t "C,,"</code>) in a temporary HOME, so no system store was touched. Wildcard names were mapped to 127.0.0.1 with <code>--host-resolver-rules</code> in Chromium and <code>--resolve</code> in curl.</p>
+<pre><code>openssl x509 -req -in leaf.csr -CA root.pem -CAkey root.key \
+  -extfile san.ext -days 90 -out leaf.pem
+# san.ext:  subjectAltName=DNS:localhost,IP:127.0.0.1
+# expired:  -not_before 20250101000000Z -not_after 20260101000000Z</code></pre>
+
+<h2>3. Results: name errors</h2>
+<table>
+<tr><th>Case</th><th>Chromium 153</th><th>Node fetch</th><th>curl</th><th>Python</th></tr>
+<tr><td>CN=localhost, no SAN</td><td>ERR_CERT_COMMON_NAME_INVALID</td><td>accepted (200)</td><td>accepted</td><td>accepted</td></tr>
+<tr><td>SAN DNS:other.test, CN=localhost, URL localhost</td><td>ERR_CERT_COMMON_NAME_INVALID</td><td>ERR_TLS_CERT_ALTNAME_INVALID</td><td>(60) no alternative certificate subject name matches</td><td>Hostname mismatch</td></tr>
+<tr><td>SAN DNS:localhost only, URL https://127.0.0.1</td><td>ERR_CERT_COMMON_NAME_INVALID</td><td>ERR_TLS_CERT_ALTNAME_INVALID</td><td>(60) ... target ipv4 address '127.0.0.1'</td><td>IP address mismatch</td></tr>
+<tr><td>SAN *.example.test, URL example.test</td><td>ERR_CERT_COMMON_NAME_INVALID</td><td>ERR_TLS_CERT_ALTNAME_INVALID</td><td>(60)</td><td>Hostname mismatch</td></tr>
+<tr><td>SAN *.example.test, URL a.example.test</td><td>200</td><td>200</td><td>ok</td><td>ok</td></tr>
+<tr><td>SAN *.example.test, URL a.b.example.test</td><td>ERR_CERT_COMMON_NAME_INVALID</td><td>ERR_TLS_CERT_ALTNAME_INVALID</td><td>(60)</td><td>Hostname mismatch</td></tr>
+</table>
+<p>The surprise is the first row. A certificate with only a Common Name and no SAN worked in curl, Node and Python, which still fall back to the CN when there is no SAN. Chromium rejected it. So "it works with curl" does not prove the certificate is fine for browsers.</p>
+<p>The second row shows the reverse. The CN said <code>localhost</code>, but once a SAN was present every client ignored the CN and failed.</p>
+<p>The exact messages we got:</p>
+<pre><code>Chromium: net::ERR_CERT_COMMON_NAME_INVALID at https://localhost:8994/
+Node:     TypeError: fetch failed
+          cause: ERR_TLS_CERT_ALTNAME_INVALID - Hostname/IP does not match
+          certificate's altnames: Host: localhost. is not in the cert's altnames: DNS:other.test
+Node (IP): Hostname/IP does not match certificate's altnames: IP: 127.0.0.1 is not in the cert's list:
+curl:     curl: (60) SSL: no alternative certificate subject name matches target hostname 'localhost'
+Python:   [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch,
+          certificate is not valid for 'localhost'. (_ssl.c:1029)</code></pre>
+
+<h2>4. Results: date errors</h2>
+<table>
+<tr><th>Case</th><th>Chromium 153</th><th>Node fetch (cause.code)</th><th>curl</th><th>Python</th></tr>
+<tr><td>Expired (notAfter 2026-01-01)</td><td>ERR_CERT_DATE_INVALID</td><td>CERT_HAS_EXPIRED "certificate has expired"</td><td>(60) SSL certificate problem: certificate has expired</td><td>certificate verify failed: certificate has expired</td></tr>
+<tr><td>Not yet valid (notBefore 2027-01-01)</td><td>ERR_CERT_DATE_INVALID</td><td>CERT_NOT_YET_VALID "certificate is not yet valid"</td><td>(60) SSL certificate problem: certificate is not yet valid</td><td>certificate verify failed: certificate is not yet valid</td></tr>
+<tr><td>825-day validity, private root</td><td>200</td><td>200</td><td>ok</td><td>ok</td></tr>
+<tr><td>Expired <em>and</em> wrong name</td><td>ERR_CERT_COMMON_NAME_INVALID</td><td>CERT_HAS_EXPIRED</td><td>certificate has expired</td><td>Hostname mismatch</td></tr>
+</table>
+<p>Chromium uses one error for both directions. Node and curl tell you which one. A not-yet-valid certificate on a correct server usually means the <em>client</em> clock is wrong, or a certificate was installed with a future start time.</p>
+<p>When both problems exist, clients disagree on which one they report. Fixing the first error may reveal the second, so check both with openssl (section 5).</p>
+<p>Validity length: our 825-day certificate from a private root loaded in Chromium. Per the CA/Browser Forum and Chrome root program docs (not measured), certificates from <em>public</em> CAs issued after 1 September 2020 must be valid for 398 days or less, and browsers reject longer ones from those CAs. Private roots you add yourself are not held to that rule in our test.</p>
+
+<h2>5. Check the certificate with openssl</h2>
+<p>Look at the certificate the server really sends (not the file you think it uses):</p>
+<pre><code>$ echo | openssl s_client -connect 127.0.0.1:8994 -servername localhost -CAfile root.pem 2&gt;/dev/null \
+    | openssl x509 -noout -subject -dates -ext subjectAltName
+subject=CN=localhost
+notBefore=Jan  1 00:00:00 2025 GMT
+notAfter=Jan  1 00:00:00 2026 GMT
+X509v3 Subject Alternative Name: 
+    DNS:localhost, IP Address:127.0.0.1</code></pre>
+<p>A certificate with no SAN prints this. Chromium will reject it with ERR_CERT_COMMON_NAME_INVALID:</p>
+<pre><code>$ openssl x509 -in cnonly.pem -noout -ext subjectAltName
+No extensions in certificate</code></pre>
+<p>Test a name, an IP and the expiry directly:</p>
+<pre><code>$ openssl x509 -in mismatch.pem -noout -checkhost localhost
+Hostname localhost does NOT match certificate
+$ openssl x509 -in good.pem -noout -checkhost localhost -checkip 127.0.0.1
+Hostname localhost does match certificate
+IP 127.0.0.1 does match certificate
+$ openssl x509 -in expired.pem -noout -checkend 0
+Certificate will expire          # exit code 1
+$ openssl x509 -in good.pem -noout -checkend 2592000
+Certificate will not expire      # exit code 0, still valid in 30 days</code></pre>
+<p>Watch out: <code>-checkhost</code> said "does match" for the CN-only certificate, because OpenSSL falls back to the CN. Use <code>-ext subjectAltName</code> to see what Chromium will see.</p>
+<p>Another trap: <code>s_client</code> does not check the host name unless you ask. Against the wrong-name certificate it said <code>Verify return code: 0 (ok)</code>. With <code>-verify_hostname localhost</code> it said <code>Verify return code: 62 (hostname mismatch)</code>. For the expired one it said <code>Verify return code: 10 (certificate has expired)</code>.</p>
+
+<h2>6. Fixes</h2>
+<ul>
+<li><strong>No SAN.</strong> Reissue with a SAN. With openssl: <code>-addext "subjectAltName=DNS:example.com,DNS:www.example.com"</code> on <code>req</code>, or <code>subjectAltName=...</code> in the <code>-extfile</code> for <code>x509 -req</code>. Public CAs such as Let's Encrypt always add a SAN.</li>
+<li><strong>Wrong name.</strong> List every name users type. <code>www.example.com</code> and <code>example.com</code> are two names. Check that the server picks the right certificate for the SNI name (on a shared IP the default certificate is often someone else's).</li>
+<li><strong>IP address URL.</strong> A DNS entry never matches an IP. Add <code>IP:203.0.113.10</code> to the SAN, or use a host name. Public CAs rarely issue IP certificates, so a name is the usual fix.</li>
+<li><strong>Wildcard.</strong> <code>*.example.com</code> covers exactly one label. It does not cover <code>example.com</code> or <code>a.b.example.com</code>. Add the apex as its own SAN entry; add <code>*.b.example.com</code> for deeper names.</li>
+<li><strong>Expired.</strong> Renew and reload the server. Then confirm with <code>s_client</code> that the new certificate is served. A renewed file on disk does nothing until nginx, Apache or Node reloads it. Set up monitoring: see <a href="/guides/check-ssl-certificate-expiry/">check SSL certificate expiry</a>.</li>
+<li><strong>Not yet valid.</strong> Check the client clock first (<code>date -u</code>). If the clock is right, the certificate was issued with a future <code>notBefore</code>; reissue it.</li>
+</ul>
+<p>Do not "fix" these by turning off verification (<code>curl -k</code>, <code>rejectUnauthorized: false</code>, <code>verify=False</code>). That accepts any certificate for any name. For other TLS failures before the certificate stage, see <a href="/guides/err-ssl-protocol-error/">ERR_SSL_PROTOCOL_ERROR</a>.</p>
+
+<aside class="cta"><strong>Check what your HTTPS server actually sends back:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why does curl work but Chrome shows ERR_CERT_COMMON_NAME_INVALID?</summary><p>Most likely the certificate has no Subject Alternative Name. In our test curl, Node and Python accepted a CN-only certificate because they fall back to the Common Name. Chromium 153 ignored the CN and failed. Run openssl x509 -noout -ext subjectAltName; if it prints &#x27;No extensions in certificate&#x27;, reissue with a SAN.</p></details>
+<details><summary>Does a wildcard certificate cover the bare domain?</summary><p>No. A certificate for *.example.test failed for example.test and for a.b.example.test in all four clients we tested. It only worked for a.example.test. Add example.test as a separate SAN entry.</p></details>
+<details><summary>What is the difference between ERR_CERT_DATE_INVALID and CERT_HAS_EXPIRED?</summary><p>They are the same problem in different clients. Chromium shows ERR_CERT_DATE_INVALID for both expired and not-yet-valid certificates. Node reports CERT_HAS_EXPIRED or CERT_NOT_YET_VALID, and curl says &#x27;certificate has expired&#x27; or &#x27;certificate is not yet valid&#x27;.</p></details>
+<details><summary>Can I use an IP address with a certificate made for a host name?</summary><p>No. A certificate with only DNS:localhost failed for https://127.0.0.1 in every client, while it worked for https://localhost. The SAN needs an IP Address entry for that exact IP.</p></details>
+<details><summary>Does Chrome reject certificates valid for more than 398 days?</summary><p>Per the CA/Browser Forum and Chrome docs (not measured), that limit applies to certificates from public CAs. An 825-day certificate from our own private root loaded fine in Chromium 153, curl, Node and Python.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with headless Chromium 153.0.8010.12 (Playwright), Node.js 24.21.0 (OpenSSL 3.5.8), curl 8.14.1 (OpenSSL 3.5.7), Python 3.13.5 (OpenSSL 3.5.7) and the openssl 3.5.7 CLI. All certificates were signed by a private test root that each client was told to trust (Chromium via a temporary NSS database under a temporary HOME, curl via --cacert, Node via NODE_EXTRA_CA_CERTS or ca, Python via cafile). The 398-day rule for public CAs is from the CA/Browser Forum and Chrome root program docs, not measured. PlainHeaders is our extension; curl, openssl, Python, Node.js and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

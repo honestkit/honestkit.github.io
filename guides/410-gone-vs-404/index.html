@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>410 Gone vs 404 Not Found: When to Use Each (Tested)</title>
+<meta name="description" content="We served 410 and 404 from Node.js and Flask, then tested curl --fail, curl --retry, fetch() and Chromium caching. One surprise: Chromium cached a 410 with no Cache-Control, but not a 404.">
+<link rel="canonical" href="https://honestkit.github.io/guides/410-gone-vs-404/">
+<meta property="og:title" content="410 Gone vs 404 Not Found: When to Use Each (Tested)">
+<meta property="og:description" content="We served 410 and 404 from Node.js and Flask, then tested curl --fail, curl --retry, fetch() and Chromium caching. One surprise: Chromium cached a 410 with no Cache-Control, but not a 404.">
+<meta property="og:url" content="https://honestkit.github.io/guides/410-gone-vs-404/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is 410 better than 404 for SEO?", "acceptedAnswer": {"@type": "Answer", "text": "Only slightly. Google has said 410 can drop a URL a little faster, but both lead to removal over time. Pick 410 when the removal is deliberate and final."}}, {"@type": "Question", "name": "Should I redirect a deleted page instead of returning 410?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, if a real replacement exists: use a 301 to the closest matching page. Do not redirect everything to the homepage; with no replacement, return 410 or 404."}}, {"@type": "Question", "name": "Do browsers cache 410 responses?", "acceptedAnswer": {"@type": "Answer", "text": "In our test, Chromium 153 cached a 410 that had an old Last-Modified and no Cache-Control: two fetch() calls made one server request. A 404 with the same headers was not cached. With Cache-Control: max-age=60 both were cached."}}, {"@type": "Question", "name": "Does curl --fail treat 404 and 410 the same?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Both gave exit code 22. Without --fail, curl exited 0 for both. fetch() returned ok=false for both and did not throw."}}, {"@type": "Question", "name": "Can a 410 page have a normal HTML body?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Chromium rendered our custom 410 page, and Playwright's page.goto reported status 410. Add a short explanation and links so visitors are not stuck."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>410 Gone vs 404 Not Found (tested)</h1>
+<p class="lead"><code>404 Not Found</code> means the server has nothing at this URL right now. <code>410 Gone</code> means the page existed and was removed on purpose, with no replacement. Both are errors to clients. The differences are small, but one of them surprised us.</p>
+<h2>1. The short answer</h2>
+<p>Use <strong>410</strong> when you removed a page on purpose and nothing replaces it. Use <strong>404</strong> for anything else that does not exist. If a replacement page exists, use a <strong>301</strong> redirect instead. See <a href="/guides/301-vs-302-vs-307-vs-308-redirect/">301 vs 302 vs 307 vs 308</a>.</p>
+<table>
+<tr><th>Situation</th><th>Status</th></tr>
+<tr><td>Typo URL, never existed</td><td>404</td></tr>
+<tr><td>Page deleted on purpose, no replacement</td><td>410</td></tr>
+<tr><td>Page moved or merged into another page</td><td>301 to the new URL</td></tr>
+<tr><td>Page still exists but should leave search results</td><td>200 + noindex</td></tr>
+</table>
+<p>For the last row, see <a href="/guides/x-robots-tag-header-nginx-apache/">X-Robots-Tag in nginx and Apache</a> and <a href="/guides/check-noindex/">how to check noindex</a>.</p>
+
+<h2>2. Return 410 in plain Node.js</h2>
+<p>Keep a list of removed paths. Return 410 for those, 404 for everything else unknown. This is the server we tested:</p>
+<pre><code>import http from 'node:http';
+const REMOVED = new Set(['/old-page', '/2019-sale']);
+
+http.createServer((req, res) =&gt; {
+  const path = new URL(req.url, 'http://x').pathname;
+  if (REMOVED.has(path)) {
+    res.writeHead(410, {'Content-Type': 'text/html; charset=utf-8'});
+    return res.end('&lt;h1&gt;Gone&lt;/h1&gt;&lt;p&gt;This page was removed on purpose.&lt;/p&gt;');
+  }
+  // ... your normal routes ...
+  res.writeHead(404, {'Content-Type': 'text/html'});
+  res.end('&lt;h1&gt;Not Found&lt;/h1&gt;');
+}).listen(8986);</code></pre>
+<pre><code>$ curl -i http://127.0.0.1:8986/old-page
+HTTP/1.1 410 Gone
+Content-Type: text/html; charset=utf-8
+Connection: keep-alive
+Transfer-Encoding: chunked
+
+&lt;h1&gt;Gone&lt;/h1&gt;&lt;p&gt;This page was removed on purpose.&lt;/p&gt;</code></pre>
+<p>In Express the same idea is one middleware placed before your routes. We did not run Express, but it uses the same Node response object:</p>
+<pre><code>const REMOVED = new Set(['/old-page', '/2019-sale']);
+app.use((req, res, next) =&gt;
+  REMOVED.has(req.path) ? res.status(410).send('Gone') : next());</code></pre>
+
+<h2>3. Return 410 in Flask</h2>
+<p><code>abort(410)</code> works anywhere. A <code>before_request</code> hook handles a whole list:</p>
+<pre><code>from flask import Flask, abort, request
+app = Flask(__name__)
+REMOVED = {"/old-page", "/2019-sale"}
+
+@app.before_request
+def gone():
+    if request.path in REMOVED:
+        abort(410)</code></pre>
+<pre><code>$ curl -i http://127.0.0.1:8987/old-page
+HTTP/1.1 410 GONE
+Server: Werkzeug/3.1.9 Python/3.13.5
+Content-Type: text/html; charset=utf-8
+Content-Length: 252
+Connection: close
+
+&lt;!doctype html&gt;
+&lt;html lang=en&gt;
+&lt;title&gt;410 Gone&lt;/title&gt;
+&lt;h1&gt;Gone&lt;/h1&gt;
+&lt;p&gt;The requested URL is no longer available on this server and there is no forwarding address. ...</code></pre>
+<p>Werkzeug writes the reason phrase as <code>GONE</code> in capitals. Clients ignore the phrase; only the number matters.</p>
+
+<h2>4. nginx and Apache</h2>
+<p>From the docs (not measured here). nginx:</p>
+<pre><code>location = /old-page { return 410; }</code></pre>
+<p>Apache (mod_alias):</p>
+<pre><code>Redirect gone /old-page</code></pre>
+
+<h2>5. Caching: Chromium cached a 410 but not a 404</h2>
+<p>RFC 9111 says 404 and 410 are both "heuristically cacheable". That means a cache may store them even without <code>Cache-Control</code>, if it has a hint like an old <code>Last-Modified</code>. We tested this. The server sent <code>Last-Modified: Mon, 01 Jan 2018</code> and no <code>Cache-Control</code>. The page called <code>fetch()</code> twice per URL in a fresh browser context. We counted requests at the server. We ran it twice; both runs gave the same counts.</p>
+<table>
+<tr><th>Response</th><th>Headers</th><th>Server hits for 2 fetches</th><th>Cached?</th></tr>
+<tr><td>200</td><td>Last-Modified only</td><td>1</td><td>Yes (heuristic)</td></tr>
+<tr><td>410</td><td>Last-Modified only</td><td>1</td><td>Yes (heuristic)</td></tr>
+<tr><td>404</td><td>Last-Modified only</td><td>2</td><td>No</td></tr>
+<tr><td>410</td><td>Cache-Control: max-age=60</td><td>1</td><td>Yes</td></tr>
+<tr><td>404</td><td>Cache-Control: max-age=60</td><td>1</td><td>Yes</td></tr>
+</table>
+<p>So Chromium 153 treats 410 like a 200 for heuristic caching, but not 404. This matters if you might bring a URL back. A browser can keep showing the cached 410 for a while. If you are not sure the removal is final, send <code>Cache-Control: no-store</code> or a short <code>max-age</code> with the 410. Or use 404.</p>
+
+<h2>6. What clients see</h2>
+<table>
+<tr><th>Client</th><th>404</th><th>410</th></tr>
+<tr><td><code>curl --fail</code> exit code</td><td>22</td><td>22</td></tr>
+<tr><td><code>curl</code> without --fail</td><td>0</td><td>0</td></tr>
+<tr><td><code>fetch()</code> <code>res.ok</code></td><td>false</td><td>false</td></tr>
+<tr><td><code>fetch()</code> <code>res.statusText</code></td><td>Not Found</td><td>Gone</td></tr>
+<tr><td>Chromium <code>page.goto</code></td><td>-</td><td>status 410, HTML body rendered</td></tr>
+</table>
+<p><code>curl --fail-with-body</code> also exits 22, but prints the body first. <code>fetch()</code> does not throw on 404 or 410; you must check <code>res.ok</code>.</p>
+<p>Chromium showed our custom 410 page normally. <code>page.goto</code> returned status 410 and the body text was "GoneThis page was removed on purpose." So give your 410 page real content: a short note and links to related pages.</p>
+
+<h2>7. curl --retry does not retry 404 or 410</h2>
+<p><code>curl --retry 3</code> only retries "transient" errors (timeouts and some 5xx codes, plus 408 and 429). We counted server hits:</p>
+<pre><code>$ curl -sS --retry 3 -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8986/h410
+410          # 1 request, exit 0
+$ curl -sS --retry 3 --fail -o /dev/null http://127.0.0.1:8986/old-page
+curl: (22) The requested URL returned error: 410   # 1 request, exit 22
+$ curl -sS --retry 3 --retry-all-errors --fail -o /dev/null http://127.0.0.1:8986/2019-sale
+curl: (22) ... error: 410   (printed 4 times)       # 4 requests, exit 22</code></pre>
+<p>Plain <code>--retry</code> made one request for both 404 and 410. Adding <code>--retry-all-errors</code> with <code>--fail</code> retried the 410 three times. Avoid that combination in scripts that hit removed URLs.</p>
+
+<h2>8. Search engines</h2>
+<p>From Google's public statements, not measured here. Google's John Mueller has said a 410 can drop a URL from the index slightly faster than a 404, but both are fine in the long run. Google Search Console lists both under the "Not found (404)" page indexing report. That report is informational: removed pages returning 404 or 410 do not hurt the rest of your site. Fix links on your own site that still point to removed pages; see <a href="/guides/find-broken-links-on-website/">how to find broken links</a>.</p>
+<aside class="cta"><strong>Check the status code and caching headers your removed pages really send:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Is 410 better than 404 for SEO?</summary><p>Only slightly. Google has said 410 can drop a URL a little faster, but both lead to removal over time. Pick 410 when the removal is deliberate and final.</p></details>
+<details><summary>Should I redirect a deleted page instead of returning 410?</summary><p>Yes, if a real replacement exists: use a 301 to the closest matching page. Do not redirect everything to the homepage; with no replacement, return 410 or 404.</p></details>
+<details><summary>Do browsers cache 410 responses?</summary><p>In our test, Chromium 153 cached a 410 that had an old Last-Modified and no Cache-Control: two fetch() calls made one server request. A 404 with the same headers was not cached. With Cache-Control: max-age=60 both were cached.</p></details>
+<details><summary>Does curl --fail treat 404 and 410 the same?</summary><p>Yes. Both gave exit code 22. Without --fail, curl exited 0 for both. fetch() returned ok=false for both and did not throw.</p></details>
+<details><summary>Can a 410 page have a normal HTML body?</summary><p>Yes. Chromium rendered our custom 410 page, and Playwright&#x27;s page.goto reported status 410. Add a short explanation and links so visitors are not stuck.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-02 with curl 8.14.1, Node.js 24.21.0 (plain http module), Flask on Werkzeug 3.1.9 and headless Chromium 153 via Playwright 1.63: we served 410 and 404 responses with and without Cache-Control and counted every request that reached the server. PlainHeaders is our extension; curl, Node.js, Flask and Chromium are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OSError: [Errno 28] No space left on device (Python, Tested)</title>
+<meta name="description" content="Python [Errno 28] No space left on device, reproduced on a 1 MB tmpfs: why it can appear at close(), shutil.disk_usage checks, partial-file cleanup, TMPDIR.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-oserror-errno-28-no-space-left-on-device/">
+<meta property="og:title" content="OSError: [Errno 28] No space left on device (Python, Tested)">
+<meta property="og:description" content="Python [Errno 28] No space left on device, reproduced on a 1 MB tmpfs: why it can appear at close(), shutil.disk_usage checks, partial-file cleanup, TMPDIR.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-oserror-errno-28-no-space-left-on-device/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Why do I get No space left on device when df shows free space?", "acceptedAnswer": {"@type": "Answer", "text": "The error is about the filesystem the path is on. Check shutil.disk_usage(path) or df on that exact path; /tmp, a container's overlay or a small volume can be full while other disks are not."}}, {"@type": "Question", "name": "Why did close() raise Errno 28?", "acceptedAnswer": {"@type": "Answer", "text": "Python buffers writes, so data that did not fit is only written when the buffer is flushed at close(). Wrap the whole with block in try/except."}}, {"@type": "Question", "name": "How do I catch Errno 28?", "acceptedAnswer": {"@type": "Answer", "text": "except OSError as e: if e.errno == errno.ENOSPC. There is no dedicated subclass."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>OSError: [Errno 28] No space left on device in Python (tested)</h1>
+<p class="lead"><code>OSError: [Errno 28] No space left on device</code> (<code>ENOSPC</code>) means the filesystem you are writing to is full. Because writes are buffered it can be raised by <code>close()</code> instead of <code>write()</code>, and it leaves a truncated file behind. Check with <code>shutil.disk_usage</code>, catch <code>errno.ENOSPC</code>, delete the partial file, and move temp files with <code>TMPDIR</code>.</p>
+<p>Every block below ran in Docker with <code>/data</code> mounted as a 1 MB tmpfs (<code>--tmpfs /data:size=1m</code>), so the disk really fills up.</p>
+<h2 id="test">1. The error</h2>
+<pre><code># /data is a 1 MB tmpfs
+with open(&quot;/data/big.bin&quot;, &quot;wb&quot;) as f:
+    f.write(b&quot;x&quot; * 2_000_000)</code></pre>
+<p>Output:</p>
+<pre><code>Traceback (most recent call last):
+  File &quot;/w/b1.py&quot;, line 3, in &lt;module&gt;
+    f.write(b&quot;x&quot; * 2_000_000)
+    ~~~~~~~^^^^^^^^^^^^^^^^^^
+OSError: [Errno 28] No space left on device</code></pre>
+<p><code>ENOSPC</code> means the filesystem the file lives on has no free blocks left. It is about <em>that</em> filesystem only: <code>/tmp</code>, a Docker volume or a small root partition can be full while another disk has plenty of room.</p>
+<h2 id="close">2. It can surface at close(), not at write()</h2>
+<pre><code>import os, shutil
+print(shutil.disk_usage(&quot;/data&quot;))
+# the error often appears at close()/flush(), not at write()
+f = open(&quot;/data/a.bin&quot;, &quot;wb&quot;)
+n = f.write(b&quot;x&quot; * 900_000)
+print(&quot;write() returned&quot;, n)
+f2 = open(&quot;/data/b.bin&quot;, &quot;wb&quot;)
+f2.write(b&quot;y&quot; * 200_000)
+print(&quot;second write() did not raise&quot;)
+try:
+    f2.close()
+except OSError as e:
+    print(&quot;close():&quot;, type(e).__name__, e)
+f.close()
+for p in (&quot;/data/a.bin&quot;, &quot;/data/b.bin&quot;):
+    print(p, os.path.getsize(p))</code></pre>
+<p>Output:</p>
+<pre><code>usage(total=1048576, used=0, free=1048576)
+write() returned 900000
+second write() did not raise
+close(): OSError [Errno 28] No space left on device
+/data/a.bin 900000
+/data/b.bin 147456</code></pre>
+<p>Python buffers writes. The second <code>write()</code> did not raise even though only part of the data fit; the error appeared at <code>close()</code> when the buffer was flushed, and <code>b.bin</code> was left truncated at 147456 bytes. Code that only wraps <code>write()</code> in <code>try</code> misses it; wrap the whole <code>with</code> block, and treat a failed <code>close()</code> as a failed write.</p>
+<h2 id="check">3. Check free space first with shutil.disk_usage</h2>
+<pre><code>import shutil
+total, used, free = shutil.disk_usage(&quot;/data&quot;)
+print(f&quot;total={total} used={used} free={free}&quot;)
+def ensure_space(path, need):
+    free = shutil.disk_usage(path).free
+    if free &lt; need:
+        raise RuntimeError(f&quot;need {need} bytes, only {free} free on {path}&quot;)
+try:
+    ensure_space(&quot;/data&quot;, 2_000_000)
+except RuntimeError as e:
+    print(e)</code></pre>
+<p>Output:</p>
+<pre><code>total=1048576 used=0 free=1048576
+need 2000000 bytes, only 1048576 free on /data</code></pre>
+<p><code>shutil.disk_usage(path)</code> returns total, used and free bytes for the filesystem that contains <code>path</code>. Checking before a large download or export gives a clear message instead of a half-written file. It is a hint, not a guarantee: other processes can fill the disk in between.</p>
+<h2 id="cleanup">4. Handle it: catch ENOSPC and delete the partial file</h2>
+<pre><code>import errno, os
+path = &quot;/data/out.bin&quot;
+try:
+    with open(path, &quot;wb&quot;) as f:
+        f.write(b&quot;z&quot; * 2_000_000)
+except OSError as e:
+    if e.errno != errno.ENOSPC:
+        raise
+    print(&quot;disk full:&quot;, errno.errorcode[e.errno])
+    print(&quot;partial file left behind:&quot;, os.path.getsize(path), &quot;bytes&quot;)
+    os.remove(path)
+    print(&quot;removed:&quot;, not os.path.exists(path))</code></pre>
+<p>Output:</p>
+<pre><code>disk full: ENOSPC
+partial file left behind: 1048576 bytes
+removed: True</code></pre>
+<p>A failed write leaves a partial file that uses up the last free space. Remove it (or write to a temporary name and <code>os.replace</code> it into place only after a successful close) so the next run does not start on a full disk.</p>
+<h2 id="tmpdir">5. /tmp is full: point TMPDIR somewhere bigger</h2>
+<pre><code>import tempfile
+print(tempfile.gettempdir())</code></pre>
+<p>Output of <code>python3 b5.py</code>, then <code>TMPDIR=/data python3 b5.py</code>:</p>
+<pre><code>/tmp
+/data</code></pre>
+<p><code>tempfile</code> uses <code>$TMPDIR</code> when it is set, so moving temporary files to a larger disk is one environment variable, no code change. Then free space properly: find what is big with <code>du -sh /path/* | sort -h</code>, and on Docker hosts see <a href="/guides/docker-no-space-left-on-device/">Docker: no space left on device</a>.</p>
+<p>Related: <a href="/guides/python-oserror-errno-36-file-name-too-long/">[Errno 36] File name too long</a> · <a href="/guides/python-oserror-errno-16-device-or-resource-busy/">[Errno 16] Device or resource busy</a> · <a href="/guides/python-permissionerror-errno-13-permission-denied/">[Errno 13] Permission denied</a>.</p>
+
+<aside class="cta"><strong>Collecting data from web tables? Copy them as CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Why do I get No space left on device when df shows free space?</summary><p>The error is about the filesystem the path is on. Check shutil.disk_usage(path) or df on that exact path; /tmp, a container&#x27;s overlay or a small volume can be full while other disks are not.</p></details>
+<details><summary>Why did close() raise Errno 28?</summary><p>Python buffers writes, so data that did not fit is only written when the buffer is flushed at close(). Wrap the whole with block in try/except.</p></details>
+<details><summary>How do I catch Errno 28?</summary><p>except OSError as e: if e.errno == errno.ENOSPC. There is no dedicated subclass.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-23 with Python 3.14.7 (python:3-alpine) in Docker with a 1 MB tmpfs mounted at /data. Each block was run verbatim and the output pasted unedited. PlainTables is our extension; Python and Docker are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

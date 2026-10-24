@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EOFError: Ran out of input &amp; EOF when reading a line (Fixed)</title>
+<meta name="description" content="We measured Python&#x27;s EOFError: pickle.load on empty or unflushed files (Ran out of input) and input() with no stdin (EOF when reading a line), with fixes.">
+<link rel="canonical" href="https://honestkit.github.io/guides/python-eoferror-ran-out-of-input-eof-when-reading-a-line/">
+<meta property="og:title" content="EOFError: Ran out of input &amp; EOF when reading a line (Fixed)">
+<meta property="og:description" content="We measured Python&#x27;s EOFError: pickle.load on empty or unflushed files (Ran out of input) and input() with no stdin (EOF when reading a line), with fixes.">
+<meta property="og:url" content="https://honestkit.github.io/guides/python-eoferror-ran-out-of-input-eof-when-reading-a-line/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "What does EOFError: Ran out of input mean in pickle?", "acceptedAnswer": {"@type": "Answer", "text": "pickle.load reached end of file before any object started. We measured it for a 0-byte file and for calling load again after the last object. A file cut mid-object raises UnpicklingError: pickle data was truncated instead."}}, {"@type": "Question", "name": "Why is my pickle file empty?", "acceptedAnswer": {"@type": "Answer", "text": "Usually the writer hadn't closed or flushed it yet (we measured 0 bytes visible before close), or open(path, 'wb') truncated it and the dump never ran. Use with open() and write to a temp file then os.replace()."}}, {"@type": "Question", "name": "How do I read multiple objects from one pickle file?", "acceptedAnswer": {"@type": "Answer", "text": "Call pickle.load in a loop and stop on EOFError. We measured three appended dumps loading back as a list of three."}}, {"@type": "Question", "name": "What does EOFError: EOF when reading a line mean?", "acceptedAnswer": {"@type": "Answer", "text": "input() found no more data on stdin. We measured it with stdin from /dev/null; it also happens with Ctrl-D, CI jobs, docker without -i, and IDE run panels without a console."}}, {"@type": "Question", "name": "How do I fix EOFError with input()?", "acceptedAnswer": {"@type": "Answer", "text": "Wrap input() in try/except EOFError with a default, read via for line in sys.stdin, or take arguments with argparse. Make sure the program actually has stdin attached."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>EOFError: Ran out of input / EOF when reading a line (tested)</h1>
+<p class="lead">Python raises <code>EOFError</code> when it needs more data and the input has ended. The two messages people hit are <code>EOFError: Ran out of input</code> from <code>pickle.load</code> and <code>EOFError: EOF when reading a line</code> from <code>input()</code>. We measured both on Python 3.13.5.</p>
+<h2 id="ran-out">1. pickle.load: EOFError: Ran out of input</h2>
+<pre><code>import pickle, os
+open(&quot;empty.pkl&quot;, &quot;wb&quot;).close()          # 0-byte file (crashed writer, touch, etc.)
+try:
+    with open(&quot;empty.pkl&quot;, &quot;rb&quot;) as f:
+        pickle.load(f)
+except EOFError as e:
+    print(&quot;empty file:&quot;, type(e).__name__, e)
+
+with open(&quot;one.pkl&quot;, &quot;wb&quot;) as f:
+    pickle.dump({&quot;a&quot;: 1}, f)
+with open(&quot;one.pkl&quot;, &quot;rb&quot;) as f:
+    print(&quot;first load:&quot;, pickle.load(f))
+    try:
+        pickle.load(f)                    # reading past the last object
+    except EOFError as e:
+        print(&quot;second load:&quot;, type(e).__name__, e)
+
+data = pickle.dumps(list(range(1000)))
+with open(&quot;cut.pkl&quot;, &quot;wb&quot;) as f:
+    f.write(data[:len(data)//2])          # truncated write
+try:
+    with open(&quot;cut.pkl&quot;, &quot;rb&quot;) as f:
+        pickle.load(f)
+except Exception as e:
+    print(&quot;truncated:&quot;, type(e).__name__, e)</code></pre>
+<p>Output:</p>
+<pre><code>empty file: EOFError Ran out of input
+first load: {&#x27;a&#x27;: 1}
+second load: EOFError Ran out of input
+truncated: UnpicklingError pickle data was truncated</code></pre>
+<p><strong>Measured on Python 3.13.5:</strong> "Ran out of input" means <code>pickle.load</code> hit end of file before the first byte of an object. Two causes: the file is empty (0 bytes), or you already read the last object and called <code>load</code> again. A file cut off <em>mid-object</em> gives a different error, <code>UnpicklingError: pickle data was truncated</code>.</p>
+
+<h2 id="why-empty">2. Why the file is empty</h2>
+<pre><code>import pickle
+f = open(&quot;data.pkl&quot;, &quot;wb&quot;)
+pickle.dump([1, 2, 3], f)
+# forgot f.close() / flush: another reader opens it now
+with open(&quot;data.pkl&quot;, &quot;rb&quot;) as g:
+    try:
+        print(pickle.load(g))
+    except EOFError as e:
+        print(&quot;before close:&quot;, type(e).__name__, e)
+f.close()
+with open(&quot;data.pkl&quot;, &quot;rb&quot;) as g:
+    print(&quot;after close:&quot;, pickle.load(g))
+
+# opening for writing truncates first, so &quot;w&quot; then read in the same script = empty
+open(&quot;data.pkl&quot;, &quot;wb&quot;)
+with open(&quot;data.pkl&quot;, &quot;rb&quot;) as g:
+    try:
+        pickle.load(g)
+    except EOFError as e:
+        print(&quot;after open(&#x27;wb&#x27;):&quot;, e)</code></pre>
+<p>Output:</p>
+<pre><code>before close: EOFError Ran out of input
+after close: [1, 2, 3]
+after open(&#x27;wb&#x27;): Ran out of input</code></pre>
+<p><strong>Measured:</strong> <code>pickle.dump</code> writes into Python's buffer; until the file is closed or flushed, a reader sees 0 bytes. Also, <code>open(path, "wb")</code> truncates the file immediately, so opening for write "just to check", or a crash between that open and the dump, leaves an empty file behind. Use <code>with open(...)</code> so the file is closed, and write to a temp file then <code>os.replace()</code> it if a crash mid-write matters.</p>
+
+<h2 id="fix">3. Fixes: load every object, or default on empty</h2>
+<pre><code>import pickle, os
+
+def load_all(path):
+    out = []
+    with open(path, &quot;rb&quot;) as f:
+        while True:
+            try:
+                out.append(pickle.load(f))
+            except EOFError:
+                return out
+
+def load_or_default(path, default):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return default
+    with open(path, &quot;rb&quot;) as f:
+        return pickle.load(f)
+
+with open(&quot;many.pkl&quot;, &quot;wb&quot;) as f:
+    for i in range(3):
+        pickle.dump({&quot;n&quot;: i}, f)
+print(load_all(&quot;many.pkl&quot;))
+open(&quot;empty.pkl&quot;, &quot;wb&quot;).close()
+print(load_or_default(&quot;empty.pkl&quot;, {}))
+print(load_or_default(&quot;missing.pkl&quot;, []))</code></pre>
+<p>Output:</p>
+<pre><code>[{&#x27;n&#x27;: 0}, {&#x27;n&#x27;: 1}, {&#x27;n&#x27;: 2}]
+{}
+[]</code></pre>
+<p>To read a file you appended several dumps to, loop until <code>EOFError</code>; that's the documented end-of-stream signal. For a cache file that may be empty or missing, check the size first and fall back to a default rather than catching every <code>EOFError</code> (which would also hide a corrupt file you'd want to know about).</p>
+
+<h2 id="input">4. input(): EOFError: EOF when reading a line</h2>
+<pre><code>name = input(&quot;name? &quot;)
+print(&quot;hello&quot;, name)</code></pre>
+<p>Run with and without stdin:</p>
+<pre><code>$ python3 b4.py &lt; /dev/null
+EOFError: EOF when reading a line
+$ echo Ada | python3 b4.py
+name? hello Ada</code></pre>
+<p><strong>Measured:</strong> <code>input()</code> raises <code>EOFError: EOF when reading a line</code> when stdin has no more data: run with <code>&lt; /dev/null</code>, piped from a command that printed nothing, Ctrl-D (Ctrl-Z Enter on Windows), a CI job, <code>docker run</code> without <code>-i</code>, or an editor "Run" panel that doesn't attach a console. Some online IDEs need you to type input into a separate stdin box before running.</p>
+
+<h2 id="input-fix">5. Handling missing input</h2>
+<pre><code>import sys
+try:
+    line = input(&quot;name? &quot;)
+except EOFError:
+    line = &quot;&quot;                       # no stdin: Ctrl-D, closed pipe, CI, Docker without -i
+print(&quot;got:&quot;, repr(line))
+for line in sys.stdin:              # reading every line: loop ends cleanly at EOF
+    print(&quot;line:&quot;, line.rstrip(&quot;\n&quot;))</code></pre>
+<p>Run with and without stdin:</p>
+<pre><code>$ python3 b5.py &lt; /dev/null
+name? got: &#x27;&#x27;
+$ printf &quot;Ada\nx\ny\n&quot; | python3 b5.py
+name? got: &#x27;Ada&#x27;
+line: x
+line: y</code></pre>
+<p>Catch <code>EOFError</code> around <code>input()</code> and use a default, or read with <code>for line in sys.stdin</code>, which just stops at end of input. For scripts that run unattended, take values from command-line arguments (<code>argparse</code>) or environment variables instead of prompting.</p>
+
+<aside class="cta"><strong>Debugging a Python HTTP script? Check the real status and headers a server returns:</strong> <a href="/plainheaders/">PlainHeaders</a> — Add, change or remove HTTP request &amp; response headers. Open source, no tracking, access only to sites you choose.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>What does EOFError: Ran out of input mean in pickle?</summary><p>pickle.load reached end of file before any object started. We measured it for a 0-byte file and for calling load again after the last object. A file cut mid-object raises UnpicklingError: pickle data was truncated instead.</p></details>
+<details><summary>Why is my pickle file empty?</summary><p>Usually the writer hadn&#x27;t closed or flushed it yet (we measured 0 bytes visible before close), or open(path, &#x27;wb&#x27;) truncated it and the dump never ran. Use with open() and write to a temp file then os.replace().</p></details>
+<details><summary>How do I read multiple objects from one pickle file?</summary><p>Call pickle.load in a loop and stop on EOFError. We measured three appended dumps loading back as a list of three.</p></details>
+<details><summary>What does EOFError: EOF when reading a line mean?</summary><p>input() found no more data on stdin. We measured it with stdin from /dev/null; it also happens with Ctrl-D, CI jobs, docker without -i, and IDE run panels without a console.</p></details>
+<details><summary>How do I fix EOFError with input()?</summary><p>Wrap input() in try/except EOFError with a default, read via for line in sys.stdin, or take arguments with argparse. Make sure the program actually has stdin attached.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-09 with Python 3.13.5 on Linux: pickle.load on an empty file, after the last object, on a truncated file and on an unflushed file; input() with stdin from /dev/null and from a pipe. Every block was run verbatim and its output pasted from that run. Windows consoles and IDE run panels were not tested. PlainHeaders is our extension; everything else here is built-in Python.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>

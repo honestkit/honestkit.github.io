@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ultralytics YOLO &quot;Weights only load failed&quot; on torch 2.6+: fix</title>
+<meta name="description" content="Old ultralytics fails to load yolov8n.pt on torch 2.6+ with UnpicklingError. Tested fixes: upgrade to 8.2.103+ or set TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1.">
+<link rel="canonical" href="https://honestkit.github.io/guides/ultralytics-yolo-weights-only-load-failed/">
+<meta property="og:title" content="ultralytics YOLO &quot;Weights only load failed&quot; on torch 2.6+: fix">
+<meta property="og:description" content="Old ultralytics fails to load yolov8n.pt on torch 2.6+ with UnpicklingError. Tested fixes: upgrade to 8.2.103+ or set TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1.">
+<meta property="og:url" content="https://honestkit.github.io/guides/ultralytics-yolo-weights-only-load-failed/">
+<meta property="og:type" content="website">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Which ultralytics version fixed it?", "acceptedAnswer": {"@type": "Answer", "text": "In our test 8.0.196 failed and 8.2.103 (2024-09-28) and 8.4.185 loaded the same yolov8n.pt on torch 2.14.1."}}, {"@type": "Question", "name": "Is TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 safe?", "acceptedAnswer": {"@type": "Answer", "text": "Only for weight files you trust. It turns full unpickling back on, which can run code stored in the file."}}]}</script>
+</head>
+<body>
+<header class="top"><nav><a class="brand" href="/">Honestkit</a>
+<a href="/#extensions">Extensions</a><a href="/#tools">Free tools</a><a href="/#apify">Data tools</a><a href="/privacy.html">Privacy</a></nav></header>
+<main>
+<article class="guide">
+<h1>ultralytics YOLO: Weights only load failed (fix)</h1>
+<p class="lead">On torch 2.6 and newer, <code>YOLO("yolov8n.pt")</code> with an old ultralytics release fails with <code>_pickle.UnpicklingError: Weights only load failed</code> and <code>Unsupported global: GLOBAL ultralytics.nn.tasks.DetectionModel</code>. Tested fixes: upgrade ultralytics to 8.2.103 or later, or set <code>TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1</code>.</p>
+<h2 id="repro">1. The error</h2>
+<p>ultralytics 8.0.196 (a common pinned version in older YOLOv8 projects) with torch 2.14.1, loading the stock <code>yolov8n.pt</code>:</p>
+<pre><code>import torch, ultralytics
+print(&quot;torch&quot;, torch.__version__, &quot;| ultralytics&quot;, ultralytics.__version__)
+from ultralytics import YOLO
+try:
+    model = YOLO(&quot;yolov8n.pt&quot;)
+except Exception as e:
+    msg = str(e).splitlines()
+    print(type(e).__module__ + &quot;.&quot; + type(e).__name__ + &quot;:&quot;, msg[0][:60] + &quot;...&quot;)
+    print([l.strip() for l in msg if &quot;Unsupported global&quot; in l][0][:110] + &quot;...&quot;)</code></pre>
+<pre><code>torch 2.14.1+cpu | ultralytics 8.0.196
+_pickle.UnpicklingError: Weights only load failed. This file can still be loaded, to ...
+WeightsUnpickler error: Unsupported global: GLOBAL ultralytics.nn.tasks.DetectionModel was not an allowed glob...</code></pre>
+<p>Old ultralytics calls <code>torch.load(file, map_location='cpu')</code> without <code>weights_only</code>. Since torch 2.6 that argument defaults to <code>True</code>, and a YOLO <code>.pt</code> file is a pickled <code>DetectionModel</code> object, not a plain state_dict, so the safe unpickler refuses it.</p>
+<h2 id="upgrade">2. Fix: upgrade ultralytics</h2>
+<p>Newer releases wrap <code>torch.load</code> and pass <code>weights_only=False</code> themselves. In our test the same file loaded on 8.2.103 (2024-09-28) and on the current release:</p>
+<pre><code>pip install -U ultralytics</code></pre>
+<pre><code>import torch, ultralytics
+from ultralytics import YOLO
+model = YOLO(&quot;yolov8n.pt&quot;)   # same file, no env var
+r = model(&quot;bus.jpg&quot;, verbose=False)[0]
+print(&quot;torch&quot;, torch.__version__, &quot;| ultralytics&quot;, ultralytics.__version__, &quot;| detections:&quot;, len(r.boxes))</code></pre>
+<pre><code>torch 2.14.1+cpu | ultralytics 8.4.185 | detections: 6</code></pre>
+<p>If your project pins <code>ultralytics==8.0.*</code> or <code>8.1.*</code>, raise the pin to at least 8.2.103, the oldest release we confirmed loads the file.</p>
+<h2 id="env">3. Fix without upgrading: TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1</h2>
+<p>If you cannot touch the ultralytics version (a frozen repo, a tool that bundles it), torch honours an environment variable that restores the old default when <code>weights_only</code> is not passed. Set it before the load, in code or in the shell (<code>export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1</code>):</p>
+<pre><code>import os
+os.environ[&quot;TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD&quot;] = &quot;1&quot;   # must be set before the load
+import ultralytics
+from ultralytics import YOLO
+model = YOLO(&quot;yolov8n.pt&quot;)
+r = model(&quot;bus.jpg&quot;, verbose=False)[0]
+print(&quot;ultralytics&quot;, ultralytics.__version__, &quot;| detections:&quot;, len(r.boxes))</code></pre>
+<pre><code>.../site-packages/ultralytics/nn/tasks.py:567: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  return torch.load(file, map_location=&#x27;cpu&#x27;), file  # load
+ultralytics 8.0.196 | detections: 6</code></pre>
+<p>Same 8.0.196 install, same file: it loads and detects with a <code>UserWarning</code>. A third option is pinning <code>torch&lt;2.6</code>, where the default was still <code>False</code>.</p>
+<h2 id="safety">Only for files you trust</h2>
+<p>Both fixes turn full unpickling back on, which can run arbitrary code from the file. That is fine for official ultralytics weights or your own training runs; for <code>.pt</code> files from unknown sources, don't. The general torch background and the <code>add_safe_globals</code> route are in <a href="/guides/torch-load-weights-only-load-failed/">torch.load: Weights only load failed</a>; the same error after fixing pkg_resources in the old <code>yolov5</code> package is covered in <a href="/guides/yolov5-no-module-named-pkg-resources/">yolov5: No module named pkg_resources</a>.</p>
+
+<aside class="cta"><strong>Turn an HTML table on any page into CSV:</strong> <a href="/plaintables/">PlainTables</a> — Copy any web table to Excel, Google Sheets, CSV or Markdown in one click. No row limits, no account, no tracking.</aside>
+<section class="faq"><h2>Frequently asked questions</h2>
+<details><summary>Which ultralytics version fixed it?</summary><p>In our test 8.0.196 failed and 8.2.103 (2024-09-28) and 8.4.185 loaded the same yolov8n.pt on torch 2.14.1.</p></details>
+<details><summary>Is TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 safe?</summary><p>Only for weight files you trust. It turns full unpickling back on, which can run code stored in the file.</p></details>
+</section>
+<p class="note">Written with AI assistance. Measured on 2026-10-24 on Linux with torch 2.14.1+cpu, CPython 3.11.17, ultralytics 8.0.196, 8.2.103 and 8.4.185. Output pasted unedited except shortened site-packages paths. PlainTables is our extension; ultralytics and PyTorch are free.</p>
+</article>
+</main>
+<footer><p>Honestkit — small, honest tools. No tracking, no signup. Built with AI assistance by an independent developer.
+Open source (MIT) — <a href="https://github.com/honestkit">source</a>.
+<a href="/privacy.html">Privacy: this site collects nothing.</a></p></footer>
+</body>
+</html>
